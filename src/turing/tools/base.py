@@ -1,0 +1,122 @@
+"""Tool interface and registry for the Turing agent."""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any
+
+import structlog
+
+logger = structlog.get_logger("turing.tools")
+
+
+class RiskLevel(str, Enum):
+    """Risk classification for tool operations."""
+
+    LOW = "low"  # Read-only operations
+    MEDIUM = "medium"  # Network access, non-destructive writes
+    HIGH = "high"  # Process management, system changes, destructive ops
+
+
+@dataclass
+class ToolResult:
+    """Result returned by a tool execution."""
+
+    success: bool
+    output: str
+    error: str = ""
+    truncated: bool = False
+
+
+class Tool(ABC):
+    """Base class for all tools."""
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Unique identifier for this tool."""
+        ...
+
+    @property
+    @abstractmethod
+    def description(self) -> str:
+        """Human-readable description of what this tool does."""
+        ...
+
+    @property
+    @abstractmethod
+    def parameters(self) -> dict[str, Any]:
+        """JSON Schema describing accepted parameters."""
+        ...
+
+    @property
+    def risk_level(self) -> RiskLevel:
+        """Default risk level for this tool."""
+        return RiskLevel.LOW
+
+    @property
+    def requires_confirmation(self) -> bool:
+        """Whether this tool requires user confirmation before execution."""
+        return self.risk_level == RiskLevel.HIGH
+
+    @abstractmethod
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        """Execute the tool with the given arguments."""
+        ...
+
+    def to_tool_definition(self) -> ToolDefinition:
+        """Convert to LLM ToolDefinition format."""
+        from turing.llm.base import ToolDefinition
+
+        return ToolDefinition(
+            name=self.name,
+            description=self.description,
+            parameters=self.parameters,
+        )
+
+
+class ToolRegistry:
+    """Registry of available tools."""
+
+    def __init__(self) -> None:
+        self._tools: dict[str, Tool] = {}
+
+    def register(self, tool: Tool) -> None:
+        """Register a tool in the registry.
+
+        Raises ValueError if a tool with the same name is already registered.
+        """
+        if tool.name in self._tools:
+            raise ValueError(f"Tool '{tool.name}' is already registered")
+        self._tools[tool.name] = tool
+        logger.info("tool_registered", tool_name=tool.name, risk_level=tool.risk_level.value)
+
+    def get(self, name: str) -> Tool | None:
+        """Retrieve a tool by name, or None if not found."""
+        return self._tools.get(name)
+
+    def get_all(self) -> list[Tool]:
+        """Return all registered tools."""
+        return list(self._tools.values())
+
+    def get_definitions(self) -> list[ToolDefinition]:
+        """Return LLM-compatible ToolDefinition objects for all registered tools."""
+        from turing.llm.base import ToolDefinition  # noqa: F811
+
+        return [tool.to_tool_definition() for tool in self._tools.values()]
+
+    async def execute(self, name: str, **kwargs: Any) -> ToolResult:
+        """Execute a tool by name with the given arguments.
+
+        Returns a ToolResult with an error if the tool is not found or execution fails.
+        """
+        tool = self.get(name)
+        if tool is None:
+            return ToolResult(success=False, output="", error=f"Tool '{name}' not found")
+        try:
+            return await tool.execute(**kwargs)
+        except Exception as exc:
+            logger.error("tool_execution_error", tool_name=name, error=str(exc))
+            return ToolResult(success=False, output="", error=f"Execution failed: {exc}")

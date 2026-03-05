@@ -1,0 +1,8 @@
+{
+    "name": "example",
+    "version": "0.1.0",
+    "description": "Example plugin demonstrating the plugin system",
+    "entry_point": "__init__:ExamplePlugin",
+    "dependencies": [],
+    "config_schema": {}
+}

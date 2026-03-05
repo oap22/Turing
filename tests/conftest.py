@@ -1,0 +1,104 @@
+"""Shared pytest fixtures for the Turing test suite."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+
+from turing.config import TuringConfig
+
+
+# ---------------------------------------------------------------------------
+# LLMResponse stub (mirrors the shape used by turing.llm)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LLMResponse:
+    """Lightweight representation of an LLM completion used in tests."""
+
+    content: str = ""
+    model: str = "test-model"
+    provider: str = "test"
+    tokens_used: int = 0
+    latency_ms: float = 0.0
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def temp_dir(tmp_path: Path) -> Path:
+    """Return the pytest-provided temporary directory."""
+    return tmp_path
+
+
+@pytest.fixture()
+def temp_db(tmp_path: Path) -> Path:
+    """Return a temporary SQLite database file path.
+
+    The parent directory is guaranteed to exist but the file itself is *not*
+    created — this lets tests exercise the "create-on-first-use" behaviour.
+    """
+    return tmp_path / "test_turing.db"
+
+
+@pytest.fixture()
+def mock_config(tmp_path: Path) -> TuringConfig:
+    """Build a ``TuringConfig`` with sensible test defaults.
+
+    Environment variables are isolated via ``monkeypatch`` semantics (we
+    patch ``env_file`` to ``None`` so no real ``.env`` is loaded).
+    """
+    db_path = tmp_path / "data" / "turing.db"
+    embedding_path = tmp_path / "models" / "all-MiniLM-L6-v2"
+    embedding_path.mkdir(parents=True, exist_ok=True)
+
+    with patch.dict(
+        "os.environ",
+        {
+            "TURING_NODE_NAME": "test-node",
+            "TURING_NODE_ID": "00000000-0000-0000-0000-000000000001",
+            "TURING_DISCORD_TOKEN": "test-discord-token",
+            "TURING_ANTHROPIC_API_KEY": "test-anthropic-key",
+            "TURING_DB_PATH": str(db_path),
+            "TURING_EMBEDDING_MODEL_PATH": str(embedding_path),
+            "TURING_ENV": "development",
+            "TURING_LOG_LEVEL": "DEBUG",
+            "TURING_MESH_ENABLED": "false",
+            "TURING_SANDBOX_ENABLED": "false",
+        },
+        clear=False,
+    ):
+        config = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+    return config
+
+
+@pytest.fixture()
+def mock_llm_response() -> type[LLMResponse]:
+    """Return the ``LLMResponse`` class so tests can construct instances.
+
+    Usage::
+
+        def test_something(mock_llm_response):
+            resp = mock_llm_response(content="Hello!", model="gemma3:1b")
+            assert resp.content == "Hello!"
+    """
+    return LLMResponse
+
+
+@pytest.fixture(scope="session")
+def event_loop():
+    """Create a session-scoped event loop for async tests."""
+    loop = asyncio.new_event_loop()
+    yield loop
+    loop.close()

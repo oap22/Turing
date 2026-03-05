@@ -1,0 +1,96 @@
+version: "3.9"
+
+x-turing-common: &turing-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file: .env
+  depends_on:
+    ollama:
+      condition: service_started
+  restart: unless-stopped
+  networks:
+    - turing-mesh
+
+services:
+  # ── Ollama — local LLM inference ──────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: turing-ollama
+    volumes:
+      - ollama-data:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - turing-mesh
+    restart: unless-stopped
+
+  # ── Node 1 — primary node (Discord + Anthropic enabled) ───────────
+  turing-node-1:
+    <<: *turing-common
+    container_name: turing-node-1
+    environment:
+      TURING_NODE_NAME: pi-alpha
+      TURING_DISCORD_TOKEN: ${TURING_DISCORD_TOKEN}
+      TURING_ANTHROPIC_API_KEY: ${TURING_ANTHROPIC_API_KEY}
+      TURING_OLLAMA_HOST: http://ollama:11434
+      TURING_MESH_ENABLED: "true"
+      TURING_MESH_PORT: "5670"
+      TURING_DB_PATH: /app/data/turing.db
+    volumes:
+      - node1-data:/app/data
+    ports:
+      - "5670:5670"
+
+  # ── Node 2 — local-only worker ────────────────────────────────────
+  turing-node-2:
+    <<: *turing-common
+    container_name: turing-node-2
+    environment:
+      TURING_NODE_NAME: pi-beta
+      TURING_OLLAMA_HOST: http://ollama:11434
+      TURING_LLM_ROUTING_MODE: local
+      TURING_MESH_ENABLED: "true"
+      TURING_MESH_PORT: "5670"
+      TURING_DB_PATH: /app/data/turing.db
+    volumes:
+      - node2-data:/app/data
+
+  # ── Node 3 — local-only worker ────────────────────────────────────
+  turing-node-3:
+    <<: *turing-common
+    container_name: turing-node-3
+    environment:
+      TURING_NODE_NAME: pi-gamma
+      TURING_OLLAMA_HOST: http://ollama:11434
+      TURING_LLM_ROUTING_MODE: local
+      TURING_MESH_ENABLED: "true"
+      TURING_MESH_PORT: "5670"
+      TURING_DB_PATH: /app/data/turing.db
+    volumes:
+      - node3-data:/app/data
+
+  # ── Node 4 — local-only worker ────────────────────────────────────
+  turing-node-4:
+    <<: *turing-common
+    container_name: turing-node-4
+    environment:
+      TURING_NODE_NAME: pi-delta
+      TURING_OLLAMA_HOST: http://ollama:11434
+      TURING_LLM_ROUTING_MODE: local
+      TURING_MESH_ENABLED: "true"
+      TURING_MESH_PORT: "5670"
+      TURING_DB_PATH: /app/data/turing.db
+    volumes:
+      - node4-data:/app/data
+
+volumes:
+  ollama-data:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
+
+networks:
+  turing-mesh:
+    driver: bridge

@@ -1,0 +1,103 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "turing"
+version = "0.1.0"
+description = "Autonomous AI Assistant for Raspberry Pi"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Owen Pacetti" },
+]
+
+dependencies = [
+    "discord.py>=2.4",
+    "anthropic>=0.40",
+    "ollama>=0.4",
+    "aiosqlite>=0.20",
+    "sqlite-vec>=0.1",
+    "pydantic-settings>=2.5",
+    "structlog>=24.1",
+    "pyzmq>=25.1",
+    "psutil>=5.9",
+    "httpx>=0.27",
+    "tokenizers>=0.15",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+embeddings = ["onnxruntime>=1.17"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+]
+
+[project.scripts]
+turing = "turing.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/turing"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "TCH",  # flake8-type-checking
+    "RUF",  # ruff-specific rules
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not perform function calls in argument defaults
+    "SIM108", # use ternary operator
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["turing"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests requiring external services",
+]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+plugins = ["pydantic.mypy"]
+
+[tool.coverage.run]
+source = ["turing"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.",
+]
