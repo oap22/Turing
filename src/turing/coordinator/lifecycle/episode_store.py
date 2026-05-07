@@ -31,6 +31,11 @@ class Episode:
     outcome: SubtaskState
     critic_score: float
     recorded_at_ms: int
+    # Per-specialty prompt version that produced this episode. Required for
+    # sound A/B comparisons during nightly prompt evolution (slice 19, #21).
+    # Defaults to "" so episodes recorded before the evolver shipped remain
+    # constructible.
+    prompt_version: str = ""
 
 
 class EpisodeStore:
