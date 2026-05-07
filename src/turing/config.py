@@ -73,6 +73,24 @@ class TuringConfig(BaseSettings):
     mesh_enabled: bool = Field(default=False, description="Enable ZeroMQ mesh networking")
     mesh_port: int = Field(default=5670, description="ZeroMQ mesh port")
 
+    # ── Runtime bus (NATS) ───────────────────────────────────────────────
+    nats_url: str = Field(
+        default="nats://127.0.0.1:4222",
+        description="NATS server URL the coordinator publishes and workers dial",
+    )
+    nats_lan_only: bool = Field(
+        default=True,
+        description="Refuse non-LAN NATS endpoints unless explicitly flipped",
+    )
+    nats_tls_enabled: bool = Field(
+        default=True,
+        description="Require TLS for NATS connections",
+    )
+    nats_nkey_seed: str | None = Field(
+        default=None,
+        description="NATS nkey seed for authentication; optional in local dev",
+    )
+
     # ── Sandbox / security ───────────────────────────────────────────────
     sandbox_enabled: bool = Field(default=True, description="Enable bubblewrap sandbox for tools")
     sandbox_timeout: int = Field(default=30, description="Sandbox execution timeout in seconds")
