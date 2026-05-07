@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from turing.coordinator.registry import CapabilityRegistry
     from turing.coordinator.registry.manifest import CapabilityManifest
 
@@ -34,6 +36,32 @@ class Scheduler:
             required_tools=subtask.required_tools,
             exclude_busy=True,
         )
+        if not candidates:
+            return None
+        return max(candidates, key=lambda m: m.eval_score)
+
+    def pick_for_retry(
+        self,
+        subtask: Subtask,
+        registry: CapabilityRegistry,
+        *,
+        exclude_worker_ids: Iterable[str],
+    ) -> CapabilityManifest | None:
+        """Pick a worker for a retry, refusing any in `exclude_worker_ids`.
+
+        Returns None when no eligible alternate worker exists, signalling
+        that the subtask should be marked terminal rather than retried.
+        """
+        excluded = frozenset(exclude_worker_ids)
+        candidates = [
+            m
+            for m in registry.find_workers(
+                specialty=subtask.specialty_required,
+                required_tools=subtask.required_tools,
+                exclude_busy=True,
+            )
+            if m.worker_id not in excluded
+        ]
         if not candidates:
             return None
         return max(candidates, key=lambda m: m.eval_score)
