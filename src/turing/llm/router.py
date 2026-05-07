@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 import structlog
 
@@ -13,10 +13,42 @@ from turing.llm.base import (
     ToolDefinition,
 )
 from turing.llm.classifier import Complexity, ComplexityClassifier
+from turing.telemetry import redact, traced
 
 logger = structlog.get_logger(__name__)
 
 RoutingMode = Literal["cloud_only", "local_only", "auto"]
+
+
+def _llm_event_payload(
+    kind: str,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+    exc: BaseException | None,
+) -> dict[str, Any]:
+    """Build the telemetry payload for ``LLMRouter._invoke_provider`` events."""
+    # _invoke_provider(self, provider, label, messages, system, tools, max_tokens, temperature)
+    self_obj = args[0] if args else None
+    provider = args[1] if len(args) > 1 else kwargs.get("provider")
+    label = args[2] if len(args) > 2 else kwargs.get("label", "unknown")
+    messages = args[3] if len(args) > 3 else kwargs.get("messages", [])
+
+    max_bytes = 2048
+    if self_obj is not None:
+        max_bytes = getattr(self_obj, "_sample_max_bytes", 2048)
+
+    data: dict[str, Any] = {
+        "provider": label,
+        "model": getattr(provider, "model", "unknown"),
+    }
+    if kind == "start":
+        joined = "\n".join(getattr(m, "content", "") for m in messages)
+        data["prompt_sample"] = redact(joined, max_bytes=max_bytes)
+    elif kind == "end" and result is not None:
+        data["response_sample"] = redact(getattr(result, "content", ""), max_bytes=max_bytes)
+        data["stop_reason"] = getattr(result, "stop_reason", "")
+    return data
 
 
 class LLMRouter:
@@ -38,11 +70,13 @@ class LLMRouter:
         local_provider: LLMProvider,
         classifier: ComplexityClassifier | None = None,
         routing_mode: RoutingMode = "auto",
+        prompt_sample_max_bytes: int = 2048,
     ) -> None:
         self._cloud = cloud_provider
         self._local = local_provider
         self._classifier = classifier or ComplexityClassifier()
         self._routing_mode: RoutingMode = routing_mode
+        self._sample_max_bytes = prompt_sample_max_bytes
 
     # ── public API ─────────────────────────────────────────────────────
 
@@ -63,13 +97,10 @@ class LLMRouter:
             routing_mode=self._routing_mode,
         )
 
+        label = _provider_label(provider, self._cloud, self._local)
         try:
-            return await provider.complete(
-                messages=messages,
-                system=system,
-                tools=tools,
-                max_tokens=max_tokens,
-                temperature=temperature,
+            return await self._invoke_provider(
+                provider, label, messages, system, tools, max_tokens, temperature
             )
         except Exception:
             # If the selected provider was local (auto mode), fall back to cloud.
@@ -78,14 +109,30 @@ class LLMRouter:
                     "llm_local_failed_falling_back_to_cloud",
                     exc_info=True,
                 )
-                return await self._cloud.complete(
-                    messages=messages,
-                    system=system,
-                    tools=tools,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
+                return await self._invoke_provider(
+                    self._cloud, "cloud", messages, system, tools, max_tokens, temperature
                 )
             raise
+
+    @traced("llm.complete", payload=_llm_event_payload)
+    async def _invoke_provider(
+        self,
+        provider: LLMProvider,
+        label: str,
+        messages: list[Message],
+        system: str,
+        tools: list[ToolDefinition] | None,
+        max_tokens: int,
+        temperature: float,
+    ) -> LLMResponse:
+        """Single instrumentation point for any provider.complete dispatch."""
+        return await provider.complete(
+            messages=messages,
+            system=system,
+            tools=tools,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
 
     # ── provider selection ─────────────────────────────────────────────
 

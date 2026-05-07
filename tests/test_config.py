@@ -72,6 +72,20 @@ class TestDefaults:
             cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.learning_extract_interval == 5
 
+    def test_default_telemetry_prompt_sample_max_bytes(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.telemetry_prompt_sample_max_bytes == 2048
+
+    def test_telemetry_prompt_sample_max_bytes_override(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"TURING_TELEMETRY_PROMPT_SAMPLE_MAX_BYTES": "512"},
+            clear=True,
+        ):
+            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.telemetry_prompt_sample_max_bytes == 512
+
 
 class TestEnvOverrides:
     """Verify that environment variables correctly override defaults."""
