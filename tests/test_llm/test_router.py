@@ -17,6 +17,7 @@ from turing.llm.base import (
 )
 from turing.llm.classifier import Complexity, ComplexityClassifier
 from turing.llm.router import LLMRouter
+from turing.telemetry.bus import Telemetry, TelemetryEvent
 
 
 # ── fixtures ──────────────────────────────────────────────────────────
@@ -252,3 +253,91 @@ class TestMisc:
         # No user message means classifier gets empty string -> SIMPLE -> local
         response = await router.route([])
         assert response.content == "local response"
+
+
+# ── telemetry ─────────────────────────────────────────────────────────
+
+
+class TestTelemetry:
+    """The router emits telemetry events for each LLM provider call."""
+
+    @pytest.mark.asyncio
+    async def test_emits_start_and_end_for_successful_call(
+        self,
+        cloud_provider: AsyncMock,
+        local_provider: AsyncMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fresh = Telemetry()
+        monkeypatch.setattr("turing.telemetry.bus._SINGLETON", fresh)
+        captured: list[TelemetryEvent] = []
+        fresh.add_sink(captured.append)
+
+        router = LLMRouter(cloud_provider, local_provider, routing_mode="cloud_only")
+        await router.route([_user_msg("hi there")])
+
+        names = [e.name for e in captured]
+        assert "llm.complete.start" in names
+        assert "llm.complete.end" in names
+
+    @pytest.mark.asyncio
+    async def test_event_payload_includes_provider_and_model(
+        self,
+        cloud_provider: AsyncMock,
+        local_provider: AsyncMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fresh = Telemetry()
+        monkeypatch.setattr("turing.telemetry.bus._SINGLETON", fresh)
+        captured: list[TelemetryEvent] = []
+        fresh.add_sink(captured.append)
+
+        router = LLMRouter(cloud_provider, local_provider, routing_mode="cloud_only")
+        await router.route([_user_msg("hi")])
+
+        end = next(e for e in captured if e.name == "llm.complete.end")
+        assert end.payload.get("provider") == "cloud"
+        assert "model" in end.payload
+
+    @pytest.mark.asyncio
+    async def test_event_payload_redacts_prompt_and_response(
+        self,
+        cloud_provider: AsyncMock,
+        local_provider: AsyncMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fresh = Telemetry()
+        monkeypatch.setattr("turing.telemetry.bus._SINGLETON", fresh)
+        captured: list[TelemetryEvent] = []
+        fresh.add_sink(captured.append)
+
+        cloud_provider.complete = AsyncMock(
+            return_value=_make_response("hi alice@example.com", "claude")
+        )
+        router = LLMRouter(cloud_provider, local_provider, routing_mode="cloud_only")
+        await router.route([_user_msg("ping bob@example.org")])
+
+        start = next(e for e in captured if e.name == "llm.complete.start")
+        end = next(e for e in captured if e.name == "llm.complete.end")
+        assert "bob@example.org" not in start.payload.get("prompt_sample", "")
+        assert "alice@example.com" not in end.payload.get("response_sample", "")
+
+    @pytest.mark.asyncio
+    async def test_emits_error_event_on_provider_failure(
+        self,
+        cloud_provider: AsyncMock,
+        local_provider: AsyncMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fresh = Telemetry()
+        monkeypatch.setattr("turing.telemetry.bus._SINGLETON", fresh)
+        captured: list[TelemetryEvent] = []
+        fresh.add_sink(captured.append)
+
+        cloud_provider.complete.side_effect = RuntimeError("API blew up")
+        router = LLMRouter(cloud_provider, local_provider, routing_mode="cloud_only")
+        with pytest.raises(RuntimeError, match="API blew up"):
+            await router.route([_user_msg("hi")])
+
+        err = next(e for e in captured if e.name == "llm.complete.error")
+        assert err.error == "RuntimeError"

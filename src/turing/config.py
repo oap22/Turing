@@ -99,6 +99,12 @@ class TuringConfig(BaseSettings):
         description="Filesystem paths the sandbox may write to",
     )
 
+    # ── Telemetry ────────────────────────────────────────────────────────
+    telemetry_prompt_sample_max_bytes: int = Field(
+        default=2048,
+        description="Per-event byte budget for redacted prompt/response samples",
+    )
+
     # ── Learning ─────────────────────────────────────────────────────────
     learning_auto_extract: bool = Field(
         default=True,
