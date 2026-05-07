@@ -1,6 +1,39 @@
-"""Vault index, embedder, and tool wrappers."""
+"""Vault index, embedder, proposer, and tool wrappers.
 
-from turing.vault.embedder import DeterministicHashEmbedder, Embedder
-from turing.vault.index import VaultHit, VaultIndex
+Re-exports are loaded lazily via ``__getattr__`` so ``import turing.vault.X``
+doesn't pull in numpy unless the caller actually touches the index path.
+"""
 
-__all__ = ["DeterministicHashEmbedder", "Embedder", "VaultHit", "VaultIndex"]
+from __future__ import annotations
+
+from typing import Any
+
+__all__ = [
+    "DeterministicHashEmbedder",
+    "Embedder",
+    "InvalidFrontmatterError",
+    "InvalidProposalPathError",
+    "VaultHit",
+    "VaultIndex",
+    "VaultProposer",
+]
+
+
+def __getattr__(name: str) -> Any:
+    if name in ("DeterministicHashEmbedder", "Embedder"):
+        from turing.vault import embedder
+
+        return getattr(embedder, name)
+    if name in ("VaultHit", "VaultIndex"):
+        from turing.vault import index
+
+        return getattr(index, name)
+    if name in (
+        "InvalidFrontmatterError",
+        "InvalidProposalPathError",
+        "VaultProposer",
+    ):
+        from turing.vault import proposer
+
+        return getattr(proposer, name)
+    raise AttributeError(f"module 'turing.vault' has no attribute {name!r}")
