@@ -94,6 +94,7 @@ class SubtaskEvent:
 class TaskLifecycle:
     def __init__(self) -> None:
         self._states: dict[str, SubtaskState] = {}
+        self._attempts: dict[str, int] = {}
 
     @classmethod
     def replay(cls, events: Iterable[SubtaskEvent]) -> TaskLifecycle:
@@ -105,12 +106,35 @@ class TaskLifecycle:
     def state_of(self, subtask_id: str) -> SubtaskState:
         return self._states[subtask_id]
 
+    def attempts_for(self, subtask_id: str) -> int:
+        return self._attempts.get(subtask_id, 0)
+
+    def retry(self, subtask_id: str) -> None:
+        """Re-open a failed subtask for another dispatch.
+
+        Only `FAILED` and `TIMED_OUT` are retryable (`SubtaskState.is_retryable`).
+        Increments the attempt counter and clears the terminal state so the
+        subsequent `apply` for `DISPATCHED` is no longer dropped by the
+        terminal-freeze guard.
+        """
+        current = self._states.get(subtask_id)
+        if current is None or not current.is_retryable():
+            raise ValueError(
+                f"cannot retry {subtask_id!r} from state {current!r}; "
+                "only FAILED or TIMED_OUT subtasks are retryable"
+            )
+        self._attempts[subtask_id] = self._attempts.get(subtask_id, 1) + 1
+        # Reset to PENDING so the next DISPATCHED is accepted by the
+        # transition guard rather than dropped by the terminal-freeze.
+        self._states[subtask_id] = SubtaskState.PENDING
+
     def apply(self, event: SubtaskEvent) -> None:
         current = self._states.get(event.subtask_id)
 
         # First sighting — accept any state as the seed.
         if current is None:
             self._states[event.subtask_id] = event.new_state
+            self._attempts.setdefault(event.subtask_id, 1)
             return
 
         # Idempotency: same state arriving again is a no-op.
