@@ -76,3 +76,17 @@ Config → Logging → MemoryStore → EmbeddingModel → VectorStore → Memory
 ### Multi-Node Architecture
 
 Docker Compose simulates 4 Pi nodes on a shared network. Node 1 (pi-alpha) has Discord token + Anthropic key. Nodes 2-4 are `local_only` workers. Mesh discovery uses Pyre (Zyre UDP broadcast) on port 5670. Plugins are loaded from `plugins/` directory via `manifest.json`.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues at `oap22/Turing`, managed via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Canonical label vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout: `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
