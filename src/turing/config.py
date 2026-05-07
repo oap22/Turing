@@ -105,6 +105,25 @@ class TuringConfig(BaseSettings):
         description="Per-event byte budget for redacted prompt/response samples",
     )
 
+    # ── Gateway (pi-alpha web UI) ────────────────────────────────────────
+    gateway_enabled: bool = Field(
+        default=False,
+        description="Run the in-process FastAPI gateway (pi-alpha only)",
+    )
+    gateway_token: str = Field(
+        default="",
+        description="Bearer token required for gateway HTTP/WS access",
+    )
+    gateway_bind: str = Field(
+        default="127.0.0.1",
+        description="Interface the gateway binds to; default is loopback "
+        "so binding externally requires explicit operator action",
+    )
+    gateway_port: int = Field(
+        default=8765,
+        description="TCP port the gateway listens on",
+    )
+
     # ── Learning ─────────────────────────────────────────────────────────
     learning_auto_extract: bool = Field(
         default=True,
