@@ -9,7 +9,7 @@ The episode schema mirrors PRD story 33.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from turing.coordinator.lifecycle.lifecycle import SubtaskState
 
@@ -45,6 +45,17 @@ class EpisodeStore:
         # First write wins so a retry storm cannot overwrite the original
         # outcome row that downstream training corpora may have already read.
         self._rows.setdefault(episode.subtask_id, episode)
+
+    def update_critic_score(self, *, subtask_id: str, critic_score: float) -> None:
+        """Backfill an episode's critic_score after async critic scoring.
+
+        Outcome and trajectory remain immutable; only the critic-derived score
+        can be updated post-hoc.
+        """
+        existing = self._rows.get(subtask_id)
+        if existing is None:
+            raise KeyError(f"no episode for subtask_id={subtask_id!r}")
+        self._rows[subtask_id] = replace(existing, critic_score=critic_score)
 
     def query(
         self,
