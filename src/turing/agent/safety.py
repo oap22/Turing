@@ -10,6 +10,25 @@ from typing import Any
 
 import structlog
 
+from turing.telemetry import traced
+
+
+def _safety_event_payload(kind, args, kwargs, result, exc):  # type: ignore[no-untyped-def]
+    """Tag every safety event with ``priority="high"`` and the rule that fired.
+
+    Safety decisions are the most diagnostically valuable events the fleet
+    produces — they get priority routing (slice 8 promotes them to
+    TCP-WHISPER; until then they ride the same SHOUT but as
+    ``MessageType.TELEMETRY_PRIORITY``).
+    """
+    tool = args[1] if len(args) > 1 else kwargs.get("tool_name", "")
+    data: dict[str, Any] = {"priority": "high", "tool": tool}
+    if kind == "end" and isinstance(result, SafetyCheckResult):
+        data["decision"] = result.decision.value
+        data["risk_level"] = result.risk_level
+        data["rule"] = result.reason
+    return data
+
 
 class SafetyDecision(str, Enum):
     """Outcome of a safety evaluation."""
@@ -53,6 +72,7 @@ class SafetyGate:
         self.logger = structlog.get_logger("turing.safety")
         self._compiled_patterns = [re.compile(p, re.IGNORECASE) for p in self.DENY_PATTERNS]
 
+    @traced("safety.check", payload=_safety_event_payload)
     async def check(
         self,
         tool_name: str,

@@ -17,6 +17,10 @@ class MessageType(str, Enum):
     STATUS_QUERY = "status_query"
     STATUS_RESPONSE = "status_response"
     HEARTBEAT = "heartbeat"
+    TELEMETRY = "telemetry"
+    # Reserved for slice 8: TCP-WHISPER fallback for never-drop events.
+    # Until then, priority events ride the same SHOUT path as TELEMETRY.
+    TELEMETRY_PRIORITY = "telemetry_priority"
 
 
 @dataclass
