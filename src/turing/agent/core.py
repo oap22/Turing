@@ -10,6 +10,7 @@ import structlog
 from turing.agent.context import AgentContext, build_context
 from turing.agent.executor import Executor
 from turing.llm.base import Message, Role
+from turing.telemetry import traced
 
 if TYPE_CHECKING:
     from turing.agent.safety import SafetyGate
@@ -149,6 +150,7 @@ class Agent:
 
         return messages
 
+    @traced("agent.handle_message")
     async def handle_message(
         self,
         message: str,

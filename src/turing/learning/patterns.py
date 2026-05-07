@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from turing.llm.base import Message, Role
+from turing.telemetry import traced
 
 if TYPE_CHECKING:
     from turing.llm.router import LLMRouter
@@ -24,6 +25,7 @@ class PatternExtractor:
         self._llm_router = llm_router
         self._memory_store = memory_store
 
+    @traced("learning.extract")
     async def extract(self, conversation_id: str) -> dict[str, Any]:
         """Analyze recent conversation and extract structured knowledge.
 

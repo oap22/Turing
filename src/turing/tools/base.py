@@ -9,7 +9,19 @@ from typing import Any
 
 import structlog
 
+from turing.telemetry import traced
+
 logger = structlog.get_logger("turing.tools")
+
+
+def _tool_dispatch_payload(kind, args, kwargs, result, exc):  # type: ignore[no-untyped-def]
+    name = args[1] if len(args) > 1 else kwargs.get("name", "")
+    data: dict[str, Any] = {"tool": name}
+    if kind == "end" and result is not None:
+        data["success"] = bool(getattr(result, "success", False))
+    if kind == "error" and exc is not None:
+        data["error_type"] = type(exc).__name__
+    return data
 
 
 class RiskLevel(str, Enum):
@@ -107,6 +119,7 @@ class ToolRegistry:
 
         return [tool.to_tool_definition() for tool in self._tools.values()]
 
+    @traced("tool.dispatch", payload=_tool_dispatch_payload)
     async def execute(self, name: str, **kwargs: Any) -> ToolResult:
         """Execute a tool by name with the given arguments.
 

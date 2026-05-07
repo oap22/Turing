@@ -11,6 +11,7 @@ import structlog
 from turing.memory.embeddings import EmbeddingModel
 from turing.memory.store import MemoryStore
 from turing.memory.vectors import VectorStore
+from turing.telemetry import traced
 
 logger = structlog.get_logger(__name__)
 
@@ -42,6 +43,7 @@ class MemoryRetriever:
         self._vectors = vector_store
         self._embeddings = embedding_model
 
+    @traced("memory.retrieve")
     async def retrieve(
         self,
         message: str,
