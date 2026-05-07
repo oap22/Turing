@@ -1,0 +1,38 @@
+[Unit]
+Description=Turing training facility pull agent
+Documentation=https://github.com/oap22/Turing
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=turing-trainer
+Group=turing-trainer
+WorkingDirectory=/var/lib/turing-trainer
+EnvironmentFile=/etc/turing/trainer.env
+ExecStart=/usr/local/bin/turing-trainer
+
+# Pull-only client: never accept inbound connections.
+# Defense in depth on top of `PullOnlySocketGuard`.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/turing-trainer
+
+# Resource limits — adjust per-facility.
+MemoryHigh=80%
+MemoryMax=95%
+
+# Restart on failure; back off so a flapping coordinator doesn't loop us.
+Restart=on-failure
+RestartSec=15s
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Install]
+WantedBy=multi-user.target
