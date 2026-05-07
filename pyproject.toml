@@ -26,6 +26,8 @@ dependencies = [
     "httpx>=0.27",
     "tokenizers>=0.15",
     "numpy>=1.24",
+    "cryptography>=42.0",
+    "nats-py>=2.6",
 ]
 
 [project.optional-dependencies]
