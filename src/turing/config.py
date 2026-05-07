@@ -124,6 +124,12 @@ class TuringConfig(BaseSettings):
         description="TCP port the gateway listens on",
     )
 
+    # ── Budget ───────────────────────────────────────────────────────────
+    budget_daily_cap_cents: int = Field(
+        default=1000,
+        description="Hard cap on cloud-LLM spend per local day, in cents (default $10)",
+    )
+
     # ── Learning ─────────────────────────────────────────────────────────
     learning_auto_extract: bool = Field(
         default=True,
