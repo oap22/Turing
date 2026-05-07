@@ -47,6 +47,11 @@ turing = "turing.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/turing"]
+# Ship the SPA build output inside the wheel so `pip install turing` is
+# self-contained — no separate static-files volume. Run `npm run build`
+# in webui/ before building the wheel; the gateway resolves this path via
+# turing.gateway.spa_assets_path().
+force-include = { "webui/dist" = "turing/_webui_dist" }
 
 [tool.ruff]
 target-version = "py311"
