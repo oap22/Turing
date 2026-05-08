@@ -54,3 +54,25 @@ class DiscordSurfaceIndex:
     def subtask_for_thread(self, thread_id: str) -> str | None:
         row = self._subtask_threads.get(thread_id)
         return row.subtask_id if row else None
+
+    def task_messages_within(
+        self, *, now_ms: int, horizon_ms: int
+    ) -> list[tuple[str, str]]:
+        """Return `(message_id, task_id)` pairs posted within the horizon."""
+        cutoff = now_ms - horizon_ms
+        return [
+            (mid, row.task_id)
+            for mid, row in self._task_messages.items()
+            if row.posted_at_ms >= cutoff
+        ]
+
+    def subtask_threads_within(
+        self, *, now_ms: int, horizon_ms: int
+    ) -> list[tuple[str, str]]:
+        """Return `(thread_id, subtask_id)` pairs posted within the horizon."""
+        cutoff = now_ms - horizon_ms
+        return [
+            (tid, row.subtask_id)
+            for tid, row in self._subtask_threads.items()
+            if row.posted_at_ms >= cutoff
+        ]
