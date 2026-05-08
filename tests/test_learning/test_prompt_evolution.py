@@ -92,9 +92,7 @@ class TestEpisodePromptVersion:
 
 class TestPromotionGate:
     def test_promotes_when_win_rate_beats_threshold(self) -> None:
-        gate = PromotionGate(
-            min_sample_size=10, win_rate_threshold=0.55, holdout_min_size=5
-        )
+        gate = PromotionGate(min_sample_size=10, win_rate_threshold=0.55, holdout_min_size=5)
         # 8 wins out of 10 → 80% > 55% with required holdout
         candidate = [_episode(subtask_id=f"c{i}", critic_score=0.9) for i in range(8)]
         candidate += [_episode(subtask_id=f"c{i}", critic_score=0.1) for i in range(8, 10)]
@@ -103,27 +101,21 @@ class TestPromotionGate:
         assert decision is PromotionDecision.PROMOTE
 
     def test_holds_when_sample_size_too_small(self) -> None:
-        gate = PromotionGate(
-            min_sample_size=10, win_rate_threshold=0.55, holdout_min_size=5
-        )
+        gate = PromotionGate(min_sample_size=10, win_rate_threshold=0.55, holdout_min_size=5)
         candidate = [_episode(subtask_id=f"c{i}", critic_score=0.9) for i in range(3)]
         baseline = [_episode(subtask_id=f"b{i}", critic_score=0.4) for i in range(10)]
         decision = gate.evaluate(candidate=candidate, baseline=baseline)
         assert decision is PromotionDecision.HOLD_INSUFFICIENT_DATA
 
     def test_holds_when_baseline_holdout_too_small(self) -> None:
-        gate = PromotionGate(
-            min_sample_size=10, win_rate_threshold=0.55, holdout_min_size=5
-        )
+        gate = PromotionGate(min_sample_size=10, win_rate_threshold=0.55, holdout_min_size=5)
         candidate = [_episode(subtask_id=f"c{i}", critic_score=0.9) for i in range(10)]
         baseline = [_episode(subtask_id=f"b{i}", critic_score=0.4) for i in range(2)]
         decision = gate.evaluate(candidate=candidate, baseline=baseline)
         assert decision is PromotionDecision.HOLD_INSUFFICIENT_DATA
 
     def test_rejects_when_win_rate_below_threshold(self) -> None:
-        gate = PromotionGate(
-            min_sample_size=10, win_rate_threshold=0.55, holdout_min_size=5
-        )
+        gate = PromotionGate(min_sample_size=10, win_rate_threshold=0.55, holdout_min_size=5)
         candidate = [_episode(subtask_id=f"c{i}", critic_score=0.4) for i in range(10)]
         baseline = [_episode(subtask_id=f"b{i}", critic_score=0.6) for i in range(10)]
         decision = gate.evaluate(candidate=candidate, baseline=baseline)
@@ -139,9 +131,7 @@ class TestABRouter:
         registry.set_baseline("research-summarize", "v1")
         registry.set_candidate("research-summarize", "v2")
         router = ABRouter(registry=registry, candidate_share=0.0)
-        choices = {
-            router.choose("research-summarize", task_id=f"t-{i}") for i in range(50)
-        }
+        choices = {router.choose("research-summarize", task_id=f"t-{i}") for i in range(50)}
         assert choices == {"v1"}
 
     def test_full_share_routes_all_to_candidate(self) -> None:
@@ -149,9 +139,7 @@ class TestABRouter:
         registry.set_baseline("research-summarize", "v1")
         registry.set_candidate("research-summarize", "v2")
         router = ABRouter(registry=registry, candidate_share=1.0)
-        choices = {
-            router.choose("research-summarize", task_id=f"t-{i}") for i in range(50)
-        }
+        choices = {router.choose("research-summarize", task_id=f"t-{i}") for i in range(50)}
         assert choices == {"v2"}
 
     def test_share_split_is_deterministic_per_task_id(self) -> None:
@@ -179,9 +167,7 @@ class TestPromptEvolver:
         """The evolver mines exemplars by delegating to PatternExtractor."""
         store = EpisodeStore()
         for i in range(5):
-            store.record(
-                _episode(subtask_id=f"s{i}", critic_score=0.9 + 0.001 * i)
-            )
+            store.record(_episode(subtask_id=f"s{i}", critic_score=0.9 + 0.001 * i))
 
         registry = PromptVersionRegistry()
         registry.set_baseline("research-summarize", "v1")

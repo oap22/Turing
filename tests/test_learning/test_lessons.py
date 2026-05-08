@@ -18,14 +18,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from turing.coordinator.lifecycle.lifecycle import SubtaskState
 from turing.coordinator.lifecycle.episode_store import Episode
+from turing.coordinator.lifecycle.lifecycle import SubtaskState
 from turing.learning.lessons import (
     CURRENT_LESSON_SCHEMA_VERSION,
     Lesson,
     LessonExtractor,
-    LessonStore,
     LessonSchemaError,
+    LessonStore,
     inject_lessons_into_prompt,
 )
 
@@ -113,9 +113,7 @@ class TestLessonExtractor:
         llm = AsyncMock()
         from turing.llm.base import LLMResponse
 
-        llm.complete = AsyncMock(
-            return_value=LLMResponse(content="lessons body", model="claude")
-        )
+        llm.complete = AsyncMock(return_value=LLMResponse(content="lessons body", model="claude"))
 
         extractor = LessonExtractor(llm_router=llm, embed=lambda _t: [0.0])
         await extractor.extract(_episode())
@@ -149,9 +147,7 @@ class TestLessonStore:
                 embedding=(0.0, 1.0),
             )
         )
-        results = store.query(
-            specialty="research-summarize", embedding=(1.0, 0.0), k=1
-        )
+        results = store.query(specialty="research-summarize", embedding=(1.0, 0.0), k=1)
         assert len(results) == 1
         assert results[0].text == "A"
 
@@ -173,9 +169,7 @@ class TestLessonStore:
                 embedding=(1.0, 0.0),
             )
         )
-        results = store.query(
-            specialty="research-summarize", embedding=(1.0, 0.0), k=5
-        )
+        results = store.query(specialty="research-summarize", embedding=(1.0, 0.0), k=5)
         assert len(results) == 1
         assert results[0].specialty == "research-summarize"
 
@@ -225,18 +219,14 @@ class TestPromptInjector:
                 embedding=(1.0,),
             ),
         ]
-        prompt = inject_lessons_into_prompt(
-            base_prompt="You are a worker.", lessons=lessons
-        )
+        prompt = inject_lessons_into_prompt(base_prompt="You are a worker.", lessons=lessons)
         assert "<lessons>" in prompt
         assert "</lessons>" in prompt
         assert "cite primary sources" in prompt
         assert "prefer concise summaries" in prompt
 
     def test_no_lessons_leaves_prompt_unchanged(self) -> None:
-        prompt = inject_lessons_into_prompt(
-            base_prompt="You are a worker.", lessons=[]
-        )
+        prompt = inject_lessons_into_prompt(base_prompt="You are a worker.", lessons=[])
         assert "<lessons>" not in prompt
         assert prompt == "You are a worker."
 
@@ -249,9 +239,7 @@ class TestPromptInjector:
                 embedding=(1.0,),
             )
         ]
-        prompt = inject_lessons_into_prompt(
-            base_prompt="BASE", lessons=lessons
-        )
+        prompt = inject_lessons_into_prompt(base_prompt="BASE", lessons=lessons)
         assert prompt.startswith("BASE")
         assert prompt.index("<lessons>") > prompt.index("BASE")
 

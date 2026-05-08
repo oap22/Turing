@@ -74,9 +74,7 @@ def test_critic_score_rejects_out_of_range_components() -> None:
 
 
 def test_critic_score_overall_is_mean_of_components() -> None:
-    score = CriticScore(
-        correctness=0.6, efficiency=0.9, specialty_fit=0.3, critique="x"
-    )
+    score = CriticScore(correctness=0.6, efficiency=0.9, specialty_fit=0.3, critique="x")
     assert score.overall == pytest.approx((0.6 + 0.9 + 0.3) / 3)
 
 
@@ -146,9 +144,7 @@ async def test_drift_detector_quiet_when_critics_agree() -> None:
 
 async def test_drift_recalibration_callback_fires_once_per_drift_event() -> None:
     fires: list[float] = []
-    detector = DriftDetector(
-        window=10, threshold=0.1, on_drift=lambda d: fires.append(d)
-    )
+    detector = DriftDetector(window=10, threshold=0.1, on_drift=lambda d: fires.append(d))
 
     for _ in range(10):
         detector.observe(local=0.3, cloud=0.7)
@@ -168,9 +164,7 @@ async def test_queue_enforces_max_size_via_backpressure() -> None:
             nonlocal calls
             await release.wait()
             calls += 1
-            return CriticScore(
-                correctness=0.5, efficiency=0.5, specialty_fit=0.5, critique=""
-            )
+            return CriticScore(correctness=0.5, efficiency=0.5, specialty_fit=0.5, critique="")
 
     queue = CriticQueue(
         local_critic=_GatedCritic(),
