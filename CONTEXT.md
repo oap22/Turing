@@ -45,6 +45,8 @@ deploy/             systemd units (turing-trainer), compose, deployment glue
 
 A worker pulls a subtask off NATS → executor runs Perceive → Think → Act → Remember → returns `TASK_RESULT` (or `needs_subtask` to extend the DAG). Every closed subtask becomes an **episode** row: `task_id, worker_id, specialty, model+adapter version, input, trajectory, output, success, latency, tokens, outcome`. Episodes are the training corpus.
 
+Every closed non-`REJECTED` episode is dispatched to the `judge`-specialty worker (MBP) for **critic scoring**; the score is written back to the episode row. Nightly at 02:00, top-K-by-score episodes per specialty are condensed into **lessons** — short, structured, vector-indexed, specialty-tagged. Workers retrieve top-3 lessons by `(specialty, prompt)` similarity and the executor renders them as a `<lessons>` block in the user message. Lessons TTL out at 60 days unless **pinned** by the prompt evolver citing them in a winning A/B prompt; pin renews on re-citation, lapses otherwise.
+
 ## Lifecycle
 
 `PENDING → DISPATCHED → RUNNING → {COMPLETED, FAILED, TIMED_OUT, REJECTED, NEEDS_SUBTASK}`. Every transition appended to JetStream subject `tasks.<id>.events` with a SQLite projection. Subtask execution idempotent on `subtask_id`.
@@ -54,6 +56,8 @@ A worker pulls a subtask off NATS → executor runs Perceive → Think → Act �
 - **Phase A** — nightly prompt + few-shot exemplar evolution. Zero training compute. Reuses `learning/patterns.py`.
 - **Phase B** — MBP MLX LoRA SFT. First target: `research-summarize`. Eval-gated promotion.
 - **Phase C** — H100 DPO via `turing-trainer`. Same eval gate.
+
+**Promotion gate.** Offline ≥2pp held-out improvement → `STAGED` in `AdapterRegistry`. K=1 round-robin canary worker re-runs the held-out eval at quantization; pass = `score ≥ prior_live_canary_score − 0.5pp` → fleet rollout to LIVE. Fail → permanent `REJECTED`, canary reverts, worst-failed cases written to `hard_examples` for next-cycle training, Discord notify with per-specialty regression rate.
 
 ## Safety boundaries
 
@@ -69,7 +73,7 @@ Coordinator hosts a vector index of the operator's Obsidian vault, refreshed by 
 
 ## Surfaces
 
-- **Discord** — only user-facing surface initially. One live-editing message per task with per-subtask thumbs-up/down threads. Reward attribution: subtask thumb → that episode (highest weight); main thumb → synthesis episode + fractional credit (±0.3) to consumed-upstream subtasks; no feedback in 24h → critic score becomes the reward.
+- **Discord** — only user-facing surface initially. One live-editing message per task with per-subtask thumbs-up/down threads. Reward attribution: subtask thumb → that episode (±1.0); main thumb → synthesis episode (±1.0) + fractional credit (±0.3) to subtasks whose `output_key ∈ synthesis.consumed_keys`; no feedback in 24h → `critic_fallback` reward in `[-0.3, +0.3]`. Rewards are *events* in `episode_rewards(episode_id, source, value, recorded_at)`; effective reward is `SUM(value)` per episode. Bot un-reactions during outages reconcile via cancellation rows on reconnect.
 - **CLI / API** — out of scope for Phase 0.
 
 ## Issue tracker
