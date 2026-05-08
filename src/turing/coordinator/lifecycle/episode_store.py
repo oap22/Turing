@@ -36,6 +36,10 @@ class Episode:
     # Defaults to "" so episodes recorded before the evolver shipped remain
     # constructible.
     prompt_version: str = ""
+    # Cents spent on cloud LLM calls for this subtask. Reportable via
+    # ``SELECT task_id, cents_spent`` per slice 12 (#14). Defaults to 0 so
+    # legacy rows recorded before the budget gate landed remain valid.
+    cents_spent: int = 0
 
 
 class EpisodeStore:
