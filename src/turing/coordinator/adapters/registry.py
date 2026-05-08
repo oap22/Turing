@@ -50,6 +50,7 @@ class UnknownAdapterError(Exception):
 class AdapterState(Enum):
     STAGED = "STAGED"
     LIVE = "LIVE"
+    REJECTED = "REJECTED"
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,8 @@ class AdapterRegistry:
         # `MessageSigner` doesn't need its own key for verify-only use.
         self._verifier = MessageSigner.generate()
         self._states: dict[_AdapterKey, AdapterState] = {}
+        self._canary_scores: dict[_AdapterKey, float] = {}
+        self._latest_live_by_name: dict[str, _AdapterKey] = {}
 
     def verify(self, manifest: AdapterManifest, blob: bytes) -> None:
         """Raise if the manifest+blob pair shouldn't be loaded."""
@@ -101,11 +104,48 @@ class AdapterRegistry:
             )
         self._states[key] = AdapterState.STAGED
 
-    def promote(self, *, name: str, version: str) -> None:
+    def promote(
+        self,
+        *,
+        name: str,
+        version: str,
+        canary_eval_score: float | None = None,
+    ) -> None:
         key = _AdapterKey(name, version)
         if key not in self._states:
             raise UnknownAdapterError(f"adapter {name}@{version} is not registered")
+        if self._states[key] is AdapterState.REJECTED:
+            raise ValueError(
+                f"adapter {name}@{version} is REJECTED and cannot be promoted"
+            )
         self._states[key] = AdapterState.LIVE
+        if canary_eval_score is not None:
+            self._canary_scores[key] = canary_eval_score
+        # Track the most-recently promoted LIVE per name; the next canary's
+        # pass check looks up this incumbent's recorded canary_eval_score.
+        self._latest_live_by_name[name] = key
+
+    def reject(self, *, name: str, version: str) -> None:
+        """Mark an adapter REJECTED — permanent terminal state per ADR 0007."""
+        key = _AdapterKey(name, version)
+        if key not in self._states:
+            raise UnknownAdapterError(f"adapter {name}@{version} is not registered")
+        self._states[key] = AdapterState.REJECTED
+
+    def canary_eval_score_of(self, *, name: str, version: str) -> float | None:
+        """Return the recorded canary_eval_score for a LIVE adapter, or None."""
+        key = _AdapterKey(name, version)
+        if key not in self._states:
+            raise UnknownAdapterError(f"adapter {name}@{version} is not registered")
+        return self._canary_scores.get(key)
+
+    def prior_live_canary_score(self, *, name: str) -> float | None:
+        """Return the canary_eval_score of the most-recent LIVE adapter for
+        this name, or None if no incumbent has been promoted yet."""
+        key = self._latest_live_by_name.get(name)
+        if key is None:
+            return None
+        return self._canary_scores.get(key)
 
     def state_of(self, *, name: str, version: str) -> AdapterState:
         key = _AdapterKey(name, version)
