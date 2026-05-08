@@ -75,6 +75,11 @@ def run(
                 result = scorer(summary, case)
         except NotImplementedError as e:
             result = ScoreResult(score=0.0, notes=[f"scorer not implemented: {e}"])
+        except Exception as e:  # any worker error -> score=0, don't crash the harness
+            result = ScoreResult(
+                score=0.0,
+                notes=[f"worker error ({type(e).__name__}): {e}"],
+            )
         by_category.setdefault(case.category, []).append(result)
         per_case.append({"id": case.id, "category": case.category, "score": result.score})
 
@@ -85,14 +90,42 @@ def run(
     return {"aggregate": aggregate, "by_category": cat_scores, "per_case": per_case}
 
 
+def _build_direct_worker(model: str, timeout_s: float) -> WorkerFn:
+    """Construct a direct worker against the configured cloud provider.
+
+    Imports happen here (not at module top) so the harness keeps loading
+    without an API key set when only the fixture worker is used.
+    """
+    import os
+
+    from turing.llm.cloud import ClaudeProvider
+
+    from .workers import DirectWorkerConfig, direct_worker
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise SystemExit("ANTHROPIC_API_KEY must be set for --worker direct")
+    provider = ClaudeProvider(api_key=api_key, model=model)
+    return direct_worker(
+        provider=provider,
+        config=DirectWorkerConfig(model=model, timeout_s=timeout_s),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--worker", default="fixture", choices=["fixture"])
+    parser.add_argument("--worker", default="fixture", choices=["fixture", "direct"])
+    parser.add_argument("--model", default="claude-sonnet-4-5")
+    parser.add_argument("--timeout-s", type=float, default=60.0)
     args = parser.parse_args()
 
-    workers = {"fixture": fixture_worker}
+    if args.worker == "direct":
+        worker: WorkerFn = _build_direct_worker(args.model, args.timeout_s)
+    else:
+        worker = fixture_worker
+
     cases = load_cases()
-    report = run(workers[args.worker], cases)
+    report = run(worker, cases)
     print(json.dumps(report, indent=2))
 
 
