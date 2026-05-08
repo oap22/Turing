@@ -18,6 +18,8 @@ export interface GraphNodeData {
   rollingAvgMs?: number;
   /** Last time we saw activity touching this node (epoch ms). */
   lastSeenMs?: number;
+  /** Pi-node only: count of events reported missing in unresolved gaps. */
+  droppedCount?: number;
 }
 
 export interface GraphEdgeData {

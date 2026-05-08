@@ -49,7 +49,28 @@ export interface HelloFrame {
   uptime_s: number;
 }
 
-export type Frame = MessageTraceFrame | MetricFrame | HelloFrame;
+export interface GapMarkerFrame {
+  type: "gap_marker";
+  node_name: string;
+  stream: string;
+  /** [first_missing, last_missing] inclusive */
+  missing: [number, number];
+  timestamp_ms: number;
+}
+
+export interface StreamResetFrame {
+  type: "stream_reset";
+  node_name: string;
+  stream: string;
+  timestamp_ms: number;
+}
+
+export type Frame =
+  | MessageTraceFrame
+  | MetricFrame
+  | HelloFrame
+  | GapMarkerFrame
+  | StreamResetFrame;
 
 export function emptyState(): GraphState {
   return { nodes: {}, edges: {} };
@@ -65,7 +86,48 @@ export function reduce(state: GraphState, frame: Frame): GraphState {
   if (frame.type === "metric") {
     return reduceMetric(state, frame);
   }
+  if (frame.type === "gap_marker") {
+    return reduceGapMarker(state, frame);
+  }
+  if (frame.type === "stream_reset") {
+    return reduceStreamReset(state, frame);
+  }
   return state;
+}
+
+function reduceGapMarker(
+  state: GraphState,
+  frame: GapMarkerFrame,
+): GraphState {
+  const next = ensurePiNode(state, frame.node_name, frame.timestamp_ms);
+  const id = piNodeId(frame.node_name);
+  const node = next.nodes[id];
+  const dropped = (node.droppedCount ?? 0) + (frame.missing[1] - frame.missing[0] + 1);
+  return {
+    ...next,
+    nodes: {
+      ...next.nodes,
+      [id]: { ...node, droppedCount: dropped },
+    },
+  };
+}
+
+function reduceStreamReset(
+  state: GraphState,
+  frame: StreamResetFrame,
+): GraphState {
+  // A producer restart wipes the dropped count for that node — its prior
+  // sequence numbers are no longer "missing", they're just from before.
+  const next = ensurePiNode(state, frame.node_name, frame.timestamp_ms);
+  const id = piNodeId(frame.node_name);
+  const node = next.nodes[id];
+  return {
+    ...next,
+    nodes: {
+      ...next.nodes,
+      [id]: { ...node, droppedCount: 0 },
+    },
+  };
 }
 
 /** Mark every Pi-node with no recent activity as stale. */
@@ -163,6 +225,7 @@ function ensurePiNode(
     inFlight: existing?.inFlight ?? 0,
     currentProvider: existing?.currentProvider,
     rollingAvgMs: existing?.rollingAvgMs,
+    droppedCount: existing?.droppedCount,
     lastSeenMs: nowMs,
     stale: false,
   };
