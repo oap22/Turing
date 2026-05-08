@@ -225,8 +225,10 @@ class SafetyGate:
 
         if self.audit_store is not None:
             try:
+                # MemoryStore.log_audit owns the persisted timestamp via
+                # _utcnow(); the structlog line above carries the same wall
+                # time for human inspection.
                 await self.audit_store.log_audit(
-                    timestamp=timestamp,
                     user_id=user_id,
                     action="tool_call",
                     tool_name=tool_name,
