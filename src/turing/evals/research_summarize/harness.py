@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -120,15 +121,86 @@ def _build_direct_worker(model: str, timeout_s: float) -> WorkerFn:
     )
 
 
+def _build_coordinator_worker(
+    *,
+    nats_url: str,
+    worker_id: str | None,
+    deadline_offset_s: float,
+) -> WorkerFn:
+    """Construct a coordinator worker connected to a live NATS coordinator.
+
+    Like `_build_direct_worker`, imports are local so the harness keeps
+    loading without nats-py / config when only `--worker fixture` runs.
+    """
+    import time
+
+    from turing.coordinator.dispatch import SubtaskDispatchClient
+    from turing.transport.nats_bus import NatsBus
+    from turing.transport.signed_transport import SignedTransport
+    from turing.transport.signer import MessageSigner
+
+    from .workers import CoordinatorWorkerConfig, coordinator_worker
+
+    async def _connect_and_build() -> WorkerFn:
+        bus = await NatsBus.connect(url=nats_url, tls_enabled=True, nkey_seed=None, lan_only=True)
+        signer = MessageSigner.generate()
+        # Trust set wired up out-of-band in production (manifests advertise
+        # public keys); for the eval harness we accept any signed reply by
+        # adding the signer's own key as trusted (loopback) — replace with
+        # a real trust list when this is deployed against the live pool.
+        transport = SignedTransport(
+            bus=bus,
+            signer=signer,
+            trusted_keys=[signer.public_key],
+            now_ms=lambda: int(time.time() * 1000),
+        )
+        client = SubtaskDispatchClient(
+            transport=transport,
+            sender_id="eval-harness",
+            now_ms=lambda: int(time.time() * 1000),
+        )
+        return coordinator_worker(
+            client=client,
+            config=CoordinatorWorkerConfig(
+                specialty="research-summarize",
+                worker_id=worker_id,
+                deadline_offset_s=deadline_offset_s,
+            ),
+        )
+
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_connect_and_build())
+    finally:
+        loop.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--worker", default="fixture", choices=["fixture", "direct"])
+    parser.add_argument("--worker", default="fixture", choices=["fixture", "direct", "coordinator"])
     parser.add_argument("--model", default="claude-sonnet-4-5")
     parser.add_argument("--timeout-s", type=float, default=60.0)
+    parser.add_argument(
+        "--url",
+        default="nats://127.0.0.1:4222",
+        help="NATS URL (used with --worker coordinator)",
+    )
+    parser.add_argument(
+        "--worker-id",
+        default=None,
+        help="If set, dispatch via worker-direct subject; else specialty queue",
+    )
+    parser.add_argument("--deadline-offset-s", type=float, default=120.0)
     args = parser.parse_args()
 
     if args.worker == "direct":
         worker: WorkerFn = _build_direct_worker(args.model, args.timeout_s)
+    elif args.worker == "coordinator":
+        worker = _build_coordinator_worker(
+            nats_url=args.url,
+            worker_id=args.worker_id,
+            deadline_offset_s=args.deadline_offset_s,
+        )
     else:
         worker = fixture_worker
 
