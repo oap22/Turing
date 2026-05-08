@@ -41,6 +41,9 @@ class Expected(BaseModel):
     required_citations: dict[str, list[int]] = Field(default_factory=dict)
     voice_features: VoiceFeatures | None = None
     target_paragraph_count: int | None = None
+    # Cosine threshold for embedding-based claim presence (overrides the
+    # scorer's 0.75 default per case). Ignored when no embedder is wired in.
+    claim_match_threshold: float | None = None
 
 
 class EvalCase(BaseModel):
