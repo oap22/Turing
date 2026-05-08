@@ -8,9 +8,22 @@ forward-compatible without bumping `version`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 ENVELOPE_VERSION = 1
+
+
+class SubtaskKind(StrEnum):
+    """Routing kinds for `SubtaskDispatch`. Wire format is the string value;
+    workers accept arbitrary kind strings (forward-compat) and reject
+    unknowns gracefully via `KindRouter`.
+    """
+
+    DEFAULT = "default"
+    CRITIC_SCORE = "critic_score"
+    CANARY_EVAL = "canary_eval"
+    EXTRACT_LESSONS = "extract_lessons"
 
 
 @dataclass(frozen=True)
@@ -37,6 +50,7 @@ class SubtaskDispatch:
     source_inputs: list[SourceInput]
     deadline_ms: int
     capability_token: dict[str, Any] | None = None
+    kind: str = SubtaskKind.DEFAULT.value
     version: int = ENVELOPE_VERSION
 
     def to_dict(self) -> dict[str, Any]:
@@ -49,6 +63,7 @@ class SubtaskDispatch:
             "source_inputs": [s.to_dict() for s in self.source_inputs],
             "deadline_ms": self.deadline_ms,
             "capability_token": self.capability_token,
+            "kind": self.kind,
         }
 
     @classmethod
@@ -61,6 +76,7 @@ class SubtaskDispatch:
             source_inputs=[SourceInput.from_dict(s) for s in d.get("source_inputs", [])],
             deadline_ms=d["deadline_ms"],
             capability_token=d.get("capability_token"),
+            kind=d.get("kind", SubtaskKind.DEFAULT.value),
             version=d.get("version", ENVELOPE_VERSION),
         )
 
