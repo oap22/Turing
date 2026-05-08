@@ -1,5 +1,5 @@
 # Turing
-Local Agentic assistant for Edge AI applications
+Hybrid agentic orchestration and self improvement framework.
 
 ## Operator UI
 
