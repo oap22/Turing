@@ -41,9 +41,23 @@ def _cosine(a: tuple[float, ...], b: tuple[float, ...]) -> float:
 class LessonStore:
     def __init__(self) -> None:
         self._lessons: list[Lesson] = []
+        self._pinned: dict[str, int] = {}
 
     def add(self, lesson: Lesson) -> None:
         self._lessons.append(lesson)
+
+    def pin(self, *, lesson_ids: list[str], until_ms: int) -> None:
+        """Mark each `lesson_id` (== `Lesson.task_id`) as pinned through `until_ms`.
+
+        Repeated pins overwrite the previous expiry, so the latest call wins.
+        Pinning does not require the lesson to currently exist in the store —
+        the pin is a separate index keyed by task_id.
+        """
+        for tid in lesson_ids:
+            self._pinned[tid] = until_ms
+
+    def pinned_until(self, task_id: str) -> int | None:
+        return self._pinned.get(task_id)
 
     def query(
         self,
