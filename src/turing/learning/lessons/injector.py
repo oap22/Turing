@@ -1,15 +1,27 @@
-"""inject_lessons_into_prompt — render top-k lessons under <lessons>...</lessons>.
+"""inject_lessons_into_prompt — prepend top-k lessons in a <lessons> block.
 
-The clearly-labelled section makes it visible to the operator (and easy to
-diff in eval fixtures) that retrieved lessons changed the worker prompt.
-An empty list short-circuits — no empty <lessons> tags appear in the prompt.
+ADR 0005 §3 + issue #105: the user prompt is the trunk; injected lessons
+are *prefix context* the worker should read before encountering the
+actual ask. Format:
+
+    <lessons>
+    - lesson 1
+    - lesson 2
+    </lessons>
+    <original user prompt>
+
+Empty lessons list short-circuits — no empty <lessons> wrappers appear
+in the prompt.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
-from turing.learning.lessons.lesson import Lesson
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from turing.learning.lessons.lesson import Lesson
 
 
 def inject_lessons_into_prompt(
@@ -19,6 +31,6 @@ def inject_lessons_into_prompt(
 ) -> str:
     if not lessons:
         return base_prompt
-    body = "\n".join(f"- {l.text}" for l in lessons)
-    block = f"\n\n<lessons>\n{body}\n</lessons>"
-    return base_prompt + block
+    body = "\n".join(f"- {lesson.text}" for lesson in lessons)
+    block = f"<lessons>\n{body}\n</lessons>\n\n"
+    return block + base_prompt
