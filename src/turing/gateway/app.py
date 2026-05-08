@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from fastapi import FastAPI, Request, Response, WebSocket
+from fastapi import FastAPI, Query, Request, Response, WebSocket
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import (
     FileResponse,
@@ -25,6 +25,9 @@ from starlette.responses import (
 from starlette.staticfiles import StaticFiles
 
 from turing.gateway.auth import COOKIE_NAME, GatewayAuth
+from turing.gateway.ring_buffer import RingBuffer
+
+DEFAULT_PAGE_LIMIT = 200
 
 PUBLIC_PATHS = frozenset({"/healthz", "/token-handoff"})
 
@@ -54,9 +57,11 @@ def create_app(
     auth: GatewayAuth,
     node_name: str,
     spa_assets_dir: Optional[Path] = None,
+    ring_buffer: Optional[RingBuffer] = None,
 ) -> FastAPI:
     app = FastAPI(title="turing-gateway")
     app.state.start_time = time.monotonic()
+    app.state.ring_buffer = ring_buffer
     app.add_middleware(_BearerMiddleware, auth=auth)
 
     @app.get("/healthz")
@@ -90,6 +95,39 @@ def create_app(
         # Kept for slice-3 tests that exercise the auth middleware without
         # depending on the SPA bundle being present.
         return {"ok": True}
+
+    @app.get("/api/events")
+    async def api_events(
+        node: list[str] = Query(default_factory=list),
+        event_type: list[str] = Query(default_factory=list),
+        since_ms: Optional[int] = None,
+        min_duration_ms: Optional[float] = None,
+        limit: int = DEFAULT_PAGE_LIMIT,
+        offset: int = 0,
+    ) -> dict:
+        """Paginated query over the telemetry ring buffer.
+
+        Slice 7's trace pane fetches recent history through this route on
+        initial paint, then layers live frames from the WebSocket on top.
+        Pagination uses ``offset`` rather than a cursor because the ring
+        buffer is append-only and rows never re-shuffle.
+        """
+        if ring_buffer is None:
+            return {"events": [], "next_offset": None}
+        # Fetch one extra row to detect whether more pages remain.
+        fetch_limit = max(0, int(limit)) + 1
+        rows = await ring_buffer.query(
+            node_names=tuple(node) if node else None,
+            event_types=tuple(event_type) if event_type else None,
+            since_ms=since_ms,
+            min_duration_ms=min_duration_ms,
+            limit=fetch_limit,
+            offset=int(offset),
+        )
+        has_more = len(rows) > limit
+        events = rows[:limit]
+        next_offset = (int(offset) + limit) if has_more else None
+        return {"events": events, "next_offset": next_offset}
 
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:

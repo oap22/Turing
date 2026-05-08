@@ -22,9 +22,11 @@ const nodeTypes = {
 
 interface Props {
   state: GraphState;
+  /** Stream-prefixed edge id (`{node}::{stream}::{seq}`) to flash. */
+  highlightedEdge?: string | null;
 }
 
-export default function CallGraphCanvas({ state }: Props) {
+export default function CallGraphCanvas({ state, highlightedEdge }: Props) {
   const nodes = useMemo<Node[]>(() => {
     return layoutNodes(state.nodes).map((n) => ({
       id: n.id,
@@ -35,21 +37,26 @@ export default function CallGraphCanvas({ state }: Props) {
   }, [state.nodes]);
 
   const edges = useMemo<Edge[]>(() => {
-    return Object.values(state.edges).map((e) => ({
-      id: e.id,
-      source: e.source,
-      target: e.target,
-      animated: e.active,
-      label: e.active
-        ? "…"
-        : e.latencyMs !== undefined
-          ? `${Math.round(e.latencyMs)} ms`
-          : undefined,
-      style: e.active
-        ? { stroke: "#22c55e", strokeWidth: 2 }
-        : { stroke: "#525252", strokeWidth: 1 },
-    }));
-  }, [state.edges]);
+    return Object.values(state.edges).map((e) => {
+      const highlighted = highlightedEdge === e.id;
+      return {
+        id: e.id,
+        source: e.source,
+        target: e.target,
+        animated: e.active || highlighted,
+        label: e.active
+          ? "…"
+          : e.latencyMs !== undefined
+            ? `${Math.round(e.latencyMs)} ms`
+            : undefined,
+        style: highlighted
+          ? { stroke: "#fbbf24", strokeWidth: 3 }
+          : e.active
+            ? { stroke: "#22c55e", strokeWidth: 2 }
+            : { stroke: "#525252", strokeWidth: 1 },
+      };
+    });
+  }, [state.edges, highlightedEdge]);
 
   return (
     <div className="h-full w-full">

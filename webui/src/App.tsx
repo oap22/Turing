@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useReducer, useState } from "react";
 import CallGraphCanvas from "./CallGraphCanvas";
 import { emptyState, markStale, reduce, type Frame } from "./graph/reducer";
+import TracePane from "./trace/TracePane";
+import type { TraceEvent } from "./trace/types";
 import { connectGatewayWS } from "./ws";
 
 const STALE_TICK_MS = 5_000;
+const HIGHLIGHT_MS = 1_500;
 
 export default function App() {
   const [state, dispatch] = useReducer(
@@ -11,6 +14,8 @@ export default function App() {
     emptyState(),
   );
   const [debugFrames, setDebugFrames] = useState<Frame[]>([]);
+  const [liveTrace, setLiveTrace] = useState<TraceEvent[]>([]);
+  const [highlightedEdge, setHighlightedEdge] = useState<string | null>(null);
   const [showDebug, setShowDebug] = useState(false);
   const [now, setNow] = useState(() => Date.now());
 
@@ -20,6 +25,22 @@ export default function App() {
       onFrame: (frame) => {
         dispatch(frame as Frame);
         setDebugFrames((prev) => [...prev.slice(-499), frame as Frame]);
+        if ((frame as Record<string, unknown>).type === "message_trace") {
+          const f = frame as Record<string, unknown>;
+          setLiveTrace((prev) => [
+            ...prev.slice(-499),
+            {
+              timestamp_ms: Number(f.timestamp_ms ?? 0),
+              node_name: String(f.node_name ?? ""),
+              event_type: String(f.event_type ?? ""),
+              seq: typeof f.seq === "number" ? f.seq : undefined,
+              duration_ms:
+                typeof f.duration_ms === "number" ? f.duration_ms : null,
+              error: (f.error as string | null | undefined) ?? null,
+              payload: (f.payload as Record<string, unknown>) ?? {},
+            },
+          ]);
+        }
       },
     });
     return stop;
@@ -32,7 +53,7 @@ export default function App() {
   }, []);
   const visibleState = useMemo(() => markStale(state, now), [state, now]);
 
-  // Backtick toggles the debug pane (hidden by default in slice 6).
+  // Backtick toggles the debug pane (hidden by default).
   useEffect(() => {
     function onKey(ev: KeyboardEvent) {
       if (ev.key === "~" || ev.key === "`") {
@@ -42,6 +63,14 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+
+  // Selecting a trace event briefly highlights the matching call-graph edge.
+  function onTraceSelect(e: TraceEvent) {
+    const stream = e.event_type.replace(/\.(start|end|error)$/, "");
+    const edgeId = `${e.node_name}::${stream}::${e.seq ?? ""}`;
+    setHighlightedEdge(edgeId);
+    setTimeout(() => setHighlightedEdge(null), HIGHLIGHT_MS);
+  }
 
   return (
     <div className="flex h-full flex-col">
@@ -53,8 +82,14 @@ export default function App() {
       </header>
       <main className="flex flex-1 overflow-hidden">
         <section className="flex-1 border-r border-neutral-800">
-          <CallGraphCanvas state={visibleState} />
+          <CallGraphCanvas
+            state={visibleState}
+            highlightedEdge={highlightedEdge}
+          />
         </section>
+        <aside className="w-[520px] border-r border-neutral-800">
+          <TracePane liveEvents={liveTrace} onSelect={onTraceSelect} />
+        </aside>
         {showDebug && (
           <aside className="w-[480px] overflow-auto bg-neutral-950 p-2 font-mono text-xs">
             <h2 className="mb-2 text-neutral-400">incoming frames (debug)</h2>

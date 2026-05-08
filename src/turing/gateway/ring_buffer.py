@@ -153,8 +153,23 @@ class RingBuffer:
         *,
         node_name: Optional[str] = None,
         event_type: Optional[str] = None,
+        node_names: Optional[tuple[str, ...]] = None,
+        event_types: Optional[tuple[str, ...]] = None,
         since_ms: Optional[int] = None,
+        min_duration_ms: Optional[float] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
     ) -> list[dict[str, Any]]:
+        """Filter telemetry rows.
+
+        ``node_name`` / ``event_type`` are kept for backwards compat; the
+        plural ``node_names`` / ``event_types`` lists are what the trace pane
+        sends since it supports multi-select. ``min_duration_ms`` filters out
+        the noisy short events when the operator wants to focus on slow calls.
+        ``limit`` and ``offset`` paginate the response — slice 7's pane
+        fetches recent history in pages so the initial paint stays under
+        500 ms even with a 24h ring buffer at full retention.
+        """
         assert self._db is not None
         clauses: list[str] = []
         params: list[Any] = []
@@ -164,11 +179,32 @@ class RingBuffer:
         if event_type is not None:
             clauses.append("event_type = ?")
             params.append(event_type)
+        if node_names:
+            placeholders = ",".join("?" for _ in node_names)
+            clauses.append(f"node_name IN ({placeholders})")
+            params.extend(node_names)
+        if event_types:
+            placeholders = ",".join("?" for _ in event_types)
+            clauses.append(f"event_type IN ({placeholders})")
+            params.extend(event_types)
         if since_ms is not None:
             clauses.append("timestamp_ms >= ?")
             params.append(since_ms)
+        if min_duration_ms is not None:
+            clauses.append("duration_ms >= ?")
+            params.append(min_duration_ms)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = f"SELECT * FROM telemetry_events {where} ORDER BY id ASC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+            if offset is not None:
+                sql += " OFFSET ?"
+                params.append(int(offset))
+        elif offset is not None:
+            # SQLite requires LIMIT when OFFSET is present; -1 means unbounded.
+            sql += " LIMIT -1 OFFSET ?"
+            params.append(int(offset))
         cur = await self._db.execute(sql, params)
         rows = await cur.fetchall()
         await cur.close()
