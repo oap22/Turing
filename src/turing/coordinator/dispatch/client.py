@@ -46,6 +46,7 @@ class SubtaskDispatchClient:
         self._transport = transport
         self._sender_id = sender_id
         self._now_ms = now_ms
+        self.now_ms = now_ms  # exposed so callers using deadlines share the clock
         # Map subtask_id -> Future awaiting that subtask's result.
         self._pending: dict[str, asyncio.Future[TaskResult]] = {}
 
