@@ -24,7 +24,7 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
 
 class InvalidTransitionError(Exception):
@@ -91,10 +91,20 @@ class SubtaskEvent:
     ts_ms: int
 
 
+_CRITIC_ELIGIBLE_TERMINAL = frozenset(
+    {SubtaskState.COMPLETED, SubtaskState.FAILED, SubtaskState.TIMED_OUT}
+)
+
+
 class TaskLifecycle:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        on_terminal: Callable[[str, SubtaskState], None] | None = None,
+    ) -> None:
         self._states: dict[str, SubtaskState] = {}
         self._attempts: dict[str, int] = {}
+        self._on_terminal = on_terminal
 
     @classmethod
     def replay(cls, events: Iterable[SubtaskEvent]) -> TaskLifecycle:
@@ -135,6 +145,7 @@ class TaskLifecycle:
         if current is None:
             self._states[event.subtask_id] = event.new_state
             self._attempts.setdefault(event.subtask_id, 1)
+            self._maybe_fire_terminal(event.subtask_id, event.new_state)
             return
 
         # Idempotency: same state arriving again is a no-op.
@@ -152,3 +163,12 @@ class TaskLifecycle:
             )
 
         self._states[event.subtask_id] = event.new_state
+        self._maybe_fire_terminal(event.subtask_id, event.new_state)
+
+    def _maybe_fire_terminal(self, subtask_id: str, new_state: SubtaskState) -> None:
+        # REJECTED is audit-only — skip the critic enqueue per ADR 0004 §5.
+        if (
+            self._on_terminal is not None
+            and new_state in _CRITIC_ELIGIBLE_TERMINAL
+        ):
+            self._on_terminal(subtask_id, new_state)

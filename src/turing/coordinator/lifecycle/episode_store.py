@@ -81,6 +81,10 @@ class EpisodeStore:
             self._rows[episode.subtask_id] = episode
             self._critic_status[episode.subtask_id] = CriticStatus.PENDING
 
+    def get(self, subtask_id: str) -> Episode:
+        """Return the recorded episode; raise ``KeyError`` if absent."""
+        return self._rows[subtask_id]
+
     def update_critic_score(self, *, subtask_id: str, critic_score: float) -> None:
         """Backfill an episode's critic_score after async critic scoring.
 
