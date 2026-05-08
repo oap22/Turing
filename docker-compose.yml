@@ -6,8 +6,8 @@ x-turing-common: &turing-common
     dockerfile: Dockerfile
   env_file: .env
   depends_on:
-    ollama:
-      condition: service_started
+    ollama-init:
+      condition: service_completed_successfully
   restart: unless-stopped
   networks:
     - turing-mesh
@@ -24,6 +24,22 @@ services:
     networks:
       - turing-mesh
     restart: unless-stopped
+
+  # ── Ollama Init — pull model before nodes start ──────────────────
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: turing-ollama-init
+    depends_on:
+      ollama:
+        condition: service_started
+    volumes:
+      - ollama-data:/root/.ollama
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["sh", "-c", "sleep 5 && ollama pull qwen2.5:7b"]
+    networks:
+      - turing-mesh
+    restart: "no"
 
   # ── Node 1 — primary node (Discord + Anthropic enabled) ───────────
   turing-node-1:
