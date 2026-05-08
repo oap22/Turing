@@ -27,10 +27,14 @@ from typing import TYPE_CHECKING, Protocol
 
 import structlog
 
+from turing.coordinator.dispatch import SourceInput, SubtaskDispatch
+from turing.coordinator.dispatch.client import SubtaskTimeoutError
 from turing.coordinator.lifecycle.episode_store import Episode
 from turing.coordinator.lifecycle.lifecycle import SubtaskState
+from turing.coordinator.scheduler.scheduler import Subtask as SchedulerSubtask
 
 if TYPE_CHECKING:
+    from turing.coordinator.dispatch.client import SubtaskDispatchClient
     from turing.coordinator.lifecycle.episode_store import EpisodeStore
     from turing.coordinator.planner.schema import (
         DAG,
@@ -38,6 +42,7 @@ if TYPE_CHECKING:
         Subtask,
     )
     from turing.coordinator.registry import CapabilityRegistry
+    from turing.coordinator.scheduler.scheduler import Scheduler
 
 
 logger = structlog.get_logger("turing.coordinator.orchestrator")
@@ -137,11 +142,15 @@ class DAGOrchestrator:
         worker_for_specialty: dict[str, WorkerClient],
         synthesizer: Synthesizer,
         now_ms=_now_ms,
+        dispatch_client: SubtaskDispatchClient | None = None,
+        scheduler: Scheduler | None = None,
     ) -> None:
         self._store = episode_store
         self._workers = worker_for_specialty
         self._synth = synthesizer
         self._now_ms = now_ms
+        self._dispatch_client = dispatch_client
+        self._scheduler = scheduler
 
     async def run(
         self,
@@ -152,12 +161,11 @@ class DAGOrchestrator:
     ) -> str:
         """Run the DAG to completion and return the synthesized reply.
 
-        ``registry`` is accepted for parity with the planning step but is
-        not strictly required here — the DAG is assumed pre-validated.
-        It will be used in future slices for live capability checks.
+        When constructed with both a ``scheduler`` and ``dispatch_client``,
+        the orchestrator consults ``registry`` per subtask: locally-resident
+        workers run in-process via ``worker_for_specialty``; remote workers
+        are dispatched over the bus and awaited.
         """
-        del registry  # reserved for future live re-checks
-
         live = _LiveDAG.from_dag(dag)
         outputs: dict[str, str] = {}
         completed: set[str] = set()
@@ -196,7 +204,7 @@ class DAGOrchestrator:
                 break
 
             results = await asyncio.gather(
-                *(self._run_one(s, outputs, live) for s in ready),
+                *(self._run_one(s, outputs, live, registry) for s in ready),
                 return_exceptions=True,
             )
             for st, res in zip(ready, results, strict=True):
@@ -242,15 +250,40 @@ class DAGOrchestrator:
         subtask: Subtask,
         outputs: dict[str, str],
         live: _LiveDAG,
+        registry: CapabilityRegistry | None,
     ) -> str | object:
         specialty = subtask.specialty_required.value
+        resolved_inputs = {key: outputs[uri] for key, uri in subtask.inputs.items()}
+
+        # Remote dispatch path: fully wired only when scheduler + dispatch
+        # client + registry are all available. Otherwise fall through to the
+        # in-process worker dict — preserving the pre-#95 local-only mode.
+        if (
+            self._dispatch_client is not None
+            and self._scheduler is not None
+            and registry is not None
+        ):
+            sched_st = SchedulerSubtask(
+                subtask_id=subtask.id,
+                specialty_required=specialty,
+                required_tools=tuple(subtask.required_tools),
+            )
+            picked = self._scheduler.pick(sched_st, registry)
+            if picked is not None and not registry.is_local(picked.worker_id):
+                return await self._run_remote(
+                    subtask=subtask,
+                    sched_st=sched_st,
+                    initial_pick=picked,
+                    resolved_inputs=resolved_inputs,
+                    registry=registry,
+                    live=live,
+                )
+
         worker = self._workers.get(specialty)
         if worker is None:
             raise RuntimeError(
                 f"no worker registered for specialty {specialty!r} (subtask {subtask.id!r})"
             )
-
-        resolved_inputs = {key: outputs[uri] for key, uri in subtask.inputs.items()}
 
         started = self._now_ms()
         try:
@@ -304,5 +337,112 @@ class DAGOrchestrator:
         )
         return out.output_text
 
+    async def _run_remote(
+        self,
+        *,
+        subtask: Subtask,
+        sched_st: SchedulerSubtask,
+        initial_pick,
+        resolved_inputs: dict[str, str],
+        registry: CapabilityRegistry,
+        live: _LiveDAG,
+    ) -> str:
+        assert self._dispatch_client is not None
+        assert self._scheduler is not None
+
+        specialty = subtask.specialty_required.value
+        deadline_ms = self._now_ms() + subtask.timeout_s * 1000
+        tried: list[str] = []
+
+        pick = initial_pick
+        last_error = "no worker available"
+        last_outcome = SubtaskState.FAILED
+
+        # AC4: dispatch once; on FAILED/TIMED_OUT, pick_for_retry and
+        # re-dispatch exactly once before marking the subtask terminal.
+        for _ in range(2):
+            if pick is None:
+                break
+            tried.append(pick.worker_id)
+            started = self._now_ms()
+            try:
+                envelope = SubtaskDispatch(
+                    subtask_id=subtask.id,
+                    task_id=live.task_id,
+                    specialty=specialty,
+                    prompt=subtask.prompt,
+                    source_inputs=[SourceInput(id=k, text=v) for k, v in resolved_inputs.items()],
+                    deadline_ms=deadline_ms,
+                )
+                result = await self._dispatch_client.dispatch(
+                    envelope,
+                    worker_id=pick.worker_id,
+                    deadline_ms=deadline_ms,
+                )
+            except SubtaskTimeoutError as exc:
+                last_error = str(exc)
+                last_outcome = SubtaskState.TIMED_OUT
+                pick = self._scheduler.pick_for_retry(sched_st, registry, exclude_worker_ids=tried)
+                continue
+
+            if result.status == "COMPLETED":
+                self._store.record(
+                    Episode(
+                        task_id=live.task_id,
+                        subtask_id=subtask.id,
+                        worker_id=pick.worker_id,
+                        specialty=specialty,
+                        model_version=result.model,
+                        adapter_version="",
+                        input_text=subtask.prompt,
+                        trajectory=tuple(resolved_inputs.values()),
+                        output_text=result.output,
+                        success=True,
+                        latency_ms=result.latency_ms or (self._now_ms() - started),
+                        tokens_used=result.tokens_used,
+                        outcome=SubtaskState.COMPLETED,
+                        critic_score=0.0,
+                        recorded_at_ms=self._now_ms(),
+                    )
+                )
+                return result.output
+
+            if result.status in _TERMINAL_FAILURE_STATUSES:
+                last_error = result.error or result.status
+                last_outcome = (
+                    SubtaskState.TIMED_OUT if result.status == "TIMED_OUT" else SubtaskState.FAILED
+                )
+                pick = self._scheduler.pick_for_retry(sched_st, registry, exclude_worker_ids=tried)
+                continue
+
+            # NEEDS_SUBTASK from a remote worker is not wired in this slice —
+            # treat as terminal rather than silently dropping it.
+            last_error = f"unhandled remote status {result.status!r}"
+            last_outcome = SubtaskState.FAILED
+            break
+
+        now = self._now_ms()
+        self._store.record(
+            Episode(
+                task_id=live.task_id,
+                subtask_id=subtask.id,
+                worker_id=tried[-1] if tried else "<none>",
+                specialty=specialty,
+                model_version="",
+                adapter_version="",
+                input_text=subtask.prompt,
+                trajectory=(),
+                output_text=last_error,
+                success=False,
+                latency_ms=0,
+                tokens_used=0,
+                outcome=last_outcome,
+                critic_score=0.0,
+                recorded_at_ms=now,
+            )
+        )
+        raise RuntimeError(f"remote dispatch for {subtask.id} exhausted retries: {last_error}")
+
 
 _NEEDS_SUBTASK_DEFERRED = object()
+_TERMINAL_FAILURE_STATUSES = frozenset({"FAILED", "TIMED_OUT", "REJECTED"})

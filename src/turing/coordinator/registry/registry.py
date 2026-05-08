@@ -31,6 +31,7 @@ class _Entry:
     manifest: CapabilityManifest
     last_seen_ms: int
     in_flight: int = 0
+    local: bool = True
 
 
 class CapabilityRegistry:
@@ -44,14 +45,27 @@ class CapabilityRegistry:
         self._ttl = heartbeat_ttl_ms
         self._entries: dict[str, _Entry] = {}
 
-    def register(self, manifest: CapabilityManifest) -> None:
+    def register(self, manifest: CapabilityManifest, *, local: bool = True) -> None:
         existing = self._entries.get(manifest.worker_id)
         in_flight = existing.in_flight if existing is not None else 0
         self._entries[manifest.worker_id] = _Entry(
             manifest=manifest,
             last_seen_ms=self._now_ms(),
             in_flight=in_flight,
+            local=local,
         )
+
+    def is_local(self, worker_id: str) -> bool:
+        """Return whether ``worker_id`` runs on the coordinator's own node.
+
+        Unknown workers are treated as remote — the orchestrator should fail
+        a dispatch loudly rather than silently fall through to the local
+        in-process path.
+        """
+        entry = self._entries.get(worker_id)
+        if entry is None:
+            return False
+        return entry.local
 
     def heartbeat(self, worker_id: str) -> None:
         entry = self._entries.get(worker_id)
