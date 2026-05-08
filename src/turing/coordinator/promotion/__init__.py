@@ -7,9 +7,19 @@ from turing.coordinator.promotion.promotion_gate import (
     PromotionGate,
     StageDecision,
 )
+from turing.coordinator.promotion.rollout import (
+    LiveEvalReport,
+    RegressionHaltedError,
+    RolloutCoordinator,
+    RolloutState,
+)
 
 __all__ = [
     "EvalDeltaTooSmallError",
+    "LiveEvalReport",
     "PromotionGate",
+    "RegressionHaltedError",
+    "RolloutCoordinator",
+    "RolloutState",
     "StageDecision",
 ]
