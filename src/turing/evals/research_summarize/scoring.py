@@ -13,12 +13,23 @@ LLM-judge proximity (citations).
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from .schema import EvalCase
+
+
+class Embedder(Protocol):
+    """Synchronous batched embedder. Project's `EmbeddingModel` is async,
+    so the harness wraps it; the scorer itself stays sync for simplicity."""
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]: ...
+
+
+DEFAULT_CLAIM_THRESHOLD = 0.75
 
 
 @dataclass
@@ -32,18 +43,47 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower()).strip()
 
 
-def _claim_present(claim: str, summary_norm: str) -> bool:
-    """Substring fallback for claim presence.
+_SENT_RE = re.compile(r"(?<=[.!?])\s+")
 
-    Production swap: replace with embedding similarity (cosine ≥ 0.75) using
-    the same embedder the worker uses, so paraphrases score correctly. The
-    substring check is a deterministic placeholder so the harness runs without
-    a live model.
+
+def _summary_chunks(summary: str) -> list[str]:
+    """Sentence-level chunks for embedding comparison."""
+    return [s.strip() for s in _SENT_RE.split(summary.strip()) if s.strip()]
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _claim_present(
+    claim: str,
+    summary_norm: str,
+    *,
+    embedder: Embedder | None = None,
+    summary_chunks: list[str] | None = None,
+    threshold: float = DEFAULT_CLAIM_THRESHOLD,
+) -> bool:
+    """Check whether a claim is present in the summary.
+
+    Order of attempts:
+      1. Exact substring (fast path; skips the embedder entirely)
+      2. Embedding cosine ≥ threshold against any summary sentence (if embedder)
+      3. Token-overlap fallback (≥70% of content tokens present)
     """
     claim_norm = _normalize(claim)
     if claim_norm in summary_norm:
         return True
-    # token-overlap fallback: ≥70% of content tokens present, in any order
+
+    if embedder is not None and summary_chunks:
+        vecs = embedder.embed_batch([claim, *summary_chunks])
+        claim_vec = vecs[0]
+        return any(_cosine(claim_vec, chunk_vec) >= threshold for chunk_vec in vecs[1:])
+
     tokens = [t for t in re.findall(r"\w+", claim_norm) if len(t) > 2]
     if not tokens:
         return False
@@ -51,17 +91,38 @@ def _claim_present(claim: str, summary_norm: str) -> bool:
     return hits / len(tokens) >= 0.7
 
 
-def score_claim_preservation_v1(summary: str, case: EvalCase) -> ScoreResult:
-    """Reward must-contain claims; penalize must-not-contain leaks."""
+def score_claim_preservation_v1(
+    summary: str,
+    case: EvalCase,
+    *,
+    embedder: Embedder | None = None,
+) -> ScoreResult:
+    """Reward must-contain claims; penalize must-not-contain leaks.
+
+    If `embedder` is provided, claims that miss the substring fast path are
+    re-checked against summary sentences via cosine similarity. The threshold
+    is `case.expected.claim_match_threshold` (default 0.75).
+    """
     summary_norm = _normalize(summary)
+    chunks = _summary_chunks(summary)
+    threshold = case.expected.claim_match_threshold or DEFAULT_CLAIM_THRESHOLD
     must = case.expected.must_contain_claims
     must_not = case.expected.must_not_contain
+
+    def present(c: str) -> bool:
+        return _claim_present(
+            c,
+            summary_norm,
+            embedder=embedder,
+            summary_chunks=chunks,
+            threshold=threshold,
+        )
 
     if not must:
         recall = 1.0
         hits = 0
     else:
-        hits = sum(1 for c in must if _claim_present(c, summary_norm))
+        hits = sum(1 for c in must if present(c))
         recall = hits / len(must)
 
     # Strict substring for forbidden phrases: hallucination guards target
@@ -78,7 +139,7 @@ def score_claim_preservation_v1(summary: str, case: EvalCase) -> ScoreResult:
             "leaks": float(leaks),
             "leak_penalty": leak_penalty,
         },
-        notes=[f"missing: {c!r}" for c in must if not _claim_present(c, summary_norm)]
+        notes=[f"missing: {c!r}" for c in must if not present(c)]
         + [f"leaked: {c!r}" for c in must_not if _normalize(c) in summary_norm],
     )
 

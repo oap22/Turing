@@ -21,7 +21,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .schema import EvalCase
-from .scoring import SCORERS, ScoreResult
+from .scoring import SCORERS, Embedder, ScoreResult
 
 # Cases live alongside operator-curated data, not in the Python package.
 # Layout: <repo_root>/evals/research-summarize/cases/*.jsonl
@@ -55,7 +55,12 @@ def fixture_worker(case: EvalCase) -> str:
     return " ".join(case.expected.must_contain_claims) or "(empty)"
 
 
-def run(worker: WorkerFn, cases: list[EvalCase]) -> dict:
+def run(
+    worker: WorkerFn,
+    cases: list[EvalCase],
+    *,
+    embedder: Embedder | None = None,
+) -> dict:
     by_category: dict[str, list[ScoreResult]] = {}
     per_case = []
     for case in cases:
@@ -64,7 +69,10 @@ def run(worker: WorkerFn, cases: list[EvalCase]) -> dict:
             raise ValueError(f"Unknown scoring_fn: {case.scoring_fn}")
         try:
             summary = worker(case)
-            result = scorer(summary, case)
+            if case.scoring_fn == "score_claim_preservation_v1" and embedder is not None:
+                result = scorer(summary, case, embedder=embedder)
+            else:
+                result = scorer(summary, case)
         except NotImplementedError as e:
             result = ScoreResult(score=0.0, notes=[f"scorer not implemented: {e}"])
         by_category.setdefault(case.category, []).append(result)
