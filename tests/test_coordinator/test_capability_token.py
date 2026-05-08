@@ -1,4 +1,4 @@
-"""Tests for the coordinator-issued capability token (#12)."""
+"""Tests for the coordinator-issued capability token primitive (ADR 0003 v1)."""
 
 from __future__ import annotations
 
@@ -15,138 +15,99 @@ from turing.coordinator.capability_token import (
 from turing.transport.signer import MessageSigner
 
 
-# ── helpers ──────────────────────────────────────────────────────────
-
-
 def _scope(
     *,
-    subtask_id: str = "t-1.s-0",
-    allowed_commands_regex: str = r"^(echo|ls)\b",
-    cwd: str = "/tmp/work",
+    subtask_id: str = "st_a",
+    task_id: str = "tsk_x",
+    allowed_commands_regex: str = r"echo .*",
     timeout_s: int = 30,
     expires_at_ms: int = 10_000_000,
+    issued_at_ms: int = 1_000,
 ) -> CapabilityScope:
     return CapabilityScope(
         subtask_id=subtask_id,
+        task_id=task_id,
         allowed_commands_regex=allowed_commands_regex,
-        cwd=cwd,
         timeout_s=timeout_s,
         expires_at_ms=expires_at_ms,
+        issued_at_ms=issued_at_ms,
     )
-
-
-# ── sign/verify ──────────────────────────────────────────────────────
 
 
 class TestSignVerify:
     def test_signed_token_round_trips(self) -> None:
         coord = MessageSigner.generate()
-        issuer = CapabilityTokenIssuer(signer=coord)
-        token = issuer.issue(_scope())
+        token = CapabilityTokenIssuer(signer=coord).issue(_scope())
         assert isinstance(token, CapabilityToken)
         assert token.signer_public_key == coord.public_key
-
-        verifier = CapabilityVerifier(trusted_issuers=[coord.public_key])
-        verified = verifier.verify(token, now_ms=1)
-        assert verified.scope.subtask_id == "t-1.s-0"
+        verified = CapabilityVerifier(trusted_issuers=[coord.public_key]).verify(token, now_ms=1)
+        assert verified.scope.subtask_id == "st_a"
+        assert verified.scope.task_id == "tsk_x"
 
     def test_unknown_signer_rejected(self) -> None:
         coord = MessageSigner.generate()
         rogue = MessageSigner.generate()
-        issuer = CapabilityTokenIssuer(signer=rogue)
-        token = issuer.issue(_scope())
-
-        verifier = CapabilityVerifier(trusted_issuers=[coord.public_key])
+        token = CapabilityTokenIssuer(signer=rogue).issue(_scope())
         with pytest.raises(TokenSignatureError):
-            verifier.verify(token, now_ms=1)
+            CapabilityVerifier(trusted_issuers=[coord.public_key]).verify(token, now_ms=1)
 
     def test_tampered_scope_rejected(self) -> None:
         coord = MessageSigner.generate()
-        issuer = CapabilityTokenIssuer(signer=coord)
-        token = issuer.issue(_scope(allowed_commands_regex=r"^ls\b"))
-        # Forge a wider regex post-sign
+        token = CapabilityTokenIssuer(signer=coord).issue(_scope(allowed_commands_regex=r"ls .*"))
         forged = CapabilityToken(
-            scope=_scope(allowed_commands_regex=r"^.*$"),
+            scope=_scope(allowed_commands_regex=r".*"),
             signature=token.signature,
             signer_public_key=token.signer_public_key,
         )
-        verifier = CapabilityVerifier(trusted_issuers=[coord.public_key])
         with pytest.raises(TokenSignatureError):
-            verifier.verify(forged, now_ms=1)
+            CapabilityVerifier(trusted_issuers=[coord.public_key]).verify(forged, now_ms=1)
+
+    def test_token_round_trips_through_dict(self) -> None:
+        coord = MessageSigner.generate()
+        token = CapabilityTokenIssuer(signer=coord).issue(_scope())
+        rebuilt = CapabilityToken.from_dict(token.to_dict())
+        assert rebuilt == token
+        assert rebuilt.fingerprint() == token.fingerprint()
 
 
-# ── scope enforcement ────────────────────────────────────────────────
-
-
-class TestScopeEnforcement:
+class TestAuthorize:
     def _verifier(self, trusted: bytes) -> CapabilityVerifier:
         return CapabilityVerifier(trusted_issuers=[trusted])
 
     def test_allowed_command_passes(self) -> None:
         coord = MessageSigner.generate()
-        token = CapabilityTokenIssuer(signer=coord).issue(
-            _scope(allowed_commands_regex=r"^(echo|ls)\b")
-        )
-        verifier = self._verifier(coord.public_key)
-        # echo / ls both pass
-        verifier.authorize(
-            token,
-            command="echo hi",
-            cwd="/tmp/work",
-            now_ms=1,
-        )
-        verifier.authorize(
-            token,
-            command="ls -la",
-            cwd="/tmp/work",
-            now_ms=1,
-        )
+        token = CapabilityTokenIssuer(signer=coord).issue(_scope(allowed_commands_regex=r"echo .*"))
+        decision = self._verifier(coord.public_key).authorize(token, command="echo hi", now_ms=1)
+        assert decision.subtask_id == "st_a"
+        assert decision.task_id == "tsk_x"
+        assert decision.timeout_s == 30
 
     def test_disallowed_command_rejected(self) -> None:
         coord = MessageSigner.generate()
-        token = CapabilityTokenIssuer(signer=coord).issue(
-            _scope(allowed_commands_regex=r"^echo\b")
-        )
-        verifier = self._verifier(coord.public_key)
+        token = CapabilityTokenIssuer(signer=coord).issue(_scope(allowed_commands_regex=r"echo"))
         with pytest.raises(ScopeViolation, match="command"):
-            verifier.authorize(token, command="rm -rf /", cwd="/tmp/work", now_ms=1)
+            self._verifier(coord.public_key).authorize(token, command="rm -rf /", now_ms=1)
 
-    def test_wrong_cwd_rejected(self) -> None:
+    def test_fullmatch_rejects_partial_match(self) -> None:
+        # `cat .*` must NOT permit `cat foo; rm -rf /` (would pass with re.match).
         coord = MessageSigner.generate()
-        token = CapabilityTokenIssuer(signer=coord).issue(_scope(cwd="/tmp/work"))
+        token = CapabilityTokenIssuer(signer=coord).issue(_scope(allowed_commands_regex=r"cat .*"))
         verifier = self._verifier(coord.public_key)
-        with pytest.raises(ScopeViolation, match="cwd"):
-            verifier.authorize(
-                token, command="echo hi", cwd="/etc", now_ms=1
-            )
+        verifier.authorize(token, command="cat foo", now_ms=1)
+        with pytest.raises(ScopeViolation, match="command"):
+            verifier.authorize(token, command="cat foo\n; rm -rf /", now_ms=1)
 
     def test_expired_token_rejected(self) -> None:
         coord = MessageSigner.generate()
-        token = CapabilityTokenIssuer(signer=coord).issue(
-            _scope(expires_at_ms=1000)
-        )
-        verifier = self._verifier(coord.public_key)
+        token = CapabilityTokenIssuer(signer=coord).issue(_scope(expires_at_ms=1000))
         with pytest.raises(ScopeViolation, match="expired"):
-            verifier.authorize(
-                token, command="echo hi", cwd="/tmp/work", now_ms=2000
-            )
+            self._verifier(coord.public_key).authorize(token, command="echo hi", now_ms=2000)
 
-    def test_timeout_budget_exposed_for_caller(self) -> None:
+    def test_v1_deny_by_default_regex_rejects_everything(self) -> None:
+        # The orchestrator's v1 default (deny-by-default) is r"(?!x)x".
         coord = MessageSigner.generate()
-        token = CapabilityTokenIssuer(signer=coord).issue(_scope(timeout_s=15))
+        token = CapabilityTokenIssuer(signer=coord).issue(_scope(allowed_commands_regex=r"(?!x)x"))
         verifier = self._verifier(coord.public_key)
-        decision = verifier.authorize(
-            token, command="echo hi", cwd="/tmp/work", now_ms=1
-        )
-        assert decision.timeout_s == 15
-
-    def test_authorize_records_subtask_id_for_audit(self) -> None:
-        coord = MessageSigner.generate()
-        token = CapabilityTokenIssuer(signer=coord).issue(
-            _scope(subtask_id="t-99.s-3")
-        )
-        verifier = self._verifier(coord.public_key)
-        decision = verifier.authorize(
-            token, command="echo hi", cwd="/tmp/work", now_ms=1
-        )
-        assert decision.subtask_id == "t-99.s-3"
+        for cmd in ["echo hi", "ls", "true", "x", "", "anything"]:
+            with pytest.raises(ScopeViolation):
+                verifier.authorize(token, command=cmd, now_ms=1)

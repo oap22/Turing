@@ -34,6 +34,7 @@ from turing.coordinator.lifecycle.lifecycle import SubtaskState
 from turing.coordinator.scheduler.scheduler import Subtask as SchedulerSubtask
 
 if TYPE_CHECKING:
+    from turing.coordinator.capability_token import TokenIssuer
     from turing.coordinator.dispatch.client import SubtaskDispatchClient
     from turing.coordinator.lifecycle.episode_store import EpisodeStore
     from turing.coordinator.planner.schema import (
@@ -144,6 +145,7 @@ class DAGOrchestrator:
         now_ms=_now_ms,
         dispatch_client: SubtaskDispatchClient | None = None,
         scheduler: Scheduler | None = None,
+        token_issuer: TokenIssuer | None = None,
     ) -> None:
         self._store = episode_store
         self._workers = worker_for_specialty
@@ -151,6 +153,7 @@ class DAGOrchestrator:
         self._now_ms = now_ms
         self._dispatch_client = dispatch_client
         self._scheduler = scheduler
+        self._token_issuer = token_issuer
 
     async def run(
         self,
@@ -374,6 +377,17 @@ class DAGOrchestrator:
                     source_inputs=[SourceInput(id=k, text=v) for k, v in resolved_inputs.items()],
                     deadline_ms=deadline_ms,
                 )
+                if self._token_issuer is not None:
+                    token = self._token_issuer.issue_for(subtask=subtask, dispatch=envelope)
+                    envelope = SubtaskDispatch(
+                        subtask_id=envelope.subtask_id,
+                        task_id=envelope.task_id,
+                        specialty=envelope.specialty,
+                        prompt=envelope.prompt,
+                        source_inputs=envelope.source_inputs,
+                        deadline_ms=envelope.deadline_ms,
+                        capability_token=token.to_dict(),
+                    )
                 result = await self._dispatch_client.dispatch(
                     envelope,
                     worker_id=pick.worker_id,
