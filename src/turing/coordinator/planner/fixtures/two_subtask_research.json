@@ -1,0 +1,28 @@
+{
+  "task_id": "tsk_research_002",
+  "version": 1,
+  "subtasks": [
+    {
+      "id": "st_a",
+      "specialty_required": "research-discover",
+      "prompt": "Find the 5 most-cited 2025 arxiv papers on speculative decoding.",
+      "depends_on": [],
+      "required_tools": ["web_fetch", "workspace_io"],
+      "inputs": {},
+      "output_key": "workspace://tsk_research_002/st_a/result",
+      "max_retries": 1,
+      "timeout_s": 120
+    },
+    {
+      "id": "st_b",
+      "specialty_required": "research-summarize",
+      "prompt": "Summarize the discoveries written to {{ inputs.papers }} into 3 paragraphs that match the operator's vault voice.",
+      "depends_on": ["st_a"],
+      "required_tools": ["vault_query", "workspace_io"],
+      "inputs": { "papers": "workspace://tsk_research_002/st_a/result" },
+      "output_key": "workspace://tsk_research_002/st_b/result",
+      "max_retries": 1,
+      "timeout_s": 180
+    }
+  ]
+}

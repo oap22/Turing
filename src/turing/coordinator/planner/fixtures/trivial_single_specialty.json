@@ -1,0 +1,17 @@
+{
+  "task_id": "tsk_trivial_001",
+  "version": 1,
+  "subtasks": [
+    {
+      "id": "st_only",
+      "specialty_required": "research-summarize",
+      "prompt": "Summarize the article at https://example.com/post.",
+      "depends_on": [],
+      "required_tools": ["web_fetch", "workspace_io"],
+      "inputs": {},
+      "output_key": "workspace://tsk_trivial_001/st_only/result",
+      "max_retries": 1,
+      "timeout_s": 120
+    }
+  ]
+}

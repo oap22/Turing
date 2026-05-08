@@ -1,0 +1,20 @@
+{
+  "status": "needs_subtask",
+  "reason": "I am research-summarize; the request needs a literature search first which requires research-deep.",
+  "fragment": {
+    "subtasks": [
+      {
+        "id": "st_a_sub1",
+        "specialty_required": "research-deep",
+        "prompt": "Read the top arxiv papers on speculative decoding and produce a structured findings doc.",
+        "depends_on": [],
+        "required_tools": ["web_fetch", "workspace_io"],
+        "inputs": {},
+        "output_key": "workspace://tsk_research_002/st_a_sub1/result",
+        "max_retries": 1,
+        "timeout_s": 240
+      }
+    ],
+    "rejoin_after": ["st_a_sub1"]
+  }
+}
