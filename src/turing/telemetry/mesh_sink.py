@@ -1,21 +1,25 @@
 """Mesh-transport sink for telemetry events.
 
 The bus emits :class:`TelemetryEvent` objects in-process; this sink translates
-each one into a :class:`MeshMessage` and shouts it on the configured Zyre group
-(``"telemetry"`` by convention). A receiving node attaches a
-:class:`TelemetrySubscriber` to its mesh client and gets an info-level log
-line per received event — that's enough to prove the pipeline before the
-gateway lands in slice 3.
+each one into a :class:`MeshMessage` and ships it across the mesh.
 
-TCP-WHISPER fallback for never-drop events is reserved for slice 8; for now
-events tagged ``priority="high"`` ride the same SHOUT but as
-``MessageType.TELEMETRY_PRIORITY`` so the receiver can already distinguish them.
+Two routes:
+
+- **SHOUT** — multicast UDP to every member of the configured Zyre group
+  (``"telemetry"`` by convention). Lossy under load but cheap; this is the
+  baseline path for ordinary telemetry.
+- **WHISPER** — direct TCP unicast to ``priority_peer`` (typically pi-alpha).
+  Used for events tagged ``priority="high"`` (errors, safety-gate denials)
+  so the most diagnostically-valuable events survive UDP loss.
+
+If ``priority_peer`` is ``None`` the sink falls back to SHOUT for priority
+events too — that's no worse than the slice-2 baseline and lets dev nodes
+run without a configured gateway.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict
-from typing import Protocol
+from typing import Optional, Protocol
 
 import structlog
 
@@ -27,10 +31,17 @@ logger = structlog.get_logger(__name__)
 
 class _Publisher(Protocol):
     def shout(self, group: str, message: MeshMessage) -> None: ...
+    # whisper is optional — not all publishers will implement it (the slice-2
+    # capturing fake doesn't, for example), so callers must check before use.
 
 
 class MeshTelemetrySink:
-    """Callable telemetry sink that shouts events on a Zyre group."""
+    """Callable telemetry sink that shouts events on a Zyre group.
+
+    Priority events (``payload['priority'] == 'high'``) route via WHISPER to
+    ``priority_peer`` when one is configured; otherwise they fall back to a
+    priority-tagged SHOUT.
+    """
 
     def __init__(
         self,
@@ -39,11 +50,13 @@ class MeshTelemetrySink:
         group: str,
         node_id: str,
         node_name: str,
+        priority_peer: Optional[str] = None,
     ) -> None:
         self._publisher = publisher
         self._group = group
         self._node_id = node_id
         self._node_name = node_name
+        self._priority_peer = priority_peer
 
     def __call__(self, event: TelemetryEvent) -> None:
         is_priority = event.payload.get("priority") == "high"
@@ -65,7 +78,14 @@ class MeshTelemetrySink:
             },
         )
         try:
-            self._publisher.shout(self._group, msg)
+            if (
+                is_priority
+                and self._priority_peer
+                and hasattr(self._publisher, "whisper")
+            ):
+                self._publisher.whisper(self._priority_peer, msg)  # type: ignore[attr-defined]
+            else:
+                self._publisher.shout(self._group, msg)
         except Exception:
             logger.warning("telemetry_mesh_publish_failed", exc_info=True)
 

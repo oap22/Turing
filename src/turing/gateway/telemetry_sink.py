@@ -21,6 +21,7 @@ import structlog
 
 from turing.gateway.ring_buffer import RingBuffer
 from turing.mesh.protocol import MeshMessage, MessageType
+from turing.telemetry.gap_detector import GapDetected, GapDetector, Reset
 
 logger = structlog.get_logger(__name__)
 
@@ -29,9 +30,12 @@ Unsubscribe = Callable[[], None]
 
 
 class TelemetrySink:
-    def __init__(self, *, buffer: RingBuffer) -> None:
+    def __init__(
+        self, *, buffer: RingBuffer, reorder_window: int = 4
+    ) -> None:
         self._buffer = buffer
         self._subscribers: list[WSSendFn] = []
+        self._gaps = GapDetector(reorder_window=reorder_window)
 
     def subscribe(self, send: WSSendFn) -> Unsubscribe:
         self._subscribers.append(send)
@@ -53,6 +57,51 @@ class TelemetrySink:
         event = self._unpack(message)
         await self._buffer.append(event)
         await self._fanout(event, priority=message.type is MessageType.TELEMETRY_PRIORITY)
+
+        # Gap detection runs after the event is durably stored so a gap
+        # that's later resolved still shows in the historical query.
+        stream = message.payload.get("stream") or _stream_from_event_type(
+            event["event_type"]
+        )
+        outcome = self._gaps.observe(
+            node=event["node_name"], stream=str(stream), seq=int(event["seq"])
+        )
+        if isinstance(outcome, GapDetected):
+            await self._handle_gap(outcome, ts_ms=int(event["timestamp_ms"]))
+        elif isinstance(outcome, Reset):
+            await self._handle_reset(outcome, ts_ms=int(event["timestamp_ms"]))
+
+    async def _handle_gap(self, gap: GapDetected, *, ts_ms: int) -> None:
+        marker_event = {
+            "node_name": gap.node,
+            "event_type": "gap_marker",
+            "seq": 0,
+            "timestamp_ms": ts_ms,
+            "duration_ms": None,
+            "error": None,
+            "payload": {
+                "stream": gap.stream,
+                "missing": [gap.missing[0], gap.missing[1]],
+            },
+        }
+        await self._buffer.append(marker_event)
+        frame = {
+            "type": "gap_marker",
+            "node_name": gap.node,
+            "stream": gap.stream,
+            "missing": [gap.missing[0], gap.missing[1]],
+            "timestamp_ms": ts_ms,
+        }
+        await self._broadcast(frame)
+
+    async def _handle_reset(self, reset: Reset, *, ts_ms: int) -> None:
+        frame = {
+            "type": "stream_reset",
+            "node_name": reset.node,
+            "stream": reset.stream,
+            "timestamp_ms": ts_ms,
+        }
+        await self._broadcast(frame)
 
     @staticmethod
     def _unpack(message: MeshMessage) -> dict[str, Any]:
@@ -87,9 +136,17 @@ class TelemetrySink:
             "error": event["error"],
             "timestamp_ms": event["timestamp_ms"],
         }
+        for frame in (trace_frame, metric_frame):
+            await self._broadcast(frame)
+
+    async def _broadcast(self, frame: dict[str, Any]) -> None:
         for send in list(self._subscribers):
-            for frame in (trace_frame, metric_frame):
-                try:
-                    await send(frame)
-                except Exception:
-                    logger.warning("telemetry_sink_send_failed", exc_info=True)
+            try:
+                await send(frame)
+            except Exception:
+                logger.warning("telemetry_sink_send_failed", exc_info=True)
+
+
+def _stream_from_event_type(event_type: str) -> str:
+    """``llm.complete.end`` → ``llm.complete``."""
+    return event_type.rsplit(".", 1)[0] if "." in event_type else event_type
