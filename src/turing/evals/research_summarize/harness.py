@@ -19,9 +19,14 @@ import argparse
 import json
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .schema import EvalCase
-from .scoring import SCORERS, Embedder, ScoreResult
+from .scoring import SCORERS, ScoreResult
+
+if TYPE_CHECKING:
+    from .judge import Judge
+    from .scoring import Embedder
 
 # Cases live alongside operator-curated data, not in the Python package.
 # Layout: <repo_root>/evals/research-summarize/cases/*.jsonl
@@ -60,6 +65,7 @@ def run(
     cases: list[EvalCase],
     *,
     embedder: Embedder | None = None,
+    judge: Judge | None = None,
 ) -> dict:
     by_category: dict[str, list[ScoreResult]] = {}
     per_case = []
@@ -71,6 +77,8 @@ def run(
             summary = worker(case)
             if case.scoring_fn == "score_claim_preservation_v1" and embedder is not None:
                 result = scorer(summary, case, embedder=embedder)
+            elif case.scoring_fn == "score_citation_correctness_v1" and judge is not None:
+                result = scorer(summary, case, judge=judge)
             else:
                 result = scorer(summary, case)
         except NotImplementedError as e:
