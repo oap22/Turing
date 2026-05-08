@@ -1,0 +1,249 @@
+"""Scoring functions for `research-summarize` eval cases.
+
+All scoring functions take a `summary: str` and an `EvalCase`, return a
+`ScoreResult` with an overall float in [0, 1] plus a breakdown dict for
+debugging. Aggregation across cases happens in `harness.py`.
+
+All three scorers are deterministic v1 implementations. Claim preservation
+uses substring + token-overlap; voice match uses style metrics derived from
+the operator's vault sample; citation correctness checks wiki-link presence
+against required source IDs. v2 swaps in embedding similarity (claims) and
+LLM-judge proximity (citations).
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .schema import EvalCase
+
+
+@dataclass
+class ScoreResult:
+    score: float
+    breakdown: dict[str, float] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+
+
+def _normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+def _claim_present(claim: str, summary_norm: str) -> bool:
+    """Substring fallback for claim presence.
+
+    Production swap: replace with embedding similarity (cosine ≥ 0.75) using
+    the same embedder the worker uses, so paraphrases score correctly. The
+    substring check is a deterministic placeholder so the harness runs without
+    a live model.
+    """
+    claim_norm = _normalize(claim)
+    if claim_norm in summary_norm:
+        return True
+    # token-overlap fallback: ≥70% of content tokens present, in any order
+    tokens = [t for t in re.findall(r"\w+", claim_norm) if len(t) > 2]
+    if not tokens:
+        return False
+    hits = sum(1 for t in tokens if t in summary_norm)
+    return hits / len(tokens) >= 0.7
+
+
+def score_claim_preservation_v1(summary: str, case: EvalCase) -> ScoreResult:
+    """Reward must-contain claims; penalize must-not-contain leaks."""
+    summary_norm = _normalize(summary)
+    must = case.expected.must_contain_claims
+    must_not = case.expected.must_not_contain
+
+    if not must:
+        recall = 1.0
+        hits = 0
+    else:
+        hits = sum(1 for c in must if _claim_present(c, summary_norm))
+        recall = hits / len(must)
+
+    # Strict substring for forbidden phrases: hallucination guards target
+    # literal phrasings, not paraphrases that happen to share vocabulary.
+    leaks = sum(1 for c in must_not if _normalize(c) in summary_norm)
+    leak_penalty = min(1.0, leaks * 0.34)  # 3 leaks = full penalty
+
+    score = max(0.0, recall - leak_penalty)
+    return ScoreResult(
+        score=score,
+        breakdown={
+            "recall": recall,
+            "hits": float(hits),
+            "leaks": float(leaks),
+            "leak_penalty": leak_penalty,
+        },
+        notes=[f"missing: {c!r}" for c in must if not _claim_present(c, summary_norm)]
+        + [f"leaked: {c!r}" for c in must_not if _normalize(c) in summary_norm],
+    )
+
+
+_HEDGE_TOKENS = {
+    "perhaps",
+    "maybe",
+    "possibly",
+    "might",
+    "may",
+    "could",
+    "somewhat",
+    "arguably",
+    "presumably",
+    "likely",
+    "seemingly",
+    "apparently",
+}
+_FIRST_PERSON = {"i", "me", "my", "we", "us", "our"}
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+_PARAGRAPH_SPLIT = re.compile(r"\n\s*\n")
+_WIKILINK = re.compile(r"\[\[[^\]]+\]\]")
+_HAS_DIGIT = re.compile(r"\d")
+
+
+def _split_sentences(text: str) -> list[str]:
+    return [s for s in _SENTENCE_SPLIT.split(text.strip()) if s.strip()]
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"\w+", text))
+
+
+def score_voice_match_v1(summary: str, case: EvalCase) -> ScoreResult:
+    """Deterministic style metrics against the operator's voice features.
+
+    Each configured feature contributes one pass/fail axis; final score is
+    the fraction passing. Failures are listed in `notes` so authoring drift
+    is visible without re-reading the case.
+    """
+    vf = case.expected.voice_features
+    if vf is None:
+        return ScoreResult(score=1.0, notes=["no voice_features configured"])
+
+    summary_norm = _normalize(summary)
+    sentences = _split_sentences(summary)
+    paragraphs = [p for p in _PARAGRAPH_SPLIT.split(summary.strip()) if p.strip()]
+    words = re.findall(r"\w+", summary_norm)
+    total_words = max(1, len(words))
+
+    axes: dict[str, float] = {}
+    failures: list[str] = []
+
+    if vf.max_avg_sentence_len is not None and sentences:
+        avg = sum(_word_count(s) for s in sentences) / len(sentences)
+        ok = avg <= vf.max_avg_sentence_len
+        axes["avg_sentence_len"] = 1.0 if ok else 0.0
+        if not ok:
+            failures.append(f"avg sentence len {avg:.1f} > {vf.max_avg_sentence_len}")
+
+    if vf.forbid_phrases:
+        bad = [p for p in vf.forbid_phrases if p.lower() in summary_norm]
+        axes["forbid_phrases"] = 1.0 if not bad else 0.0
+        if bad:
+            failures.append(f"used forbidden phrases: {bad}")
+
+    if vf.require_first_person is not None:
+        has_fp = any(t in _FIRST_PERSON for t in words)
+        ok = has_fp if vf.require_first_person else not has_fp
+        axes["first_person"] = 1.0 if ok else 0.0
+        if not ok:
+            failures.append(
+                "missing first person" if vf.require_first_person else "used first person"
+            )
+
+    if vf.hedge_density_max is not None:
+        hedge_count = sum(1 for t in words if t in _HEDGE_TOKENS)
+        density = hedge_count / total_words
+        ok = density <= vf.hedge_density_max
+        axes["hedge_density"] = 1.0 if ok else 0.0
+        if not ok:
+            failures.append(f"hedge density {density:.3f} > {vf.hedge_density_max}")
+
+    if vf.max_paragraphs is not None:
+        ok = len(paragraphs) <= vf.max_paragraphs
+        axes["max_paragraphs"] = 1.0 if ok else 0.0
+        if not ok:
+            failures.append(f"paragraphs {len(paragraphs)} > {vf.max_paragraphs}")
+
+    if vf.max_sentences_per_paragraph is not None:
+        worst = max((len(_split_sentences(p)) for p in paragraphs), default=0)
+        ok = worst <= vf.max_sentences_per_paragraph
+        axes["max_sent_per_para"] = 1.0 if ok else 0.0
+        if not ok:
+            failures.append(
+                f"longest paragraph has {worst} sentences > {vf.max_sentences_per_paragraph}"
+            )
+
+    if vf.min_em_dash_count is not None:
+        # ASCII " -- " is the operator's convention; also accept unicode em-dash.
+        count = summary.count(" -- ") + summary.count("—")
+        ok = count >= vf.min_em_dash_count
+        axes["em_dashes"] = 1.0 if ok else 0.0
+        if not ok:
+            failures.append(f"em-dash count {count} < {vf.min_em_dash_count}")
+
+    if vf.min_wikilink_count is not None:
+        count = len(_WIKILINK.findall(summary))
+        ok = count >= vf.min_wikilink_count
+        axes["wikilinks"] = 1.0 if ok else 0.0
+        if not ok:
+            failures.append(f"wikilink count {count} < {vf.min_wikilink_count}")
+
+    if vf.require_concrete_numbers:
+        ok = bool(_HAS_DIGIT.search(summary))
+        axes["concrete_numbers"] = 1.0 if ok else 0.0
+        if not ok:
+            failures.append("no digit-bearing tokens")
+
+    if not axes:
+        return ScoreResult(score=1.0, notes=["no voice axes evaluated"])
+    score = sum(axes.values()) / len(axes)
+    return ScoreResult(score=score, breakdown=axes, notes=failures)
+
+
+def score_citation_correctness_v1(summary: str, case: EvalCase) -> ScoreResult:
+    """Verify wiki-link citations against required source IDs.
+
+    Citation format is `[[src_id]]`, matching the operator's Obsidian-style
+    inline links. Two checks:
+      - precision: every wiki-linked id is in case.source_docs
+      - recall: every id in expected.required_citations appears at least once
+
+    A v2 should add proximity (the link must appear near the claim it
+    grounds) once we have an LLM judge in the loop.
+    """
+    valid_ids = {d.id for d in case.source_docs}
+    cited = {m.strip("[]") for m in _WIKILINK.findall(summary)}
+    required = set(case.expected.required_citations.keys())
+
+    if not required:
+        return ScoreResult(score=1.0, notes=["no required citations"])
+
+    bad = cited - valid_ids
+    missing = required - cited
+
+    precision = len(cited & valid_ids) / len(cited) if cited else 0.0
+    recall = len(required & cited) / len(required)
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    notes = []
+    if bad:
+        notes.append(f"cited unknown sources: {sorted(bad)}")
+    if missing:
+        notes.append(f"missing required citations: {sorted(missing)}")
+
+    return ScoreResult(
+        score=f1,
+        breakdown={"precision": precision, "recall": recall, "f1": f1},
+        notes=notes,
+    )
+
+
+SCORERS = {
+    "score_claim_preservation_v1": score_claim_preservation_v1,
+    "score_voice_match_v1": score_voice_match_v1,
+    "score_citation_correctness_v1": score_citation_correctness_v1,
+}
