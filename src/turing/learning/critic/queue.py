@@ -77,6 +77,16 @@ class CriticQueue:
         self.start()
         await self._queue.put(episode)
 
+    def enqueue_nowait(self, episode: Episode) -> None:
+        """Sync push for sync call sites (e.g. lifecycle hooks).
+
+        Raises ``asyncio.QueueFull`` instead of blocking — backpressure
+        surfaces as a hard error so callers know the queue is saturated
+        rather than dropping silently.
+        """
+        self.start()
+        self._queue.put_nowait(episode)
+
     async def drain(self) -> None:
         self.start()
         await self._queue.join()
