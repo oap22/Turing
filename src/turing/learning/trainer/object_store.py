@@ -7,7 +7,8 @@ publisher uses: put-by-key, get-by-key, list-keys.
 
 from __future__ import annotations
 
-from typing import Iterable, Protocol
+from collections.abc import Iterable
+from typing import Protocol
 
 
 class ObjectStore(Protocol):

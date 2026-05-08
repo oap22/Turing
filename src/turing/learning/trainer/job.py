@@ -30,7 +30,7 @@ class TrainingJob:
     hyperparameters: dict[str, Any]
 
     @classmethod
-    def from_bytes(cls, payload: bytes) -> "TrainingJob":
+    def from_bytes(cls, payload: bytes) -> TrainingJob:
         try:
             raw = json.loads(payload.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -40,7 +40,7 @@ class TrainingJob:
         return cls.from_dict(raw)
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "TrainingJob":
+    def from_dict(cls, raw: dict[str, Any]) -> TrainingJob:
         for field in ("job_id", "dataset_url", "dataset_sha256", "base_model", "method", "hyperparameters"):
             if field not in raw:
                 raise TrainingJobValidationError(f"missing required field {field!r}")

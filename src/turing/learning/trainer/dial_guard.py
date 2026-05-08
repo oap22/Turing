@@ -25,7 +25,7 @@ class PullOnlySocketGuard:
     def __init__(self) -> None:
         self._original: Any | None = None
 
-    def __enter__(self) -> "PullOnlySocketGuard":
+    def __enter__(self) -> PullOnlySocketGuard:
         self._original = socket.socket.listen
 
         def _refuse(self_socket: socket.socket, *args: Any, **kwargs: Any) -> None:

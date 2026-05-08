@@ -9,9 +9,10 @@ enough to drive end-to-end pipeline tests.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional, Protocol
+from typing import Any, Protocol
 
 from turing.learning.trainer.job import TrainingJob
 
@@ -30,7 +31,7 @@ class Trainer(Protocol):
         self,
         job: TrainingJob,
         artifact_dir: Path,
-        emit: Optional[EmitFn] = None,
+        emit: EmitFn | None = None,
     ) -> TrainingResult: ...
 
 
@@ -44,10 +45,10 @@ class StubTrainer:
         self,
         job: TrainingJob,
         artifact_dir: Path,
-        emit: Optional[EmitFn] = None,
+        emit: EmitFn | None = None,
     ) -> TrainingResult:
         artifact_dir.mkdir(parents=True, exist_ok=True)
-        blob = f"stub-adapter:{job.job_id}:{job.base_model}:{job.method}".encode("utf-8")
+        blob = f"stub-adapter:{job.job_id}:{job.base_model}:{job.method}".encode()
         adapter_path = artifact_dir / f"{job.job_id}.adapter.bin"
         adapter_path.write_bytes(blob)
         if emit is not None:
@@ -85,7 +86,7 @@ class RealLoraTrainer:
         self,
         job: TrainingJob,
         artifact_dir: Path,
-        emit: Optional[EmitFn] = None,
+        emit: EmitFn | None = None,
     ) -> TrainingResult:
         import torch
 

@@ -14,6 +14,8 @@ from turing.learning.trainer.dial_guard import (
     PullOnlySocketGuard,
 )
 from turing.learning.trainer.job import TrainingJob, TrainingJobValidationError
+from turing.learning.trainer.job_builder import DatasetInfo, TrainingJobBuilder
+from turing.learning.trainer.mlx_trainer import MLXLoraTrainer
 from turing.learning.trainer.object_store import InMemoryObjectStore, ObjectStore
 from turing.learning.trainer.publisher import TrainerPublisher
 from turing.learning.trainer.runner import (
@@ -24,8 +26,10 @@ from turing.learning.trainer.runner import (
 )
 
 __all__ = [
+    "DatasetInfo",
     "InMemoryObjectStore",
     "InboundConnectionRefused",
+    "MLXLoraTrainer",
     "ObjectStore",
     "PullOnlySocketGuard",
     "RealLoraTrainer",
@@ -35,6 +39,7 @@ __all__ = [
     "TrainerPublisher",
     "TrainerPullAgent",
     "TrainingJob",
+    "TrainingJobBuilder",
     "TrainingJobValidationError",
     "TrainingResult",
 ]

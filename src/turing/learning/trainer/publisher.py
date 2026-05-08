@@ -9,8 +9,6 @@ a separate trust namespace so a compromised worker can't issue adapters.
 
 from __future__ import annotations
 
-from typing import Any
-
 from turing.coordinator.adapters.manifest import (
     CURRENT_ADAPTER_MANIFEST_VERSION,
     AdapterManifest,
