@@ -10,8 +10,23 @@ The episode schema mirrors PRD story 33.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from enum import Enum
 
 from turing.coordinator.lifecycle.lifecycle import SubtaskState
+
+
+class CriticStatus(str, Enum):  # noqa: UP042
+    """Per-episode critic-scoring lifecycle (ADR 0004 §6).
+
+    PENDING: written at episode close, eligible for backfill.
+    SCORED: critic returned a score; ``critic_score`` is meaningful.
+    FAILED: retry budget exhausted; backfill skips so a poison-pill
+    episode never re-enters the queue.
+    """
+
+    PENDING = "pending"
+    SCORED = "scored"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -45,6 +60,7 @@ class Episode:
 class EpisodeStore:
     def __init__(self) -> None:
         self._rows: dict[str, Episode] = {}
+        self._critic_status: dict[str, CriticStatus] = {}
 
     def record(self, episode: Episode) -> None:
         if not episode.outcome.is_terminal():
@@ -53,7 +69,9 @@ class EpisodeStore:
             )
         # First write wins so a retry storm cannot overwrite the original
         # outcome row that downstream training corpora may have already read.
-        self._rows.setdefault(episode.subtask_id, episode)
+        if episode.subtask_id not in self._rows:
+            self._rows[episode.subtask_id] = episode
+            self._critic_status[episode.subtask_id] = CriticStatus.PENDING
 
     def update_critic_score(self, *, subtask_id: str, critic_score: float) -> None:
         """Backfill an episode's critic_score after async critic scoring.
@@ -65,6 +83,39 @@ class EpisodeStore:
         if existing is None:
             raise KeyError(f"no episode for subtask_id={subtask_id!r}")
         self._rows[subtask_id] = replace(existing, critic_score=critic_score)
+        self._critic_status[subtask_id] = CriticStatus.SCORED
+
+    def mark_critic_failed(self, *, subtask_id: str) -> None:
+        """Mark an episode's critic-scoring as permanently failed (ADR 0004 §6).
+
+        Retry budget exhausted. ``critic_score`` stays at its existing value
+        (typically the default 0.0); status is the durable signal.
+        """
+        if subtask_id not in self._rows:
+            raise KeyError(f"no episode for subtask_id={subtask_id!r}")
+        self._critic_status[subtask_id] = CriticStatus.FAILED
+
+    def critic_status_of(self, subtask_id: str) -> CriticStatus:
+        if subtask_id not in self._critic_status:
+            raise KeyError(f"no episode for subtask_id={subtask_id!r}")
+        return self._critic_status[subtask_id]
+
+    def backfill_unscored(self, *, now_ms: int, horizon_ms: int) -> list[Episode]:
+        """Episodes eligible for critic backfill per ADR 0004 §5.
+
+        Filters: status PENDING, recorded within ``horizon_ms`` of ``now_ms``,
+        outcome not REJECTED (audit-only per PRD safety contract).
+        """
+        cutoff = now_ms - horizon_ms
+        results = [
+            ep
+            for sid, ep in self._rows.items()
+            if self._critic_status.get(sid) is CriticStatus.PENDING
+            and ep.recorded_at_ms > cutoff
+            and ep.outcome is not SubtaskState.REJECTED
+        ]
+        results.sort(key=lambda e: e.recorded_at_ms)
+        return results
 
     def query(
         self,
