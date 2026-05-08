@@ -70,6 +70,10 @@ class EpisodeStore:
         self._rows: dict[str, Episode] = {}
         self._critic_status: dict[str, CriticStatus] = {}
 
+    def all_episodes(self) -> list[Episode]:
+        """Snapshot of every recorded episode. Caller-owned; safe to iterate."""
+        return list(self._rows.values())
+
     def record(self, episode: Episode) -> None:
         if not episode.outcome.is_terminal():
             raise ValueError(
