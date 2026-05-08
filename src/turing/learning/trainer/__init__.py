@@ -13,6 +13,10 @@ from turing.learning.trainer.dial_guard import (
     InboundConnectionRefused,
     PullOnlySocketGuard,
 )
+from turing.learning.trainer.dpo_dataset_builder import (
+    DPODatasetBuilder,
+    DPODatasetInfo,
+)
 from turing.learning.trainer.job import TrainingJob, TrainingJobValidationError
 from turing.learning.trainer.job_builder import DatasetInfo, TrainingJobBuilder
 from turing.learning.trainer.mlx_trainer import MLXLoraTrainer
@@ -26,6 +30,8 @@ from turing.learning.trainer.runner import (
 )
 
 __all__ = [
+    "DPODatasetBuilder",
+    "DPODatasetInfo",
     "DatasetInfo",
     "InMemoryObjectStore",
     "InboundConnectionRefused",
