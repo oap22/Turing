@@ -10,13 +10,17 @@ Discord boundary stubbed so a regression on either wire fails loudly.
 from __future__ import annotations
 
 import asyncio
-import socket
+import contextlib
 import secrets
-from pathlib import Path
+import socket
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import httpx
 import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from turing.config import TuringConfig
 from turing.gateway.spa import spa_assets_path
@@ -128,9 +132,9 @@ async def test_boot_path_serves_spa_and_authenticates(tmp_path: Path) -> None:
                 assert r.status_code == 200, r.text
                 assert r.headers["content-type"].startswith("text/html")
                 body = r.text
-                assert (
-                    '<script type="module"' in body or "<title>" in body
-                ), "SPA index.html missing expected markers"
+                assert '<script type="module"' in body or "<title>" in body, (
+                    "SPA index.html missing expected markers"
+                )
 
                 # /assets/<known> with cookie → 200
                 assets_dir = spa_assets_path()
@@ -138,13 +142,9 @@ async def test_boot_path_serves_spa_and_authenticates(tmp_path: Path) -> None:
                 asset_files = list((assets_dir / "assets").iterdir())
                 assert asset_files, "no built assets present"
                 first_asset = asset_files[0].name
-                r = await client.get(
-                    f"{base}/assets/{first_asset}", cookies=cookies
-                )
+                r = await client.get(f"{base}/assets/{first_asset}", cookies=cookies)
                 assert r.status_code == 200
         finally:
             run_task.cancel()
-            try:
+            with contextlib.suppress(TimeoutError, asyncio.CancelledError):
                 await asyncio.wait_for(run_task, timeout=5.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
