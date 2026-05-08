@@ -131,6 +131,19 @@ async def _run(config: TuringConfig) -> None:
     # Give executor reference to bot for confirmation views
     executor.bot = bot
 
+    # 8b. Operator UI gateway (pi-alpha only)
+    gateway = None
+    if config.gateway_enabled:
+        from turing.gateway.service import GatewayService
+
+        gateway = GatewayService(
+            token=config.gateway_token,
+            bind=config.gateway_bind,
+            port=config.gateway_port,
+            node_name=config.node_name,
+        )
+        await gateway.start()
+
     logger.info("turing.starting", node=config.node_name, env=config.env)
 
     # 9. Run with graceful shutdown
@@ -159,6 +172,8 @@ async def _run(config: TuringConfig) -> None:
     finally:
         # Cleanup
         logger.info("turing.shutting_down")
+        if gateway:
+            await gateway.stop()
         if discovery:
             await discovery.stop()
         if mesh_node:

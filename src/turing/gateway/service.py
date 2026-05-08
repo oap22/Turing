@@ -13,6 +13,7 @@ import structlog
 
 from turing.gateway.app import create_app
 from turing.gateway.auth import GatewayAuth
+from turing.gateway.spa import spa_assets_path
 
 logger = structlog.get_logger(__name__)
 
@@ -50,7 +51,9 @@ class GatewayService:
             )
 
         app = create_app(
-            auth=GatewayAuth(token=self._token), node_name=self._node_name
+            auth=GatewayAuth(token=self._token),
+            node_name=self._node_name,
+            spa_assets_dir=spa_assets_path(),
         )
         config = uvicorn.Config(
             app,
