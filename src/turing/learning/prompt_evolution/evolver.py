@@ -6,18 +6,27 @@ story 66 — the new module's job is orchestration, not extraction.
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from typing import Protocol
 
 import structlog
 
 from turing.coordinator.lifecycle.episode_store import EpisodeStore
+from turing.learning.prompt_evolution.promotion_gate import PromotionDecision
 from turing.learning.prompt_evolution.registry import PromptVersionRegistry
 
 logger = structlog.get_logger(__name__)
 
+LESSON_PIN_DURATION_MS = 60 * 24 * 3600 * 1000
+
 
 class _PatternExtractorLike(Protocol):
     async def extract(self, conversation_id: str) -> object: ...
+
+
+class _LessonStoreLike(Protocol):
+    def pin(self, *, lesson_ids: list[str], until_ms: int) -> None: ...
 
 
 class PromptEvolver:
@@ -29,12 +38,46 @@ class PromptEvolver:
         pattern_extractor: _PatternExtractorLike,
         top_k: int = 20,
         min_critic_score: float = 0.7,
+        lesson_store: _LessonStoreLike | None = None,
+        now_ms: Callable[[], int] | None = None,
     ) -> None:
         self._store = episode_store
         self._registry = registry
         self._patterns = pattern_extractor
         self._top_k = top_k
         self._min_score = min_critic_score
+        self._lesson_store = lesson_store
+        self._now_ms = now_ms or (lambda: int(time.time() * 1000))
+        self._cited: dict[str, list[str]] = {}
+
+    def record_cited_lessons(self, specialty: str, lesson_ids: list[str]) -> None:
+        """Record which lesson_ids the candidate prompt for `specialty` consulted."""
+        self._cited[specialty] = list(lesson_ids)
+
+    def cited_lessons(self, specialty: str) -> list[str]:
+        return list(self._cited.get(specialty, ()))
+
+    def apply_decision(self, specialty: str, decision: PromotionDecision) -> None:
+        """Apply a PromotionGate decision: promote+pin, or do nothing."""
+        if decision is not PromotionDecision.PROMOTE:
+            return
+        self._registry.promote(specialty)
+        if self._lesson_store is None:
+            return
+        cited = self._cited.get(specialty)
+        if not cited:
+            return
+        try:
+            self._lesson_store.pin(
+                lesson_ids=list(cited),
+                until_ms=self._now_ms() + LESSON_PIN_DURATION_MS,
+            )
+        except Exception as exc:  # best-effort — promotion already succeeded
+            logger.warning(
+                "lesson_pin_failed",
+                specialty=specialty,
+                error=f"{type(exc).__name__}: {exc}",
+            )
 
     async def evolve(self, specialty: str) -> str | None:
         """Return the registered candidate version, or None if no episodes."""
