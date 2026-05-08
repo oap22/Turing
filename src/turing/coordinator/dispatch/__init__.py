@@ -10,6 +10,7 @@ from .envelopes import (
     ENVELOPE_VERSION,
     SourceInput,
     SubtaskDispatch,
+    SubtaskKind,
     TaskResult,
 )
 
@@ -18,6 +19,7 @@ __all__ = [
     "SourceInput",
     "SubtaskDispatch",
     "SubtaskDispatchClient",
+    "SubtaskKind",
     "SubtaskTimeoutError",
     "TaskResult",
 ]
