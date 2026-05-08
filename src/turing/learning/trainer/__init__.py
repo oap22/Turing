@@ -28,6 +28,7 @@ from turing.learning.trainer.runner import (
     Trainer,
     TrainingResult,
 )
+from turing.learning.trainer.torch_dpo_trainer import TorchDPOTrainer
 
 __all__ = [
     "DPODatasetBuilder",
@@ -40,6 +41,7 @@ __all__ = [
     "PullOnlySocketGuard",
     "RealLoraTrainer",
     "StubTrainer",
+    "TorchDPOTrainer",
     "Trainer",
     "TrainerConfig",
     "TrainerPublisher",
