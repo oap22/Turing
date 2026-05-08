@@ -15,7 +15,7 @@ logger = structlog.get_logger("turing.tools")
 
 
 def _tool_dispatch_payload(kind, args, kwargs, result, exc):  # type: ignore[no-untyped-def]
-    name = args[1] if len(args) > 1 else kwargs.get("name", "")
+    name = args[1] if len(args) > 1 else kwargs.get("tool_name", "")
     data: dict[str, Any] = {"tool": name}
     if kind == "end" and result is not None:
         data["success"] = bool(getattr(result, "success", False))
@@ -120,16 +120,24 @@ class ToolRegistry:
         return [tool.to_tool_definition() for tool in self._tools.values()]
 
     @traced("tool.dispatch", payload=_tool_dispatch_payload)
-    async def execute(self, name: str, **kwargs: Any) -> ToolResult:
+    async def execute(self, tool_name: str, /, **kwargs: Any) -> ToolResult:
         """Execute a tool by name with the given arguments.
 
-        Returns a ToolResult with an error if the tool is not found or execution fails.
+        ``tool_name`` is positional-only so a tool whose own parameter list
+        contains a ``name`` field (the example plugin's ``hello`` tool, for
+        instance) doesn't collide with the dispatch parameter — see
+        regression test ``tests/test_tools/test_registry_kwargs_collision``.
+
+        Returns a ToolResult with an error if the tool is not found or
+        execution fails.
         """
-        tool = self.get(name)
+        tool = self.get(tool_name)
         if tool is None:
-            return ToolResult(success=False, output="", error=f"Tool '{name}' not found")
+            return ToolResult(
+                success=False, output="", error=f"Tool '{tool_name}' not found"
+            )
         try:
             return await tool.execute(**kwargs)
         except Exception as exc:
-            logger.error("tool_execution_error", tool_name=name, error=str(exc))
+            logger.error("tool_execution_error", tool_name=tool_name, error=str(exc))
             return ToolResult(success=False, output="", error=f"Execution failed: {exc}")
