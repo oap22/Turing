@@ -43,7 +43,7 @@ async def test_judge_says_half_present_returns_half() -> None:
 @pytest.mark.asyncio
 async def test_empty_expected_returns_one() -> None:
     """Nothing to recall is a vacuous pass — and we never call the LLM."""
-    judge = _llm('this should never be reached')
+    judge = _llm("this should never be reached")
     score = await claim_recall(output="x", expected_claims=[], llm=judge)
     assert score == 1.0
     judge.complete.assert_not_awaited()
@@ -71,7 +71,12 @@ async def test_judge_never_writes_expected_claims() -> None:
     from turing.learning.eval_set.judge import _SYSTEM_PROMPT
 
     lower = _SYSTEM_PROMPT.lower()
-    assert "do not invent" in lower or "never invent" in lower or "do not synthesise" in lower or "do not generate" in lower
+    assert (
+        "do not invent" in lower
+        or "never invent" in lower
+        or "do not synthesise" in lower
+        or "do not generate" in lower
+    )
 
 
 @pytest.mark.asyncio
@@ -79,9 +84,7 @@ async def test_mutation_drop_a_claim_drops_score() -> None:
     """Mutation: with a known-good output the judge returns recall=1.0;
     the same output minus one claim must drop below 1.0."""
     full_judge = _llm('{"recalled": ["a", "b"], "missing": []}')
-    full_score = await claim_recall(
-        output="full", expected_claims=["a", "b"], llm=full_judge
-    )
+    full_score = await claim_recall(output="full", expected_claims=["a", "b"], llm=full_judge)
 
     dropped_judge = _llm('{"recalled": ["a"], "missing": ["b"]}')
     dropped_score = await claim_recall(

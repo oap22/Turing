@@ -63,9 +63,7 @@ def test_id_includes_arxiv_id() -> None:
 
 
 def test_input_field_uses_paper_title() -> None:
-    case = mine_eval_case(
-        _paper(title="On the limits of long-context retrieval")
-    )
+    case = mine_eval_case(_paper(title="On the limits of long-context retrieval"))
     assert "long-context retrieval" in case["input"]
 
 

@@ -16,9 +16,7 @@ from turing.llm.base import LLMResponse
 
 
 def _write_cases(path: Path, cases: list[dict]) -> None:
-    path.write_text(
-        "\n".join(json.dumps(c) for c in cases) + "\n", encoding="utf-8"
-    )
+    path.write_text("\n".join(json.dumps(c) for c in cases) + "\n", encoding="utf-8")
 
 
 def _case(

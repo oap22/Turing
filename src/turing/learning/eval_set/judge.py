@@ -26,9 +26,7 @@ _SYSTEM_PROMPT = (
 
 
 class _LLMRouter(Protocol):
-    async def complete(
-        self, messages: list[Message], system: str = "", **_: Any
-    ) -> Any: ...
+    async def complete(self, messages: list[Message], system: str = "", **_: Any) -> Any: ...
 
 
 async def claim_recall(
@@ -41,10 +39,7 @@ async def claim_recall(
     if not expected_claims:
         return 1.0
 
-    user_prompt = (
-        f"expected_claims: {json.dumps(expected_claims)}\n\n"
-        f"worker_output: {output}"
-    )
+    user_prompt = f"expected_claims: {json.dumps(expected_claims)}\n\nworker_output: {output}"
     response = await llm.complete(
         messages=[Message(role=Role.USER, content=user_prompt)],
         system=_SYSTEM_PROMPT,

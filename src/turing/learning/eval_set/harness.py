@@ -78,9 +78,7 @@ async def run_eval_set(
         # Axis: citation_correctness — always run, even if not declared on
         # the case, so an output that hallucinates citations gets caught.
         if "citation_correctness" in case.axes or case.expected_citations:
-            scores["citation_correctness"] = citation_exact_match(
-                output, case.expected_citations
-            )
+            scores["citation_correctness"] = citation_exact_match(output, case.expected_citations)
 
         # Axis: claim_preservation — uses the LLM judge.
         if "claim_preservation" in case.axes or case.expected_claims:
@@ -100,9 +98,7 @@ async def run_eval_set(
                 embed=embed,
             )
 
-        case_aggregate = (
-            statistics.fmean(scores.values()) if scores else 0.0
-        )
+        case_aggregate = statistics.fmean(scores.values()) if scores else 0.0
         case_reports.append(
             CaseReport(
                 case_id=case.id,
@@ -115,9 +111,7 @@ async def run_eval_set(
             axis_buckets.setdefault(axis, []).append(value)
 
     per_axis = {axis: statistics.fmean(vals) for axis, vals in axis_buckets.items()}
-    aggregate = (
-        statistics.fmean([r.aggregate for r in case_reports]) if case_reports else 0.0
-    )
+    aggregate = statistics.fmean([r.aggregate for r in case_reports]) if case_reports else 0.0
     return EvalReport(
         case_count=len(case_reports),
         aggregate=aggregate,

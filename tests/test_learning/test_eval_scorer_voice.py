@@ -19,9 +19,7 @@ def _embed(text: str) -> list[float]:
 
 def test_identical_text_scores_one() -> None:
     voice_ref = _embed("the cluster's voice")
-    score = voice_cosine(
-        output="the cluster's voice", voice_ref_embedding=voice_ref, embed=_embed
-    )
+    score = voice_cosine(output="the cluster's voice", voice_ref_embedding=voice_ref, embed=_embed)
     assert math.isclose(score, 1.0, abs_tol=1e-9)
 
 
@@ -70,9 +68,7 @@ def test_mutation_paraphrase_drops_score_below_threshold() -> None:
     """Mutation: replace the output with neutralised text. The score
     must drop below a paraphrase-grade threshold (0.85) so the gate
     catches a worker that adopts a foreign voice."""
-    voice_ref = _embed(
-        "Brief, citation-heavy, slightly skeptical of model claims."
-    )
+    voice_ref = _embed("Brief, citation-heavy, slightly skeptical of model claims.")
     on_voice = voice_cosine(
         "Brief, citation-heavy, slightly skeptical of model claims.",
         voice_ref,
