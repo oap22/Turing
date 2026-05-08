@@ -38,7 +38,10 @@ class VoiceFeatures(BaseModel):
 class Expected(BaseModel):
     must_contain_claims: list[str] = Field(default_factory=list)
     must_not_contain: list[str] = Field(default_factory=list)
-    required_citations: dict[str, list[int]] = Field(default_factory=dict)
+    # Per-source list of operator-authored claim texts that must be grounded
+    # by [[src_id]] in the worker's summary. Empty list = presence-only check
+    # (v1 behaviour); non-empty list activates judge-based grading.
+    required_citations: dict[str, list[str]] = Field(default_factory=dict)
     voice_features: VoiceFeatures | None = None
     target_paragraph_count: int | None = None
     # Cosine threshold for embedding-based claim presence (overrides the

@@ -265,32 +265,32 @@ def score_voice_match_v1(summary: str, case: EvalCase) -> ScoreResult:
     return ScoreResult(score=score, breakdown=axes, notes=failures)
 
 
-def score_citation_correctness_v1(summary: str, case: EvalCase) -> ScoreResult:
-    """Verify wiki-link citations against required source IDs.
+def _f1(precision: float, recall: float) -> float:
+    if precision + recall == 0.0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
 
-    Citation format is `[[src_id]]`, matching the operator's Obsidian-style
-    inline links. Two checks:
-      - precision: every wiki-linked id is in case.source_docs
-      - recall: every id in expected.required_citations appears at least once
 
-    A v2 should add proximity (the link must appear near the claim it
-    grounds) once we have an LLM judge in the loop.
-    """
+def _wikilinks_in(text: str) -> list[str]:
+    return [m.strip("[]") for m in _WIKILINK.findall(text)]
+
+
+def _presence_score(summary: str, case: EvalCase) -> ScoreResult:
+    """v1 fallback: just check each required src_id appears as [[src_id]]."""
     valid_ids = {d.id for d in case.source_docs}
-    cited = {m.strip("[]") for m in _WIKILINK.findall(summary)}
+    cited = set(_wikilinks_in(summary))
     required = set(case.expected.required_citations.keys())
 
     if not required:
         return ScoreResult(score=1.0, notes=["no required citations"])
 
-    bad = cited - valid_ids
-    missing = required - cited
-
     precision = len(cited & valid_ids) / len(cited) if cited else 0.0
     recall = len(required & cited) / len(required)
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    f1 = _f1(precision, recall)
 
     notes = []
+    bad = cited - valid_ids
+    missing = required - cited
     if bad:
         notes.append(f"cited unknown sources: {sorted(bad)}")
     if missing:
@@ -301,6 +301,96 @@ def score_citation_correctness_v1(summary: str, case: EvalCase) -> ScoreResult:
         breakdown={"precision": precision, "recall": recall, "f1": f1},
         notes=notes,
     )
+
+
+def score_citation_correctness_v1(
+    summary: str,
+    case: EvalCase,
+    *,
+    judge=None,
+) -> ScoreResult:
+    """Grade wiki-link citations.
+
+    Behaviour:
+      - No `required_citations` -> trivially 1.0.
+      - Without `judge`, falls back to presence-only F1 (existing behaviour).
+      - With `judge`, applies sentence-level proximity + judge verdicts:
+        * Recall  = (required (claim, src_id) pairs grounded) / total required
+        * Precision = (citations made that judge says 'supports' the
+          claim in their sentence) / total citations made
+        * Score = F1
+    """
+    has_claim_text = any(case.expected.required_citations.values())
+    if judge is None or not has_claim_text:
+        return _presence_score(summary, case)
+
+    valid_ids = {d.id for d in case.source_docs}
+    src_text = {d.id: d.text for d in case.source_docs}
+    sentences = [s.strip() for s in _SENT_RE.split(summary.strip()) if s.strip()]
+
+    # Required (src_id, claim_text) pairs the operator authored as ground truth.
+    required_pairs = [
+        (sid, claim) for sid, claims in case.expected.required_citations.items() for claim in claims
+    ]
+
+    # Recall: each required pair counts iff some sentence contains the claim
+    # AND cites src_id AND the judge confirms support.
+    grounded = 0
+    missing_notes: list[str] = []
+    for sid, claim in required_pairs:
+        for sent in sentences:
+            if sid not in _wikilinks_in(sent):
+                continue
+            if not _claim_in_sentence(claim, sent):
+                continue
+            verdict = judge.judge(claim=claim, source_id=sid, source_text=src_text.get(sid, ""))
+            if verdict == "supports":
+                grounded += 1
+                break
+        else:
+            missing_notes.append(f"ungrounded: src={sid!r} claim={claim!r}")
+    recall = grounded / len(required_pairs) if required_pairs else 1.0
+
+    # Precision: every (sentence, cited_src_id) the worker actually wrote must
+    # match a required pair AND have judge='supports' for the sentence's text.
+    correct_citations = 0
+    total_citations = 0
+    bad_notes: list[str] = []
+    for sent in sentences:
+        for sid in _wikilinks_in(sent):
+            if sid not in valid_ids:
+                bad_notes.append(f"cited unknown source: {sid!r}")
+                total_citations += 1
+                continue
+            total_citations += 1
+            verdict = judge.judge(claim=sent, source_id=sid, source_text=src_text.get(sid, ""))
+            if verdict == "supports":
+                correct_citations += 1
+            else:
+                bad_notes.append(f"unsupported citation: src={sid!r} verdict={verdict!r}")
+    precision = correct_citations / total_citations if total_citations else 0.0
+
+    f1 = _f1(precision, recall)
+    return ScoreResult(
+        score=f1,
+        breakdown={"precision": precision, "recall": recall, "f1": f1},
+        notes=missing_notes + bad_notes,
+    )
+
+
+def _claim_in_sentence(claim: str, sentence: str) -> bool:
+    """Heuristic: claim is 'in' the sentence if normalised substring or ≥60%
+    of content tokens overlap. Cheap and good enough for grading; the judge
+    is the authoritative call."""
+    claim_n = _normalize(claim)
+    sent_n = _normalize(sentence)
+    if claim_n in sent_n:
+        return True
+    tokens = [t for t in re.findall(r"\w+", claim_n) if len(t) > 2]
+    if not tokens:
+        return False
+    hits = sum(1 for t in tokens if t in sent_n)
+    return hits / len(tokens) >= 0.6
 
 
 SCORERS = {
