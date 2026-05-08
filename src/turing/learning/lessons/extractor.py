@@ -9,7 +9,8 @@ re-extraction migrates them.
 
 from __future__ import annotations
 
-from typing import Callable, Protocol
+from collections.abc import Callable
+from typing import Protocol
 
 from turing.coordinator.lifecycle.episode_store import Episode
 from turing.learning.lessons.lesson import (
@@ -17,7 +18,6 @@ from turing.learning.lessons.lesson import (
     Lesson,
 )
 from turing.llm.base import Message, Role
-
 
 _SYSTEM_PROMPT_TEMPLATE = (
     "You are the cluster's lessons extractor (schema v{version}). "

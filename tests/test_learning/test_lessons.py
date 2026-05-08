@@ -230,7 +230,9 @@ class TestPromptInjector:
         assert "<lessons>" not in prompt
         assert prompt == "You are a worker."
 
-    def test_lessons_block_appears_after_base_prompt(self) -> None:
+    def test_lessons_block_appears_before_base_prompt(self) -> None:
+        """ADR 0005 §3: lessons are prefix context. The block precedes
+        the user prompt so the worker reads guidance first."""
         lessons = [
             Lesson(
                 specialty="x",
@@ -240,8 +242,10 @@ class TestPromptInjector:
             )
         ]
         prompt = inject_lessons_into_prompt(base_prompt="BASE", lessons=lessons)
-        assert prompt.startswith("BASE")
-        assert prompt.index("<lessons>") > prompt.index("BASE")
+        assert prompt.startswith("<lessons>")
+        assert prompt.index("</lessons>") < prompt.index("BASE")
+        # Original prompt preserved verbatim.
+        assert prompt.endswith("BASE")
 
 
 # ── A/B fixture ───────────────────────────────────────────────────────
