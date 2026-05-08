@@ -55,6 +55,14 @@ class Episode:
     # ``SELECT task_id, cents_spent`` per slice 12 (#14). Defaults to 0 so
     # legacy rows recorded before the budget gate landed remain valid.
     cents_spent: int = 0
+    # Workspace key this subtask wrote its output to (ADR 0006 §3).
+    # Synthesis attribution credits upstream subtasks whose output_key
+    # appears in synthesis.consumed_keys. Defaults to "" for legacy rows.
+    output_key: str = ""
+    # Workspace keys this subtask read via the workspace_io tool, populated
+    # by the wrapper at runtime; immutable post-close. Defaults to () for
+    # legacy rows pre-dating consumed-keys tracking.
+    consumed_keys: tuple[str, ...] = ()
 
 
 class EpisodeStore:
