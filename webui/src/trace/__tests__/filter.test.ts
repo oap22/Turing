@@ -6,7 +6,7 @@ const E = (overrides: Partial<{ duration_ms: number | null; node_name: string; e
   timestamp_ms: 1000,
   node_name: overrides.node_name ?? "pi-alpha",
   event_type: overrides.event_type ?? "tool.dispatch.end",
-  duration_ms: overrides.duration_ms ?? 10,
+  duration_ms: "duration_ms" in overrides ? overrides.duration_ms ?? null : 10,
   payload: {},
 });
 

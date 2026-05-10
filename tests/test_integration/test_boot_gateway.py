@@ -127,8 +127,8 @@ async def test_boot_path_serves_spa_and_authenticates(tmp_path: Path) -> None:
                 assert "turing_gateway_token=" in set_cookie
 
                 # / with cookie → 200, HTML, SPA marker present
-                cookies = {"turing_gateway_token": token}
-                r = await client.get(f"{base}/", cookies=cookies)
+                client.cookies.set("turing_gateway_token", token)
+                r = await client.get(f"{base}/")
                 assert r.status_code == 200, r.text
                 assert r.headers["content-type"].startswith("text/html")
                 body = r.text
@@ -142,7 +142,7 @@ async def test_boot_path_serves_spa_and_authenticates(tmp_path: Path) -> None:
                 asset_files = list((assets_dir / "assets").iterdir())
                 assert asset_files, "no built assets present"
                 first_asset = asset_files[0].name
-                r = await client.get(f"{base}/assets/{first_asset}", cookies=cookies)
+                r = await client.get(f"{base}/assets/{first_asset}")
                 assert r.status_code == 200
         finally:
             run_task.cancel()

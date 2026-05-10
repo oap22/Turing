@@ -202,7 +202,7 @@ class NetworkTool(Tool):
             lines = [f"DNS lookup results for '{host}':"]
             seen: set[str] = set()
             for family, _type, _proto, _canonname, sockaddr in results:
-                addr = sockaddr[0]
+                addr = str(sockaddr[0])
                 if addr in seen:
                     continue
                 seen.add(addr)

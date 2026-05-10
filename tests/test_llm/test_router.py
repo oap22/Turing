@@ -14,7 +14,7 @@ from turing.llm.base import (
     ToolDefinition,
 )
 from turing.llm.classifier import ComplexityClassifier
-from turing.llm.router import LLMRouter
+from turing.llm.router import LLMRouter, warn_if_local_only_disables_tools
 from turing.telemetry.bus import Telemetry, TelemetryEvent
 
 # ── fixtures ──────────────────────────────────────────────────────────
@@ -364,3 +364,42 @@ class TestTelemetry:
 
         err = next(e for e in captured if e.name == "llm.complete.error")
         assert err.error == "RuntimeError"
+
+
+class TestWarnIfLocalOnlyDisablesTools:
+    """Issue #158 — local_only routing silently disables tool use."""
+
+    def test_warns_when_local_only_with_tools(self) -> None:
+        import structlog
+
+        with structlog.testing.capture_logs() as cap:
+            emitted = warn_if_local_only_disables_tools("local_only", tool_count=5)
+        assert emitted is True
+        warns = [e for e in cap if e.get("event") == "llm.local_only_disables_tools"]
+        assert len(warns) == 1
+        assert warns[0]["log_level"] == "warning"
+        assert warns[0]["tool_count"] == 5
+
+    def test_silent_when_local_only_but_no_tools(self) -> None:
+        import structlog
+
+        with structlog.testing.capture_logs() as cap:
+            emitted = warn_if_local_only_disables_tools("local_only", tool_count=0)
+        assert emitted is False
+        assert not [e for e in cap if e.get("event") == "llm.local_only_disables_tools"]
+
+    def test_silent_when_auto_with_tools(self) -> None:
+        import structlog
+
+        with structlog.testing.capture_logs() as cap:
+            emitted = warn_if_local_only_disables_tools("auto", tool_count=5)
+        assert emitted is False
+        assert not [e for e in cap if e.get("event") == "llm.local_only_disables_tools"]
+
+    def test_silent_when_cloud_only_with_tools(self) -> None:
+        import structlog
+
+        with structlog.testing.capture_logs() as cap:
+            emitted = warn_if_local_only_disables_tools("cloud_only", tool_count=5)
+        assert emitted is False
+        assert not [e for e in cap if e.get("event") == "llm.local_only_disables_tools"]

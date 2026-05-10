@@ -160,7 +160,8 @@ class EmbeddingModel:
         norm = np.clip(norm, a_min=1e-9, a_max=None)
         normalised = pooled / norm
 
-        return normalised[0].tolist()
+        result: list[float] = normalised[0].tolist()
+        return result
 
     def _embed_batch_sync(self, texts: list[str]) -> list[list[float]]:
         """Run batched embedding inference (blocking)."""
@@ -194,7 +195,8 @@ class EmbeddingModel:
         norms = np.clip(norms, a_min=1e-9, a_max=None)
         normalised = pooled / norms
 
-        return normalised.tolist()
+        result: list[list[float]] = normalised.tolist()
+        return result
 
     # ── internal helpers ──────────────────────────────────────────────
 

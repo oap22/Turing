@@ -22,6 +22,28 @@ logger = structlog.get_logger(__name__)
 RoutingMode = Literal["cloud_only", "local_only", "auto"]
 
 
+def warn_if_local_only_disables_tools(routing_mode: str, tool_count: int) -> bool:
+    """Emit a startup WARN when ``local_only`` routing makes tools unreachable.
+
+    Local Ollama models in this codebase don't surface ``tool_calls`` in their
+    responses, so when the router is forced to ``local_only`` every
+    tool-requiring request is silently answered as prose. The router enforces
+    "tools => cloud" only when ``routing_mode='auto'``; under ``local_only``
+    that escape hatch is disabled. See issue #158.
+
+    Returns True when the warning was emitted, False otherwise — handy for
+    tests and so callers can react if they want to.
+    """
+    if routing_mode == "local_only" and tool_count > 0:
+        logger.warning(
+            "llm.local_only_disables_tools",
+            tool_count=tool_count,
+            hint="set TURING_LLM_ROUTING_MODE=auto (or cloud) for tool calls to fire",
+        )
+        return True
+    return False
+
+
 def _llm_event_payload(
     kind: str,
     args: tuple[Any, ...],
@@ -109,9 +131,10 @@ class LLMRouter:
         )
 
         try:
-            return await self._invoke_provider(
+            primary: LLMResponse = await self._invoke_provider(
                 provider, label, messages, system, effective_tools, max_tokens, temperature
             )
+            return primary
         except Exception:
             # If the selected provider was local (auto mode), fall back to cloud
             # — and restore the original tool catalog for the cloud retry.
@@ -120,9 +143,10 @@ class LLMRouter:
                     "llm_local_failed_falling_back_to_cloud",
                     exc_info=True,
                 )
-                return await self._invoke_provider(
+                fallback: LLMResponse = await self._invoke_provider(
                     self._cloud, "cloud", messages, system, tools, max_tokens, temperature
                 )
+                return fallback
             raise
 
     @traced("llm.complete", payload=_llm_event_payload)

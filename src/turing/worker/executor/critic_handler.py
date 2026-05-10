@@ -30,7 +30,9 @@ def _failure_score(payload: dict[str, object]) -> CriticScore:
     )
 
 
-def make_critic_handler(judge_fn: JudgeFn):
+def make_critic_handler(
+    judge_fn: JudgeFn,
+) -> Callable[[SubtaskDispatch], Awaitable[dict[str, object]]]:
     """Build a kind handler returning a `{output, status, ...}` dict.
 
     The wrapper handles the empty-output short-circuit so each judge_fn
