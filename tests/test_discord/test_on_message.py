@@ -106,9 +106,7 @@ async def test_on_message_skips_bot_authors_silently(mock_config, monkeypatch) -
 
 
 @pytest.mark.asyncio
-async def test_on_message_uses_mentioned_in_for_detection(
-    mock_config, monkeypatch
-) -> None:
+async def test_on_message_uses_mentioned_in_for_detection(mock_config, monkeypatch) -> None:
     """Detection must use `self.user.mentioned_in(message)` so role mentions
     and reply auto-pings count, not just `self.user in message.mentions`."""
     from turing.discord_bot.bot import TuringBot
@@ -150,9 +148,7 @@ async def test_on_message_uses_mentioned_in_for_detection(
 
 
 @pytest.mark.asyncio
-async def test_on_message_logs_when_dropping_empty_content(
-    mock_config, monkeypatch
-) -> None:
+async def test_on_message_logs_when_dropping_empty_content(mock_config, monkeypatch) -> None:
     """When a mention has no text after stripping, the drop must be logged
     rather than silently returning."""
     from turing.discord_bot.bot import TuringBot
@@ -190,6 +186,7 @@ async def test_on_message_logs_when_dropping_empty_content(
 async def test_on_message_handles_dm_with_content(mock_config, monkeypatch) -> None:
     """DM happy path: content reaches the agent without requiring a mention."""
     import discord
+
     from turing.discord_bot.bot import TuringBot
 
     bot = TuringBot(mock_config)
