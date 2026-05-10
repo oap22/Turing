@@ -31,3 +31,23 @@ The SPA shows three panes:
 The pi-alpha node is the only one that runs the gateway —
 `TURING_GATEWAY_ENABLED` defaults to `false`, and only pi-alpha's compose
 file flips it on.
+
+## Database migrations
+
+Schema lives under `alembic/versions/` as raw-SQL migrations authored with
+`alembic.op.create_table`/`op.execute` — the project does **not** define
+SQLAlchemy declarative models, so `alembic/env.py` exposes
+`target_metadata = None`.
+
+Supported commands:
+
+```bash
+alembic upgrade head    # apply pending migrations
+alembic current         # show current revision
+alembic history         # list revisions
+```
+
+**`alembic check` is not supported.** Without a `MetaData` object it cannot
+diff models against the DB; running it errors with "environment script
+alembic/env.py does not provide a MetaData object". Drift is caught by
+hand-written migration tests under `tests/test_alembic_*.py` instead.

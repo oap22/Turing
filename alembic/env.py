@@ -21,7 +21,11 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# No SQLAlchemy MetaData object for autogenerate — we manage DDL manually.
+# Migrations are hand-written raw SQL (op.create_table / op.execute); the
+# project does not define SQLAlchemy declarative models. As a result
+# `alembic check` and `alembic revision --autogenerate` are unsupported —
+# they require a MetaData object to diff against the DB. See README.md
+# ("Database migrations") and issue #145.
 target_metadata = None
 
 
