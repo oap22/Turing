@@ -222,3 +222,64 @@ async def test_on_message_handles_dm_with_content(mock_config, monkeypatch) -> N
     agent.handle_message.assert_awaited_once()
     assert agent.handle_message.await_args.kwargs["message"] == "hello there"
     msg.reply.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_on_message_replies_gracefully_when_agent_raises(
+    mock_config, monkeypatch
+) -> None:
+    """Bug #159: if the agent (e.g. cloud provider) raises, on_message must
+    reply with a friendly error in-channel instead of letting the exception
+    propagate to discord.py's handler, which would leave the user with
+    silence and the logs with a multi-thousand-line traceback."""
+    import discord
+
+    from turing.discord_bot.bot import TuringBot
+
+    bot = TuringBot(mock_config)
+    error_events: list[tuple[str, dict]] = []
+    bot.logger = MagicMock()
+    bot.logger.debug = lambda *a, **k: None
+    bot.logger.info = lambda *a, **k: None
+    bot.logger.warning = lambda *a, **k: None
+    bot.logger.error = lambda evt, **kw: error_events.append((evt, kw))
+
+    bot_user = MagicMock()
+    bot_user.id = 42
+    bot_user.mentioned_in = MagicMock(return_value=False)
+    monkeypatch.setattr(type(bot), "user", property(lambda self: bot_user))
+
+    agent = MagicMock()
+    agent.handle_message = AsyncMock(side_effect=RuntimeError("credit balance too low"))
+    bot.agent = agent
+
+    msg = MagicMock(spec=discord.Message)
+    msg.author.bot = False
+    msg.author.id = 7
+    msg.author.display_name = "alice"
+    msg.channel = MagicMock(spec=discord.DMChannel)
+    msg.channel.id = 99
+    msg.content = "hello"
+    msg.mentions = []
+    msg.reply = AsyncMock()
+
+    typing_cm = MagicMock()
+    typing_cm.__aenter__ = AsyncMock()
+    # __aexit__ must return False so exceptions propagate to bot.on_message's
+    # try/except rather than being swallowed by the context manager.
+    typing_cm.__aexit__ = AsyncMock(return_value=False)
+    msg.channel.typing = MagicMock(return_value=typing_cm)
+
+    monkeypatch.setattr(bot, "process_commands", AsyncMock())
+
+    # Must not raise.
+    await bot.on_message(msg)
+
+    msg.reply.assert_awaited()
+    reply_text = msg.reply.await_args.args[0]
+    assert "trouble" in reply_text.lower() or "error" in reply_text.lower(), (
+        f"expected a friendly error reply, got {reply_text!r}"
+    )
+    assert any(evt.endswith(".error") or "error" in evt for evt, _ in error_events), (
+        f"expected a structured error log, got {error_events}"
+    )
