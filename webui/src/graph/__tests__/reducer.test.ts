@@ -1,12 +1,19 @@
 // Vitest unit tests for the graph reducer. Run via `npm run test` (CI image).
 // We don't wire vitest into pyproject — it lives alongside Vite.
 
-import { describe, expect, it } from "vitest";
-import { emptyState, markStale, reduce, type Frame } from "../reducer";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  emptyState,
+  markStale,
+  reduce,
+  type MessageTraceFrame,
+} from "../reducer";
 
 const NOW = 1_000_000;
 
-function trace(overrides: Partial<Frame> & { type: "message_trace" }): Frame {
+function trace(
+  overrides: Partial<Omit<MessageTraceFrame, "type">> = {},
+): MessageTraceFrame {
   return {
     type: "message_trace",
     node_name: "pi-alpha",
@@ -17,7 +24,7 @@ function trace(overrides: Partial<Frame> & { type: "message_trace" }): Frame {
     error: null,
     payload: { tool: "shell" },
     ...overrides,
-  } as Frame;
+  };
 }
 
 describe("graph reducer — Pi nodes", () => {
@@ -77,6 +84,14 @@ describe("graph reducer — edges", () => {
 });
 
 describe("graph reducer — stale state", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("marks Pi nodes stale after the window", () => {
     let state = reduce(emptyState(), {
       type: "hello",
