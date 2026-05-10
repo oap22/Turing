@@ -1,5 +1,3 @@
-version: "3.9"
-
 x-nats-url: &nats-url "nats://nats:4222"
 
 x-turing-common: &turing-common
