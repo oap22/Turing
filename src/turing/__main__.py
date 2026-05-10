@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import signal
 import sys
 from pathlib import Path
@@ -41,9 +42,7 @@ async def _run(config: TuringConfig) -> None:
     from turing.llm.local import OllamaProvider
     from turing.llm.router import LLMRouter
 
-    cloud_provider = ClaudeProvider(
-        api_key=config.anthropic_api_key, model=config.anthropic_model
-    )
+    cloud_provider = ClaudeProvider(api_key=config.anthropic_api_key, model=config.anthropic_model)
     local_provider = OllamaProvider(host=config.ollama_host, model=config.ollama_model)
     classifier = ComplexityClassifier()
 
@@ -125,9 +124,7 @@ async def _run(config: TuringConfig) -> None:
     # 8. Discord Bot
     from turing.discord_bot.bot import TuringBot
 
-    bot = TuringBot(
-        config, agent=agent, mesh_node=mesh_node, memory_store=memory_store
-    )
+    bot = TuringBot(config, agent=agent, mesh_node=mesh_node, memory_store=memory_store)
     # Give executor reference to bot for confirmation views
     executor.bot = bot
 
@@ -161,7 +158,7 @@ async def _run(config: TuringConfig) -> None:
         bot_task = asyncio.create_task(bot.start_bot())
         shutdown_task = asyncio.create_task(shutdown_event.wait())
 
-        done, pending = await asyncio.wait(
+        _done, pending = await asyncio.wait(
             [bot_task, shutdown_task],
             return_when=asyncio.FIRST_COMPLETED,
         )
@@ -189,10 +186,8 @@ def main() -> None:
     config = TuringConfig()
     setup_logging(config)
 
-    try:
+    with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(_run(config))
-    except KeyboardInterrupt:
-        pass
     sys.exit(0)
 
 

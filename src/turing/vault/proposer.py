@@ -15,7 +15,10 @@ from __future__ import annotations
 import re
 import subprocess
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 REQUIRED_FRONTMATTER_FIELDS = (
     "source",
@@ -66,9 +69,7 @@ class VaultProposer:
         path = inbox_dir / f"{slug}.md"
         # Belt and braces: the resolved path must remain inside vault/inbox/.
         if not path.resolve().is_relative_to(self._root.joinpath(*_INBOX_SUBDIR)):
-            raise InvalidProposalPathError(
-                f"resolved path {path} escapes vault/inbox/"
-            )
+            raise InvalidProposalPathError(f"resolved path {path} escapes vault/inbox/")
 
         path.write_text(_render(frontmatter, body), encoding="utf-8")
 
@@ -85,9 +86,7 @@ class VaultProposer:
     def _validate_frontmatter(frontmatter: Mapping[str, Any]) -> None:
         for field in REQUIRED_FRONTMATTER_FIELDS:
             if field not in frontmatter:
-                raise InvalidFrontmatterError(
-                    f"missing required frontmatter field {field!r}"
-                )
+                raise InvalidFrontmatterError(f"missing required frontmatter field {field!r}")
         for ratio_field in ("confidence", "critic_score"):
             value = frontmatter[ratio_field]
             try:
@@ -97,9 +96,7 @@ class VaultProposer:
                     f"{ratio_field} must be a number, got {value!r}"
                 ) from exc
             if not 0.0 <= fv <= 1.0:
-                raise InvalidFrontmatterError(
-                    f"{ratio_field} must be in [0, 1], got {fv!r}"
-                )
+                raise InvalidFrontmatterError(f"{ratio_field} must be in [0, 1], got {fv!r}")
 
     @staticmethod
     def _validate_path_components(*, task_id: str, slug: str) -> None:

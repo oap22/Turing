@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, Query, Request, Response, WebSocket
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -25,7 +25,11 @@ from starlette.responses import (
 from starlette.staticfiles import StaticFiles
 
 from turing.gateway.auth import COOKIE_NAME, GatewayAuth
-from turing.gateway.ring_buffer import RingBuffer
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from turing.gateway.ring_buffer import RingBuffer
 
 DEFAULT_PAGE_LIMIT = 200
 
@@ -56,8 +60,8 @@ def create_app(
     *,
     auth: GatewayAuth,
     node_name: str,
-    spa_assets_dir: Optional[Path] = None,
-    ring_buffer: Optional[RingBuffer] = None,
+    spa_assets_dir: Path | None = None,
+    ring_buffer: RingBuffer | None = None,
 ) -> FastAPI:
     app = FastAPI(title="turing-gateway")
     app.state.start_time = time.monotonic()
@@ -76,9 +80,7 @@ def create_app(
         subsequent navigation to ``/`` succeeds without the operator ever
         seeing the token in the address bar.
         """
-        if not token or not auth.check(
-            authorization_header=f"Bearer {token}", cookie_token=None
-        ):
+        if not token or not auth.check(authorization_header=f"Bearer {token}", cookie_token=None):
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
         response = RedirectResponse(url="/", status_code=303)
         response.set_cookie(
@@ -100,8 +102,8 @@ def create_app(
     async def api_events(
         node: list[str] = Query(default_factory=list),
         event_type: list[str] = Query(default_factory=list),
-        since_ms: Optional[int] = None,
-        min_duration_ms: Optional[float] = None,
+        since_ms: int | None = None,
+        min_duration_ms: float | None = None,
         limit: int = DEFAULT_PAGE_LIMIT,
         offset: int = 0,
     ) -> dict:

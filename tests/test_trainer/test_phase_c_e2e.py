@@ -112,9 +112,9 @@ def test_phase_c_signed_adapter_clears_promotion_gate(
         signer=signer, object_store=InMemoryObjectStore(), facility_name="dgx-1"
     )
     manifest = publisher.publish(job, result, version="rs-dpo@v1")
-    AdapterRegistry(
-        worker_base_model="qwen2.5-7b", trusted_issuers=[signer.public_key]
-    ).verify(manifest, result.adapter_path.read_bytes())
+    AdapterRegistry(worker_base_model="qwen2.5-7b", trusted_issuers=[signer.public_key]).verify(
+        manifest, result.adapter_path.read_bytes()
+    )
 
     # 4. Promotion gate
     gate = PromotionGate(min_delta=0.02)
@@ -180,9 +180,7 @@ def test_failed_dpo_examples_never_reappear_in_dpo_pairs(
             ),
         ],
         episode_store=store,
-        notifier=type(
-            "N", (), {"notify": lambda self, *a, **k: None}
-        )(),
+        notifier=type("N", (), {"notify": lambda self, *a, **k: None})(),
     )
     store.record(
         _ep(

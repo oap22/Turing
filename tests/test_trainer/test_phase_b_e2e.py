@@ -48,9 +48,7 @@ def _ep(
 
 
 def _stub_backend(*, job: TrainingJob, dataset_path: Path, out_path: Path) -> bytes:
-    blob = (
-        f"adapter[{job.base_model}|{dataset_path.read_bytes().decode()}]"
-    ).encode()
+    blob = (f"adapter[{job.base_model}|{dataset_path.read_bytes().decode()}]").encode()
     out_path.write_bytes(blob)
     return blob
 
@@ -81,9 +79,7 @@ def test_phase_b_chain_passes_eval_delta_and_lands_as_staged(
     # --- 2. Build the dataset -------------------------------------------------
     builder = TrainingJobBuilder(episode_store=store, min_critic_score=0.7)
     dataset_path = tmp_path / "dataset.jsonl"
-    info = builder.build(
-        specialty="research-summarize", top_k=10, out_path=dataset_path
-    )
+    info = builder.build(specialty="research-summarize", top_k=10, out_path=dataset_path)
     assert info.example_count == 5
 
     # --- 3. Train the adapter -------------------------------------------------

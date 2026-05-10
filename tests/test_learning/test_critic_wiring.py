@@ -47,9 +47,7 @@ def _episode(*, subtask_id: str, outcome: SubtaskState, recorded_at_ms: int = 0)
 
 class _ScoringCritic:
     async def score(self, episode):
-        return CriticScore(
-            correctness=0.5, efficiency=0.5, specialty_fit=0.5, critique=""
-        )
+        return CriticScore(correctness=0.5, efficiency=0.5, specialty_fit=0.5, critique="")
 
 
 # ── Lifecycle terminal hook ──────────────────────────────────────────
@@ -178,9 +176,13 @@ async def test_backfill_enqueues_pending_within_horizon():
     now = 10_000_000
     horizon = 1_000
     # Inside horizon
-    store.record(_episode(subtask_id="recent", outcome=SubtaskState.COMPLETED, recorded_at_ms=now - 100))
+    store.record(
+        _episode(subtask_id="recent", outcome=SubtaskState.COMPLETED, recorded_at_ms=now - 100)
+    )
     # Outside horizon
-    store.record(_episode(subtask_id="old", outcome=SubtaskState.COMPLETED, recorded_at_ms=now - 5_000))
+    store.record(
+        _episode(subtask_id="old", outcome=SubtaskState.COMPLETED, recorded_at_ms=now - 5_000)
+    )
 
     queue = CriticQueue(
         local_critic=_ScoringCritic(),

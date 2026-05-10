@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import time
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 import structlog
 
@@ -23,12 +24,12 @@ PayloadHook = Callable[..., dict[str, Any]]
 
 
 def _safe_payload(
-    hook: Optional[PayloadHook],
+    hook: PayloadHook | None,
     kind: str,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     result: Any,
-    exc: Optional[BaseException],
+    exc: BaseException | None,
 ) -> dict[str, Any]:
     if hook is None:
         return {}
@@ -40,7 +41,7 @@ def _safe_payload(
         return {}
 
 
-def traced(event_name: str, *, payload: Optional[PayloadHook] = None) -> Callable[..., Any]:
+def traced(event_name: str, *, payload: PayloadHook | None = None) -> Callable[..., Any]:
     """Wrap a function so it emits telemetry events.
 
     Parameters

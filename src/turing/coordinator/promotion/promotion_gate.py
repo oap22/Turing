@@ -27,9 +27,7 @@ class EvalDeltaTooSmallError(Exception):
     """Raised when a candidate adapter's eval improvement is below ``min_delta``."""
 
     def __init__(self, *, delta: float, required: float) -> None:
-        super().__init__(
-            f"eval delta {delta:.4f} < required {required:.4f}"
-        )
+        super().__init__(f"eval delta {delta:.4f} < required {required:.4f}")
         self.delta = delta
         self.required = required
 

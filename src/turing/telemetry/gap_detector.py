@@ -81,9 +81,7 @@ class GapDetector:
             self._pending[key] = pending
         else:
             self._pending.pop(key, None)
-        return GapDetected(
-            node=node, stream=stream, missing=(first_missing, last_missing)
-        )
+        return GapDetected(node=node, stream=stream, missing=(first_missing, last_missing))
 
     def _drain_pending(self, key: tuple[str, str]) -> None:
         pending = self._pending.get(key)

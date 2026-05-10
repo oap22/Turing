@@ -26,7 +26,5 @@ class NatsUrlAnnouncement:
     def from_headers(cls, headers: dict[str, str]) -> NatsUrlAnnouncement:
         url = headers.get(_NATS_URL_HEADER)
         if not url:
-            raise ValueError(
-                f"announcement missing required header {_NATS_URL_HEADER!r}"
-            )
+            raise ValueError(f"announcement missing required header {_NATS_URL_HEADER!r}")
         return cls(nats_url=url)

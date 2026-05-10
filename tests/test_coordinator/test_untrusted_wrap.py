@@ -12,7 +12,6 @@ from turing.coordinator.untrusted_wrap import (
     wrap_untrusted,
 )
 
-
 # ── wrap_untrusted ────────────────────────────────────────────────────
 
 

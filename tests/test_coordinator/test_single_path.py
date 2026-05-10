@@ -8,12 +8,11 @@ callbacks for the cog's edit-message loop.
 
 from __future__ import annotations
 
-from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
-from turing.coordinator.lifecycle.episode_store import Episode, EpisodeStore
+from turing.coordinator.lifecycle.episode_store import EpisodeStore
 from turing.coordinator.lifecycle.lifecycle import SubtaskState
 from turing.coordinator.registry import CapabilityRegistry
 from turing.coordinator.registry.manifest import CapabilityManifest
@@ -76,17 +75,13 @@ class TestKeywordClassifier:
         assert choice.specialty == "code-debug"
 
     def test_falls_back_to_default(self) -> None:
-        clf = KeywordSpecialtyClassifier(
-            mapping={"x": ("foo",)}, default="research-summarize"
-        )
+        clf = KeywordSpecialtyClassifier(mapping={"x": ("foo",)}, default="research-summarize")
         choice = clf.classify("nothing matches")
         assert choice.specialty == "research-summarize"
         assert choice.reason  # explanation present
 
     def test_choice_includes_reason(self) -> None:
-        clf = KeywordSpecialtyClassifier(
-            mapping={"code-debug": ("debug",)}, default="x"
-        )
+        clf = KeywordSpecialtyClassifier(mapping={"code-debug": ("debug",)}, default="x")
         choice = clf.classify("debug me")
         assert "debug" in choice.reason.lower()
 
@@ -146,9 +141,7 @@ def telemetry(monkeypatch: pytest.MonkeyPatch) -> Telemetry:
 
 class TestSinglePathRouter:
     @pytest.mark.asyncio
-    async def test_happy_path_returns_worker_output(
-        self, telemetry: Telemetry
-    ) -> None:
+    async def test_happy_path_returns_worker_output(self, telemetry: Telemetry) -> None:
         registry = _registry(_manifest("research-summarize"))
         scheduler = Scheduler()
         store = EpisodeStore()
@@ -168,9 +161,7 @@ class TestSinglePathRouter:
         assert "dlrow olleh" in result
 
     @pytest.mark.asyncio
-    async def test_writes_episode_with_correct_specialty(
-        self, telemetry: Telemetry
-    ) -> None:
+    async def test_writes_episode_with_correct_specialty(self, telemetry: Telemetry) -> None:
         registry = _registry(_manifest("research-summarize"))
         scheduler = Scheduler()
         store = EpisodeStore()
@@ -195,9 +186,7 @@ class TestSinglePathRouter:
         assert ep.success is True
 
     @pytest.mark.asyncio
-    async def test_classifier_decision_emitted_as_telemetry(
-        self, telemetry: Telemetry
-    ) -> None:
+    async def test_classifier_decision_emitted_as_telemetry(self, telemetry: Telemetry) -> None:
         captured: list[TelemetryEvent] = []
         telemetry.add_sink(captured.append)
 
@@ -223,9 +212,7 @@ class TestSinglePathRouter:
         assert choice_event.payload["reason"] == "stub"
 
     @pytest.mark.asyncio
-    async def test_status_reporter_called_at_each_stage(
-        self, telemetry: Telemetry
-    ) -> None:
+    async def test_status_reporter_called_at_each_stage(self, telemetry: Telemetry) -> None:
         registry = _registry(_manifest("research-summarize"))
         store = EpisodeStore()
         statuses: list[str] = []
@@ -268,9 +255,7 @@ class TestSinglePathRouter:
             await router.handle(message="hi", task_id="t-1")
 
     @pytest.mark.asyncio
-    async def test_dispatch_failure_records_failed_episode(
-        self, telemetry: Telemetry
-    ) -> None:
+    async def test_dispatch_failure_records_failed_episode(self, telemetry: Telemetry) -> None:
         registry = _registry(_manifest("research-summarize"))
         store = EpisodeStore()
 

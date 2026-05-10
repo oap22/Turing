@@ -8,9 +8,12 @@ to evict.
 
 from __future__ import annotations
 
-from typing import Iterable, Protocol
+from typing import TYPE_CHECKING, Protocol
 
-from turing.coordinator.workspace.ref import WorkspaceRef
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from turing.coordinator.workspace.ref import WorkspaceRef
 
 
 class WorkspaceClient(Protocol):
@@ -34,4 +37,4 @@ class InMemoryWorkspaceClient:
         self._blobs.pop((ref.task_id, ref.key), None)
 
     def keys_for_task(self, task_id: str) -> Iterable[str]:
-        return [k for (t, k) in self._blobs.keys() if t == task_id]
+        return [k for (t, k) in self._blobs if t == task_id]

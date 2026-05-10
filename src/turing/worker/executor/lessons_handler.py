@@ -18,9 +18,7 @@ if TYPE_CHECKING:
     from turing.coordinator.dispatch import SubtaskDispatch
 
 
-ExtractorFn = Callable[
-    [str, Sequence[dict[str, Any]]], Awaitable[list[LessonCandidate]]
-]
+ExtractorFn = Callable[[str, Sequence[dict[str, Any]]], Awaitable[list[LessonCandidate]]]
 
 
 def make_extract_lessons_handler(extract_fn: ExtractorFn):

@@ -14,14 +14,17 @@ flaky browser cannot break the rest of the fan-out.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from turing.gateway.ring_buffer import RingBuffer
 from turing.mesh.protocol import MeshMessage, MessageType
 from turing.telemetry.gap_detector import GapDetected, GapDetector, Reset
+
+if TYPE_CHECKING:
+    from turing.gateway.ring_buffer import RingBuffer
 
 logger = structlog.get_logger(__name__)
 
@@ -30,9 +33,7 @@ Unsubscribe = Callable[[], None]
 
 
 class TelemetrySink:
-    def __init__(
-        self, *, buffer: RingBuffer, reorder_window: int = 4
-    ) -> None:
+    def __init__(self, *, buffer: RingBuffer, reorder_window: int = 4) -> None:
         self._buffer = buffer
         self._subscribers: list[WSSendFn] = []
         self._gaps = GapDetector(reorder_window=reorder_window)
@@ -41,10 +42,8 @@ class TelemetrySink:
         self._subscribers.append(send)
 
         def _unsubscribe() -> None:
-            try:
+            with contextlib.suppress(ValueError):
                 self._subscribers.remove(send)
-            except ValueError:
-                pass
 
         return _unsubscribe
 
@@ -60,9 +59,7 @@ class TelemetrySink:
 
         # Gap detection runs after the event is durably stored so a gap
         # that's later resolved still shows in the historical query.
-        stream = message.payload.get("stream") or _stream_from_event_type(
-            event["event_type"]
-        )
+        stream = message.payload.get("stream") or _stream_from_event_type(event["event_type"])
         outcome = self._gaps.observe(
             node=event["node_name"], stream=str(stream), seq=int(event["seq"])
         )

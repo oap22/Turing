@@ -21,9 +21,8 @@ import argparse
 import os
 import sys
 import webbrowser
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
-
 
 HttpGetFn = Callable[..., object]
 """Signature: ``(url, *, headers, timeout) -> response`` where the response
@@ -56,13 +55,9 @@ def run_launcher(
     timeout_s: float = 5.0,
 ) -> LauncherResult:
     if not host:
-        raise LauncherError(
-            "no gateway host configured — set --host or TURING_GATEWAY_HOST"
-        )
+        raise LauncherError("no gateway host configured — set --host or TURING_GATEWAY_HOST")
     if not token:
-        raise LauncherError(
-            "no gateway token configured — set --token or TURING_GATEWAY_TOKEN"
-        )
+        raise LauncherError("no gateway token configured — set --token or TURING_GATEWAY_TOKEN")
 
     base = f"http://{host}:{port}"
     healthz = f"{base}/healthz"
@@ -71,17 +66,13 @@ def run_launcher(
     try:
         response = http_get(healthz, headers=headers, timeout=timeout_s)
     except Exception as exc:
-        raise LauncherError(
-            f"network unreachable: cannot reach {healthz}: {exc}"
-        ) from exc
+        raise LauncherError(f"network unreachable: cannot reach {healthz}: {exc}") from exc
 
     status = getattr(response, "status_code", None)
     if status == 401:
         raise LauncherError(f"unauthorized (401) at {healthz} — token rejected")
     if status != 200:
-        raise LauncherError(
-            f"gateway returned {status} at {healthz}; expected 200"
-        )
+        raise LauncherError(f"gateway returned {status} at {healthz}; expected 200")
 
     handoff = f"{base}/token-handoff?token={token}"
     open_browser(handoff)
@@ -104,7 +95,7 @@ def _open_browser(url: str) -> None:
     webbrowser.open(url)
 
 
-def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="turing-ui",
         description=(
@@ -132,7 +123,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
         run_launcher(

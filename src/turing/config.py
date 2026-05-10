@@ -153,7 +153,7 @@ class TuringConfig(BaseSettings):
     # ── Validators ───────────────────────────────────────────────────────
 
     @model_validator(mode="after")
-    def _autogenerate_node_id(self) -> "TuringConfig":
+    def _autogenerate_node_id(self) -> TuringConfig:
         """Generate a stable UUID for the node when none is provided."""
         if not self.node_id:
             self.node_id = str(uuid.uuid4())

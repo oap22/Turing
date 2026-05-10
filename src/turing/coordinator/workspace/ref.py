@@ -26,19 +26,16 @@ class WorkspaceRef:
             )
         if not _SAFE_KEY_RE.match(self.key) or ".." in self.key:
             raise InvalidWorkspaceRefError(
-                f"key must match {_SAFE_KEY_RE.pattern!r} and contain no '..', "
-                f"got {self.key!r}"
+                f"key must match {_SAFE_KEY_RE.pattern!r} and contain no '..', got {self.key!r}"
             )
 
     def __str__(self) -> str:
         return f"{_SCHEME}{self.task_id}/{self.key}"
 
     @classmethod
-    def parse(cls, raw: str) -> "WorkspaceRef":
+    def parse(cls, raw: str) -> WorkspaceRef:
         if not raw.startswith(_SCHEME):
-            raise InvalidWorkspaceRefError(
-                f"missing {_SCHEME!r} scheme: {raw!r}"
-            )
+            raise InvalidWorkspaceRefError(f"missing {_SCHEME!r} scheme: {raw!r}")
         rest = raw[len(_SCHEME) :]
         if "/" not in rest:
             raise InvalidWorkspaceRefError(f"missing '/<key>' in {raw!r}")

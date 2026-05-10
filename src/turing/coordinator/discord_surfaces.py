@@ -37,14 +37,10 @@ class DiscordSurfaceIndex:
         self._task_messages: dict[str, _TaskMessageRow] = {}
         self._subtask_threads: dict[str, _SubtaskThreadRow] = {}
 
-    def record_task_message(
-        self, message_id: str, task_id: str, posted_at_ms: int
-    ) -> None:
+    def record_task_message(self, message_id: str, task_id: str, posted_at_ms: int) -> None:
         self._task_messages[message_id] = _TaskMessageRow(task_id, posted_at_ms)
 
-    def record_subtask_thread(
-        self, thread_id: str, subtask_id: str, posted_at_ms: int
-    ) -> None:
+    def record_subtask_thread(self, thread_id: str, subtask_id: str, posted_at_ms: int) -> None:
         self._subtask_threads[thread_id] = _SubtaskThreadRow(subtask_id, posted_at_ms)
 
     def task_for_message(self, message_id: str) -> str | None:
@@ -55,9 +51,7 @@ class DiscordSurfaceIndex:
         row = self._subtask_threads.get(thread_id)
         return row.subtask_id if row else None
 
-    def task_messages_within(
-        self, *, now_ms: int, horizon_ms: int
-    ) -> list[tuple[str, str]]:
+    def task_messages_within(self, *, now_ms: int, horizon_ms: int) -> list[tuple[str, str]]:
         """Return `(message_id, task_id)` pairs posted within the horizon."""
         cutoff = now_ms - horizon_ms
         return [
@@ -66,9 +60,7 @@ class DiscordSurfaceIndex:
             if row.posted_at_ms >= cutoff
         ]
 
-    def subtask_threads_within(
-        self, *, now_ms: int, horizon_ms: int
-    ) -> list[tuple[str, str]]:
+    def subtask_threads_within(self, *, now_ms: int, horizon_ms: int) -> list[tuple[str, str]]:
         """Return `(thread_id, subtask_id)` pairs posted within the horizon."""
         cutoff = now_ms - horizon_ms
         return [

@@ -69,9 +69,7 @@ class TestComplexMessages:
             "architect",
         ],
     )
-    def test_complex_keywords(
-        self, classifier: ComplexityClassifier, keyword: str
-    ) -> None:
+    def test_complex_keywords(self, classifier: ComplexityClassifier, keyword: str) -> None:
         message = f"Please {keyword} the system performance"
         assert classifier.classify(message) == Complexity.COMPLEX
 
@@ -80,26 +78,17 @@ class TestComplexMessages:
         assert classifier.classify(message) == Complexity.COMPLEX
 
     def test_code_generation_request(self, classifier: ComplexityClassifier) -> None:
-        assert (
-            classifier.classify("Write a script to parse JSON files")
-            == Complexity.COMPLEX
-        )
+        assert classifier.classify("Write a script to parse JSON files") == Complexity.COMPLEX
 
     def test_code_block_present(self, classifier: ComplexityClassifier) -> None:
         msg = "Fix this:\n```python\nprint('hello')\n```"
         assert classifier.classify(msg) == Complexity.COMPLEX
 
     def test_fix_code_request(self, classifier: ComplexityClassifier) -> None:
-        assert (
-            classifier.classify("Fix the bug in the authentication module")
-            == Complexity.COMPLEX
-        )
+        assert classifier.classify("Fix the bug in the authentication module") == Complexity.COMPLEX
 
     def test_multiple_questions(self, classifier: ComplexityClassifier) -> None:
-        assert (
-            classifier.classify("What is X? And how does Y relate?")
-            == Complexity.COMPLEX
-        )
+        assert classifier.classify("What is X? And how does Y relate?") == Complexity.COMPLEX
 
     def test_numbered_list(self, classifier: ComplexityClassifier) -> None:
         msg = "Do the following:\n1. First thing\n2. Second thing\n3. Third thing"
@@ -136,7 +125,8 @@ class TestToolIndicators:
         assert classifier.classify(message, has_tool_definitions=True) == Complexity.COMPLEX
 
     def test_tool_indicators_without_tools(
-        self, classifier: ComplexityClassifier,
+        self,
+        classifier: ComplexityClassifier,
     ) -> None:
         # Without tool definitions, a simple tool phrase should remain SIMPLE
         # (unless it triggers other complexity rules).

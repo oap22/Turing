@@ -8,12 +8,15 @@ and skips if unavailable.
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
 from turing.learning.trainer.job import TrainingJob
 from turing.learning.trainer.runner import StubTrainer, TrainingResult
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _job(method: str = "sft") -> TrainingJob:

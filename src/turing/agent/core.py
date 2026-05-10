@@ -80,32 +80,25 @@ class Agent:
         parts: list[str] = [_BASE_SYSTEM_PROMPT]
 
         # Node identity
-        parts.append(
-            f"\nYou are running on node '{context.node_name}' (ID: {context.node_id})."
-        )
+        parts.append(f"\nYou are running on node '{context.node_name}' (ID: {context.node_id}).")
 
         # User preferences
         if context.user_preferences:
             pref_lines = [f"- {k}: {v}" for k, v in context.user_preferences.items()]
-            parts.append(
-                "\nKnown preferences for this user:\n" + "\n".join(pref_lines)
-            )
+            parts.append("\nKnown preferences for this user:\n" + "\n".join(pref_lines))
 
         # Available tools
         tools = self.tool_registry.get_all()
         if tools:
             tool_names = [t.name for t in tools]
-            parts.append(
-                f"\nAvailable tools: {', '.join(tool_names)}"
-            )
+            parts.append(f"\nAvailable tools: {', '.join(tool_names)}")
 
         # Mesh peers
         if context.peer_count > 0:
             peer_info = context.system_state.get("peers", [])
             peer_names = [p.get("name", "unknown") for p in peer_info]
             parts.append(
-                f"\nMesh network: {context.peer_count} peer(s) connected: "
-                f"{', '.join(peer_names)}"
+                f"\nMesh network: {context.peer_count} peer(s) connected: {', '.join(peer_names)}"
             )
 
         # Plugin additions
@@ -122,9 +115,7 @@ class Agent:
                     f"- {fact.get('subject', '')} {fact.get('predicate', '')} "
                     f"{fact.get('object', '')}"
                 )
-            parts.append(
-                "\nRelevant knowledge:\n" + "\n".join(fact_lines)
-            )
+            parts.append("\nRelevant knowledge:\n" + "\n".join(fact_lines))
 
         return "\n".join(parts)
 
@@ -199,9 +190,7 @@ class Agent:
             await self.memory_store.touch_conversation(conv_id)
 
         # 3. Store user message
-        await self.memory_store.add_message(
-            conv_id, "user", message, user_id, user_name
-        )
+        await self.memory_store.add_message(conv_id, "user", message, user_id, user_name)
 
         # 4. Build system prompt and messages
         system_prompt = self._build_system_prompt(context)
@@ -232,9 +221,7 @@ class Agent:
 
             # Execute each tool call and feed results back
             for tool_call in response.tool_calls:
-                result = await self.executor.execute_tool_call(
-                    tool_call, user_id, channel_id
-                )
+                result = await self.executor.execute_tool_call(tool_call, user_id, channel_id)
 
                 # Append assistant message with tool_calls
                 messages.append(

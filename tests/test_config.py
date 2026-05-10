@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import uuid
-from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-import pytest
-
 from turing.config import TuringConfig
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class TestDefaults:

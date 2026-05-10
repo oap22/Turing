@@ -55,8 +55,7 @@ class CapabilityManifest:
         version = raw.get("schema_version")
         if version != CURRENT_MANIFEST_VERSION:
             raise ManifestVersionError(
-                f"manifest schema_version {version!r} does not match "
-                f"{CURRENT_MANIFEST_VERSION}"
+                f"manifest schema_version {version!r} does not match {CURRENT_MANIFEST_VERSION}"
             )
         return cls(
             worker_id=raw["worker_id"],

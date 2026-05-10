@@ -119,10 +119,7 @@ class Planner:
             return True
 
         # Check for multiple question marks (multiple questions)
-        if message.count("?") >= 2:
-            return True
-
-        return False
+        return message.count("?") >= 2
 
     async def create_plan(
         self,
@@ -134,9 +131,7 @@ class Planner:
         Sends the goal and available tools to the LLM and parses the
         structured response into a Plan with PlanStep objects.
         """
-        tool_descriptions = "\n".join(
-            f"- {t.name}: {t.description}" for t in available_tools
-        )
+        tool_descriptions = "\n".join(f"- {t.name}: {t.description}" for t in available_tools)
 
         planning_prompt = (
             "You are a task planner. Break down the following goal into concrete, "

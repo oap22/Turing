@@ -38,11 +38,7 @@ class CanaryPassGate:
         prior_live_canary_score: float | None,
     ) -> CanaryPassResult:
         if prior_live_canary_score is None:
-            return CanaryPassResult(
-                passed=True, delta_pp=None, epsilon_pp=self._epsilon_pp
-            )
+            return CanaryPassResult(passed=True, delta_pp=None, epsilon_pp=self._epsilon_pp)
         delta_pp = canary_score - prior_live_canary_score
         passed = delta_pp >= -self._epsilon_pp
-        return CanaryPassResult(
-            passed=passed, delta_pp=delta_pp, epsilon_pp=self._epsilon_pp
-        )
+        return CanaryPassResult(passed=passed, delta_pp=delta_pp, epsilon_pp=self._epsilon_pp)

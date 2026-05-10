@@ -59,9 +59,7 @@ _TERMINAL_STATES = frozenset(
 _RETRYABLE_STATES = frozenset({SubtaskState.FAILED, SubtaskState.TIMED_OUT})
 
 _ALLOWED: dict[SubtaskState, frozenset[SubtaskState]] = {
-    SubtaskState.PENDING: frozenset(
-        {SubtaskState.DISPATCHED, SubtaskState.REJECTED}
-    ),
+    SubtaskState.PENDING: frozenset({SubtaskState.DISPATCHED, SubtaskState.REJECTED}),
     SubtaskState.DISPATCHED: frozenset(
         {
             SubtaskState.RUNNING,
@@ -167,8 +165,5 @@ class TaskLifecycle:
 
     def _maybe_fire_terminal(self, subtask_id: str, new_state: SubtaskState) -> None:
         # REJECTED is audit-only — skip the critic enqueue per ADR 0004 §5.
-        if (
-            self._on_terminal is not None
-            and new_state in _CRITIC_ELIGIBLE_TERMINAL
-        ):
+        if self._on_terminal is not None and new_state in _CRITIC_ELIGIBLE_TERMINAL:
             self._on_terminal(subtask_id, new_state)

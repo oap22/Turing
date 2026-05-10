@@ -43,16 +43,12 @@ def test_dry_run_happy_path_advances_through_states() -> None:
     assert rollout.state is RolloutState.STAGED
 
     # Step 3: canary worker confirms.
-    rollout.report_live_eval(
-        LiveEvalReport(worker_id="w1", score=0.73, version="rs@v2")
-    )
+    rollout.report_live_eval(LiveEvalReport(worker_id="w1", score=0.73, version="rs@v2"))
     assert rollout.state is RolloutState.FLEET_ROLLOUT
 
     # Step 4: fleet rollout — every remaining worker confirms.
     for w in ("w2", "w3"):
-        rollout.report_live_eval(
-            LiveEvalReport(worker_id=w, score=0.73, version="rs@v2")
-        )
+        rollout.report_live_eval(LiveEvalReport(worker_id=w, score=0.73, version="rs@v2"))
     assert rollout.state is RolloutState.COMPLETED
     # No regression notifications during a clean rollout.
     assert not [c for c in notifier.calls if c[0] == "regression_halted"]
@@ -83,9 +79,7 @@ def test_dry_run_synthetic_regression_halts_and_notifies() -> None:
 
     # Synthetic regression: canary returns a score 10 points below baseline.
     with pytest.raises(RegressionHaltedError):
-        rollout.report_live_eval(
-            LiveEvalReport(worker_id="w1", score=0.55, version="rs@v2")
-        )
+        rollout.report_live_eval(LiveEvalReport(worker_id="w1", score=0.55, version="rs@v2"))
 
     assert rollout.state is RolloutState.HALTED
     halt_calls = [c for c in notifier.calls if c[0] == "regression_halted"]

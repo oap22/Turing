@@ -11,10 +11,7 @@ Three deliverables:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from typing import Any
-
-import pytest
+from datetime import UTC, datetime, timedelta
 
 from turing.coordinator.budget import (
     BudgetDecision,
@@ -25,7 +22,6 @@ from turing.coordinator.budget import (
 from turing.coordinator.lifecycle.episode_store import Episode
 from turing.coordinator.lifecycle.lifecycle import SubtaskState
 
-
 # ── ModelPriceTable / estimate ────────────────────────────────────────
 
 
@@ -35,17 +31,13 @@ class TestEstimate:
             cents_per_kilo_input={"claude-sonnet-4": 100},  # $1 / 1K input
             cents_per_kilo_output={"claude-sonnet-4": 500},  # $5 / 1K output
         )
-        cents = prices.estimate(
-            model="claude-sonnet-4", input_tokens=2000, output_tokens=1000
-        )
+        cents = prices.estimate(model="claude-sonnet-4", input_tokens=2000, output_tokens=1000)
         # 2K input * $1/K + 1K output * $5/K = $2 + $5 = $7 = 700 cents
         assert cents == 700
 
     def test_unknown_model_falls_back_to_zero(self) -> None:
         prices = ModelPriceTable(cents_per_kilo_input={}, cents_per_kilo_output={})
-        cents = prices.estimate(
-            model="unknown-model", input_tokens=1000, output_tokens=1000
-        )
+        cents = prices.estimate(model="unknown-model", input_tokens=1000, output_tokens=1000)
         assert cents == 0
 
 
@@ -53,7 +45,7 @@ class TestEstimate:
 
 
 def _now(year: int = 2026, month: int = 5, day: int = 7, hour: int = 12) -> datetime:
-    return datetime(year, month, day, hour, tzinfo=timezone.utc)
+    return datetime(year, month, day, hour, tzinfo=UTC)
 
 
 class TestSpendTracker:
@@ -157,9 +149,7 @@ class TestBudgetGate:
             cents_per_kilo_input={"claude-sonnet-4": 100},
             cents_per_kilo_output={"claude-sonnet-4": 500},
         )
-        gate = BudgetGate(
-            daily_cap_cents=1000, spend_tracker=tracker, price_table=prices
-        )
+        gate = BudgetGate(daily_cap_cents=1000, spend_tracker=tracker, price_table=prices)
         # Pre-rollover: a $4 call would exceed
         d1 = gate.check(
             task_id="t-1",
@@ -233,13 +223,9 @@ class TestBudgetFooter:
     def test_footer_renders_dollars_remaining(self) -> None:
         from turing.coordinator.budget import format_remaining_budget
 
-        assert format_remaining_budget(remaining_cents=534) == (
-            "budget remaining: $5.34"
-        )
+        assert format_remaining_budget(remaining_cents=534) == ("budget remaining: $5.34")
 
     def test_footer_zero_remaining(self) -> None:
         from turing.coordinator.budget import format_remaining_budget
 
-        assert format_remaining_budget(remaining_cents=0) == (
-            "budget remaining: $0.00"
-        )
+        assert format_remaining_budget(remaining_cents=0) == ("budget remaining: $0.00")

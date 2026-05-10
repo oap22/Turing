@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from turing.plugins.base import Plugin
 from turing.tools.base import Tool
+
+if TYPE_CHECKING:
+    from turing.plugins.base import Plugin
 
 logger = structlog.get_logger("turing.plugins.registry")
 

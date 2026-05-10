@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
 from turing.gateway.ring_buffer import RingBuffer, RingBufferConfig
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.fixture
@@ -18,22 +21,46 @@ async def buffer(tmp_path: Path):
     )
     buf = RingBuffer(cfg)
     await buf.open()
-    await buf.append({
-        "timestamp_ms": 1000, "node_name": "a", "event_type": "x.start",
-        "seq": 1, "duration_ms": 5, "payload": {},
-    })
-    await buf.append({
-        "timestamp_ms": 2000, "node_name": "a", "event_type": "x.end",
-        "seq": 2, "duration_ms": 50, "payload": {},
-    })
-    await buf.append({
-        "timestamp_ms": 3000, "node_name": "b", "event_type": "y.end",
-        "seq": 1, "duration_ms": 200, "payload": {},
-    })
-    await buf.append({
-        "timestamp_ms": 4000, "node_name": "b", "event_type": "z.end",
-        "seq": 1, "duration_ms": 800, "payload": {},
-    })
+    await buf.append(
+        {
+            "timestamp_ms": 1000,
+            "node_name": "a",
+            "event_type": "x.start",
+            "seq": 1,
+            "duration_ms": 5,
+            "payload": {},
+        }
+    )
+    await buf.append(
+        {
+            "timestamp_ms": 2000,
+            "node_name": "a",
+            "event_type": "x.end",
+            "seq": 2,
+            "duration_ms": 50,
+            "payload": {},
+        }
+    )
+    await buf.append(
+        {
+            "timestamp_ms": 3000,
+            "node_name": "b",
+            "event_type": "y.end",
+            "seq": 1,
+            "duration_ms": 200,
+            "payload": {},
+        }
+    )
+    await buf.append(
+        {
+            "timestamp_ms": 4000,
+            "node_name": "b",
+            "event_type": "z.end",
+            "seq": 1,
+            "duration_ms": 800,
+            "payload": {},
+        }
+    )
     yield buf
     await buf.close()
 
@@ -52,9 +79,7 @@ class TestNodeNamesList:
 
 class TestEventTypesList:
     @pytest.mark.asyncio
-    async def test_query_filters_by_multiple_event_types(
-        self, buffer: RingBuffer
-    ) -> None:
+    async def test_query_filters_by_multiple_event_types(self, buffer: RingBuffer) -> None:
         rows = await buffer.query(event_types=("x.end", "y.end"))
         assert {r["event_type"] for r in rows} == {"x.end", "y.end"}
 
@@ -84,15 +109,11 @@ class TestBackwardsCompat:
     """Existing `node_name` / `event_type` (singular) callers still work."""
 
     @pytest.mark.asyncio
-    async def test_singular_node_name_still_supported(
-        self, buffer: RingBuffer
-    ) -> None:
+    async def test_singular_node_name_still_supported(self, buffer: RingBuffer) -> None:
         rows = await buffer.query(node_name="a")
         assert {r["node_name"] for r in rows} == {"a"}
 
     @pytest.mark.asyncio
-    async def test_singular_event_type_still_supported(
-        self, buffer: RingBuffer
-    ) -> None:
+    async def test_singular_event_type_still_supported(self, buffer: RingBuffer) -> None:
         rows = await buffer.query(event_type="x.end")
         assert {r["event_type"] for r in rows} == {"x.end"}

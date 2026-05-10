@@ -56,8 +56,8 @@ class AdminCog(commands.Cog, name="Admin"):
             uptime_str = f"{hours}h {minutes}m {seconds}s"
 
             mem = psutil.virtual_memory()
-            mem_used = f"{mem.used / (1024 ** 3):.1f} GB"
-            mem_total = f"{mem.total / (1024 ** 3):.1f} GB"
+            mem_used = f"{mem.used / (1024**3):.1f} GB"
+            mem_total = f"{mem.total / (1024**3):.1f} GB"
             mem_pct = f"{mem.percent}%"
 
             peer_count = len(self.bot.mesh_node.peers) if self.bot.mesh_node else 0
@@ -100,7 +100,11 @@ class AdminCog(commands.Cog, name="Admin"):
             lines: list[str] = [f"{'Peer':<20} {'Status':<12}"]
             lines.append("-" * 32)
             for peer_name, peer_info in peers.items():
-                status = peer_info.get("status", "unknown") if isinstance(peer_info, dict) else str(peer_info)
+                status = (
+                    peer_info.get("status", "unknown")
+                    if isinstance(peer_info, dict)
+                    else str(peer_info)
+                )
                 lines.append(f"{peer_name:<20} {status:<12}")
 
             await ctx.reply(format_code_block("\n".join(lines)))
@@ -171,18 +175,13 @@ class AdminCog(commands.Cog, name="Admin"):
             # If the store has a delete/forget method, call it.
             if hasattr(self.bot.memory_store, "forget"):
                 await self.bot.memory_store.forget(topic)
-                await ctx.reply(
-                    f"Removed {len(results)} memory/memories related to: *{topic}*"
-                )
+                await ctx.reply(f"Removed {len(results)} memory/memories related to: *{topic}*")
             elif hasattr(self.bot.memory_store, "delete_facts"):
                 await self.bot.memory_store.delete_facts(topic)
-                await ctx.reply(
-                    f"Removed {len(results)} memory/memories related to: *{topic}*"
-                )
+                await ctx.reply(f"Removed {len(results)} memory/memories related to: *{topic}*")
             else:
                 await ctx.reply(
-                    "The memory store does not support deletion. "
-                    "Please remove memories manually."
+                    "The memory store does not support deletion. Please remove memories manually."
                 )
 
         except Exception as exc:

@@ -45,7 +45,9 @@ def _episode(
     )
 
 
-def _store_with_scored(*, subtask_id: str, age_ms: int, score: float, outcome=SubtaskState.COMPLETED):
+def _store_with_scored(
+    *, subtask_id: str, age_ms: int, score: float, outcome=SubtaskState.COMPLETED
+):
     eps = EpisodeStore()
     eps.record(_episode(subtask_id=subtask_id, age_ms=age_ms, critic_score=score, outcome=outcome))
     if outcome is not SubtaskState.REJECTED:
@@ -59,9 +61,7 @@ def _store_with_scored(*, subtask_id: str, age_ms: int, score: float, outcome=Su
 def test_25h_old_scored_episode_with_no_thumbs_writes_fallback():
     eps = _store_with_scored(subtask_id="s-1", age_ms=25 * 60 * 60 * 1000, score=0.8)
     rew = EpisodeRewardsStore()
-    written = sweep_critic_fallbacks(
-        episode_store=eps, rewards_store=rew, now_ms=NOW
-    )
+    written = sweep_critic_fallbacks(episode_store=eps, rewards_store=rew, now_ms=NOW)
     assert written == 1
     events = rew.events_for("s-1")
     assert len(events) == 1
@@ -74,9 +74,7 @@ def test_25h_old_scored_episode_with_no_thumbs_writes_fallback():
 def test_23h_old_scored_episode_is_skipped():
     eps = _store_with_scored(subtask_id="s-1", age_ms=23 * 60 * 60 * 1000, score=0.8)
     rew = EpisodeRewardsStore()
-    written = sweep_critic_fallbacks(
-        episode_store=eps, rewards_store=rew, now_ms=NOW
-    )
+    written = sweep_critic_fallbacks(episode_store=eps, rewards_store=rew, now_ms=NOW)
     assert written == 0
     assert rew.events_for("s-1") == []
 
@@ -90,9 +88,7 @@ def test_pre_existing_subtask_thumb_blocks_fallback():
         positive=True,
         recorded_at_ms=NOW - 12 * 60 * 60 * 1000,
     )
-    written = sweep_critic_fallbacks(
-        episode_store=eps, rewards_store=rew, now_ms=NOW
-    )
+    written = sweep_critic_fallbacks(episode_store=eps, rewards_store=rew, now_ms=NOW)
     assert written == 0
     sources = {e.source for e in rew.events_for("s-1")}
     assert RewardSource.CRITIC_FALLBACK not in sources
@@ -121,9 +117,7 @@ def test_rejected_episode_skipped():
     # Note: critic_status stays PENDING for REJECTED rows; the outcome guard
     # is what matters here.
     rew = EpisodeRewardsStore()
-    written = sweep_critic_fallbacks(
-        episode_store=eps, rewards_store=rew, now_ms=NOW
-    )
+    written = sweep_critic_fallbacks(episode_store=eps, rewards_store=rew, now_ms=NOW)
     assert written == 0
 
 
@@ -132,9 +126,7 @@ def test_critic_status_failed_skipped():
     eps.record(_episode(subtask_id="s-1", age_ms=25 * 60 * 60 * 1000, critic_score=0.0))
     eps.mark_critic_failed(subtask_id="s-1")
     rew = EpisodeRewardsStore()
-    written = sweep_critic_fallbacks(
-        episode_store=eps, rewards_store=rew, now_ms=NOW
-    )
+    written = sweep_critic_fallbacks(episode_store=eps, rewards_store=rew, now_ms=NOW)
     assert written == 0
 
 
@@ -143,9 +135,7 @@ def test_pending_critic_status_skipped():
     eps = EpisodeStore()
     eps.record(_episode(subtask_id="s-1", age_ms=25 * 60 * 60 * 1000, critic_score=0.0))
     rew = EpisodeRewardsStore()
-    written = sweep_critic_fallbacks(
-        episode_store=eps, rewards_store=rew, now_ms=NOW
-    )
+    written = sweep_critic_fallbacks(episode_store=eps, rewards_store=rew, now_ms=NOW)
     assert written == 0
 
 

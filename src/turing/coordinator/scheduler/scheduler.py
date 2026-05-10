@@ -28,9 +28,7 @@ class Subtask:
 
 
 class Scheduler:
-    def pick(
-        self, subtask: Subtask, registry: CapabilityRegistry
-    ) -> CapabilityManifest | None:
+    def pick(self, subtask: Subtask, registry: CapabilityRegistry) -> CapabilityManifest | None:
         candidates = registry.find_workers(
             specialty=subtask.specialty_required,
             required_tools=subtask.required_tools,

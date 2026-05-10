@@ -87,9 +87,7 @@ def test_parse_critic_score_round_trip() -> None:
         {"correctness": 0.8, "efficiency": 0.6, "specialty_fit": 0.7, "critique": "ok"}
     )
     score = parse_critic_score(raw)
-    assert score == CriticScore(
-        correctness=0.8, efficiency=0.6, specialty_fit=0.7, critique="ok"
-    )
+    assert score == CriticScore(correctness=0.8, efficiency=0.6, specialty_fit=0.7, critique="ok")
 
 
 # ── RemoteCritic round-trip ───────────────────────────────────────────
@@ -131,9 +129,7 @@ async def test_remote_critic_dispatches_kind_critic_score_and_returns_score():
 
     await judge_t.subscribe(f"subtasks.{JUDGE_SPECIALTY}", judge_handler)
 
-    client = SubtaskDispatchClient(
-        transport=coord, sender_id="coordinator", now_ms=lambda: 1_000
-    )
+    client = SubtaskDispatchClient(transport=coord, sender_id="coordinator", now_ms=lambda: 1_000)
     critic = RemoteCritic(dispatch_client=client, now_ms=lambda: 1_000)
 
     score = await critic.score(_episode())
@@ -180,9 +176,7 @@ async def test_judge_handler_calls_judge_fn_for_non_empty_output():
 
     async def judge_fn(payload: dict[str, object]) -> CriticScore:
         seen.append(payload)
-        return CriticScore(
-            correctness=0.6, efficiency=0.5, specialty_fit=0.7, critique="meh"
-        )
+        return CriticScore(correctness=0.6, efficiency=0.5, specialty_fit=0.7, critique="meh")
 
     handler = make_critic_handler(judge_fn)
 

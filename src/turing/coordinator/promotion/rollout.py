@@ -107,10 +107,7 @@ class RolloutCoordinator:
             )
 
         self._confirmed.add(report.worker_id)
-        if (
-            self._state is RolloutState.STAGED
-            and report.worker_id == self.canary_worker
-        ):
+        if self._state is RolloutState.STAGED and report.worker_id == self.canary_worker:
             self._state = RolloutState.FLEET_ROLLOUT
         if self._confirmed >= set(self._fleet):
             self._state = RolloutState.COMPLETED

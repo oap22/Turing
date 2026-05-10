@@ -99,7 +99,7 @@ class TrainingJobApprovalView(discord.ui.View):
     def __init__(
         self,
         *,
-        proposal: "TrainingJobProposal",
+        proposal: TrainingJobProposal,
         authorized_user_id: int,
         timeout: float = 60.0,
     ) -> None:

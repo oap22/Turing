@@ -18,7 +18,7 @@ class GoalsRegistry:
     goals: tuple[Goal, ...]
 
     @classmethod
-    def load(cls, path: Path) -> "GoalsRegistry":
+    def load(cls, path: Path) -> GoalsRegistry:
         raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
         if not isinstance(raw, dict) or "goals" not in raw:
             raise ValueError("goals.yaml must be a mapping with a 'goals' list")

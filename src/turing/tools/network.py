@@ -133,7 +133,7 @@ class NetworkTool(Tool):
                 output=output,
                 error=stderr_text if not success else "",
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return ToolResult(success=False, output="", error=f"Ping to {safe_host} timed out")
 
     async def _http_request(self, **kwargs: Any) -> ToolResult:
@@ -246,7 +246,7 @@ class NetworkTool(Tool):
                 success=True,
                 output=f"Port {port} on {host} is OPEN",
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return ToolResult(
                 success=False,
                 output=f"Port {port} on {host} is CLOSED or FILTERED (timeout)",

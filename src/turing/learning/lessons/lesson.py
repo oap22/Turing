@@ -56,8 +56,7 @@ class Lesson:
         version = raw.get("schema_version")
         if version != CURRENT_LESSON_SCHEMA_VERSION:
             raise LessonSchemaError(
-                f"lesson schema_version {version!r} does not match "
-                f"{CURRENT_LESSON_SCHEMA_VERSION}"
+                f"lesson schema_version {version!r} does not match {CURRENT_LESSON_SCHEMA_VERSION}"
             )
         pinned_raw = raw.get("pinned_until_ms")
         return cls(

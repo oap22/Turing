@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from turing.tools.shell import DENY_PATTERNS, ShellTool
+from turing.tools.shell import ShellTool
 
 
 @pytest.fixture()
@@ -215,7 +214,9 @@ class TestToolProperties:
         assert shell_tool.name == "shell"
 
     def test_description(self, shell_tool: ShellTool):
-        assert "shell" in shell_tool.description.lower() or "command" in shell_tool.description.lower()
+        assert (
+            "shell" in shell_tool.description.lower() or "command" in shell_tool.description.lower()
+        )
 
     def test_parameters_schema(self, shell_tool: ShellTool):
         params = shell_tool.parameters

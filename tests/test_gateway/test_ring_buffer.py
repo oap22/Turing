@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from turing.gateway.ring_buffer import RingBuffer, RingBufferConfig
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _evt(
@@ -69,9 +70,7 @@ class TestAppendAndQuery:
         assert [r["event_type"] for r in rows] == ["llm.complete.end"]
 
     @pytest.mark.asyncio
-    async def test_query_filters_since_timestamp(
-        self, buffer: RingBuffer
-    ) -> None:
+    async def test_query_filters_since_timestamp(self, buffer: RingBuffer) -> None:
         await buffer.append(_evt(timestamp_ms=100))
         await buffer.append(_evt(timestamp_ms=200))
         await buffer.append(_evt(timestamp_ms=300))
@@ -79,12 +78,8 @@ class TestAppendAndQuery:
         assert sorted(r["timestamp_ms"] for r in rows) == [200, 300]
 
     @pytest.mark.asyncio
-    async def test_query_returns_payload_intact(
-        self, buffer: RingBuffer
-    ) -> None:
-        await buffer.append(
-            _evt(timestamp_ms=1, payload={"provider": "cloud", "model": "claude"})
-        )
+    async def test_query_returns_payload_intact(self, buffer: RingBuffer) -> None:
+        await buffer.append(_evt(timestamp_ms=1, payload={"provider": "cloud", "model": "claude"}))
         rows = await buffer.query()
         assert rows[0]["payload"] == {"provider": "cloud", "model": "claude"}
 
@@ -94,9 +89,7 @@ class TestAppendAndQuery:
 
 class TestTtlPrune:
     @pytest.mark.asyncio
-    async def test_prune_removes_events_older_than_retention(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_prune_removes_events_older_than_retention(self, tmp_path: Path) -> None:
         cfg = RingBufferConfig(
             path=tmp_path / "t.db",
             retention_seconds=10,  # 10s
@@ -121,9 +114,7 @@ class TestTtlPrune:
 
 class TestFifoEviction:
     @pytest.mark.asyncio
-    async def test_oldest_rows_dropped_when_cap_exceeded(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_oldest_rows_dropped_when_cap_exceeded(self, tmp_path: Path) -> None:
         # Tight cap: each row's payload is a few hundred bytes so a handful
         # easily blows the budget.
         cfg = RingBufferConfig(

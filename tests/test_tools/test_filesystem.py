@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 import pytest
 
 from turing.tools.filesystem import FileSystemTool
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.fixture()

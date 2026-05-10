@@ -12,7 +12,6 @@ output is JSON: `{"correctness", "efficiency", "specialty_fit", "critique"}`.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from turing.coordinator.dispatch import (
@@ -24,6 +23,8 @@ from turing.learning.critic.critic import CriticScore
 from turing.learning.critic.truncate import truncate_episode
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from turing.coordinator.dispatch import SubtaskDispatchClient
     from turing.coordinator.lifecycle.episode_store import Episode
 
@@ -72,9 +73,7 @@ class RemoteCritic:
         self._client = dispatch_client
         self._now_ms = now_ms
         self._deadline_budget = deadline_ms_budget
-        self._make_subtask_id = subtask_id_factory or (
-            lambda ep: f"critic-{ep.subtask_id}"
-        )
+        self._make_subtask_id = subtask_id_factory or (lambda ep: f"critic-{ep.subtask_id}")
 
     async def score(self, episode: Episode) -> CriticScore:
         payload = episode_to_judge_payload(episode)

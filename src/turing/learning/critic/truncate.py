@@ -40,12 +40,9 @@ def truncate_episode(episode: Episode) -> Episode:
     boundary; the canonical ``EpisodeStore`` row stays untouched.
     """
     truncated_trajectory = tuple(
-        _truncate_field(step, head_tail=STEP_HEAD_TAIL_BYTES)
-        for step in episode.trajectory
+        _truncate_field(step, head_tail=STEP_HEAD_TAIL_BYTES) for step in episode.trajectory
     )
-    truncated_output = _truncate_field(
-        episode.output_text, head_tail=OUTPUT_HEAD_TAIL_BYTES
-    )
+    truncated_output = _truncate_field(episode.output_text, head_tail=OUTPUT_HEAD_TAIL_BYTES)
     return replace(
         episode,
         trajectory=truncated_trajectory,

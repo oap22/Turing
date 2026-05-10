@@ -118,9 +118,7 @@ class CriticQueue:
                     exc,
                 )
                 if attempt < self._max_attempts:
-                    backoff = self._backoffs[
-                        min(attempt - 1, len(self._backoffs) - 1)
-                    ]
+                    backoff = self._backoffs[min(attempt - 1, len(self._backoffs) - 1)]
                     if backoff > 0:
                         await asyncio.sleep(backoff)
                 continue

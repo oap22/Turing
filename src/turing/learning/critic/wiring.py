@@ -67,9 +67,7 @@ async def backfill_pending_critic(
     """
     seen = already_enqueued if already_enqueued is not None else set()
     pushed = 0
-    for episode in episode_store.backfill_unscored(
-        now_ms=now_ms, horizon_ms=horizon_ms
-    ):
+    for episode in episode_store.backfill_unscored(now_ms=now_ms, horizon_ms=horizon_ms):
         if episode.subtask_id in seen:
             continue
         await critic_queue.enqueue(episode)

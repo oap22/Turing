@@ -41,7 +41,14 @@ class TrainingJob:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> TrainingJob:
-        for field in ("job_id", "dataset_url", "dataset_sha256", "base_model", "method", "hyperparameters"):
+        for field in (
+            "job_id",
+            "dataset_url",
+            "dataset_sha256",
+            "base_model",
+            "method",
+            "hyperparameters",
+        ):
             if field not in raw:
                 raise TrainingJobValidationError(f"missing required field {field!r}")
         if raw["method"] not in ALLOWED_METHODS:

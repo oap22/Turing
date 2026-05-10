@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import glob as globmod
-import os
 from pathlib import Path
 from typing import Any
 
@@ -146,7 +145,9 @@ class FileSystemTool(Tool):
         filepath.parent.mkdir(parents=True, exist_ok=True)
         filepath.write_text(content, encoding="utf-8")
         logger.info("file_written", path=str(filepath), size=len(content))
-        return ToolResult(success=True, output=f"Successfully wrote {len(content)} bytes to {filepath}")
+        return ToolResult(
+            success=True, output=f"Successfully wrote {len(content)} bytes to {filepath}"
+        )
 
     async def _list_directory(self, path_str: str, **_kwargs: Any) -> ToolResult:
         """List the contents of a directory."""

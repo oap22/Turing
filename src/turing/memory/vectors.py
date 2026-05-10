@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import struct
-from typing import Any
+from typing import TYPE_CHECKING
 
-import aiosqlite
 import structlog
+
+if TYPE_CHECKING:
+    import aiosqlite
 
 logger = structlog.get_logger(__name__)
 
@@ -53,8 +55,7 @@ class VectorStore:
             await db.enable_load_extension(False)
         except Exception:
             logger.warning(
-                "sqlite-vec extension could not be loaded. "
-                "Semantic search will be unavailable.",
+                "sqlite-vec extension could not be loaded. Semantic search will be unavailable.",
                 exc_info=True,
             )
             return

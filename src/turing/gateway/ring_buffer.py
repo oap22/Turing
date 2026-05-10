@@ -18,7 +18,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import aiosqlite
 
@@ -54,7 +54,7 @@ CREATE INDEX IF NOT EXISTS idx_telemetry_event_type
 class RingBuffer:
     def __init__(self, config: RingBufferConfig) -> None:
         self._config = config
-        self._db: Optional[aiosqlite.Connection] = None
+        self._db: aiosqlite.Connection | None = None
 
     # ── lifecycle ──────────────────────────────────────────────────────
 
@@ -134,7 +134,7 @@ class RingBuffer:
 
     # ── pruning ────────────────────────────────────────────────────────
 
-    async def prune(self, *, now_ms: Optional[int] = None) -> int:
+    async def prune(self, *, now_ms: int | None = None) -> int:
         assert self._db is not None
         cutoff_ms = (now_ms if now_ms is not None else int(time.time() * 1000)) - (
             self._config.retention_seconds * 1000
@@ -151,14 +151,14 @@ class RingBuffer:
     async def query(
         self,
         *,
-        node_name: Optional[str] = None,
-        event_type: Optional[str] = None,
-        node_names: Optional[tuple[str, ...]] = None,
-        event_types: Optional[tuple[str, ...]] = None,
-        since_ms: Optional[int] = None,
-        min_duration_ms: Optional[float] = None,
-        limit: Optional[int] = None,
-        offset: Optional[int] = None,
+        node_name: str | None = None,
+        event_type: str | None = None,
+        node_names: tuple[str, ...] | None = None,
+        event_types: tuple[str, ...] | None = None,
+        since_ms: int | None = None,
+        min_duration_ms: float | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
     ) -> list[dict[str, Any]]:
         """Filter telemetry rows.
 

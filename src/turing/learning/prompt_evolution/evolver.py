@@ -7,14 +7,17 @@ story 66 — the new module's job is orchestration, not extraction.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import structlog
 
-from turing.coordinator.lifecycle.episode_store import EpisodeStore
 from turing.learning.prompt_evolution.promotion_gate import PromotionDecision
-from turing.learning.prompt_evolution.registry import PromptVersionRegistry
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from turing.coordinator.lifecycle.episode_store import EpisodeStore
+    from turing.learning.prompt_evolution.registry import PromptVersionRegistry
 
 logger = structlog.get_logger(__name__)
 

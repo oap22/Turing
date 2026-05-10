@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from typing import AsyncIterator
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -12,13 +11,11 @@ from turing.llm.base import (
     LLMResponse,
     Message,
     Role,
-    ToolCall,
     ToolDefinition,
 )
-from turing.llm.classifier import Complexity, ComplexityClassifier
+from turing.llm.classifier import ComplexityClassifier
 from turing.llm.router import LLMRouter
 from turing.telemetry.bus import Telemetry, TelemetryEvent
-
 
 # ── fixtures ──────────────────────────────────────────────────────────
 
@@ -128,9 +125,7 @@ class TestFallback:
         cloud_provider.complete.side_effect = RuntimeError("API error")
         router = LLMRouter(cloud_provider, local_provider, classifier, "auto")
         with pytest.raises(RuntimeError, match="API error"):
-            await router.route(
-                [_user_msg("Analyze and explain the entire system architecture")]
-            )
+            await router.route([_user_msg("Analyze and explain the entire system architecture")])
 
 
 # ── explicit modes ───────────────────────────────────────────────────
@@ -158,9 +153,7 @@ class TestExplicitModes:
         local_provider: AsyncMock,
     ) -> None:
         router = LLMRouter(cloud_provider, local_provider, routing_mode="local_only")
-        response = await router.route(
-            [_user_msg("Analyze this complex problem in detail")]
-        )
+        response = await router.route([_user_msg("Analyze this complex problem in detail")])
         assert response.content == "local response"
         local_provider.complete.assert_awaited_once()
         cloud_provider.complete.assert_not_awaited()

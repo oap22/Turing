@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,6 +11,9 @@ from fastapi.testclient import TestClient
 from turing.gateway.app import create_app
 from turing.gateway.auth import GatewayAuth
 from turing.gateway.ring_buffer import RingBuffer, RingBufferConfig
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _evt(
@@ -44,11 +45,51 @@ async def populated_buffer(tmp_path: Path):
     buf = RingBuffer(cfg)
     await buf.open()
     # Seed: 5 events across 2 nodes, 2 event types, varying durations.
-    await buf.append(_evt(timestamp_ms=1000, node_name="pi-alpha", event_type="tool.dispatch.end", duration_ms=10, seq=1))
-    await buf.append(_evt(timestamp_ms=2000, node_name="pi-alpha", event_type="llm.complete.end", duration_ms=200, seq=1))
-    await buf.append(_evt(timestamp_ms=3000, node_name="pi-beta", event_type="tool.dispatch.end", duration_ms=50, seq=1))
-    await buf.append(_evt(timestamp_ms=4000, node_name="pi-beta", event_type="llm.complete.end", duration_ms=900, seq=2))
-    await buf.append(_evt(timestamp_ms=5000, node_name="pi-alpha", event_type="memory.retrieve.end", duration_ms=30, seq=1))
+    await buf.append(
+        _evt(
+            timestamp_ms=1000,
+            node_name="pi-alpha",
+            event_type="tool.dispatch.end",
+            duration_ms=10,
+            seq=1,
+        )
+    )
+    await buf.append(
+        _evt(
+            timestamp_ms=2000,
+            node_name="pi-alpha",
+            event_type="llm.complete.end",
+            duration_ms=200,
+            seq=1,
+        )
+    )
+    await buf.append(
+        _evt(
+            timestamp_ms=3000,
+            node_name="pi-beta",
+            event_type="tool.dispatch.end",
+            duration_ms=50,
+            seq=1,
+        )
+    )
+    await buf.append(
+        _evt(
+            timestamp_ms=4000,
+            node_name="pi-beta",
+            event_type="llm.complete.end",
+            duration_ms=900,
+            seq=2,
+        )
+    )
+    await buf.append(
+        _evt(
+            timestamp_ms=5000,
+            node_name="pi-alpha",
+            event_type="memory.retrieve.end",
+            duration_ms=30,
+            seq=1,
+        )
+    )
     yield buf
     await buf.close()
 
@@ -72,9 +113,7 @@ class TestAuth:
         assert r.status_code == 401
 
     def test_correct_token_returns_200(self, client: TestClient) -> None:
-        r = client.get(
-            "/api/events", headers={"Authorization": "Bearer secret"}
-        )
+        r = client.get("/api/events", headers={"Authorization": "Bearer secret"})
         assert r.status_code == 200
 
 

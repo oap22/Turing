@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -116,14 +116,13 @@ class TestErrorPaths:
 
 
 class TestMainSmoke:
-    def test_main_returns_nonzero_on_auth_failure(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_main_returns_nonzero_on_auth_failure(self, capsys: pytest.CaptureFixture[str]) -> None:
         from turing.launcher import main
 
         http = _FakeHTTP(_FakeResponse(401))
-        with patch("turing.launcher._build_http_get", return_value=http.get), patch(
-            "turing.launcher._open_browser", lambda _u: None
+        with (
+            patch("turing.launcher._build_http_get", return_value=http.get),
+            patch("turing.launcher._open_browser", lambda _u: None),
         ):
             exit_code = main(
                 argv=[
@@ -139,14 +138,13 @@ class TestMainSmoke:
         captured = capsys.readouterr()
         assert "401" in captured.err or "unauthorized" in captured.err.lower()
 
-    def test_main_returns_zero_on_success(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_main_returns_zero_on_success(self, capsys: pytest.CaptureFixture[str]) -> None:
         from turing.launcher import main
 
         http = _FakeHTTP(_FakeResponse(200))
-        with patch("turing.launcher._build_http_get", return_value=http.get), patch(
-            "turing.launcher._open_browser", lambda _u: None
+        with (
+            patch("turing.launcher._build_http_get", return_value=http.get),
+            patch("turing.launcher._open_browser", lambda _u: None),
         ):
             exit_code = main(
                 argv=[

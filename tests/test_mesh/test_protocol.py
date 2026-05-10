@@ -33,13 +33,15 @@ class TestMeshMessageSerialization:
 
     def test_deserialize_task_request(self):
         """Test deserializing a TASK_REQUEST message."""
-        raw = json.dumps({
-            "type": "task_request",
-            "sender_id": "node-1",
-            "sender_name": "pi-alpha",
-            "payload": {"task": "check disk"},
-            "request_id": "req-002",
-        })
+        raw = json.dumps(
+            {
+                "type": "task_request",
+                "sender_id": "node-1",
+                "sender_name": "pi-alpha",
+                "payload": {"task": "check disk"},
+                "request_id": "req-002",
+            }
+        )
         msg = MeshMessage.from_json(raw)
 
         assert msg.type == MessageType.TASK_REQUEST
@@ -88,21 +90,25 @@ class TestMeshMessageSerialization:
 
     def test_deserialize_missing_payload(self):
         """Test deserializing when payload is absent."""
-        raw = json.dumps({
-            "type": "heartbeat",
-            "sender_id": "node-1",
-            "sender_name": "pi-alpha",
-        })
+        raw = json.dumps(
+            {
+                "type": "heartbeat",
+                "sender_id": "node-1",
+                "sender_name": "pi-alpha",
+            }
+        )
         msg = MeshMessage.from_json(raw)
         assert msg.payload == {}
 
     def test_deserialize_missing_request_id(self):
         """Test deserializing when request_id is absent (a new one is generated)."""
-        raw = json.dumps({
-            "type": "status_query",
-            "sender_id": "node-1",
-            "sender_name": "pi-alpha",
-        })
+        raw = json.dumps(
+            {
+                "type": "status_query",
+                "sender_id": "node-1",
+                "sender_name": "pi-alpha",
+            }
+        )
         msg = MeshMessage.from_json(raw)
         assert msg.request_id is not None
         assert len(msg.request_id) > 0
@@ -152,38 +158,46 @@ class TestInvalidJSON:
 
     def test_missing_required_field_type(self):
         """Test that missing 'type' field raises an error."""
-        raw = json.dumps({
-            "sender_id": "node-1",
-            "sender_name": "pi-alpha",
-        })
+        raw = json.dumps(
+            {
+                "sender_id": "node-1",
+                "sender_name": "pi-alpha",
+            }
+        )
         with pytest.raises(KeyError):
             MeshMessage.from_json(raw)
 
     def test_missing_required_field_sender_id(self):
         """Test that missing 'sender_id' field raises an error."""
-        raw = json.dumps({
-            "type": "heartbeat",
-            "sender_name": "pi-alpha",
-        })
+        raw = json.dumps(
+            {
+                "type": "heartbeat",
+                "sender_name": "pi-alpha",
+            }
+        )
         with pytest.raises(KeyError):
             MeshMessage.from_json(raw)
 
     def test_missing_required_field_sender_name(self):
         """Test that missing 'sender_name' field raises an error."""
-        raw = json.dumps({
-            "type": "heartbeat",
-            "sender_id": "node-1",
-        })
+        raw = json.dumps(
+            {
+                "type": "heartbeat",
+                "sender_id": "node-1",
+            }
+        )
         with pytest.raises(KeyError):
             MeshMessage.from_json(raw)
 
     def test_invalid_message_type(self):
         """Test that an invalid message type raises ValueError."""
-        raw = json.dumps({
-            "type": "invalid_type",
-            "sender_id": "node-1",
-            "sender_name": "pi-alpha",
-        })
+        raw = json.dumps(
+            {
+                "type": "invalid_type",
+                "sender_id": "node-1",
+                "sender_name": "pi-alpha",
+            }
+        )
         with pytest.raises(ValueError):
             MeshMessage.from_json(raw)
 
@@ -211,13 +225,15 @@ class TestByteSerialization:
 
     def test_from_bytes(self):
         """Test deserializing from bytes."""
-        raw = json.dumps({
-            "type": "status_response",
-            "sender_id": "node-2",
-            "sender_name": "pi-beta",
-            "payload": {"status": "online"},
-            "request_id": "req-100",
-        }).encode("utf-8")
+        raw = json.dumps(
+            {
+                "type": "status_response",
+                "sender_id": "node-2",
+                "sender_name": "pi-beta",
+                "payload": {"status": "online"},
+                "request_id": "req-100",
+            }
+        ).encode("utf-8")
         msg = MeshMessage.from_bytes(raw)
         assert msg.type == MessageType.STATUS_RESPONSE
         assert msg.sender_id == "node-2"

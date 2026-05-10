@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 from turing.coordinator.adapters.registry import AdapterRegistry
 from turing.learning.trainer import (
@@ -24,6 +24,9 @@ from turing.learning.trainer import (
     TrainingJob,
 )
 from turing.transport.signer import MessageSigner
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _job(*, dataset_path: Path) -> TrainingJob:
@@ -52,26 +55,19 @@ def _stub_backend(*, job: TrainingJob, dataset_path: Path, out_path: Path) -> by
 
 def test_mlx_trainer_writes_adapter_to_artifact_dir(tmp_path: Path) -> None:
     dataset = tmp_path / "ds.jsonl"
-    dataset.write_text(
-        json.dumps({"input": "i", "output": "o"}) + "\n", encoding="utf-8"
-    )
+    dataset.write_text(json.dumps({"input": "i", "output": "o"}) + "\n", encoding="utf-8")
     artifact_dir = tmp_path / "out"
     trainer = MLXLoraTrainer(backend=_stub_backend, dataset_path=dataset)
     result = trainer.train(_job(dataset_path=dataset), artifact_dir=artifact_dir)
     assert result.adapter_path.exists()
     assert result.adapter_path.parent == artifact_dir
     # The sha256 in the result actually corresponds to the bytes on disk.
-    assert (
-        result.sha256
-        == hashlib.sha256(result.adapter_path.read_bytes()).hexdigest()
-    )
+    assert result.sha256 == hashlib.sha256(result.adapter_path.read_bytes()).hexdigest()
 
 
 def test_publisher_signs_manifest_registry_accepts(tmp_path: Path) -> None:
     dataset = tmp_path / "ds.jsonl"
-    dataset.write_text(
-        json.dumps({"input": "i", "output": "o"}) + "\n", encoding="utf-8"
-    )
+    dataset.write_text(json.dumps({"input": "i", "output": "o"}) + "\n", encoding="utf-8")
     artifact_dir = tmp_path / "out"
     trainer = MLXLoraTrainer(backend=_stub_backend, dataset_path=dataset)
     result = trainer.train(_job(dataset_path=dataset), artifact_dir=artifact_dir)
@@ -80,9 +76,7 @@ def test_publisher_signs_manifest_registry_accepts(tmp_path: Path) -> None:
     publisher = TrainerPublisher(
         signer=signer, object_store=InMemoryObjectStore(), facility_name="mbp"
     )
-    manifest = publisher.publish(
-        _job(dataset_path=dataset), result, version="v1"
-    )
+    manifest = publisher.publish(_job(dataset_path=dataset), result, version="v1")
 
     registry = AdapterRegistry(
         worker_base_model="qwen2.5-7b",

@@ -20,22 +20,17 @@ def client() -> TestClient:
 
 class TestWebSocketAuth:
     def test_ws_without_token_is_rejected(self, client: TestClient) -> None:
-        with pytest.raises(WebSocketDisconnect):
-            with client.websocket_connect("/ws") as ws:
-                ws.receive_text()
+        with pytest.raises(WebSocketDisconnect), client.websocket_connect("/ws") as ws:
+            ws.receive_text()
 
     def test_ws_with_wrong_token_is_rejected(self, client: TestClient) -> None:
         with pytest.raises(WebSocketDisconnect):
-            with client.websocket_connect(
-                "/ws", headers={"Authorization": "Bearer wrong"}
-            ) as ws:
+            with client.websocket_connect("/ws", headers={"Authorization": "Bearer wrong"}) as ws:
                 ws.receive_text()
 
 
 class TestWebSocketHelloFrame:
-    def test_handshake_succeeds_with_correct_token(
-        self, client: TestClient
-    ) -> None:
+    def test_handshake_succeeds_with_correct_token(self, client: TestClient) -> None:
         with client.websocket_connect(
             "/ws", headers={"Authorization": "Bearer secret-token"}
         ) as ws:

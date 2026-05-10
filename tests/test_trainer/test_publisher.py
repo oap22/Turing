@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -14,6 +14,9 @@ from turing.learning.trainer.object_store import InMemoryObjectStore
 from turing.learning.trainer.publisher import TrainerPublisher
 from turing.learning.trainer.runner import TrainingResult
 from turing.transport.signer import MessageSigner
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _job() -> TrainingJob:
@@ -41,24 +44,18 @@ class TestPublish:
     def test_uploads_blob_and_returns_signed_manifest(self, tmp_path: Path) -> None:
         signer = MessageSigner.generate()
         store = InMemoryObjectStore()
-        publisher = TrainerPublisher(
-            signer=signer, object_store=store, facility_name="dgx-1"
-        )
+        publisher = TrainerPublisher(signer=signer, object_store=store, facility_name="dgx-1")
         manifest = publisher.publish(_job(), _result(tmp_path), version="1.0.0")
 
         assert isinstance(manifest, AdapterManifest)
         assert manifest.signer_public_key == signer.public_key
         # Blob is uploaded under a deterministic key
-        assert manifest.sha256 in store.keys()
+        assert manifest.sha256 in store.keys()  # noqa: SIM118
 
-    def test_manifest_passes_adapter_registry_verification(
-        self, tmp_path: Path
-    ) -> None:
+    def test_manifest_passes_adapter_registry_verification(self, tmp_path: Path) -> None:
         signer = MessageSigner.generate()
         store = InMemoryObjectStore()
-        publisher = TrainerPublisher(
-            signer=signer, object_store=store, facility_name="dgx-1"
-        )
+        publisher = TrainerPublisher(signer=signer, object_store=store, facility_name="dgx-1")
         manifest = publisher.publish(_job(), _result(tmp_path), version="1.0.0")
 
         registry = AdapterRegistry(
@@ -96,9 +93,7 @@ class TestFacilityKeyIsolation:
         signer = MessageSigner.generate()
         other = MessageSigner.generate()
         store = InMemoryObjectStore()
-        publisher = TrainerPublisher(
-            signer=signer, object_store=store, facility_name="dgx-1"
-        )
+        publisher = TrainerPublisher(signer=signer, object_store=store, facility_name="dgx-1")
         manifest = publisher.publish(_job(), _result(tmp_path), version="1.0.0")
 
         # Worker only trusts a different key — must reject this manifest.

@@ -60,9 +60,8 @@ def test_promote_records_canary_eval_score() -> None:
 
     reg.promote(name=manifest.name, version=manifest.version, canary_eval_score=72.4)
 
-    assert (
-        reg.canary_eval_score_of(name=manifest.name, version=manifest.version)
-        == pytest.approx(72.4)
+    assert reg.canary_eval_score_of(name=manifest.name, version=manifest.version) == pytest.approx(
+        72.4
     )
 
 
@@ -72,10 +71,7 @@ def test_canary_eval_score_unset_for_staged_adapter() -> None:
     manifest, blob = _make_manifest(signer)
     reg.register(manifest, blob)
     # Not yet promoted → no canary score recorded.
-    assert (
-        reg.canary_eval_score_of(name=manifest.name, version=manifest.version)
-        is None
-    )
+    assert reg.canary_eval_score_of(name=manifest.name, version=manifest.version) is None
 
 
 def test_canary_eval_score_for_unknown_adapter_raises() -> None:
@@ -97,14 +93,10 @@ def test_prior_live_canary_score_lookup_for_specialty() -> None:
     reg.register(manifest, blob)
     reg.promote(name="research-summarize", version="1.0.0", canary_eval_score=70.0)
 
-    assert reg.prior_live_canary_score(name="research-summarize") == pytest.approx(
-        70.0
-    )
+    assert reg.prior_live_canary_score(name="research-summarize") == pytest.approx(70.0)
 
     # When v2 promotes, prior_live points at the most-recent LIVE.
     manifest_v2, blob_v2 = _make_manifest(signer, version="2.0.0")
     reg.register(manifest_v2, blob_v2)
     reg.promote(name="research-summarize", version="2.0.0", canary_eval_score=72.5)
-    assert reg.prior_live_canary_score(name="research-summarize") == pytest.approx(
-        72.5
-    )
+    assert reg.prior_live_canary_score(name="research-summarize") == pytest.approx(72.5)

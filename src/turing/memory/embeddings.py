@@ -5,8 +5,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    import onnxruntime
+    import tokenizers
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +32,8 @@ class EmbeddingModel:
 
     def __init__(self, model_path: str | Path | None = None) -> None:
         self._model_path = Path(model_path) if model_path else None
-        self._session: "onnxruntime.InferenceSession | None" = None  # type: ignore[name-defined]
-        self._tokenizer: "tokenizers.Tokenizer | None" = None  # type: ignore[name-defined]
+        self._session: onnxruntime.InferenceSession | None = None
+        self._tokenizer: tokenizers.Tokenizer | None = None
         self._ready: bool = False
         self._warned: bool = False
 
@@ -42,12 +47,10 @@ class EmbeddingModel:
     def _load_model(self) -> None:
         """Synchronously load the ONNX session and HuggingFace tokenizer."""
         try:
-            from tokenizers import Tokenizer  # type: ignore[import-untyped]
             import onnxruntime as ort  # type: ignore[import-untyped]
+            from tokenizers import Tokenizer  # type: ignore[import-untyped]
         except ImportError:
-            logger.warning(
-                "onnxruntime or tokenizers not installed. Vector search disabled."
-            )
+            logger.warning("onnxruntime or tokenizers not installed. Vector search disabled.")
             return
 
         model_path = self._model_path

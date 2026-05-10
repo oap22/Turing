@@ -12,11 +12,14 @@ entry point so tests can advance the clock deterministically.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Callable, Optional
+from typing import TYPE_CHECKING
 
-from turing.coordinator.workspace.client import WorkspaceClient
 from turing.coordinator.workspace.ref import WorkspaceRef
+
+if TYPE_CHECKING:
+    from turing.coordinator.workspace.client import WorkspaceClient
 
 ArchiveFn = Callable[[WorkspaceRef, bytes], None]
 
@@ -27,7 +30,7 @@ class WorkspaceGC:
         *,
         client: WorkspaceClient,
         retention_hours: int,
-        archive: Optional[ArchiveFn] = None,
+        archive: ArchiveFn | None = None,
     ) -> None:
         self._client = client
         self._retention = timedelta(hours=retention_hours)

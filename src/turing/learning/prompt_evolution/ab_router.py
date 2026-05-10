@@ -8,8 +8,10 @@ the gate's win-rate measurement.
 from __future__ import annotations
 
 import hashlib
+from typing import TYPE_CHECKING
 
-from turing.learning.prompt_evolution.registry import PromptVersionRegistry
+if TYPE_CHECKING:
+    from turing.learning.prompt_evolution.registry import PromptVersionRegistry
 
 
 class ABRouter:
@@ -20,9 +22,7 @@ class ABRouter:
         candidate_share: float,
     ) -> None:
         if not 0.0 <= candidate_share <= 1.0:
-            raise ValueError(
-                f"candidate_share must be in [0, 1], got {candidate_share!r}"
-            )
+            raise ValueError(f"candidate_share must be in [0, 1], got {candidate_share!r}")
         self._registry = registry
         self._share = candidate_share
 
@@ -36,6 +36,6 @@ class ABRouter:
         if self._share >= 1.0:
             return candidate
         # Deterministic hash on task_id keeps retries on the same arm.
-        digest = hashlib.sha256(f"{specialty}:{task_id}".encode("utf-8")).digest()
+        digest = hashlib.sha256(f"{specialty}:{task_id}".encode()).digest()
         bucket = int.from_bytes(digest[:8], "big") / 2**64
         return candidate if bucket < self._share else baseline

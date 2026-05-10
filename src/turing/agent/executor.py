@@ -8,12 +8,12 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from turing.agent.safety import SafetyDecision
-from turing.llm.base import ToolCall
 from turing.tools.base import ToolResult
 
 if TYPE_CHECKING:
     from turing.agent.safety import SafetyGate
     from turing.discord_bot.bot import TuringBot
+    from turing.llm.base import ToolCall
     from turing.tools.base import ToolRegistry
 
 logger = structlog.get_logger("turing.agent.executor")
@@ -205,8 +205,7 @@ class Executor:
                 return False
 
             await channel.send(  # type: ignore[union-attr]
-                f"**Confirmation required**: {reason}\n"
-                f"Action: `{action_desc}`",
+                f"**Confirmation required**: {reason}\nAction: `{action_desc}`",
                 view=view,
             )
 

@@ -8,6 +8,7 @@ lands in slice 2, the only sink is a structlog debug logger.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from collections.abc import Callable
@@ -63,10 +64,8 @@ class Telemetry:
         self._sinks.append(sink)
 
     def remove_sink(self, sink: EventSink) -> None:
-        try:
+        with contextlib.suppress(ValueError):
             self._sinks.remove(sink)
-        except ValueError:
-            pass
 
 
 def _structlog_sink(event: TelemetryEvent) -> None:

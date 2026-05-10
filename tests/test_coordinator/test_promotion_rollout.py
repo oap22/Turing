@@ -40,9 +40,7 @@ def test_canary_confirmation_advances_to_fleet_rollout() -> None:
         notifier=_RecordingNotifier(),
         regression_threshold=0.05,
     )
-    coord.report_live_eval(
-        LiveEvalReport(worker_id="w1", score=0.73, version="rs@v2")
-    )
+    coord.report_live_eval(LiveEvalReport(worker_id="w1", score=0.73, version="rs@v2"))
     assert coord.state is RolloutState.FLEET_ROLLOUT
     # Remaining workers are queued.
     assert set(coord.pending_workers()) == {"w2", "w3"}
@@ -59,9 +57,7 @@ def test_canary_regression_halts_rollout_and_notifies() -> None:
     )
     # Canary scores 5 points below baseline → regression.
     with pytest.raises(RegressionHaltedError):
-        coord.report_live_eval(
-            LiveEvalReport(worker_id="w1", score=0.60, version="rs@v2")
-        )
+        coord.report_live_eval(LiveEvalReport(worker_id="w1", score=0.60, version="rs@v2"))
     assert coord.state is RolloutState.HALTED
     # Operator notified through the configured Discord path.
     assert any(kind == "regression_halted" for kind, _ in notifier.calls)
@@ -77,14 +73,10 @@ def test_fleet_worker_regression_mid_rollout_halts() -> None:
         regression_threshold=0.05,
     )
     # Canary OK
-    coord.report_live_eval(
-        LiveEvalReport(worker_id="w1", score=0.73, version="rs@v2")
-    )
+    coord.report_live_eval(LiveEvalReport(worker_id="w1", score=0.73, version="rs@v2"))
     # w2 drops a regression mid-rollout
     with pytest.raises(RegressionHaltedError):
-        coord.report_live_eval(
-            LiveEvalReport(worker_id="w2", score=0.60, version="rs@v2")
-        )
+        coord.report_live_eval(LiveEvalReport(worker_id="w2", score=0.60, version="rs@v2"))
     assert coord.state is RolloutState.HALTED
 
 
@@ -96,9 +88,7 @@ def test_all_workers_confirmed_completes_rollout() -> None:
         notifier=_RecordingNotifier(),
     )
     for w in ("w1", "w2", "w3"):
-        coord.report_live_eval(
-            LiveEvalReport(worker_id=w, score=0.73, version="rs@v2")
-        )
+        coord.report_live_eval(LiveEvalReport(worker_id=w, score=0.73, version="rs@v2"))
     assert coord.state is RolloutState.COMPLETED
     assert coord.pending_workers() == ()
 
@@ -115,9 +105,7 @@ def test_report_for_wrong_version_ignored() -> None:
         regression_threshold=0.05,
     )
     # No exception, no state change.
-    coord.report_live_eval(
-        LiveEvalReport(worker_id="w1", score=0.10, version="rs@v1")
-    )
+    coord.report_live_eval(LiveEvalReport(worker_id="w1", score=0.10, version="rs@v1"))
     assert coord.state is RolloutState.STAGED
 
 
@@ -129,7 +117,5 @@ def test_unknown_worker_report_ignored() -> None:
         notifier=_RecordingNotifier(),
         regression_threshold=0.05,
     )
-    coord.report_live_eval(
-        LiveEvalReport(worker_id="w-unknown", score=0.10, version="rs@v2")
-    )
+    coord.report_live_eval(LiveEvalReport(worker_id="w-unknown", score=0.10, version="rs@v2"))
     assert coord.state is RolloutState.STAGED

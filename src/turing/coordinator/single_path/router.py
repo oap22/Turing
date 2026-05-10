@@ -12,19 +12,22 @@ log-parsing infrastructure.
 from __future__ import annotations
 
 import time
-from typing import Any, Awaitable, Callable, Optional, Protocol
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Protocol
 
 from turing.coordinator.lifecycle.episode_store import Episode, EpisodeStore
 from turing.coordinator.lifecycle.lifecycle import SubtaskState
-from turing.coordinator.registry import CapabilityRegistry
-from turing.coordinator.registry.manifest import CapabilityManifest
 from turing.coordinator.scheduler.scheduler import Scheduler, Subtask
-from turing.coordinator.single_path.classifier import (
-    SpecialtyChoice,
-    SpecialtyClassifier,
-)
 from turing.telemetry import get_telemetry
 from turing.telemetry.bus import TelemetryEvent, now_ms
+
+if TYPE_CHECKING:
+    from turing.coordinator.registry import CapabilityRegistry
+    from turing.coordinator.registry.manifest import CapabilityManifest
+    from turing.coordinator.single_path.classifier import (
+        SpecialtyChoice,
+        SpecialtyClassifier,
+    )
 
 DispatchFn = Callable[..., Awaitable[str]]
 ReportFn = Callable[[str], Awaitable[None]]
@@ -73,7 +76,7 @@ class SinglePathRouter:
         *,
         message: str,
         task_id: str,
-        report: Optional[ReportFn] = None,
+        report: ReportFn | None = None,
     ) -> str:
         await _maybe_report(report, "classifying")
         choice = await _classify_async(self._classifier, message)
@@ -85,9 +88,7 @@ class SinglePathRouter:
         )
         manifest = self._scheduler.pick(subtask, self._registry)
         if manifest is None:
-            raise NoMatchingWorkerError(
-                f"no worker available for specialty {choice.specialty!r}"
-            )
+            raise NoMatchingWorkerError(f"no worker available for specialty {choice.specialty!r}")
         await _maybe_report(report, "dispatched")
 
         await _maybe_report(report, "running")
@@ -119,9 +120,7 @@ class SinglePathRouter:
     # ── helpers ────────────────────────────────────────────────────────
 
     @staticmethod
-    def _emit_classifier_event(
-        *, message: str, choice: SpecialtyChoice
-    ) -> None:
+    def _emit_classifier_event(*, message: str, choice: SpecialtyChoice) -> None:
         tel = get_telemetry()
         tel.emit(
             TelemetryEvent(
@@ -208,6 +207,6 @@ async def _classify_async(classifier: Any, message: str) -> SpecialtyChoice:
     return result
 
 
-async def _maybe_report(report: Optional[ReportFn], stage: str) -> None:
+async def _maybe_report(report: ReportFn | None, stage: str) -> None:
     if report is not None:
         await report(stage)

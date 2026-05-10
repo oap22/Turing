@@ -19,18 +19,21 @@ run without a configured gateway.
 
 from __future__ import annotations
 
-from typing import Optional, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import structlog
 
 from turing.mesh.protocol import MeshMessage, MessageType
-from turing.telemetry.bus import TelemetryEvent
+
+if TYPE_CHECKING:
+    from turing.telemetry.bus import TelemetryEvent
 
 logger = structlog.get_logger(__name__)
 
 
 class _Publisher(Protocol):
     def shout(self, group: str, message: MeshMessage) -> None: ...
+
     # whisper is optional — not all publishers will implement it (the slice-2
     # capturing fake doesn't, for example), so callers must check before use.
 
@@ -50,7 +53,7 @@ class MeshTelemetrySink:
         group: str,
         node_id: str,
         node_name: str,
-        priority_peer: Optional[str] = None,
+        priority_peer: str | None = None,
     ) -> None:
         self._publisher = publisher
         self._group = group
@@ -60,9 +63,7 @@ class MeshTelemetrySink:
 
     def __call__(self, event: TelemetryEvent) -> None:
         is_priority = event.payload.get("priority") == "high"
-        msg_type = (
-            MessageType.TELEMETRY_PRIORITY if is_priority else MessageType.TELEMETRY
-        )
+        msg_type = MessageType.TELEMETRY_PRIORITY if is_priority else MessageType.TELEMETRY
         msg = MeshMessage(
             type=msg_type,
             sender_id=self._node_id,
@@ -78,11 +79,7 @@ class MeshTelemetrySink:
             },
         )
         try:
-            if (
-                is_priority
-                and self._priority_peer
-                and hasattr(self._publisher, "whisper")
-            ):
+            if is_priority and self._priority_peer and hasattr(self._publisher, "whisper"):
                 self._publisher.whisper(self._priority_peer, msg)  # type: ignore[attr-defined]
             else:
                 self._publisher.shout(self._group, msg)

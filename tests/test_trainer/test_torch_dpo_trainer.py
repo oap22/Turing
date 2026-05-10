@@ -48,10 +48,7 @@ def test_torch_dpo_trainer_writes_adapter(tmp_path: Path) -> None:
     trainer = TorchDPOTrainer(backend=_stub_backend, dataset_path=dataset)
     result = trainer.train(_job(dataset_path=dataset), artifact_dir=artifact_dir)
     assert result.adapter_path.exists()
-    assert (
-        result.sha256
-        == hashlib.sha256(result.adapter_path.read_bytes()).hexdigest()
-    )
+    assert result.sha256 == hashlib.sha256(result.adapter_path.read_bytes()).hexdigest()
 
 
 def test_publisher_signs_manifest_registry_accepts(tmp_path: Path) -> None:
@@ -69,9 +66,7 @@ def test_publisher_signs_manifest_registry_accepts(tmp_path: Path) -> None:
     )
     manifest = publisher.publish(_job(dataset_path=dataset), result, version="rs-dpo@v1")
 
-    registry = AdapterRegistry(
-        worker_base_model="qwen2.5-7b", trusted_issuers=[signer.public_key]
-    )
+    registry = AdapterRegistry(worker_base_model="qwen2.5-7b", trusted_issuers=[signer.public_key])
     registry.verify(manifest, result.adapter_path.read_bytes())
 
 

@@ -8,7 +8,7 @@ Covers issue #28's three deliverables:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -19,7 +19,6 @@ from turing.coordinator.training_approval.policy import (
 )
 from turing.coordinator.training_approval.proposal import TrainingJobProposal
 from turing.coordinator.training_approval.quota import QuotaTracker, SpecialtyQuota
-
 
 # ── proposal model ────────────────────────────────────────────────────
 
@@ -52,7 +51,7 @@ class TestTrainingJobProposal:
 
 
 def _now() -> datetime:
-    return datetime(2026, 5, 7, 12, 0, tzinfo=timezone.utc)
+    return datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
 
 
 class TestQuotaTracker:
@@ -150,9 +149,7 @@ class TestAutonomyPolicy:
         self,
     ) -> None:
         quota = QuotaTracker(now=_now)
-        policy = AutonomyPolicy(
-            mode=AutonomyMode.MANUAL_WITH_DEFAULTS, quota_tracker=quota
-        )
+        policy = AutonomyPolicy(mode=AutonomyMode.MANUAL_WITH_DEFAULTS, quota_tracker=quota)
         decision = policy.evaluate(self._proposal())
         # Still goes to a Discord prompt — but the operator sees pre-filled
         # defaults so the click is one tap.
@@ -164,9 +161,7 @@ class TestAutonomyPolicy:
             "research-summarize",
             SpecialtyQuota(jobs_per_week=10, dollars_per_week=100.0),
         )
-        policy = AutonomyPolicy(
-            mode=AutonomyMode.AUTO_WITHIN_QUOTA, quota_tracker=quota
-        )
+        policy = AutonomyPolicy(mode=AutonomyMode.AUTO_WITHIN_QUOTA, quota_tracker=quota)
         decision = policy.evaluate(self._proposal(cost=5.0))
         assert decision is PolicyDecision.AUTO_APPROVE
 
@@ -177,9 +172,7 @@ class TestAutonomyPolicy:
             SpecialtyQuota(jobs_per_week=1, dollars_per_week=2.0),
         )
         quota.record("research-summarize", cost_usd=1.0)
-        policy = AutonomyPolicy(
-            mode=AutonomyMode.AUTO_WITHIN_QUOTA, quota_tracker=quota
-        )
+        policy = AutonomyPolicy(mode=AutonomyMode.AUTO_WITHIN_QUOTA, quota_tracker=quota)
         # $5 > $2 cap remaining → can't auto-approve, escalate
         decision = policy.evaluate(self._proposal(cost=5.0))
         assert decision is PolicyDecision.REQUIRE_APPROVAL

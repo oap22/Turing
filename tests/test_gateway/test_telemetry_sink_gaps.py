@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
 from turing.gateway.ring_buffer import RingBuffer, RingBufferConfig
 from turing.gateway.telemetry_sink import TelemetrySink
 from turing.mesh.protocol import MeshMessage, MessageType
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _msg(seq: int, *, sender: str = "pi-beta") -> MeshMessage:
@@ -43,9 +46,7 @@ async def buffer(tmp_path: Path):
 
 class TestGapMarkerFanout:
     @pytest.mark.asyncio
-    async def test_skipped_seq_emits_gap_marker_frame(
-        self, buffer: RingBuffer
-    ) -> None:
+    async def test_skipped_seq_emits_gap_marker_frame(self, buffer: RingBuffer) -> None:
         sink = TelemetrySink(buffer=buffer, reorder_window=0)
         frames: list[dict] = []
 
@@ -64,9 +65,7 @@ class TestGapMarkerFanout:
         assert gap["missing"] == [2, 2]
 
     @pytest.mark.asyncio
-    async def test_gap_marker_persisted_to_ring_buffer(
-        self, buffer: RingBuffer
-    ) -> None:
+    async def test_gap_marker_persisted_to_ring_buffer(self, buffer: RingBuffer) -> None:
         sink = TelemetrySink(buffer=buffer, reorder_window=0)
         await sink.on_mesh_message(_msg(seq=1))
         await sink.on_mesh_message(_msg(seq=4))
@@ -76,9 +75,7 @@ class TestGapMarkerFanout:
         assert rows[0]["payload"]["missing"] == [2, 3]
 
     @pytest.mark.asyncio
-    async def test_clean_sequence_emits_no_gap(
-        self, buffer: RingBuffer
-    ) -> None:
+    async def test_clean_sequence_emits_no_gap(self, buffer: RingBuffer) -> None:
         sink = TelemetrySink(buffer=buffer, reorder_window=0)
         frames: list[dict] = []
 

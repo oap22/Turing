@@ -7,10 +7,12 @@ threshold lands in the workspace store and the message carries the
 
 from __future__ import annotations
 
-from typing import Union
+from typing import TYPE_CHECKING
 
-from turing.coordinator.workspace.client import WorkspaceClient
 from turing.coordinator.workspace.ref import WorkspaceRef
+
+if TYPE_CHECKING:
+    from turing.coordinator.workspace.client import WorkspaceClient
 
 
 def auto_promote(
@@ -20,7 +22,7 @@ def auto_promote(
     key: str,
     payload: bytes,
     threshold_bytes: int,
-) -> Union[bytes, str]:
+) -> bytes | str:
     """Return ``payload`` as-is if small; otherwise upload + return its URI."""
     if len(payload) <= threshold_bytes:
         return payload

@@ -187,10 +187,6 @@ def test_hard_examples_pk_and_adapter_query():
 
 def test_last_canary_worker_round_trip():
     conn = _fresh_conn()
-    conn.execute(
-        "INSERT INTO last_canary_worker (specialty, worker_id) VALUES ('x', 'w-a')"
-    )
-    wid = conn.execute(
-        "SELECT worker_id FROM last_canary_worker WHERE specialty='x'"
-    ).fetchone()
+    conn.execute("INSERT INTO last_canary_worker (specialty, worker_id) VALUES ('x', 'w-a')")
+    wid = conn.execute("SELECT worker_id FROM last_canary_worker WHERE specialty='x'").fetchone()
     assert wid == ("w-a",)
