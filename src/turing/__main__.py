@@ -40,7 +40,7 @@ async def _run(config: TuringConfig) -> None:
     from turing.llm.classifier import ComplexityClassifier
     from turing.llm.cloud import ClaudeProvider
     from turing.llm.local import OllamaProvider
-    from turing.llm.router import LLMRouter
+    from turing.llm.router import LLMRouter, warn_if_local_only_disables_tools
 
     cloud_provider = ClaudeProvider(api_key=config.anthropic_api_key, model=config.anthropic_model)
     local_provider = OllamaProvider(host=config.ollama_host, model=config.ollama_model)
@@ -89,6 +89,9 @@ async def _run(config: TuringConfig) -> None:
                 logger.info("plugin.loaded", name=plugin.name)
             except Exception as e:
                 logger.warning("plugin.load_failed", name=manifest.name, error=str(e))
+
+    # Issue #158 — warn loudly when local_only is set with tools registered.
+    warn_if_local_only_disables_tools(routing_mode, len(tool_registry.get_all()))
 
     # 5. Safety Gate
     from turing.agent.safety import SafetyGate
