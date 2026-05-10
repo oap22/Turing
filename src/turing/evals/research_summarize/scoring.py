@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from .schema import EvalCase
@@ -307,7 +307,7 @@ def score_citation_correctness_v1(
     summary: str,
     case: EvalCase,
     *,
-    judge=None,
+    judge: Any = None,
 ) -> ScoreResult:
     """Grade wiki-link citations.
 
@@ -393,7 +393,7 @@ def _claim_in_sentence(claim: str, sentence: str) -> bool:
     return hits / len(tokens) >= 0.6
 
 
-SCORERS = {
+SCORERS: dict[str, Any] = {
     "score_claim_preservation_v1": score_claim_preservation_v1,
     "score_voice_match_v1": score_voice_match_v1,
     "score_citation_correctness_v1": score_citation_correctness_v1,

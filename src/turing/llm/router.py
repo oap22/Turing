@@ -101,9 +101,10 @@ class LLMRouter:
 
         label = _provider_label(provider, self._cloud, self._local)
         try:
-            return await self._invoke_provider(
+            primary: LLMResponse = await self._invoke_provider(
                 provider, label, messages, system, tools, max_tokens, temperature
             )
+            return primary
         except Exception:
             # If the selected provider was local (auto mode), fall back to cloud.
             if provider is self._local and self._routing_mode == "auto":
@@ -111,9 +112,10 @@ class LLMRouter:
                     "llm_local_failed_falling_back_to_cloud",
                     exc_info=True,
                 )
-                return await self._invoke_provider(
+                fallback: LLMResponse = await self._invoke_provider(
                     self._cloud, "cloud", messages, system, tools, max_tokens, temperature
                 )
+                return fallback
             raise
 
     @traced("llm.complete", payload=_llm_event_payload)
