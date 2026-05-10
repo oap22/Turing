@@ -26,7 +26,9 @@ LoadFn = Callable[[dict[str, Any], str], Awaitable[Any]]
 EvalFn = Callable[[Any, str], Awaitable[tuple[float, list[dict[str, Any]]]]]
 
 
-def make_canary_handler(*, load_fn: LoadFn, eval_fn: EvalFn):
+def make_canary_handler(
+    *, load_fn: LoadFn, eval_fn: EvalFn
+) -> Callable[[SubtaskDispatch], Awaitable[dict[str, object]]]:
     """Build a kind handler that returns a JSON-encoded canary result."""
 
     async def handle(envelope: SubtaskDispatch) -> dict[str, object]:

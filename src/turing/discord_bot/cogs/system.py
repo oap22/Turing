@@ -196,17 +196,20 @@ def _fmt_bytes(num_bytes: int | float) -> str:
 def _get_cpu_temperature() -> float | None:
     """Read CPU temperature if available (Linux / Raspberry Pi)."""
     try:
-        temps = psutil.sensors_temperatures()
+        sensors_temperatures = getattr(psutil, "sensors_temperatures", None)
+        if sensors_temperatures is None:
+            return None
+        temps = sensors_temperatures()
         if not temps:
             return None
         # Try common sensor names on Raspberry Pi and generic Linux
         for name in ("cpu_thermal", "coretemp", "cpu-thermal"):
             if temps.get(name):
-                return temps[name][0].current
+                return float(temps[name][0].current)
         # Fallback: return the first available sensor
         first_key = next(iter(temps))
         if temps[first_key]:
-            return temps[first_key][0].current
+            return float(temps[first_key][0].current)
     except (AttributeError, OSError, StopIteration):
         pass
     return None
@@ -216,7 +219,7 @@ async def _check_database(bot: TuringBot) -> bool:
     """Return True if the database file exists and is accessible."""
     try:
         db_path = bot.config.db_path
-        return db_path.exists()
+        return bool(db_path.exists())
     except Exception:
         return False
 

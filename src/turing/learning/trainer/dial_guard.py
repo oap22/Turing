@@ -33,7 +33,7 @@ class PullOnlySocketGuard:
                 "trainer is a pull-only client; listening sockets are forbidden"
             )
 
-        socket.socket.listen = _refuse  # type: ignore[method-assign]
+        socket.socket.listen = _refuse  # type: ignore[method-assign,assignment]
         return self
 
     def __exit__(self, *exc: Any) -> None:

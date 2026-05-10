@@ -40,15 +40,20 @@ async def _run(config: TuringConfig) -> None:
     from turing.llm.classifier import ComplexityClassifier
     from turing.llm.cloud import ClaudeProvider
     from turing.llm.local import OllamaProvider
-    from turing.llm.router import LLMRouter
+    from turing.llm.router import LLMRouter, warn_if_local_only_disables_tools
 
     cloud_provider = ClaudeProvider(api_key=config.anthropic_api_key, model=config.anthropic_model)
     local_provider = OllamaProvider(host=config.ollama_host, model=config.ollama_model)
     classifier = ComplexityClassifier()
 
     # Map config routing mode to router's expected values
+    from typing import Literal, cast
+
     routing_mode_map = {"auto": "auto", "cloud": "cloud_only", "local": "local_only"}
-    routing_mode = routing_mode_map.get(config.llm_routing_mode, "auto")
+    routing_mode = cast(
+        "Literal['cloud_only', 'local_only', 'auto']",
+        routing_mode_map.get(config.llm_routing_mode, "auto"),
+    )
     llm_router = LLMRouter(cloud_provider, local_provider, classifier, routing_mode)
 
     # 3. Initialize Tools
@@ -84,6 +89,9 @@ async def _run(config: TuringConfig) -> None:
                 logger.info("plugin.loaded", name=plugin.name)
             except Exception as e:
                 logger.warning("plugin.load_failed", name=manifest.name, error=str(e))
+
+    # Issue #158 — warn loudly when local_only is set with tools registered.
+    warn_if_local_only_disables_tools(routing_mode, len(tool_registry.get_all()))
 
     # 5. Safety Gate
     from turing.agent.safety import SafetyGate

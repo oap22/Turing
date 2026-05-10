@@ -10,7 +10,7 @@ Workers stay pure executors — they never reach back into LessonStore.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from turing.learning.lessons.injector import inject_lessons_into_prompt
 
@@ -19,10 +19,10 @@ if TYPE_CHECKING:
 
 
 class _EmbedderLike(Protocol):
-    def embed(self, text: str): ...
+    def embed(self, text: str) -> Any: ...
 
 
-def _to_float_tuple(vec) -> tuple[float, ...]:
+def _to_float_tuple(vec: Any) -> tuple[float, ...]:
     return tuple(float(x) for x in vec)
 
 

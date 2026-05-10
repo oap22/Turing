@@ -95,7 +95,7 @@ class WorkerLoop:
             await self._transport.subscribe(
                 f"subtasks.{specialty}",
                 self._handle,
-                on_error=lambda exc, s=specialty: logger.warning(
+                on_error=lambda exc, s=specialty: logger.warning(  # type: ignore[misc]
                     "subtasks.%s subscribe error: %s", s, exc
                 ),
             )

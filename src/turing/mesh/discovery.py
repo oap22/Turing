@@ -19,7 +19,7 @@ logger = structlog.get_logger("turing.mesh.discovery")
 
 # Attempt to import Pyre.  It may not be available on all platforms.
 try:
-    from pyre import Pyre  # type: ignore[import-untyped]
+    from pyre import Pyre
 
     PYRE_AVAILABLE = True
 except ImportError:
