@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
 from turing.vault.proposer import VaultProposer
 from turing.worker.tools.vault_propose import vault_propose
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _init_repo(repo: Path) -> None:

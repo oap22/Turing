@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import structlog
 
-from turing.llm.base import (
-    LLMProvider,
-    LLMResponse,
-    Message,
-    ToolDefinition,
-)
 from turing.llm.classifier import Complexity, ComplexityClassifier
 from turing.telemetry import redact, traced
+
+if TYPE_CHECKING:
+    from turing.llm.base import (
+        LLMProvider,
+        LLMResponse,
+        Message,
+        ToolDefinition,
+    )
 
 logger = structlog.get_logger(__name__)
 

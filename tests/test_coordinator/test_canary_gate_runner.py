@@ -24,7 +24,6 @@ from turing.transport.signed_transport import SignedTransport
 from turing.transport.signer import MessageSigner
 from turing.worker.executor.canary_handler import make_canary_handler
 
-
 SPECIALTY = "research-summarize"
 BASE_MODEL = "qwen2.5-7b"
 
@@ -174,9 +173,7 @@ async def test_canary_handler_eval_failure():
 
 def _runner_setup():
     signer = MessageSigner.generate()
-    registry = AdapterRegistry(
-        worker_base_model=BASE_MODEL, trusted_issuers=[signer.public_key]
-    )
+    registry = AdapterRegistry(worker_base_model=BASE_MODEL, trusted_issuers=[signer.public_key])
     return signer, registry
 
 

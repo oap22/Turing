@@ -101,9 +101,7 @@ def should_run_now(
       - `last_run_ts` is on a strictly earlier calendar day and the most
         recent scheduled tick has passed.
     """
-    scheduled_today = datetime.combine(
-        now.date(), time(hour=nightly_hour), tzinfo=now.tzinfo
-    )
+    scheduled_today = datetime.combine(now.date(), time(hour=nightly_hour), tzinfo=now.tzinfo)
     if now < scheduled_today:
         # Today's tick hasn't arrived yet.
         return False
@@ -115,9 +113,7 @@ def should_run_now(
 
 def next_run_at(*, now: datetime, nightly_hour: int = _NIGHTLY_HOUR) -> datetime:
     """Next scheduled tick at or after `now`."""
-    scheduled_today = datetime.combine(
-        now.date(), time(hour=nightly_hour), tzinfo=now.tzinfo
-    )
+    scheduled_today = datetime.combine(now.date(), time(hour=nightly_hour), tzinfo=now.tzinfo)
     if now < scheduled_today:
         return scheduled_today
     return scheduled_today + timedelta(days=1)

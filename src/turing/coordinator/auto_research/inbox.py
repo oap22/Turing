@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 _SAFE_SPECIALTY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 

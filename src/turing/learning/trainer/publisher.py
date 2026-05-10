@@ -9,14 +9,18 @@ a separate trust namespace so a compromised worker can't issue adapters.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from turing.coordinator.adapters.manifest import (
     CURRENT_ADAPTER_MANIFEST_VERSION,
     AdapterManifest,
 )
-from turing.learning.trainer.job import TrainingJob
-from turing.learning.trainer.object_store import ObjectStore
-from turing.learning.trainer.runner import TrainingResult
-from turing.transport.signer import MessageSigner
+
+if TYPE_CHECKING:
+    from turing.learning.trainer.job import TrainingJob
+    from turing.learning.trainer.object_store import ObjectStore
+    from turing.learning.trainer.runner import TrainingResult
+    from turing.transport.signer import MessageSigner
 
 
 class TrainerPublisher:

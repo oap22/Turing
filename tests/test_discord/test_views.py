@@ -9,7 +9,6 @@ import pytest
 
 from turing.discord_bot.views import ConfirmActionView
 
-
 # ----------------------------------------------------------------------
 # Helpers -- lightweight mocks for discord.Interaction
 # ----------------------------------------------------------------------

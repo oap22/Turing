@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from turing.agent.safety import SafetyCheckResult, SafetyDecision, SafetyGate
+from turing.agent.safety import SafetyDecision, SafetyGate
 
 
 @pytest.fixture()
@@ -56,7 +56,9 @@ class TestLowRiskTools:
 
     async def test_process_info_approved(self, safety_gate: SafetyGate):
         """Test that getting process info is auto-approved."""
-        result = await safety_gate.check("process", {"action": "get_process_info", "pid": 1}, "user1")
+        result = await safety_gate.check(
+            "process", {"action": "get_process_info", "pid": 1}, "user1"
+        )
         assert result.decision == SafetyDecision.APPROVED
         assert result.risk_level == "low"
 
@@ -76,7 +78,9 @@ class TestDenylistCommands:
 
     async def test_dd_denied(self, safety_gate: SafetyGate):
         """Test that dd to disk is denied."""
-        result = await safety_gate.check("shell", {"command": "dd if=/dev/zero of=/dev/sda"}, "user1")
+        result = await safety_gate.check(
+            "shell", {"command": "dd if=/dev/zero of=/dev/sda"}, "user1"
+        )
         assert result.decision == SafetyDecision.DENIED
 
     async def test_fork_bomb_denied(self, safety_gate: SafetyGate):
@@ -257,10 +261,10 @@ class TestDenyPatterns:
 
     def test_check_denylist_poweroff(self, safety_gate: SafetyGate):
         """Test that poweroff is caught."""
-        denied, reason = safety_gate._check_denylist("poweroff")
+        denied, _reason = safety_gate._check_denylist("poweroff")
         assert denied is True
 
     def test_check_denylist_halt(self, safety_gate: SafetyGate):
         """Test that halt is caught."""
-        denied, reason = safety_gate._check_denylist("halt")
+        denied, _reason = safety_gate._check_denylist("halt")
         assert denied is True

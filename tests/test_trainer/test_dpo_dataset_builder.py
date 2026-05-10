@@ -101,9 +101,7 @@ def test_pairs_only_from_same_specialty(tmp_path: Path) -> None:
     store.record(
         _ep(subtask_id="s-1", input_text="x", critic_score=0.9, specialty="research-summarize")
     )
-    store.record(
-        _ep(subtask_id="s-2", input_text="x", critic_score=0.2, specialty="code-debug")
-    )
+    store.record(_ep(subtask_id="s-2", input_text="x", critic_score=0.2, specialty="code-debug"))
 
     builder = DPODatasetBuilder(episode_store=store, min_score_gap=0.3)
     info = builder.build(

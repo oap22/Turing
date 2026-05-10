@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -13,7 +13,6 @@ from turing.coordinator.workspace import (
     WorkspaceRef,
     auto_promote,
 )
-
 
 # ── WorkspaceRef ──────────────────────────────────────────────────────
 
@@ -113,9 +112,7 @@ class TestAutoPromote:
 
 
 def _now(*, days: int = 0, hours: int = 0) -> datetime:
-    return datetime(2026, 5, 7, 12, 0, tzinfo=timezone.utc) + timedelta(
-        days=days, hours=hours
-    )
+    return datetime(2026, 5, 7, 12, 0, tzinfo=UTC) + timedelta(days=days, hours=hours)
 
 
 class TestWorkspaceGC:

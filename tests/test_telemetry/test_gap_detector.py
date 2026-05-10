@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from turing.telemetry.gap_detector import (
     GapDetected,
     GapDetector,

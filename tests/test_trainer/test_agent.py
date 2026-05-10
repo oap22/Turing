@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -16,14 +16,17 @@ from turing.learning.trainer.runner import StubTrainer
 from turing.transport.bus import InMemoryBus
 from turing.transport.signer import MessageSigner
 
+if TYPE_CHECKING:
+    from pathlib import Path
 
-def _make_agent(tmp_path: Path) -> tuple[TrainerPullAgent, InMemoryBus, InMemoryObjectStore, MessageSigner]:
+
+def _make_agent(
+    tmp_path: Path,
+) -> tuple[TrainerPullAgent, InMemoryBus, InMemoryObjectStore, MessageSigner]:
     bus = InMemoryBus()
     store = InMemoryObjectStore()
     signer = MessageSigner.generate()
-    publisher = TrainerPublisher(
-        signer=signer, object_store=store, facility_name="dgx-1"
-    )
+    publisher = TrainerPublisher(signer=signer, object_store=store, facility_name="dgx-1")
     config = TrainerConfig(
         facility_name="dgx-1",
         artifact_dir=tmp_path,
@@ -59,7 +62,7 @@ async def test_agent_subscribes_to_facility_queue(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_agent_runs_job_and_publishes_signed_manifest(tmp_path: Path) -> None:
-    agent, bus, store, signer = _make_agent(tmp_path)
+    agent, bus, store, _signer = _make_agent(tmp_path)
     await agent.start()
     await bus.publish("training.queue.dgx-1", _job_payload())
     # InMemoryBus dispatch is sync within publish; the agent's handler awaits
@@ -97,18 +100,14 @@ async def test_agent_emits_failure_event_when_trainer_raises(tmp_path: Path) -> 
     bus = InMemoryBus()
     store = InMemoryObjectStore()
     signer = MessageSigner.generate()
-    publisher = TrainerPublisher(
-        signer=signer, object_store=store, facility_name="dgx-1"
-    )
+    publisher = TrainerPublisher(signer=signer, object_store=store, facility_name="dgx-1")
 
     class BoomTrainer(StubTrainer):
         def train(self, *args, **kwargs):  # type: ignore[no-untyped-def]
             raise RuntimeError("CUDA OOM")
 
     config = TrainerConfig(facility_name="dgx-1", artifact_dir=tmp_path)
-    agent = TrainerPullAgent(
-        config=config, bus=bus, trainer=BoomTrainer(), publisher=publisher
-    )
+    agent = TrainerPullAgent(config=config, bus=bus, trainer=BoomTrainer(), publisher=publisher)
 
     received: list[bytes] = []
 

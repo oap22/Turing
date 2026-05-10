@@ -9,15 +9,18 @@ re-extraction migrates them.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
-from turing.coordinator.lifecycle.episode_store import Episode
 from turing.learning.lessons.lesson import (
     CURRENT_LESSON_SCHEMA_VERSION,
     Lesson,
 )
 from turing.llm.base import Message, Role
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from turing.coordinator.lifecycle.episode_store import Episode
 
 _SYSTEM_PROMPT_TEMPLATE = (
     "You are the cluster's lessons extractor (schema v{version}). "
@@ -47,9 +50,7 @@ class LessonExtractor:
         self._embed = embed
 
     async def extract(self, episode: Episode) -> Lesson:
-        system = _SYSTEM_PROMPT_TEMPLATE.format(
-            version=CURRENT_LESSON_SCHEMA_VERSION
-        )
+        system = _SYSTEM_PROMPT_TEMPLATE.format(version=CURRENT_LESSON_SCHEMA_VERSION)
         user_text = (
             f"specialty: {episode.specialty}\n"
             f"input: {episode.input_text}\n"

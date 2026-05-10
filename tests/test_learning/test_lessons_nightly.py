@@ -152,9 +152,7 @@ async def test_extraction_runs_eviction_sweep():
     )
 
     async def extract_fn(_s, _e):
-        return [
-            LessonCandidate(task_id="new", text="fresh", embedding=(0.0, 0.0))
-        ]
+        return [LessonCandidate(task_id="new", text="fresh", embedding=(0.0, 0.0))]
 
     now = LESSON_TTL_MS + 10_000
     await run_nightly_extraction(
@@ -165,9 +163,7 @@ async def test_extraction_runs_eviction_sweep():
         now_ms=now,
     )
     # The fresh lesson stays; the ancient one is gone.
-    remaining = [
-        l for l in store.query(specialty="x", embedding=(0.0, 0.0), k=10)
-    ]
+    remaining = [l for l in store.query(specialty="x", embedding=(0.0, 0.0), k=10)]
     task_ids = {l.task_id for l in remaining}
     assert "new" in task_ids
     assert "ancient" not in task_ids

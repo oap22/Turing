@@ -29,9 +29,7 @@ if TYPE_CHECKING:
 
 REWARD_FALLBACK_AGE_MS = 24 * 60 * 60 * 1000
 
-_THUMB_SOURCES = frozenset(
-    {RewardSource.SUBTASK_THUMB, RewardSource.SYNTHESIS_THUMB_FRACTIONAL}
-)
+_THUMB_SOURCES = frozenset({RewardSource.SUBTASK_THUMB, RewardSource.SYNTHESIS_THUMB_FRACTIONAL})
 
 
 def sweep_critic_fallbacks(

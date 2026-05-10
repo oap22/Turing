@@ -37,29 +37,21 @@ class TestGatewayDefaults:
 
 class TestGatewayOverrides:
     def test_enabled_via_env(self) -> None:
-        with patch.dict(
-            "os.environ", {"TURING_GATEWAY_ENABLED": "true"}, clear=True
-        ):
+        with patch.dict("os.environ", {"TURING_GATEWAY_ENABLED": "true"}, clear=True):
             cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.gateway_enabled is True
 
     def test_token_via_env(self) -> None:
-        with patch.dict(
-            "os.environ", {"TURING_GATEWAY_TOKEN": "abc-123"}, clear=True
-        ):
+        with patch.dict("os.environ", {"TURING_GATEWAY_TOKEN": "abc-123"}, clear=True):
             cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.gateway_token == "abc-123"
 
     def test_port_via_env(self) -> None:
-        with patch.dict(
-            "os.environ", {"TURING_GATEWAY_PORT": "9000"}, clear=True
-        ):
+        with patch.dict("os.environ", {"TURING_GATEWAY_PORT": "9000"}, clear=True):
             cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.gateway_port == 9000
 
     def test_bind_via_env(self) -> None:
-        with patch.dict(
-            "os.environ", {"TURING_GATEWAY_BIND": "100.64.0.1"}, clear=True
-        ):
+        with patch.dict("os.environ", {"TURING_GATEWAY_BIND": "100.64.0.1"}, clear=True):
             cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.gateway_bind == "100.64.0.1"

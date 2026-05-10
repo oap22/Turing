@@ -25,9 +25,7 @@ class TestBearerHeader:
         assert r.status_code == 401
 
     def test_correct_token_returns_200(self, client: TestClient) -> None:
-        r = client.get(
-            "/static-stub", headers={"Authorization": "Bearer secret-token"}
-        )
+        r = client.get("/static-stub", headers={"Authorization": "Bearer secret-token"})
         # The /static-stub route exists in the app for testing; it returns 200
         # only when auth passes. Specific response body is unimportant.
         assert r.status_code == 200

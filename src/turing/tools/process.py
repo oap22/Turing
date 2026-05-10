@@ -257,5 +257,5 @@ def _format_timestamp(ts: float) -> str:
     """Format a UNIX timestamp as a human-readable datetime string."""
     import datetime
 
-    dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+    dt = datetime.datetime.fromtimestamp(ts, tz=datetime.UTC)
     return dt.strftime("%Y-%m-%d %H:%M:%S UTC")

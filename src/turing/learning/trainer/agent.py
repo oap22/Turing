@@ -10,14 +10,17 @@ it only publishes and subscribes through the supplied ``Bus``.
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING
 
 import structlog
 
-from turing.learning.trainer.config import TrainerConfig
 from turing.learning.trainer.job import TrainingJob, TrainingJobValidationError
-from turing.learning.trainer.publisher import TrainerPublisher
-from turing.learning.trainer.runner import Trainer
-from turing.transport.bus import Bus
+
+if TYPE_CHECKING:
+    from turing.learning.trainer.config import TrainerConfig
+    from turing.learning.trainer.publisher import TrainerPublisher
+    from turing.learning.trainer.runner import Trainer
+    from turing.transport.bus import Bus
 
 logger = structlog.get_logger(__name__)
 

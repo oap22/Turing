@@ -76,9 +76,7 @@ class EpisodeStore:
 
     def record(self, episode: Episode) -> None:
         if not episode.outcome.is_terminal():
-            raise ValueError(
-                f"episode outcome must be terminal, got {episode.outcome.value}"
-            )
+            raise ValueError(f"episode outcome must be terminal, got {episode.outcome.value}")
         # First write wins so a retry storm cannot overwrite the original
         # outcome row that downstream training corpora may have already read.
         if episode.subtask_id not in self._rows:

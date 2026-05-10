@@ -76,9 +76,7 @@ class TrainingJobBuilder:
 
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        body = "\n".join(
-            json.dumps(r, sort_keys=True, separators=(",", ":")) for r in rows
-        )
+        body = "\n".join(json.dumps(r, sort_keys=True, separators=(",", ":")) for r in rows)
         if rows:
             body += "\n"
         out_path.write_text(body, encoding="utf-8")

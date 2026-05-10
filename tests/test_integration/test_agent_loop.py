@@ -6,12 +6,11 @@ mocked LLM responses and mocked subprocess calls.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from turing.agent.core import Agent
-from turing.agent.executor import Executor
 from turing.agent.safety import SafetyGate
 from turing.llm.base import LLMResponse, Message, Role, ToolCall, ToolDefinition
 from turing.memory.embeddings import EmbeddingModel
@@ -19,7 +18,6 @@ from turing.memory.retriever import MemoryRetriever
 from turing.memory.store import MemoryStore
 from turing.memory.vectors import VectorStore
 from turing.tools.base import ToolRegistry, ToolResult
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -117,7 +115,7 @@ def tool_registry():
     registry = ToolRegistry()
     # We need to register a tool that implements the Tool interface
     # Use a real-ish mock
-    from turing.tools.base import Tool, RiskLevel
+    from turing.tools.base import RiskLevel, Tool
 
     class TestShellTool(Tool):
         @property
@@ -182,9 +180,7 @@ def safety_gate():
 # ---------------------------------------------------------------------------
 
 
-async def test_full_pipeline_simple_message(
-    memory_store, retriever, tool_registry, safety_gate
-):
+async def test_full_pipeline_simple_message(memory_store, retriever, tool_registry, safety_gate):
     """End-to-end: send a simple message, verify response and storage."""
     config = _make_config()
 
@@ -227,9 +223,7 @@ async def test_full_pipeline_simple_message(
     assert messages[1]["content"] == "Hello! I am Turing, your AI assistant."
 
 
-async def test_tool_use_pipeline(
-    memory_store, retriever, tool_registry, safety_gate
-):
+async def test_tool_use_pipeline(memory_store, retriever, tool_registry, safety_gate):
     """End-to-end: LLM requests a tool, tool executes, result fed back."""
     config = _make_config()
 
@@ -343,9 +337,7 @@ async def test_memory_persistence_across_messages(
     assert messages[3]["content"] == "Response 2"
 
 
-async def test_context_includes_history(
-    memory_store, retriever, tool_registry, safety_gate
-):
+async def test_context_includes_history(memory_store, retriever, tool_registry, safety_gate):
     """On a second message, context should include previous messages."""
     config = _make_config()
 

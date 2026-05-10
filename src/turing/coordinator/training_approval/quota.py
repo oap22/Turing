@@ -7,10 +7,12 @@ window is computed at check time so the tracker has no background state.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 WEEK = timedelta(days=7)
 
@@ -28,10 +30,10 @@ class _Record:
 
 
 class QuotaTracker:
-    def __init__(self, *, now: Optional[Callable[[], datetime]] = None) -> None:
+    def __init__(self, *, now: Callable[[], datetime] | None = None) -> None:
         self._quotas: dict[str, SpecialtyQuota] = {}
         self._records: dict[str, list[_Record]] = {}
-        self._now = now or (lambda: datetime.now(tz=timezone.utc))
+        self._now = now or (lambda: datetime.now(tz=UTC))
 
     def set_quota(self, specialty: str, quota: SpecialtyQuota) -> None:
         self._quotas[specialty] = quota
@@ -48,9 +50,7 @@ class QuotaTracker:
         cutoff = self._now() - WEEK
         active = [r for r in self._records.get(specialty, ()) if r.when >= cutoff]
         if len(active) >= quota.jobs_per_week:
-            return False, (
-                f"jobs/week quota exhausted: {len(active)}/{quota.jobs_per_week}"
-            )
+            return False, (f"jobs/week quota exhausted: {len(active)}/{quota.jobs_per_week}")
         spent = sum(r.cost_usd for r in active)
         if spent + cost_usd > quota.dollars_per_week:
             return False, (

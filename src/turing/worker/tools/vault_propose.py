@@ -7,13 +7,16 @@ can reference the resulting path in downstream subtasks.
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any
 
 from turing.vault.proposer import (
     InvalidFrontmatterError,
     InvalidProposalPathError,
     VaultProposer,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 def vault_propose(

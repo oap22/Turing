@@ -16,9 +16,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Iterable, Mapping
+from typing import TYPE_CHECKING
 
-from turing.coordinator.auto_research.goal import Goal
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
+    from turing.coordinator.auto_research.goal import Goal
 
 
 @dataclass(frozen=True)

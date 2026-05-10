@@ -73,9 +73,7 @@ def test_backfill_query_returns_only_pending_within_horizon() -> None:
     # 1. Pending within horizon — yes.
     store.record(_episode("recent_pending", recorded_at_ms=now_ms - 1000))
     # 2. Pending older than horizon — no.
-    store.record(
-        _episode("ancient_pending", recorded_at_ms=now_ms - horizon_ms - 1000)
-    )
+    store.record(_episode("ancient_pending", recorded_at_ms=now_ms - horizon_ms - 1000))
     # 3. Already scored — no.
     store.record(_episode("scored", recorded_at_ms=now_ms - 1000))
     store.update_critic_score(subtask_id="scored", critic_score=0.7)

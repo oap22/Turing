@@ -18,6 +18,4 @@ class TrainingJobProposal:
 
     def __post_init__(self) -> None:
         if self.method not in ALLOWED_METHODS:
-            raise ValueError(
-                f"method must be one of {ALLOWED_METHODS}, got {self.method!r}"
-            )
+            raise ValueError(f"method must be one of {ALLOWED_METHODS}, got {self.method!r}")

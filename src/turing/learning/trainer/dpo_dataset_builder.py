@@ -97,9 +97,7 @@ class DPODatasetBuilder:
 
         # Stable order so the sha is content-addressed.
         pairs.sort(key=lambda p: p["prompt"])
-        body = "\n".join(
-            json.dumps(p, sort_keys=True, separators=(",", ":")) for p in pairs
-        )
+        body = "\n".join(json.dumps(p, sort_keys=True, separators=(",", ":")) for p in pairs)
         if pairs:
             body += "\n"
 

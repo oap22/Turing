@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import textwrap
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -19,7 +19,7 @@ from turing.coordinator.auto_research import (
 
 
 def _now(hour: int = 3, day: int = 7) -> datetime:
-    return datetime(2026, 5, day, hour, 0, tzinfo=timezone.utc)
+    return datetime(2026, 5, day, hour, 0, tzinfo=UTC)
 
 
 # ── Goal + GoalsRegistry ─────────────────────────────────────────────
@@ -55,9 +55,7 @@ class TestGoalRegistry:
 
     def test_missing_required_field_rejected(self, tmp_path: Path) -> None:
         path = tmp_path / "goals.yaml"
-        path.write_text(
-            "goals:\n  - specialty: x\n    prompt: y\n", encoding="utf-8"
-        )
+        path.write_text("goals:\n  - specialty: x\n    prompt: y\n", encoding="utf-8")
         with pytest.raises(ValueError, match="cadence_hours"):
             GoalsRegistry.load(path)
 
@@ -110,9 +108,7 @@ class TestSchedulerWindow:
         assert due == []
 
     def test_blocks_outside_clock_window(self) -> None:
-        scheduler = GoalScheduler(
-            min_idle_seconds=60, allowed_hour_range=(2, 6)
-        )
+        scheduler = GoalScheduler(min_idle_seconds=60, allowed_hour_range=(2, 6))
         due = scheduler.due_goals(
             goals=[_goal()],
             now=_now(hour=14),  # 2 PM
@@ -195,9 +191,7 @@ class TestLocalOnlyBudgetGuard:
 
 class TestInboxDirectory:
     def test_path_includes_specialty_and_date(self) -> None:
-        path = inbox_directory_for(
-            specialty="research-summarize", at=_now(day=7)
-        )
+        path = inbox_directory_for(specialty="research-summarize", at=_now(day=7))
         assert path == Path("vault/inbox/auto_research/research-summarize/2026-05-07")
 
     def test_specialty_with_slashes_rejected(self) -> None:

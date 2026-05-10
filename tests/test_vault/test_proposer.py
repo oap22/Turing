@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -12,6 +12,9 @@ from turing.vault.proposer import (
     InvalidProposalPathError,
     VaultProposer,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _init_repo(repo: Path) -> None:
@@ -62,9 +65,7 @@ class TestSuccessfulPropose:
         )
         assert "research-on-bose-einstein-condensates" in path.name
 
-    def test_creates_git_commit_authored_by_cluster_identity(
-        self, tmp_path: Path
-    ) -> None:
+    def test_creates_git_commit_authored_by_cluster_identity(self, tmp_path: Path) -> None:
         proposer = _proposer(tmp_path)
         proposer.propose(frontmatter=_frontmatter(), body="x", slug="n1")
 
@@ -83,9 +84,7 @@ class TestSuccessfulPropose:
 
     def test_frontmatter_serialized_to_yaml(self, tmp_path: Path) -> None:
         proposer = _proposer(tmp_path)
-        path = proposer.propose(
-            frontmatter=_frontmatter(), body="hello", slug="my-note"
-        )
+        path = proposer.propose(frontmatter=_frontmatter(), body="hello", slug="my-note")
         text = path.read_text(encoding="utf-8")
         assert "source: research-summarize-worker" in text
         assert "specialty: research-summarize" in text
@@ -96,9 +95,7 @@ class TestFrontmatterValidation:
     @pytest.mark.parametrize(
         "missing", ["source", "task_id", "specialty", "confidence", "critic_score"]
     )
-    def test_missing_required_field_rejected(
-        self, tmp_path: Path, missing: str
-    ) -> None:
+    def test_missing_required_field_rejected(self, tmp_path: Path, missing: str) -> None:
         proposer = _proposer(tmp_path)
         fm = _frontmatter()
         del fm[missing]
@@ -124,9 +121,7 @@ class TestPathSafety:
     def test_slug_with_traversal_rejected(self, tmp_path: Path) -> None:
         proposer = _proposer(tmp_path)
         with pytest.raises(InvalidProposalPathError):
-            proposer.propose(
-                frontmatter=_frontmatter(), body="x", slug="../escape"
-            )
+            proposer.propose(frontmatter=_frontmatter(), body="x", slug="../escape")
 
     def test_task_id_with_traversal_rejected(self, tmp_path: Path) -> None:
         proposer = _proposer(tmp_path)

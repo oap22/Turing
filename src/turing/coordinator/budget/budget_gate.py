@@ -10,12 +10,14 @@ to today.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
+from typing import TYPE_CHECKING
 
-from turing.coordinator.budget.spend_tracker import SpendTracker
+if TYPE_CHECKING:
+    from turing.coordinator.budget.spend_tracker import SpendTracker
 
 
-class BudgetDecision(str, Enum):
+class BudgetDecision(StrEnum):
     APPROVE = "approve"
     FALLBACK_LOCAL = "fallback_local"
 
@@ -39,9 +41,7 @@ class ModelPriceTable:
     cents_per_kilo_input: dict[str, int] = field(default_factory=dict)
     cents_per_kilo_output: dict[str, int] = field(default_factory=dict)
 
-    def estimate(
-        self, *, model: str, input_tokens: int, output_tokens: int
-    ) -> int:
+    def estimate(self, *, model: str, input_tokens: int, output_tokens: int) -> int:
         in_rate = self.cents_per_kilo_input.get(model, 0)
         out_rate = self.cents_per_kilo_output.get(model, 0)
         # Round up to nearest cent so we never under-estimate.
@@ -81,8 +81,8 @@ class BudgetGate:
                 estimated_cents=estimate,
                 remaining_cents=remaining,
                 reason=(
-                    f"estimate ${estimate/100:.2f} would push today's spend "
-                    f"past ${self._cap/100:.2f}"
+                    f"estimate ${estimate / 100:.2f} would push today's spend "
+                    f"past ${self._cap / 100:.2f}"
                 ),
             )
         return BudgetCheckResult(

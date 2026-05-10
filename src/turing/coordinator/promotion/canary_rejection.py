@@ -15,7 +15,6 @@ with timestamp tracking.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -24,6 +23,8 @@ from turing.coordinator.promotion.hard_examples import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from turing.coordinator.lifecycle.episode_store import EpisodeStore
     from turing.coordinator.promotion.canary_gate_runner import CanaryGateOutcome
     from turing.coordinator.promotion.hard_examples import _Notifier
@@ -55,11 +56,7 @@ class RejectionLog:
 
     def count_within(self, *, specialty: str, now_ms: int, horizon_ms: int) -> int:
         cutoff = now_ms - horizon_ms
-        return sum(
-            1
-            for r in self._rows
-            if r.specialty == specialty and r.ts_ms >= cutoff
-        )
+        return sum(1 for r in self._rows if r.specialty == specialty and r.ts_ms >= cutoff)
 
 
 def format_rejection_notice(
@@ -73,19 +70,11 @@ def format_rejection_notice(
     regressions_30d: int,
 ) -> str:
     """ADR 0007 §3 message body for the live-DAG channel."""
-    delta = (
-        f"{outcome.delta_pp:+.2f}pp"
-        if outcome.delta_pp is not None
-        else "n/a"
-    )
-    canary_score = (
-        f"{outcome.score:.2f}" if outcome.score is not None else "n/a"
-    )
+    delta = f"{outcome.delta_pp:+.2f}pp" if outcome.delta_pp is not None else "n/a"
+    canary_score = f"{outcome.score:.2f}" if outcome.score is not None else "n/a"
     prior_score = "n/a"
     prior_label = (
-        f"{prior_name}:{prior_version}"
-        if prior_name and prior_version
-        else "(no prior LIVE)"
+        f"{prior_name}:{prior_version}" if prior_name and prior_version else "(no prior LIVE)"
     )
     return (
         f"Adapter `{name}:{version}` failed canary on `{specialty}`.\n"

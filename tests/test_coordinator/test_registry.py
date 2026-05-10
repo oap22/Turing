@@ -73,9 +73,7 @@ def test_find_workers_excludes_busy_when_requested(registry: CapabilityRegistry)
 
     registry.note_dispatch("worker-1")  # now in_flight=1, at capacity
 
-    found = registry.find_workers(
-        specialty="research-summarize", exclude_busy=True
-    )
+    found = registry.find_workers(specialty="research-summarize", exclude_busy=True)
 
     assert [m.worker_id for m in found] == ["worker-2"]
 
@@ -85,9 +83,7 @@ def test_note_complete_frees_capacity(registry: CapabilityRegistry) -> None:
     registry.note_dispatch("worker-1")
     registry.note_complete("worker-1")
 
-    found = registry.find_workers(
-        specialty="research-summarize", exclude_busy=True
-    )
+    found = registry.find_workers(specialty="research-summarize", exclude_busy=True)
 
     assert [m.worker_id for m in found] == ["worker-1"]
 
@@ -103,9 +99,7 @@ def test_workers_expire_without_heartbeat(
     assert found == []
 
 
-def test_heartbeat_refreshes_liveness(
-    registry: CapabilityRegistry, clock: dict[str, int]
-) -> None:
+def test_heartbeat_refreshes_liveness(registry: CapabilityRegistry, clock: dict[str, int]) -> None:
     registry.register(_manifest("worker-1"))
 
     clock["t"] = 8_000

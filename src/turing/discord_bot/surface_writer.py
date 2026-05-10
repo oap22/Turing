@@ -6,10 +6,11 @@ the call, the helper propagates the error and does NOT touch the index.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from turing.coordinator.discord_surfaces import DiscordSurfaceIndex
 
 

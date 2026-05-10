@@ -19,7 +19,6 @@ NATS publish + Discord post on the other side.
 from __future__ import annotations
 
 import json
-from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -28,13 +27,15 @@ from turing.coordinator.dispatch import (
     SubtaskDispatch,
     SubtaskKind,
 )
-from turing.coordinator.promotion.canary_pass_gate import CanaryPassGate
-from turing.coordinator.promotion.canary_selector import CanarySelector
 from turing.coordinator.promotion.hard_examples import HardExample
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Sequence
+
     from turing.coordinator.adapters.registry import AdapterRegistry
     from turing.coordinator.dispatch import SubtaskDispatchClient
+    from turing.coordinator.promotion.canary_pass_gate import CanaryPassGate
+    from turing.coordinator.promotion.canary_selector import CanarySelector
 
 
 _CANARY_DEADLINE_MS = 10 * 60 * 1000  # 10 minutes
@@ -59,8 +60,7 @@ class CanaryGateRunner:
         dispatch_client: SubtaskDispatchClient,
         now_ms: Callable[[], int],
         on_promoted: Callable[[str, str, str], Awaitable[None]] | None = None,
-        on_rejected: Callable[[CanaryGateOutcome, str, str, str], Awaitable[None]]
-        | None = None,
+        on_rejected: Callable[[CanaryGateOutcome, str, str, str], Awaitable[None]] | None = None,
     ) -> None:
         self._registry = registry
         self._selector = selector
@@ -110,9 +110,7 @@ class CanaryGateRunner:
         outcome = self._interpret(name=name, result_output=result.output)
 
         if outcome.promoted:
-            self._registry.promote(
-                name=name, version=version, canary_eval_score=outcome.score
-            )
+            self._registry.promote(name=name, version=version, canary_eval_score=outcome.score)
             if self._on_promoted is not None:
                 await self._on_promoted(name, version, specialty)
         else:
@@ -137,9 +135,7 @@ class CanaryGateRunner:
 
         score = float(body["score"])
         prior = self._registry.prior_live_canary_score(name=name)
-        decision = self._pass_gate.evaluate(
-            canary_score=score, prior_live_canary_score=prior
-        )
+        decision = self._pass_gate.evaluate(canary_score=score, prior_live_canary_score=prior)
         if decision.passed:
             return CanaryGateOutcome(
                 promoted=True, score=score, delta_pp=decision.delta_pp, status="scored"

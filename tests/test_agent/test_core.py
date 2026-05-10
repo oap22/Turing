@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
+from unittest.mock import AsyncMock, MagicMock
 
 from turing.agent.core import Agent
-from turing.llm.base import LLMResponse, Message, Role, ToolCall, ToolDefinition
+from turing.llm.base import LLMResponse, ToolCall, ToolDefinition
 from turing.memory.retriever import RetrievalResult
 from turing.tools.base import ToolResult
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -53,9 +50,7 @@ def _make_mock_tool_registry() -> MagicMock:
     registry = MagicMock()
     registry.get_definitions.return_value = []
     registry.get_all.return_value = []
-    registry.execute = AsyncMock(
-        return_value=ToolResult(success=True, output="tool output")
-    )
+    registry.execute = AsyncMock(return_value=ToolResult(success=True, output="tool output"))
     return registry
 
 
@@ -170,9 +165,7 @@ async def test_max_iterations_safety():
 
     llm_router = AsyncMock()
     # Always return tool calls, never a text-only response
-    llm_router.route.return_value = LLMResponse(
-        content="", tool_calls=[tool_call], model="test"
-    )
+    llm_router.route.return_value = LLMResponse(content="", tool_calls=[tool_call], model="test")
 
     agent = _make_agent(llm_router=llm_router, tool_registry=tool_registry)
 
@@ -193,9 +186,7 @@ async def test_safety_denied():
     """When safety gate denies a tool call, the agent reports the denial."""
     from turing.agent.safety import SafetyCheckResult, SafetyDecision
 
-    tool_call = ToolCall(
-        id="tc-denied", name="shell", arguments={"command": "rm -rf /"}
-    )
+    tool_call = ToolCall(id="tc-denied", name="shell", arguments={"command": "rm -rf /"})
     tool_registry = _make_mock_tool_registry()
     tool_registry.get_definitions.return_value = [
         ToolDefinition(
@@ -281,9 +272,7 @@ async def test_existing_conversation_reuse():
     memory_store.get_active_conversation.return_value = {"id": "existing-conv"}
 
     llm_router = AsyncMock()
-    llm_router.route.return_value = LLMResponse(
-        content="Response", tool_calls=[], model="test"
-    )
+    llm_router.route.return_value = LLMResponse(content="Response", tool_calls=[], model="test")
 
     agent = _make_agent(llm_router=llm_router, memory_store=memory_store)
 

@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from turing.memory.embeddings import EmbeddingModel
-from turing.memory.store import MemoryStore
-from turing.memory.vectors import VectorStore
 from turing.telemetry import traced
+
+if TYPE_CHECKING:
+    from turing.memory.embeddings import EmbeddingModel
+    from turing.memory.store import MemoryStore
+    from turing.memory.vectors import VectorStore
 
 logger = structlog.get_logger(__name__)
 
@@ -99,15 +101,11 @@ class MemoryRetriever:
 
     # ── individual fetchers ───────────────────────────────────────────
 
-    async def _fetch_recent_messages(
-        self, channel_id: str, limit: int
-    ) -> list[dict[str, Any]]:
+    async def _fetch_recent_messages(self, channel_id: str, limit: int) -> list[dict[str, Any]]:
         """Fetch the most recent messages in the channel."""
         return await self._store.get_recent_messages(channel_id, limit=limit)
 
-    async def _fetch_semantic_matches(
-        self, message: str, limit: int
-    ) -> list[dict[str, Any]]:
+    async def _fetch_semantic_matches(self, message: str, limit: int) -> list[dict[str, Any]]:
         """Embed the message and find similar stored memories."""
         if not self._embeddings.ready:
             return []
@@ -132,9 +130,7 @@ class MemoryRetriever:
         """Load all stored preferences for the user."""
         return await self._store.get_user_preferences(user_id)
 
-    async def _fetch_relevant_facts(
-        self, message: str, limit: int
-    ) -> list[dict[str, Any]]:
+    async def _fetch_relevant_facts(self, message: str, limit: int) -> list[dict[str, Any]]:
         """Text-search the fact store for entries matching the message."""
         # Use the first few significant words as the search query
         words = message.split()

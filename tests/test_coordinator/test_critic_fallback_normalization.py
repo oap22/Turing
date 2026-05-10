@@ -37,9 +37,7 @@ def test_high_critic_score_falls_inside_bounds() -> None:
 
 def test_write_critic_fallback_inserts_event_with_correct_source() -> None:
     store = EpisodeRewardsStore()
-    write_critic_fallback(
-        store, episode_id="ep1", critic_score=0.8, recorded_at_ms=1000
-    )
+    write_critic_fallback(store, episode_id="ep1", critic_score=0.8, recorded_at_ms=1000)
     events = store.events_for("ep1")
     assert len(events) == 1
     assert events[0].source is RewardSource.CRITIC_FALLBACK

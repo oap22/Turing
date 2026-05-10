@@ -5,11 +5,8 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock
 
-import pytest
-
-from turing.agent.planner import Plan, PlanStep, Planner
+from turing.agent.planner import Plan, Planner, PlanStep
 from turing.llm.base import LLMResponse, ToolDefinition
-
 
 # ---------------------------------------------------------------------------
 # Plan / PlanStep unit tests
@@ -126,10 +123,12 @@ async def test_should_not_plan_simple_message():
 
 async def test_create_plan_success():
     """Planner should parse a valid LLM response into a Plan."""
-    steps_json = json.dumps([
-        {"description": "List files", "tool_name": "shell", "tool_args": {"command": "ls"}},
-        {"description": "Analyze output", "tool_name": None, "tool_args": {}},
-    ])
+    steps_json = json.dumps(
+        [
+            {"description": "List files", "tool_name": "shell", "tool_args": {"command": "ls"}},
+            {"description": "Analyze output", "tool_name": None, "tool_args": {}},
+        ]
+    )
 
     llm_router = AsyncMock()
     llm_router.route.return_value = LLMResponse(
@@ -161,9 +160,11 @@ async def test_create_plan_with_code_fences():
     """Planner should handle responses wrapped in markdown code fences."""
     steps_json = (
         "```json\n"
-        + json.dumps([
-            {"description": "Check status", "tool_name": "system_info", "tool_args": {}},
-        ])
+        + json.dumps(
+            [
+                {"description": "Check status", "tool_name": "system_info", "tool_args": {}},
+            ]
+        )
         + "\n```"
     )
 

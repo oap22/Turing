@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from turing.gateway.ring_buffer import RingBuffer, RingBufferConfig
 from turing.gateway.telemetry_sink import TelemetrySink
 from turing.mesh.protocol import MeshMessage, MessageType
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _telemetry_message(
@@ -51,9 +52,7 @@ async def buffer(tmp_path: Path):
 
 class TestSinkDrainsToBuffer:
     @pytest.mark.asyncio
-    async def test_telemetry_message_lands_in_buffer(
-        self, buffer: RingBuffer
-    ) -> None:
+    async def test_telemetry_message_lands_in_buffer(self, buffer: RingBuffer) -> None:
         sink = TelemetrySink(buffer=buffer)
         await sink.on_mesh_message(_telemetry_message())
         rows = await buffer.query()
@@ -61,9 +60,7 @@ class TestSinkDrainsToBuffer:
         assert rows[0]["event_type"] == "llm.complete.end"
 
     @pytest.mark.asyncio
-    async def test_non_telemetry_message_ignored(
-        self, buffer: RingBuffer
-    ) -> None:
+    async def test_non_telemetry_message_ignored(self, buffer: RingBuffer) -> None:
         sink = TelemetrySink(buffer=buffer)
         await sink.on_mesh_message(
             MeshMessage(
@@ -106,9 +103,7 @@ class TestSinkFansOutToClients:
         sub_b()
 
     @pytest.mark.asyncio
-    async def test_metric_frame_emitted_alongside_trace(
-        self, buffer: RingBuffer
-    ) -> None:
+    async def test_metric_frame_emitted_alongside_trace(self, buffer: RingBuffer) -> None:
         sink = TelemetrySink(buffer=buffer)
         frames: list[dict] = []
 
@@ -136,9 +131,7 @@ class TestSinkFansOutToClients:
         assert frames == []
 
     @pytest.mark.asyncio
-    async def test_failing_client_does_not_break_others(
-        self, buffer: RingBuffer
-    ) -> None:
+    async def test_failing_client_does_not_break_others(self, buffer: RingBuffer) -> None:
         sink = TelemetrySink(buffer=buffer)
         good_frames: list[dict] = []
 

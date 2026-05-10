@@ -17,8 +17,5 @@ def vault_query(*, index: VaultIndex, query: str, k: int) -> dict[str, Any]:
     hits = index.query(query, k=k)
     return {
         "query": query,
-        "hits": [
-            {"path": hit.path, "snippet": hit.snippet, "score": hit.score}
-            for hit in hits
-        ],
+        "hits": [{"path": hit.path, "snippet": hit.snippet, "score": hit.score} for hit in hits],
     }

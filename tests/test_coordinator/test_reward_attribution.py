@@ -85,10 +85,7 @@ class TestCriticFallback:
         critic = {"st_a": 0.5}
         now = FEEDBACK_TIMEOUT_MS - 1
         assert (
-            critic_fallback_rewards(
-                recorded_at_ms=recorded, critic_scores=critic, now_ms=now
-            )
-            == []
+            critic_fallback_rewards(recorded_at_ms=recorded, critic_scores=critic, now_ms=now) == []
         )
 
     def test_skips_subtasks_without_critic_score(self) -> None:

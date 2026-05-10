@@ -63,9 +63,7 @@ class _FailThenSucceedCritic(Critic):
         self.calls += 1
         if self.calls <= self.fail_until:
             raise RuntimeError(f"transient failure #{self.calls}")
-        return CriticScore(
-            correctness=0.7, efficiency=0.7, specialty_fit=0.7, critique="ok"
-        )
+        return CriticScore(correctness=0.7, efficiency=0.7, specialty_fit=0.7, critique="ok")
 
 
 @pytest.mark.asyncio

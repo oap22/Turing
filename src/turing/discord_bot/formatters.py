@@ -208,9 +208,7 @@ def format_system_info(info: dict) -> str:
         value = info[key]
 
         # Add units or formatting based on field type
-        if key == "cpu_percent":
-            value = f"{value}%"
-        elif key in ("memory_percent", "disk_percent"):
+        if key == "cpu_percent" or key in ("memory_percent", "disk_percent"):
             value = f"{value}%"
         elif key in ("memory_total", "memory_used", "disk_total", "disk_used"):
             value = _format_bytes(value) if isinstance(value, (int, float)) else str(value)

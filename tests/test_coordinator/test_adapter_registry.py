@@ -89,9 +89,7 @@ def test_verify_rejects_blob_whose_hash_does_not_match(
         registry.verify(manifest, b"tampered-bytes")
 
 
-def test_verify_rejects_forged_signature(
-    registry: AdapterRegistry, issuer: MessageSigner
-) -> None:
+def test_verify_rejects_forged_signature(registry: AdapterRegistry, issuer: MessageSigner) -> None:
     blob = b"adapter-bytes-research-summarize1.0.0"
     manifest = _sign_manifest(issuer, sha256=_sha(blob))
     forged = manifest.with_signature(b"\x00" * 64)
@@ -117,9 +115,7 @@ def test_verify_rejects_base_model_mismatch(
     registry: AdapterRegistry, issuer: MessageSigner
 ) -> None:
     blob = b"adapter-bytes-research-summarize1.0.0"
-    manifest = _sign_manifest(
-        issuer, sha256=_sha(blob), base_model="llama3:70b"
-    )
+    manifest = _sign_manifest(issuer, sha256=_sha(blob), base_model="llama3:70b")
 
     with pytest.raises(BaseModelMismatchError):
         registry.verify(manifest, blob)
@@ -154,10 +150,7 @@ def test_promote_transitions_staged_to_live(
 
     registry.promote(name="research-summarize", version="1.0.0")
 
-    assert (
-        registry.state_of(name="research-summarize", version="1.0.0")
-        is AdapterState.LIVE
-    )
+    assert registry.state_of(name="research-summarize", version="1.0.0") is AdapterState.LIVE
 
 
 def test_promote_unknown_adapter_raises(registry: AdapterRegistry) -> None:

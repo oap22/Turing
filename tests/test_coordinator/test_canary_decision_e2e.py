@@ -77,13 +77,9 @@ def _decide_and_apply(
     canary_score: float,
 ) -> tuple[str, bool]:
     """Run the slice-4 decision flow inline. Returns (canary_worker, promoted)."""
-    canary_worker = selector.next(
-        fleet=fleet, last_canary_worker_id=last_canary_worker_id
-    )
+    canary_worker = selector.next(fleet=fleet, last_canary_worker_id=last_canary_worker_id)
     prior = reg.prior_live_canary_score(name=name)
-    result = pass_gate.evaluate(
-        canary_score=canary_score, prior_live_canary_score=prior
-    )
+    result = pass_gate.evaluate(canary_score=canary_score, prior_live_canary_score=prior)
     if result.passed:
         reg.promote(name=name, version=version, canary_eval_score=canary_score)
         return canary_worker, True
@@ -113,9 +109,9 @@ def test_first_ever_promotion_passes_with_no_incumbent() -> None:
     assert canary == "jetson-a"
     assert promoted is True
     assert reg.state_of(name="research-summarize", version="1.0.0") is AdapterState.LIVE
-    assert reg.canary_eval_score_of(
-        name="research-summarize", version="1.0.0"
-    ) == pytest.approx(68.0)
+    assert reg.canary_eval_score_of(name="research-summarize", version="1.0.0") == pytest.approx(
+        68.0
+    )
 
 
 def test_within_epsilon_against_incumbent_promotes_and_rotates_canary() -> None:
@@ -148,9 +144,7 @@ def test_within_epsilon_against_incumbent_promotes_and_rotates_canary() -> None:
     assert promoted is True
     assert reg.state_of(name="research-summarize", version="2.0.0") is AdapterState.LIVE
     # New incumbent's score becomes the next canary's reference.
-    assert reg.prior_live_canary_score(name="research-summarize") == pytest.approx(
-        69.7
-    )
+    assert reg.prior_live_canary_score(name="research-summarize") == pytest.approx(69.7)
 
 
 def test_below_epsilon_against_incumbent_rejects_permanent() -> None:
@@ -179,14 +173,9 @@ def test_below_epsilon_against_incumbent_rejects_permanent() -> None:
         canary_score=69.4,
     )
     assert promoted is False
-    assert (
-        reg.state_of(name="research-summarize", version="2.0.0")
-        is AdapterState.REJECTED
-    )
+    assert reg.state_of(name="research-summarize", version="2.0.0") is AdapterState.REJECTED
     # Incumbent unchanged — prior_live_canary_score still points at v1's 70.0.
-    assert reg.prior_live_canary_score(name="research-summarize") == pytest.approx(
-        70.0
-    )
+    assert reg.prior_live_canary_score(name="research-summarize") == pytest.approx(70.0)
     # REJECTED is permanent: re-registering same version refused.
     with pytest.raises(ValueError, match="already registered"):
         reg.register(m2, b2)

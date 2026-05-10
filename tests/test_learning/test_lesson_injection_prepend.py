@@ -64,8 +64,6 @@ def test_empty_lessons_returns_base_prompt_unchanged() -> None:
 
 def test_user_prompt_text_preserved_verbatim() -> None:
     base = "do the thing exactly as I said"
-    rendered = inject_lessons_into_prompt(
-        base_prompt=base, lessons=[_lesson("never mention x")]
-    )
+    rendered = inject_lessons_into_prompt(base_prompt=base, lessons=[_lesson("never mention x")])
     # Original prompt appears verbatim somewhere after the lessons block.
     assert base in rendered

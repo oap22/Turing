@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, AsyncIterator
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -14,6 +14,9 @@ from turing.llm.base import (
     ToolCall,
     ToolDefinition,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 logger = structlog.get_logger(__name__)
 
@@ -166,7 +169,11 @@ class OllamaProvider(LLMProvider):
     @staticmethod
     def _parse_response(response: Any) -> LLMResponse:
         """Parse an Ollama chat response into an LLMResponse."""
-        message = response.get("message", {}) if isinstance(response, dict) else getattr(response, "message", {})
+        message = (
+            response.get("message", {})
+            if isinstance(response, dict)
+            else getattr(response, "message", {})
+        )
         if not isinstance(message, dict):
             # ollama client may return an object with attributes
             message = {
@@ -180,7 +187,9 @@ class OllamaProvider(LLMProvider):
         raw_tool_calls = message.get("tool_calls")
         if raw_tool_calls:
             for i, tc in enumerate(raw_tool_calls):
-                func = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", {})
+                func = (
+                    tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", {})
+                )
                 if not isinstance(func, dict):
                     func = {
                         "name": getattr(func, "name", ""),

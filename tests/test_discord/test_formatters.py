@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from turing.discord_bot.formatters import (
     chunk_message,
     format_code_block,
@@ -11,7 +9,6 @@ from turing.discord_bot.formatters import (
     format_tool_result,
     truncate,
 )
-
 
 # ======================================================================
 # chunk_message

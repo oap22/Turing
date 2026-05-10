@@ -73,7 +73,7 @@ class GatewayService:
         if self._task is not None:
             try:
                 await asyncio.wait_for(self._task, timeout=5.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 self._task.cancel()
             self._task = None
         logger.info("gateway_stopped")

@@ -48,7 +48,9 @@ class _ReactionsClient(Protocol):
 TaskEpisodesLookup = Callable[[str], "tuple[Episode | None, list[Episode]]"]
 
 
-def _net_for(rewards_store: EpisodeRewardsStore, *, episode_id: str, user: str, message: str) -> float:
+def _net_for(
+    rewards_store: EpisodeRewardsStore, *, episode_id: str, user: str, message: str
+) -> float:
     return sum(
         e.value
         for e in rewards_store.events_for(episode_id)
@@ -70,9 +72,7 @@ async def reconcile_reactions(
     rows = 0
 
     # Subtask threads first.
-    for thread_id, subtask_id in index.subtask_threads_within(
-        now_ms=now_ms, horizon_ms=horizon_ms
-    ):
+    for thread_id, subtask_id in index.subtask_threads_within(now_ms=now_ms, horizon_ms=horizon_ms):
         rows += await _reconcile_subtask_surface(
             discord_client=discord_client,
             rewards=rewards,
@@ -83,9 +83,7 @@ async def reconcile_reactions(
         )
 
     # Live-DAG main messages.
-    for message_id, task_id in index.task_messages_within(
-        now_ms=now_ms, horizon_ms=horizon_ms
-    ):
+    for message_id, task_id in index.task_messages_within(now_ms=now_ms, horizon_ms=horizon_ms):
         synthesis, upstreams = task_episodes_lookup(task_id)
         if synthesis is None:
             continue
@@ -167,9 +165,7 @@ async def _reconcile_synthesis_surface(
 
     operator_up = operator in up
     operator_down = operator in down
-    net = _net_for(
-        rewards, episode_id=synthesis.subtask_id, user=operator, message=message_id
-    )
+    net = _net_for(rewards, episode_id=synthesis.subtask_id, user=operator, message=message_id)
 
     if operator_up and net <= 0:
         write_synthesis_thumb(

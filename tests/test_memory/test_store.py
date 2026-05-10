@@ -29,14 +29,16 @@ class TestInitialization:
         )
         rows = await cursor.fetchall()
         table_names = sorted(row[0] for row in rows)
-        expected = sorted([
-            "conversations",
-            "messages",
-            "facts",
-            "user_preferences",
-            "task_outcomes",
-            "audit_log",
-        ])
+        expected = sorted(
+            [
+                "conversations",
+                "messages",
+                "facts",
+                "user_preferences",
+                "task_outcomes",
+                "audit_log",
+            ]
+        )
         for name in expected:
             assert name in table_names, f"Missing table: {name}"
 
@@ -166,9 +168,7 @@ class TestMessages:
         assert results[0]["content"] == "The weather is sunny"
 
     @pytest.mark.asyncio
-    async def test_add_message_updates_conversation_timestamp(
-        self, store: MemoryStore
-    ) -> None:
+    async def test_add_message_updates_conversation_timestamp(self, store: MemoryStore) -> None:
         conv_id = await store.create_conversation("ch")
         conv_before = await store.get_conversation(conv_id)
         assert conv_before is not None
@@ -276,9 +276,7 @@ class TestUserPreferences:
 class TestTaskOutcomes:
     @pytest.mark.asyncio
     async def test_add_and_query(self, store: MemoryStore) -> None:
-        tid = await store.add_task_outcome(
-            "deploy app", tool_used="shell", success=True, duration_ms=500
-        )
+        await store.add_task_outcome("deploy app", tool_used="shell", success=True, duration_ms=500)
         outcomes = await store.get_task_outcomes()
         assert len(outcomes) >= 1
         assert any(o["task_description"] == "deploy app" for o in outcomes)

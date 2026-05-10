@@ -8,9 +8,12 @@ naturally resets ``spent_today`` without any background task.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 @dataclass
@@ -22,7 +25,7 @@ class _Record:
 
 class SpendTracker:
     def __init__(self, *, now: Callable[[], datetime] | None = None) -> None:
-        self._now = now or (lambda: datetime.now(tz=timezone.utc))
+        self._now = now or (lambda: datetime.now(tz=UTC))
         self._records: list[_Record] = []
 
     def record(self, *, task_id: str, cents: int) -> None:

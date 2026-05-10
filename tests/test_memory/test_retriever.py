@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -10,7 +10,6 @@ from turing.memory.embeddings import EmbeddingModel
 from turing.memory.retriever import MemoryRetriever, RetrievalResult
 from turing.memory.store import MemoryStore
 from turing.memory.vectors import VectorStore
-
 
 # ── fixtures ──────────────────────────────────────────────────────────
 
@@ -24,9 +23,7 @@ def mock_store() -> AsyncMock:
             {"id": 2, "role": "assistant", "content": "hi!", "timestamp": "2024-01-01T00:00:01Z"},
         ]
     )
-    store.get_user_preferences = AsyncMock(
-        return_value={"theme": "dark", "language": "en"}
-    )
+    store.get_user_preferences = AsyncMock(return_value={"theme": "dark", "language": "en"})
     store.search_facts = AsyncMock(
         return_value=[
             {
@@ -126,9 +123,7 @@ class TestRetriever:
         mock_vector_store: AsyncMock,
         mock_embedding_model_unavailable: MagicMock,
     ) -> None:
-        retriever = MemoryRetriever(
-            mock_store, mock_vector_store, mock_embedding_model_unavailable
-        )
+        retriever = MemoryRetriever(mock_store, mock_vector_store, mock_embedding_model_unavailable)
         result = await retriever.retrieve(
             message="test query",
             channel_id="ch1",

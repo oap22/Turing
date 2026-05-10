@@ -74,9 +74,7 @@ def test_thumb_up_on_subtask_thread_writes_subtask_thumb_plus_1():
     idx.record_subtask_thread("th-1", "st-1", 0)
     rewards = EpisodeRewardsStore()
     listener = _listener(index=idx, rewards=rewards)
-    listener.on_reaction_add(
-        message_id="m-99", thread_id="th-1", emoji=THUMBS_UP, user_id=OPERATOR
-    )
+    listener.on_reaction_add(message_id="m-99", thread_id="th-1", emoji=THUMBS_UP, user_id=OPERATOR)
     assert rewards.effective_reward("st-1") == pytest.approx(1.0)
     ev = rewards.events_for("st-1")[0]
     assert ev.source is RewardSource.SUBTASK_THUMB
@@ -113,9 +111,7 @@ def test_thumb_up_on_live_dag_message_credits_synthesis_and_consumed_upstreams()
         _episode(subtask_id="r2", specialty="research-deep", output_key="k-r2"),
     ]
     listener = _listener(index=idx, rewards=rewards, synthesis=syn, upstreams=upstreams)
-    listener.on_reaction_add(
-        message_id="m-main", thread_id=None, emoji=THUMBS_UP, user_id=OPERATOR
-    )
+    listener.on_reaction_add(message_id="m-main", thread_id=None, emoji=THUMBS_UP, user_id=OPERATOR)
     assert rewards.effective_reward("syn") == pytest.approx(1.0)
     assert rewards.effective_reward("r1") == pytest.approx(0.3)
     assert rewards.effective_reward("r2") == pytest.approx(0.0)
@@ -150,9 +146,7 @@ def test_non_thumb_emoji_ignored():
     idx.record_subtask_thread("th-1", "st-1", 0)
     rewards = EpisodeRewardsStore()
     listener = _listener(index=idx, rewards=rewards)
-    listener.on_reaction_add(
-        message_id="m-1", thread_id="th-1", emoji="🚀", user_id=OPERATOR
-    )
+    listener.on_reaction_add(message_id="m-1", thread_id="th-1", emoji="🚀", user_id=OPERATOR)
     assert rewards.effective_reward("st-1") == pytest.approx(0.0)
 
 
@@ -164,9 +158,7 @@ def test_reaction_remove_after_thumb_up_zeroes_reward():
     idx.record_subtask_thread("th-1", "st-1", 0)
     rewards = EpisodeRewardsStore()
     listener = _listener(index=idx, rewards=rewards)
-    listener.on_reaction_add(
-        message_id="m-1", thread_id="th-1", emoji=THUMBS_UP, user_id=OPERATOR
-    )
+    listener.on_reaction_add(message_id="m-1", thread_id="th-1", emoji=THUMBS_UP, user_id=OPERATOR)
     listener.on_reaction_remove(
         message_id="m-1", thread_id="th-1", emoji=THUMBS_UP, user_id=OPERATOR
     )
@@ -179,9 +171,7 @@ def test_reaction_remove_for_synthesis_zeroes_synthesis_reward():
     rewards = EpisodeRewardsStore()
     syn = _episode(subtask_id="syn", specialty="synthesis", output_key="o", consumed_keys=())
     listener = _listener(index=idx, rewards=rewards, synthesis=syn)
-    listener.on_reaction_add(
-        message_id="m-main", thread_id=None, emoji=THUMBS_UP, user_id=OPERATOR
-    )
+    listener.on_reaction_add(message_id="m-main", thread_id=None, emoji=THUMBS_UP, user_id=OPERATOR)
     listener.on_reaction_remove(
         message_id="m-main", thread_id=None, emoji=THUMBS_UP, user_id=OPERATOR
     )
@@ -196,12 +186,8 @@ def test_duplicate_thumb_up_does_not_double_record():
     idx.record_subtask_thread("th-1", "st-1", 0)
     rewards = EpisodeRewardsStore()
     listener = _listener(index=idx, rewards=rewards)
-    listener.on_reaction_add(
-        message_id="m-1", thread_id="th-1", emoji=THUMBS_UP, user_id=OPERATOR
-    )
-    listener.on_reaction_add(
-        message_id="m-1", thread_id="th-1", emoji=THUMBS_UP, user_id=OPERATOR
-    )
+    listener.on_reaction_add(message_id="m-1", thread_id="th-1", emoji=THUMBS_UP, user_id=OPERATOR)
+    listener.on_reaction_add(message_id="m-1", thread_id="th-1", emoji=THUMBS_UP, user_id=OPERATOR)
     assert rewards.effective_reward("st-1") == pytest.approx(1.0)
     # Only one event recorded.
     same_user_msg = [

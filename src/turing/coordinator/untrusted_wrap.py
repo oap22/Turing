@@ -12,7 +12,10 @@ inspection (a unicode-like sentinel) without re-introducing the close tag.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 OPEN_TAG = "<untrusted_data>"
 CLOSE_TAG = "</untrusted_data>"

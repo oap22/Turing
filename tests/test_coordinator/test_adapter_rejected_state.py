@@ -63,10 +63,7 @@ def test_reject_transitions_to_rejected_state() -> None:
 
     reg.reject(name=manifest.name, version=manifest.version)
 
-    assert (
-        reg.state_of(name=manifest.name, version=manifest.version)
-        is AdapterState.REJECTED
-    )
+    assert reg.state_of(name=manifest.name, version=manifest.version) is AdapterState.REJECTED
 
 
 def test_rejected_is_permanent_same_version_refused() -> None:
@@ -91,10 +88,7 @@ def test_rejected_does_not_block_different_version() -> None:
     # A *different* version proceeds normally.
     manifest_v2, blob_v2 = _make_manifest(signer, version="2.0.0")
     reg.register(manifest_v2, blob_v2)
-    assert (
-        reg.state_of(name=manifest_v2.name, version=manifest_v2.version)
-        is AdapterState.STAGED
-    )
+    assert reg.state_of(name=manifest_v2.name, version=manifest_v2.version) is AdapterState.STAGED
 
 
 def test_reject_unknown_adapter_raises() -> None:

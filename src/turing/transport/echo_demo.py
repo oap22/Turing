@@ -46,9 +46,7 @@ async def run_echo_round_trip(
     coordinator = SignedTransport(
         bus=bus, signer=coordinator_signer, trusted_keys=trusted, now_ms=lambda: 0
     )
-    worker = SignedTransport(
-        bus=bus, signer=worker_signer, trusted_keys=trusted, now_ms=lambda: 0
-    )
+    worker = SignedTransport(bus=bus, signer=worker_signer, trusted_keys=trusted, now_ms=lambda: 0)
 
     result_received: asyncio.Future[bytes] = asyncio.get_event_loop().create_future()
 

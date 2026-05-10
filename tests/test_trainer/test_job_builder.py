@@ -48,14 +48,9 @@ def test_builds_jsonl_from_episode_store(tmp_path: Path) -> None:
 
     builder = TrainingJobBuilder(episode_store=store, min_critic_score=0.0)
     out_path = tmp_path / "dataset.jsonl"
-    info = builder.build(
-        specialty="research-summarize", top_k=5, out_path=out_path
-    )
+    info = builder.build(specialty="research-summarize", top_k=5, out_path=out_path)
     assert info.example_count == 2
-    lines = [
-        json.loads(line)
-        for line in out_path.read_text(encoding="utf-8").splitlines()
-    ]
+    lines = [json.loads(line) for line in out_path.read_text(encoding="utf-8").splitlines()]
     assert {row["input"] for row in lines} == {"paper A", "paper B"}
 
 
@@ -66,9 +61,7 @@ def test_filters_below_critic_score(tmp_path: Path) -> None:
 
     builder = TrainingJobBuilder(episode_store=store, min_critic_score=0.7)
     out_path = tmp_path / "dataset.jsonl"
-    info = builder.build(
-        specialty="research-summarize", top_k=10, out_path=out_path
-    )
+    info = builder.build(specialty="research-summarize", top_k=10, out_path=out_path)
     assert info.example_count == 1
 
 
@@ -76,15 +69,11 @@ def test_filters_failed_outcomes(tmp_path: Path) -> None:
     """A FAILED episode is not training data even if its critic score is high."""
     store = EpisodeStore()
     store.record(_ep(subtask_id="s-1", critic_score=0.9))
-    store.record(
-        _ep(subtask_id="s-2", critic_score=0.95, outcome=SubtaskState.FAILED)
-    )
+    store.record(_ep(subtask_id="s-2", critic_score=0.95, outcome=SubtaskState.FAILED))
 
     builder = TrainingJobBuilder(episode_store=store, min_critic_score=0.7)
     out_path = tmp_path / "dataset.jsonl"
-    info = builder.build(
-        specialty="research-summarize", top_k=10, out_path=out_path
-    )
+    info = builder.build(specialty="research-summarize", top_k=10, out_path=out_path)
     assert info.example_count == 1
 
 
@@ -97,9 +86,7 @@ def test_dedup_by_content_hash(tmp_path: Path) -> None:
 
     builder = TrainingJobBuilder(episode_store=store, min_critic_score=0.0)
     out_path = tmp_path / "dataset.jsonl"
-    info = builder.build(
-        specialty="research-summarize", top_k=10, out_path=out_path
-    )
+    info = builder.build(specialty="research-summarize", top_k=10, out_path=out_path)
     assert info.example_count == 2
     assert info.duplicates_dropped == 1
 
@@ -113,12 +100,8 @@ def test_dataset_hash_is_content_addressed(tmp_path: Path) -> None:
 
     builder = TrainingJobBuilder(episode_store=store, min_critic_score=0.0)
 
-    a = builder.build(
-        specialty="research-summarize", top_k=10, out_path=tmp_path / "a.jsonl"
-    )
-    b = builder.build(
-        specialty="research-summarize", top_k=10, out_path=tmp_path / "b.jsonl"
-    )
+    a = builder.build(specialty="research-summarize", top_k=10, out_path=tmp_path / "a.jsonl")
+    b = builder.build(specialty="research-summarize", top_k=10, out_path=tmp_path / "b.jsonl")
     assert a.dataset_sha256 == b.dataset_sha256
     assert len(a.dataset_sha256) == 64
 

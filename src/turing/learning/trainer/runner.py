@@ -11,10 +11,12 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-from turing.learning.trainer.job import TrainingJob
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from turing.learning.trainer.job import TrainingJob
 
 EmitFn = Callable[[dict[str, Any]], None]
 

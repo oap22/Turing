@@ -14,11 +14,13 @@ informative — a key bit of the issue's auditability requirement.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Iterable, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from turing.llm.base import Message, Role
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
 
 
 @dataclass(frozen=True)

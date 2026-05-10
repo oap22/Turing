@@ -99,9 +99,7 @@ class AdapterRegistry:
         self.verify(manifest, blob)
         key = _AdapterKey(manifest.name, manifest.version)
         if key in self._states:
-            raise ValueError(
-                f"adapter {manifest.name}@{manifest.version} already registered"
-            )
+            raise ValueError(f"adapter {manifest.name}@{manifest.version} already registered")
         self._states[key] = AdapterState.STAGED
 
     def promote(
@@ -115,9 +113,7 @@ class AdapterRegistry:
         if key not in self._states:
             raise UnknownAdapterError(f"adapter {name}@{version} is not registered")
         if self._states[key] is AdapterState.REJECTED:
-            raise ValueError(
-                f"adapter {name}@{version} is REJECTED and cannot be promoted"
-            )
+            raise ValueError(f"adapter {name}@{version} is REJECTED and cannot be promoted")
         self._states[key] = AdapterState.LIVE
         if canary_eval_score is not None:
             self._canary_scores[key] = canary_eval_score

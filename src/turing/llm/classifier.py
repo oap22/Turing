@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import re
-from enum import Enum
+from enum import StrEnum
 
 
-class Complexity(str, Enum):
+class Complexity(StrEnum):
     """Complexity level determines which LLM backend handles a request."""
 
     SIMPLE = "simple"  # Route to local LLM
@@ -134,14 +134,8 @@ class ComplexityClassifier:
 
     def _has_tool_indicators(self, lowered: str) -> bool:
         """Return True if the message looks like it wants a tool action."""
-        for indicator in self.TOOL_INDICATORS:
-            if indicator in lowered:
-                return True
-        return False
+        return any(indicator in lowered for indicator in self.TOOL_INDICATORS)
 
     def _has_code_patterns(self, message: str) -> bool:
         """Return True if the message contains code or asks for code."""
-        for pattern in self.CODE_PATTERNS:
-            if pattern.search(message):
-                return True
-        return False
+        return any(pattern.search(message) for pattern in self.CODE_PATTERNS)

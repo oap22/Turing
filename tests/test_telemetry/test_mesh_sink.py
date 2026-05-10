@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
-import pytest
-
 from turing.mesh.protocol import MeshMessage, MessageType
 from turing.telemetry.bus import Telemetry, TelemetryEvent
 from turing.telemetry.mesh_sink import MeshTelemetrySink, TelemetrySubscriber

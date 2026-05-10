@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from turing.mesh.node import MeshNode
 from turing.mesh.protocol import MeshMessage, MessageType
+
+if TYPE_CHECKING:
+    from turing.mesh.node import MeshNode
 
 logger = structlog.get_logger("turing.mesh.client")
 
@@ -75,7 +77,7 @@ class MeshClient:
         try:
             response = await self.wait_for_response(message.request_id, timeout=10.0)
             return response.payload
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return {"error": "Peer did not respond within timeout", "peer_id": peer_id}
 
     async def broadcast(self, message: MeshMessage) -> None:
@@ -116,7 +118,7 @@ class MeshClient:
         try:
             result = await asyncio.wait_for(future, timeout=timeout)
             return result
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("response_timeout", request_id=request_id, timeout=timeout)
             raise
         finally:

@@ -58,9 +58,9 @@ class PatternExtractor:
             "Analyze the following conversation and extract structured knowledge.\n\n"
             "Return a JSON object with three keys:\n"
             '1. "facts": array of {subject, predicate, object} triples '
-            "(e.g. {\"subject\": \"Python\", \"predicate\": \"is\", \"object\": \"a programming language\"})\n"
+            '(e.g. {"subject": "Python", "predicate": "is", "object": "a programming language"})\n'
             '2. "preferences": array of {user_id, key, value} for user preferences '
-            "(e.g. {\"user_id\": \"123\", \"key\": \"language\", \"value\": \"Python\"})\n"
+            '(e.g. {"user_id": "123", "key": "language", "value": "Python"})\n'
             '3. "patterns": array of strings describing recurring patterns\n\n'
             "Only extract clear, factual information. Do not speculate.\n"
             "If nothing useful can be extracted, return empty arrays.\n\n"

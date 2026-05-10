@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
+from typing import TYPE_CHECKING
 
-from turing.coordinator.training_approval.proposal import TrainingJobProposal
-from turing.coordinator.training_approval.quota import QuotaTracker
+if TYPE_CHECKING:
+    from turing.coordinator.training_approval.proposal import TrainingJobProposal
+    from turing.coordinator.training_approval.quota import QuotaTracker
 
 
-class AutonomyMode(str, Enum):
+class AutonomyMode(StrEnum):
     """How much trust the operator has granted the trainer.
 
     - ``MANUAL``: every proposal goes to Discord with empty fields.
@@ -24,7 +26,7 @@ class AutonomyMode(str, Enum):
     AUTO_WITHIN_QUOTA = "auto-within-quota"
 
 
-class PolicyDecision(str, Enum):
+class PolicyDecision(StrEnum):
     REQUIRE_APPROVAL = "require_approval"
     REQUIRE_APPROVAL_WITH_DEFAULTS = "require_approval_with_defaults"
     AUTO_APPROVE = "auto_approve"
@@ -50,9 +52,7 @@ class AutonomyPolicy:
         if self._mode is AutonomyMode.MANUAL_WITH_DEFAULTS:
             return PolicyDecision.REQUIRE_APPROVAL_WITH_DEFAULTS
         # AUTO_WITHIN_QUOTA
-        ok, _ = self._quota.check(
-            proposal.specialty, cost_usd=proposal.estimated_cost_usd
-        )
+        ok, _ = self._quota.check(proposal.specialty, cost_usd=proposal.estimated_cost_usd)
         if ok:
             return PolicyDecision.AUTO_APPROVE
         return PolicyDecision.REQUIRE_APPROVAL

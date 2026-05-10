@@ -66,9 +66,7 @@ class TestAsyncSuccess:
 
 class TestAsyncError:
     @pytest.mark.asyncio
-    async def test_exception_emits_error_event_and_propagates(
-        self, tel: Telemetry
-    ) -> None:
+    async def test_exception_emits_error_event_and_propagates(self, tel: Telemetry) -> None:
         captured: list[TelemetryEvent] = []
         tel.add_sink(captured.append)
 
@@ -114,9 +112,7 @@ class TestPayloadHook:
         assert end.payload["result"] == 5
 
     @pytest.mark.asyncio
-    async def test_payload_exception_does_not_break_tracing(
-        self, tel: Telemetry
-    ) -> None:
+    async def test_payload_exception_does_not_break_tracing(self, tel: Telemetry) -> None:
         captured: list[TelemetryEvent] = []
         tel.add_sink(captured.append)
 

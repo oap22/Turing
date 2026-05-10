@@ -24,13 +24,13 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-from turing.learning.lessons.lesson import Lesson
+    from turing.learning.lessons.lesson import Lesson
 
 
 def _cosine(a: tuple[float, ...], b: tuple[float, ...]) -> float:
     if len(a) != len(b):
         return 0.0
-    num = sum(x * y for x, y in zip(a, b))
+    num = sum(x * y for x, y in zip(a, b, strict=False))
     da = math.sqrt(sum(x * x for x in a))
     db = math.sqrt(sum(y * y for y in b))
     if da == 0.0 or db == 0.0:
@@ -82,10 +82,7 @@ class LessonStore:
         for i, lesson in enumerate(self._lessons):
             if lesson.task_id not in targets:
                 continue
-            if (
-                lesson.pinned_until_ms is None
-                or until_ms > lesson.pinned_until_ms
-            ):
+            if lesson.pinned_until_ms is None or until_ms > lesson.pinned_until_ms:
                 self._lessons[i] = replace(lesson, pinned_until_ms=until_ms)
 
     def evict_expired(self, *, now_ms: int, ttl_ms: int) -> int:
@@ -101,10 +98,7 @@ class LessonStore:
             for lesson in self._lessons
             if not (
                 lesson.created_at_ms < cutoff
-                and (
-                    lesson.pinned_until_ms is None
-                    or lesson.pinned_until_ms < now_ms
-                )
+                and (lesson.pinned_until_ms is None or lesson.pinned_until_ms < now_ms)
             )
         ]
         return before - len(self._lessons)

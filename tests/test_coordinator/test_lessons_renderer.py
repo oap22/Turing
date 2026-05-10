@@ -49,11 +49,43 @@ def test_prepends_top_k_in_lessons_block() -> None:
     embedder = DeterministicHashEmbedder(dims=64)
     store = LessonStore()
     # Five lessons; the three textually closest to the query should win.
-    store.add(_lesson(specialty="research-summarize", task_id="t1", text="cite primary sources", embedder=embedder))
-    store.add(_lesson(specialty="research-summarize", task_id="t2", text="prefer recent papers", embedder=embedder))
-    store.add(_lesson(specialty="research-summarize", task_id="t3", text="quote verbatim sparingly", embedder=embedder))
-    store.add(_lesson(specialty="research-summarize", task_id="t4", text="bake bread daily", embedder=embedder))
-    store.add(_lesson(specialty="research-summarize", task_id="t5", text="paint walls slowly", embedder=embedder))
+    store.add(
+        _lesson(
+            specialty="research-summarize",
+            task_id="t1",
+            text="cite primary sources",
+            embedder=embedder,
+        )
+    )
+    store.add(
+        _lesson(
+            specialty="research-summarize",
+            task_id="t2",
+            text="prefer recent papers",
+            embedder=embedder,
+        )
+    )
+    store.add(
+        _lesson(
+            specialty="research-summarize",
+            task_id="t3",
+            text="quote verbatim sparingly",
+            embedder=embedder,
+        )
+    )
+    store.add(
+        _lesson(
+            specialty="research-summarize", task_id="t4", text="bake bread daily", embedder=embedder
+        )
+    )
+    store.add(
+        _lesson(
+            specialty="research-summarize",
+            task_id="t5",
+            text="paint walls slowly",
+            embedder=embedder,
+        )
+    )
 
     out = render_prompt_with_lessons(
         base_prompt="cite sources from recent papers and quote sparingly",
@@ -76,7 +108,11 @@ def test_prepends_top_k_in_lessons_block() -> None:
 def test_specialty_filtering_excludes_other_specialties() -> None:
     embedder = DeterministicHashEmbedder(dims=64)
     store = LessonStore()
-    store.add(_lesson(specialty="research-summarize", task_id="t1", text="cite sources", embedder=embedder))
+    store.add(
+        _lesson(
+            specialty="research-summarize", task_id="t1", text="cite sources", embedder=embedder
+        )
+    )
     store.add(_lesson(specialty="critic", task_id="t2", text="cite sources", embedder=embedder))
 
     out = render_prompt_with_lessons(

@@ -9,10 +9,9 @@ this helper walks both shapes so the gateway can serve assets either way.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 
-def spa_assets_path() -> Optional[Path]:
+def spa_assets_path() -> Path | None:
     """Return the SPA assets directory if it exists, else None.
 
     The gateway treats ``None`` as "no SPA available" — it still serves the

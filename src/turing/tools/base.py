@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import Enum
-from typing import Any
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from turing.telemetry import traced
+
+if TYPE_CHECKING:
+    from turing.llm.base import ToolDefinition
 
 logger = structlog.get_logger("turing.tools")
 
@@ -24,7 +27,7 @@ def _tool_dispatch_payload(kind, args, kwargs, result, exc):  # type: ignore[no-
     return data
 
 
-class RiskLevel(str, Enum):
+class RiskLevel(StrEnum):
     """Risk classification for tool operations."""
 
     LOW = "low"  # Read-only operations
@@ -115,7 +118,6 @@ class ToolRegistry:
 
     def get_definitions(self) -> list[ToolDefinition]:
         """Return LLM-compatible ToolDefinition objects for all registered tools."""
-        from turing.llm.base import ToolDefinition  # noqa: F811
 
         return [tool.to_tool_definition() for tool in self._tools.values()]
 
@@ -133,9 +135,7 @@ class ToolRegistry:
         """
         tool = self.get(tool_name)
         if tool is None:
-            return ToolResult(
-                success=False, output="", error=f"Tool '{tool_name}' not found"
-            )
+            return ToolResult(success=False, output="", error=f"Tool '{tool_name}' not found")
         try:
             return await tool.execute(**kwargs)
         except Exception as exc:

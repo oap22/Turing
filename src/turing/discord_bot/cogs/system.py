@@ -5,7 +5,7 @@ from __future__ import annotations
 import platform
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import psutil
@@ -78,8 +78,8 @@ class SystemCog(commands.Cog, name="System"):
         """Show system and bot uptime."""
         try:
             # System uptime
-            boot_time = datetime.fromtimestamp(psutil.boot_time(), tz=timezone.utc)
-            sys_uptime = datetime.now(tz=timezone.utc) - boot_time
+            boot_time = datetime.fromtimestamp(psutil.boot_time(), tz=UTC)
+            sys_uptime = datetime.now(tz=UTC) - boot_time
             sys_days = sys_uptime.days
             sys_hours, sys_rem = divmod(sys_uptime.seconds, 3600)
             sys_mins, sys_secs = divmod(sys_rem, 60)
@@ -147,7 +147,9 @@ class SystemCog(commands.Cog, name="System"):
 
             # Ollama (local LLM) check
             ollama_ok = await _check_ollama(self.bot.config.ollama_host)
-            checks.append(f"{'[OK]' if ollama_ok else '[FAIL]':>6}  Ollama ({self.bot.config.ollama_host})")
+            checks.append(
+                f"{'[OK]' if ollama_ok else '[FAIL]':>6}  Ollama ({self.bot.config.ollama_host})"
+            )
 
             # Anthropic check
             anthropic_ok = bool(self.bot.config.anthropic_api_key)
@@ -168,7 +170,9 @@ class SystemCog(commands.Cog, name="System"):
             checks.append(f"{'[OK]' if agent_ok else '[FAIL]':>6}  Agent")
 
             header = "Health Check"
-            await ctx.reply(format_code_block(f"{header}\n{'=' * len(header)}\n" + "\n".join(checks)))
+            await ctx.reply(
+                format_code_block(f"{header}\n{'=' * len(header)}\n" + "\n".join(checks))
+            )
 
         except Exception as exc:
             logger.error("health.error", error=str(exc), traceback=traceback.format_exc())
@@ -197,7 +201,7 @@ def _get_cpu_temperature() -> float | None:
             return None
         # Try common sensor names on Raspberry Pi and generic Linux
         for name in ("cpu_thermal", "coretemp", "cpu-thermal"):
-            if name in temps and temps[name]:
+            if temps.get(name):
                 return temps[name][0].current
         # Fallback: return the first available sensor
         first_key = next(iter(temps))

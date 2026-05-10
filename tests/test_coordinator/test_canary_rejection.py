@@ -48,9 +48,17 @@ def test_format_rejection_notice_includes_all_fields():
         name="research",
         version="v3",
         specialty="research-deep",
-        outcome=_outcome(hard_examples=(
-            HardExample(subtask_id="c1", input_text="i", expected_text="e", actual_output="a", failure_reason="r"),
-        )),
+        outcome=_outcome(
+            hard_examples=(
+                HardExample(
+                    subtask_id="c1",
+                    input_text="i",
+                    expected_text="e",
+                    actual_output="a",
+                    failure_reason="r",
+                ),
+            )
+        ),
         prior_name="research",
         prior_version="v2",
         regressions_30d=4,
@@ -69,7 +77,10 @@ def test_format_rejection_notice_handles_no_prior_live():
         version="v1",
         specialty="x",
         outcome=CanaryGateOutcome(
-            promoted=False, score=None, delta_pp=None, status="load_failed",
+            promoted=False,
+            score=None,
+            delta_pp=None,
+            status="load_failed",
         ),
         prior_name=None,
         prior_version=None,
@@ -107,14 +118,30 @@ async def test_handler_writes_hard_examples_and_posts_notice():
 
     outcome = _outcome(
         hard_examples=(
-            HardExample(subtask_id="c1", input_text="q", expected_text="e", actual_output="a", failure_reason="wrong"),
-            HardExample(subtask_id="c2", input_text="q2", expected_text="e2", actual_output="a2", failure_reason="missing"),
+            HardExample(
+                subtask_id="c1",
+                input_text="q",
+                expected_text="e",
+                actual_output="a",
+                failure_reason="wrong",
+            ),
+            HardExample(
+                subtask_id="c2",
+                input_text="q2",
+                expected_text="e2",
+                actual_output="a2",
+                failure_reason="missing",
+            ),
         )
     )
     await handler(outcome, "research", "v3", "research-deep")
 
     # Hard examples archived as FAILED episodes.
-    archived = episode_store.all_episodes() if hasattr(episode_store, "all_episodes") else list(episode_store._rows.values())
+    archived = (
+        episode_store.all_episodes()
+        if hasattr(episode_store, "all_episodes")
+        else list(episode_store._rows.values())
+    )
     assert {e.subtask_id for e in archived} == {"c1", "c2"}
     assert all(e.specialty == "research-deep" for e in archived)
 
@@ -123,15 +150,17 @@ async def test_handler_writes_hard_examples_and_posts_notice():
     assert posted and "research:v3" in posted[0]
     assert "Regressions this month for `research-deep`: 1" in posted[0]
     # RejectionLog updated.
-    assert log.count_within(
-        specialty="research-deep", now_ms=5_000, horizon_ms=REGRESSION_HORIZON_MS
-    ) == 1
+    assert (
+        log.count_within(specialty="research-deep", now_ms=5_000, horizon_ms=REGRESSION_HORIZON_MS)
+        == 1
+    )
 
 
 @pytest.mark.asyncio
 async def test_handler_no_hard_examples_skips_archive_but_still_posts():
     episode_store = EpisodeStore()
     log = RejectionLog()
+
     class _Notifier:
         def notify(self, kind, payload):
             raise AssertionError("no hard examples → notifier should not fire")
@@ -163,6 +192,7 @@ async def test_handler_no_hard_examples_skips_archive_but_still_posts():
 async def test_handler_works_without_discord_post():
     episode_store = EpisodeStore()
     log = RejectionLog()
+
     class _Notifier:
         def notify(self, *args, **kwargs):
             pass

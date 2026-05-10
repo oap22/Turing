@@ -168,8 +168,7 @@ def cancel_reaction(
     matching = [
         e
         for e in store.events_for(episode_id)
-        if e.discord_user_id == discord_user_id
-        and e.discord_message_id == discord_message_id
+        if e.discord_user_id == discord_user_id and e.discord_message_id == discord_message_id
     ]
     if not matching:
         return

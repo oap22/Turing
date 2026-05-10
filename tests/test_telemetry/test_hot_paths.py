@@ -8,7 +8,6 @@ Telemetry singleton attached and assert the expected events appear.
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -61,9 +60,7 @@ class TestToolDispatchTraced:
         assert "tool.dispatch.end" in names
 
     @pytest.mark.asyncio
-    async def test_tool_event_payload_includes_tool_name(
-        self, tel: Telemetry
-    ) -> None:
+    async def test_tool_event_payload_includes_tool_name(self, tel: Telemetry) -> None:
         captured: list[TelemetryEvent] = []
         tel.add_sink(captured.append)
 
@@ -77,9 +74,7 @@ class TestToolDispatchTraced:
 
 class TestSafetyGateTraced:
     @pytest.mark.asyncio
-    async def test_safety_check_emits_priority_high_event(
-        self, tel: Telemetry
-    ) -> None:
+    async def test_safety_check_emits_priority_high_event(self, tel: Telemetry) -> None:
         captured: list[TelemetryEvent] = []
         tel.add_sink(captured.append)
 
@@ -134,9 +129,7 @@ class TestPerformanceBudget:
     """Telemetry overhead must not stall the agent loop."""
 
     @pytest.mark.asyncio
-    async def test_traced_tool_dispatch_overhead_is_bounded(
-        self, tel: Telemetry
-    ) -> None:
+    async def test_traced_tool_dispatch_overhead_is_bounded(self, tel: Telemetry) -> None:
         # 100 dispatches under 1 second is generous — the actual budget is
         # usually well under 50ms in real runs; we leave a safety margin so
         # this test is not flaky on slow CI workers.

@@ -158,7 +158,7 @@ class ShellTool(Tool):
                     process.communicate(),
                     timeout=self._sandbox_timeout,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 process.kill()
                 await process.communicate()
                 return ToolResult(
@@ -179,7 +179,9 @@ class ShellTool(Tool):
             success = process.returncode == 0
             output = stdout_text
             if stderr_text and not success:
-                output = f"{stdout_text}\n--- stderr ---\n{stderr_text}" if stdout_text else stderr_text
+                output = (
+                    f"{stdout_text}\n--- stderr ---\n{stderr_text}" if stdout_text else stderr_text
+                )
 
             return ToolResult(
                 success=success,
@@ -208,13 +210,21 @@ class ShellTool(Tool):
         # Build bwrap invocation with restricted filesystem access.
         bwrap_args = [
             bwrap_path,
-            "--ro-bind", "/", "/",
-            "--tmpfs", "/tmp",
-            "--dev", "/dev",
-            "--proc", "/proc",
+            "--ro-bind",
+            "/",
+            "/",
+            "--tmpfs",
+            "/tmp",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
             "--unshare-net",
             "--die-with-parent",
-            "--", "sh", "-c", command,
+            "--",
+            "sh",
+            "-c",
+            command,
         ]
         # Shell-quote each argument for safe embedding.
         import shlex

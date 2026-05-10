@@ -4,13 +4,10 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
-
 from turing.agent.executor import Executor
 from turing.agent.safety import SafetyCheckResult, SafetyDecision
 from turing.llm.base import ToolCall
 from turing.tools.base import ToolResult
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -19,9 +16,7 @@ from turing.tools.base import ToolResult
 
 def _make_mock_tool_registry() -> MagicMock:
     registry = MagicMock()
-    registry.execute = AsyncMock(
-        return_value=ToolResult(success=True, output="command output")
-    )
+    registry.execute = AsyncMock(return_value=ToolResult(success=True, output="command output"))
     return registry
 
 
@@ -56,9 +51,7 @@ async def test_successful_execution():
 
     assert result.success is True
     assert result.output == "command output"
-    gate.check.assert_awaited_once_with(
-        tool_name="system_info", arguments={}, user_id="user-1"
-    )
+    gate.check.assert_awaited_once_with(tool_name="system_info", arguments={}, user_id="user-1")
     registry.execute.assert_awaited_once_with("system_info")
 
 
@@ -72,9 +65,7 @@ async def test_safety_denied_tool():
     )
     executor = Executor(registry, gate)
 
-    tool_call = ToolCall(
-        id="tc-denied", name="shell", arguments={"command": "rm -rf /"}
-    )
+    tool_call = ToolCall(id="tc-denied", name="shell", arguments={"command": "rm -rf /"})
     result = await executor.execute_tool_call(tool_call, user_id="user-1")
 
     assert result.success is False
@@ -96,9 +87,7 @@ async def test_needs_confirmation_no_bot():
     tool_call = ToolCall(
         id="tc-confirm", name="process", arguments={"action": "kill_process", "pid": 1234}
     )
-    result = await executor.execute_tool_call(
-        tool_call, user_id="user-1", channel_id="ch-1"
-    )
+    result = await executor.execute_tool_call(tool_call, user_id="user-1", channel_id="ch-1")
 
     assert result.success is False
     assert "not confirmed" in result.error.lower()
@@ -130,12 +119,8 @@ async def test_needs_confirmation_approved(monkeypatch):
         lambda **kwargs: mock_view,
     )
 
-    tool_call = ToolCall(
-        id="tc-confirmed", name="process", arguments={"action": "kill_process"}
-    )
-    result = await executor.execute_tool_call(
-        tool_call, user_id="123", channel_id="456"
-    )
+    tool_call = ToolCall(id="tc-confirmed", name="process", arguments={"action": "kill_process"})
+    result = await executor.execute_tool_call(tool_call, user_id="123", channel_id="456")
 
     assert result.success is True
     assert result.output == "command output"
@@ -170,9 +155,7 @@ async def test_needs_confirmation_denied(monkeypatch):
         name="process",
         arguments={"action": "kill_process"},
     )
-    result = await executor.execute_tool_call(
-        tool_call, user_id="123", channel_id="456"
-    )
+    result = await executor.execute_tool_call(tool_call, user_id="123", channel_id="456")
 
     assert result.success is False
     assert "not confirmed" in result.error.lower()

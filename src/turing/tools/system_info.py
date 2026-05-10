@@ -149,7 +149,9 @@ class SystemInfoTool(Tool):
         try:
             usage = psutil.disk_usage(mount_point)
         except OSError as exc:
-            return ToolResult(success=False, output="", error=f"Cannot read disk at '{mount_point}': {exc}")
+            return ToolResult(
+                success=False, output="", error=f"Cannot read disk at '{mount_point}': {exc}"
+            )
 
         # Also list all partitions.
         partitions = psutil.disk_partitions(all=False)
@@ -210,7 +212,9 @@ class SystemInfoTool(Tool):
                     try:
                         raw = temp_file.read_text().strip()
                         temp_c = int(raw) / 1000.0
-                        zone_type = type_file.read_text().strip() if type_file.exists() else zone.name
+                        zone_type = (
+                            type_file.read_text().strip() if type_file.exists() else zone.name
+                        )
                         lines.append(f"  {zone_type}: {temp_c:.1f} C")
                         found_any = True
                     except (ValueError, OSError):
@@ -247,7 +251,7 @@ class SystemInfoTool(Tool):
         minutes = int((uptime_seconds % 3600) // 60)
         seconds = int(uptime_seconds % 60)
 
-        boot_dt = datetime.datetime.fromtimestamp(boot_time, tz=datetime.timezone.utc)
+        boot_dt = datetime.datetime.fromtimestamp(boot_time, tz=datetime.UTC)
 
         lines = [
             "System Uptime",

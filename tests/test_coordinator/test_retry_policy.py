@@ -47,13 +47,9 @@ def test_pick_for_retry_returns_different_worker() -> None:
     registry.register(_manifest("worker-1", eval_score=0.9))
     registry.register(_manifest("worker-2", eval_score=0.7))
     scheduler = Scheduler()
-    subtask = Subtask(
-        subtask_id="sub-1", specialty_required="research-summarize"
-    )
+    subtask = Subtask(subtask_id="sub-1", specialty_required="research-summarize")
 
-    pick = scheduler.pick_for_retry(
-        subtask, registry, exclude_worker_ids=("worker-1",)
-    )
+    pick = scheduler.pick_for_retry(subtask, registry, exclude_worker_ids=("worker-1",))
 
     assert pick is not None and pick.worker_id == "worker-2"
 
@@ -62,13 +58,9 @@ def test_pick_for_retry_returns_none_when_no_other_worker_available() -> None:
     registry = _registry()
     registry.register(_manifest("worker-1"))
     scheduler = Scheduler()
-    subtask = Subtask(
-        subtask_id="sub-1", specialty_required="research-summarize"
-    )
+    subtask = Subtask(subtask_id="sub-1", specialty_required="research-summarize")
 
-    pick = scheduler.pick_for_retry(
-        subtask, registry, exclude_worker_ids=("worker-1",)
-    )
+    pick = scheduler.pick_for_retry(subtask, registry, exclude_worker_ids=("worker-1",))
 
     assert pick is None
 
@@ -79,13 +71,9 @@ def test_pick_for_retry_excludes_multiple_failed_workers() -> None:
     registry.register(_manifest("worker-2"))
     registry.register(_manifest("worker-3", eval_score=0.95))
     scheduler = Scheduler()
-    subtask = Subtask(
-        subtask_id="sub-1", specialty_required="research-summarize"
-    )
+    subtask = Subtask(subtask_id="sub-1", specialty_required="research-summarize")
 
-    pick = scheduler.pick_for_retry(
-        subtask, registry, exclude_worker_ids=("worker-1", "worker-2")
-    )
+    pick = scheduler.pick_for_retry(subtask, registry, exclude_worker_ids=("worker-1", "worker-2"))
 
     assert pick is not None and pick.worker_id == "worker-3"
 
@@ -96,13 +84,9 @@ def test_pick_for_retry_still_breaks_ties_on_eval_score() -> None:
     registry.register(_manifest("worker-low", eval_score=0.2))
     registry.register(_manifest("worker-high", eval_score=0.9))
     scheduler = Scheduler()
-    subtask = Subtask(
-        subtask_id="sub-1", specialty_required="research-summarize"
-    )
+    subtask = Subtask(subtask_id="sub-1", specialty_required="research-summarize")
 
-    pick = scheduler.pick_for_retry(
-        subtask, registry, exclude_worker_ids=("worker-1",)
-    )
+    pick = scheduler.pick_for_retry(subtask, registry, exclude_worker_ids=("worker-1",))
 
     assert pick is not None and pick.worker_id == "worker-high"
 

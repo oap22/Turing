@@ -5,11 +5,11 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 
-class MessageType(str, Enum):
+class MessageType(StrEnum):
     """Types of messages that can be exchanged between mesh nodes."""
 
     TASK_REQUEST = "task_request"

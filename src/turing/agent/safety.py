@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 
 import structlog
@@ -30,7 +30,7 @@ def _safety_event_payload(kind, args, kwargs, result, exc):  # type: ignore[no-u
     return data
 
 
-class SafetyDecision(str, Enum):
+class SafetyDecision(StrEnum):
     """Outcome of a safety evaluation."""
 
     APPROVED = "approved"
@@ -158,7 +158,6 @@ class SafetyGate:
     def _get_tool_risk(self, tool_name: str, arguments: dict[str, Any]) -> str:
         """Determine the effective risk level based on tool and action."""
         # Tools with action-dependent risk.
-        high_risk_tools = {"shell", "process"}
         medium_risk_tools = {"filesystem", "network"}
         low_risk_tools = {"system_info"}
 
@@ -169,9 +168,25 @@ class SafetyGate:
             # Check if command matches safe prefixes.
             command = arguments.get("command", "").strip()
             safe_prefixes = (
-                "echo", "cat", "ls", "pwd", "whoami", "date", "uptime",
-                "hostname", "uname", "df", "free", "head", "tail", "wc",
-                "grep", "find", "which", "id", "ps",
+                "echo",
+                "cat",
+                "ls",
+                "pwd",
+                "whoami",
+                "date",
+                "uptime",
+                "hostname",
+                "uname",
+                "df",
+                "free",
+                "head",
+                "tail",
+                "wc",
+                "grep",
+                "find",
+                "which",
+                "id",
+                "ps",
             )
             for prefix in safe_prefixes:
                 if command.startswith(prefix):
@@ -210,7 +225,7 @@ class SafetyGate:
         If an audit store is configured, the action is persisted for later
         review.  Otherwise, the action is logged via structlog only.
         """
-        timestamp = datetime.now(tz=timezone.utc).isoformat()
+        timestamp = datetime.now(tz=UTC).isoformat()
 
         self.logger.info(
             "audit_log",

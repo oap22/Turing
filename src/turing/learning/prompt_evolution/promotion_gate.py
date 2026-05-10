@@ -15,14 +15,17 @@ test; this slice keeps the gate transparent and unit-testable.
 from __future__ import annotations
 
 import statistics
-from collections.abc import Sequence
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
+from typing import TYPE_CHECKING
 
-from turing.coordinator.lifecycle.episode_store import Episode
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from turing.coordinator.lifecycle.episode_store import Episode
 
 
-class PromotionDecision(str, Enum):
+class PromotionDecision(StrEnum):
     PROMOTE = "promote"
     REJECT = "reject"
     HOLD_INSUFFICIENT_DATA = "hold_insufficient_data"
@@ -40,10 +43,7 @@ class PromotionGate:
         candidate: Sequence[Episode],
         baseline: Sequence[Episode],
     ) -> PromotionDecision:
-        if (
-            len(candidate) < self.min_sample_size
-            or len(baseline) < self.holdout_min_size
-        ):
+        if len(candidate) < self.min_sample_size or len(baseline) < self.holdout_min_size:
             return PromotionDecision.HOLD_INSUFFICIENT_DATA
 
         cand_mean = statistics.fmean(e.critic_score for e in candidate)

@@ -112,9 +112,7 @@ class PluginLoader:
             module_file = plugin_dir / "__init__.py"
 
         if not module_file.exists():
-            raise ImportError(
-                f"Module file '{module_file}' not found for plugin '{manifest.name}'"
-            )
+            raise ImportError(f"Module file '{module_file}' not found for plugin '{manifest.name}'")
 
         # Create a unique module name to avoid collisions.
         unique_module_name = f"turing_plugin_{manifest.name}_{module_name}"
@@ -130,16 +128,13 @@ class PluginLoader:
         # Get the plugin class.
         plugin_class = getattr(module, class_name, None)
         if plugin_class is None:
-            raise AttributeError(
-                f"Class '{class_name}' not found in module '{module_file}'"
-            )
+            raise AttributeError(f"Class '{class_name}' not found in module '{module_file}'")
 
         # Instantiate and validate.
         instance = plugin_class()
         if not isinstance(instance, Plugin):
             raise TypeError(
-                f"Class '{class_name}' in plugin '{manifest.name}' "
-                f"does not inherit from Plugin"
+                f"Class '{class_name}' in plugin '{manifest.name}' does not inherit from Plugin"
             )
 
         logger.info(

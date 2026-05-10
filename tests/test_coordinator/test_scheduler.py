@@ -89,6 +89,4 @@ def test_pick_returns_none_when_required_tool_unavailable() -> None:
     registry.register(_manifest("worker-1", tools=("vault_query",)))
     scheduler = Scheduler()
 
-    assert (
-        scheduler.pick(_subtask(required_tools=("shell",)), registry) is None
-    )
+    assert scheduler.pick(_subtask(required_tools=("shell",)), registry) is None

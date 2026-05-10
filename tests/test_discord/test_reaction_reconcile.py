@@ -32,7 +32,9 @@ class _FakeDiscord:
         return list(self._table.get((message_id, emoji), []))
 
 
-def _episode(*, subtask_id: str, output_key: str = "", consumed_keys: tuple[str, ...] = ()) -> Episode:
+def _episode(
+    *, subtask_id: str, output_key: str = "", consumed_keys: tuple[str, ...] = ()
+) -> Episode:
     return Episode(
         task_id="t",
         subtask_id=subtask_id,
@@ -54,7 +56,9 @@ def _episode(*, subtask_id: str, output_key: str = "", consumed_keys: tuple[str,
     )
 
 
-def _index_with_subtask(thread_id: str, subtask_id: str, posted_at_ms: int = 0) -> DiscordSurfaceIndex:
+def _index_with_subtask(
+    thread_id: str, subtask_id: str, posted_at_ms: int = 0
+) -> DiscordSurfaceIndex:
     idx = DiscordSurfaceIndex()
     idx.record_subtask_thread(thread_id, subtask_id, posted_at_ms)
     return idx
