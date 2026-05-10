@@ -2,9 +2,24 @@
 
 from __future__ import annotations
 
+import re
+
 import discord
 import structlog
 from discord.ext import commands
+
+
+def _strip_bot_mentions(content: str, user_id: int | None) -> str:
+    """Strip every shape of the bot's user mention from `content`.
+
+    Handles `<@id>` and `<@!id>`. Leaves role mentions (`<@&id>`) and
+    other users' mentions intact. Returns the input unchanged when
+    `user_id` is None (e.g. before the bot has logged in).
+    """
+    if user_id is None:
+        return content
+    pattern = re.compile(rf"<@!?{user_id}>")
+    return pattern.sub("", content).strip()
 
 
 class TuringBot(commands.Bot):
@@ -51,43 +66,54 @@ class TuringBot(commands.Bot):
         if message.author.bot:
             return
 
-        # Check if mentioned or DM
-        is_dm = isinstance(message.channel, discord.DMChannel)
-        is_mentioned = self.user in message.mentions if message.mentions else False
+        # Log every human message that reaches us — keeps drop paths observable (bug #141).
+        self.logger.debug(
+            "bot.message_received",
+            channel_id=getattr(message.channel, "id", None),
+            author_id=getattr(message.author, "id", None),
+            content_len=len(message.content or ""),
+            mention_count=len(message.mentions or []),
+        )
 
-        if is_dm or is_mentioned:
-            # Strip the mention from message content
-            content = message.content
-            if is_mentioned and self.user is not None:
-                content = (
-                    content.replace(f"<@{self.user.id}>", "")
-                    .replace(f"<@!{self.user.id}>", "")
-                    .strip()
+        is_dm = isinstance(message.channel, discord.DMChannel)
+        # `mentioned_in` covers user mentions, role mentions of the bot,
+        # and reply auto-pings — and uses ID-based equality so it survives
+        # post-reconnect ClientUser drift.
+        is_mentioned = self.user is not None and self.user.mentioned_in(message)
+
+        if not (is_dm or is_mentioned):
+            await self.process_commands(message)
+            return
+
+        bot_user_id = self.user.id if self.user is not None else None
+        content = _strip_bot_mentions(message.content, bot_user_id)
+
+        if not content:
+            self.logger.warning(
+                "bot.message_dropped",
+                reason="empty_after_strip",
+                channel_id=getattr(message.channel, "id", None),
+                author_id=getattr(message.author, "id", None),
+            )
+            return
+
+        if self.agent:
+            async with message.channel.typing():
+                response = await self.agent.handle_message(
+                    message=content,
+                    channel_id=str(message.channel.id),
+                    user_id=str(message.author.id),
+                    user_name=message.author.display_name,
                 )
 
-            if not content:
-                return
+            from .formatters import chunk_message
 
-            # Process through agent
-            if self.agent:
-                async with message.channel.typing():
-                    response = await self.agent.handle_message(
-                        message=content,
-                        channel_id=str(message.channel.id),
-                        user_id=str(message.author.id),
-                        user_name=message.author.display_name,
-                    )
+            chunks = chunk_message(response)
+            for chunk in chunks:
+                await message.reply(chunk)
+        else:
+            await message.reply("Agent not initialized yet. Please wait...")
 
-                # Send response, chunking if needed
-                from .formatters import chunk_message
-
-                chunks = chunk_message(response)
-                for chunk in chunks:
-                    await message.reply(chunk)
-            else:
-                await message.reply("Agent not initialized yet. Please wait...")
-
-        # Process commands too
         await self.process_commands(message)
 
     async def start_bot(self) -> None:
