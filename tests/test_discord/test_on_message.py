@@ -225,9 +225,7 @@ async def test_on_message_handles_dm_with_content(mock_config, monkeypatch) -> N
 
 
 @pytest.mark.asyncio
-async def test_on_message_replies_gracefully_when_agent_raises(
-    mock_config, monkeypatch
-) -> None:
+async def test_on_message_replies_gracefully_when_agent_raises(mock_config, monkeypatch) -> None:
     """Bug #159: if the agent (e.g. cloud provider) raises, on_message must
     reply with a friendly error in-channel instead of letting the exception
     propagate to discord.py's handler, which would leave the user with
