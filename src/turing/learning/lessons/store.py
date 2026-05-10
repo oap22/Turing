@@ -58,10 +58,10 @@ class LessonStore:
         embedding: tuple[float, ...],
         k: int,
     ) -> list[Lesson]:
-        candidates = [l for l in self._lessons if l.specialty == specialty]
-        scored = [(_cosine(embedding, l.embedding), l) for l in candidates]
+        candidates = [lesson for lesson in self._lessons if lesson.specialty == specialty]
+        scored = [(_cosine(embedding, lesson.embedding), lesson) for lesson in candidates]
         scored.sort(key=lambda pair: pair[0], reverse=True)
-        return [l for _, l in scored[: max(0, k)]]
+        return [lesson for _, lesson in scored[: max(0, k)]]
 
     def get_by_task_id(self, task_id: str) -> Lesson:
         """Return the lesson with this task_id; raise ``KeyError`` if absent."""

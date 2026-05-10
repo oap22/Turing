@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from turing.coordinator.auto_research import (
-    AutoResearchCloudRefused,
+    AutoResearchCloudRefusedError,
     Goal,
     GoalScheduler,
     GoalsRegistry,
@@ -182,7 +182,7 @@ class TestLocalOnlyBudgetGuard:
 
     def test_rejects_cloud_calls(self) -> None:
         guard = LocalOnlyBudgetGuard()
-        with pytest.raises(AutoResearchCloudRefused):
+        with pytest.raises(AutoResearchCloudRefusedError):
             guard.check(provider="cloud")
 
 

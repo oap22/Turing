@@ -2,7 +2,7 @@
 
 The trainer is a pull-only client; it must never accept inbound traffic. This
 guard installs a context-bound monkey-patch on ``socket.socket.listen`` so any
-attempt to start a TCP listener raises ``InboundConnectionRefused`` instead.
+attempt to start a TCP listener raises ``InboundConnectionRefusedError`` instead.
 
 This is defense-in-depth, not a substitute for firewall rules. The systemd
 unit also sets ``RestrictAddressFamilies`` and ``PrivateNetwork`` where
@@ -15,7 +15,7 @@ import socket
 from typing import Any
 
 
-class InboundConnectionRefused(RuntimeError):
+class InboundConnectionRefusedError(RuntimeError):
     """Raised when something tries to bind a listening socket inside a guard."""
 
 
@@ -29,7 +29,7 @@ class PullOnlySocketGuard:
         self._original = socket.socket.listen
 
         def _refuse(self_socket: socket.socket, *args: Any, **kwargs: Any) -> None:
-            raise InboundConnectionRefused(
+            raise InboundConnectionRefusedError(
                 "trainer is a pull-only client; listening sockets are forbidden"
             )
 

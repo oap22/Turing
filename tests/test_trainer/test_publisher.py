@@ -13,7 +13,7 @@ from turing.learning.trainer.job import TrainingJob
 from turing.learning.trainer.object_store import InMemoryObjectStore
 from turing.learning.trainer.publisher import TrainerPublisher
 from turing.learning.trainer.runner import TrainingResult
-from turing.transport.signer import MessageSigner
+from turing.transport.signer import MessageSigner, SignatureError
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -101,5 +101,5 @@ class TestFacilityKeyIsolation:
             worker_base_model="qwen2.5-7b",
             trusted_issuers=[other.public_key],
         )
-        with pytest.raises(Exception):
+        with pytest.raises(SignatureError):
             registry.verify(manifest, store.get(manifest.sha256))

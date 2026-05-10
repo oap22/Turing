@@ -13,7 +13,7 @@ from turing.coordinator.capability_token.token import (
     CapabilityToken,
     CapabilityTokenIssuer,
     CapabilityVerifier,
-    ScopeViolation,
+    ScopeViolationError,
     TokenSignatureError,
 )
 
@@ -25,7 +25,7 @@ __all__ = [
     "CapabilityToken",
     "CapabilityTokenIssuer",
     "CapabilityVerifier",
-    "ScopeViolation",
+    "ScopeViolationError",
     "TokenIssuer",
     "TokenSignatureError",
 ]

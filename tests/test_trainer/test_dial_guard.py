@@ -7,7 +7,7 @@ import socket
 import pytest
 
 from turing.learning.trainer.dial_guard import (
-    InboundConnectionRefused,
+    InboundConnectionRefusedError,
     PullOnlySocketGuard,
 )
 
@@ -19,7 +19,7 @@ class TestPullOnlySocketGuard:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 s.bind(("127.0.0.1", 0))
-                with pytest.raises(InboundConnectionRefused):
+                with pytest.raises(InboundConnectionRefusedError):
                     s.listen(1)
             finally:
                 s.close()
@@ -29,11 +29,11 @@ class TestPullOnlySocketGuard:
         with guard:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             # connect to a closed port should fail with ConnectionRefused
-            # (the OS error), not InboundConnectionRefused (our guard) —
+            # (the OS error), not InboundConnectionRefusedError (our guard) —
             # i.e., the guard must not interfere with outbound traffic.
             with pytest.raises((ConnectionRefusedError, OSError)) as excinfo:
                 s.connect(("127.0.0.1", 1))
-            assert not isinstance(excinfo.value, InboundConnectionRefused)
+            assert not isinstance(excinfo.value, InboundConnectionRefusedError)
             s.close()
 
     def test_restored_on_exit(self) -> None:
