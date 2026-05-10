@@ -29,7 +29,7 @@ dependencies = [
     "cryptography>=42.0",
     "nats-py>=2.6",
     "fastapi>=0.115",
-    "uvicorn>=0.30",
+    "uvicorn[standard]>=0.30",
 ]
 
 [project.optional-dependencies]
