@@ -41,6 +41,8 @@ dev = [
     "ruff",
     "mypy",
     "alembic>=1.13",
+    "types-psutil",
+    "types-PyYAML",
 ]
 
 [project.scripts]
@@ -101,6 +103,10 @@ warn_unused_configs = true
 disallow_untyped_defs = true
 check_untyped_defs = true
 plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["mlx_lm", "pyre", "onnxruntime", "tokenizers", "trl", "torch", "torch.*"]
+ignore_missing_imports = true
 
 [tool.coverage.run]
 source = ["turing"]

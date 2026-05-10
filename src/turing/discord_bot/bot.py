@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 import discord
 import structlog
@@ -31,11 +32,11 @@ class TuringBot(commands.Bot):
 
     def __init__(
         self,
-        config,
-        agent=None,
-        mesh_node=None,
-        memory_store=None,
-    ):
+        config: Any,
+        agent: Any = None,
+        mesh_node: Any = None,
+        memory_store: Any = None,
+    ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
         intents.members = True

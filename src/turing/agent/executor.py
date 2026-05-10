@@ -129,6 +129,7 @@ class Executor:
             )
 
         duration_ms = int((time.monotonic() - start_time) * 1000)
+        assert isinstance(result, ToolResult)
 
         # Audit log
         result_text = result.output if result.success else f"Error: {result.error}"

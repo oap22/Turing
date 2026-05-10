@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from turing.coordinator.lifecycle.episode_store import Episode, EpisodeStore
 from turing.coordinator.lifecycle.lifecycle import SubtaskState
@@ -203,8 +203,8 @@ async def _classify_async(classifier: Any, message: str) -> SpecialtyChoice:
 
     result = classifier.classify(message)
     if inspect.isawaitable(result):
-        return await result
-    return result
+        return cast("SpecialtyChoice", await result)
+    return cast("SpecialtyChoice", result)
 
 
 async def _maybe_report(report: ReportFn | None, stage: str) -> None:

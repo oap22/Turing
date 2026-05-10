@@ -47,8 +47,13 @@ async def _run(config: TuringConfig) -> None:
     classifier = ComplexityClassifier()
 
     # Map config routing mode to router's expected values
+    from typing import Literal, cast
+
     routing_mode_map = {"auto": "auto", "cloud": "cloud_only", "local": "local_only"}
-    routing_mode = routing_mode_map.get(config.llm_routing_mode, "auto")
+    routing_mode = cast(
+        "Literal['cloud_only', 'local_only', 'auto']",
+        routing_mode_map.get(config.llm_routing_mode, "auto"),
+    )
     llm_router = LLMRouter(cloud_provider, local_provider, classifier, routing_mode)
 
     # 3. Initialize Tools
