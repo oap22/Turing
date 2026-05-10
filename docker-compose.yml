@@ -1,5 +1,7 @@
 version: "3.9"
 
+x-nats-url: &nats-url "nats://nats:4222"
+
 x-turing-common: &turing-common
   build:
     context: .
@@ -8,6 +10,8 @@ x-turing-common: &turing-common
   depends_on:
     ollama-init:
       condition: service_completed_successfully
+    nats:
+      condition: service_started
   restart: unless-stopped
   networks:
     - turing-mesh
@@ -41,6 +45,19 @@ services:
       - turing-mesh
     restart: "no"
 
+  # ── NATS — message broker for close-the-loop pipeline ────────────
+  nats:
+    image: nats:2.10
+    container_name: turing-nats
+    command: ["-js", "-sd", "/data"]
+    volumes:
+      - nats-data:/data
+    ports:
+      - "4222:4222"
+    networks:
+      - turing-mesh
+    restart: unless-stopped
+
   # ── Node 1 — primary node (Discord + Anthropic enabled) ───────────
   turing-node-1:
     <<: *turing-common
@@ -53,6 +70,7 @@ services:
       TURING_MESH_ENABLED: "true"
       TURING_MESH_PORT: "5670"
       TURING_DB_PATH: /app/data/turing.db
+      TURING_NATS_URL: *nats-url
     volumes:
       - node1-data:/app/data
     ports:
@@ -69,6 +87,7 @@ services:
       TURING_MESH_ENABLED: "true"
       TURING_MESH_PORT: "5670"
       TURING_DB_PATH: /app/data/turing.db
+      TURING_NATS_URL: *nats-url
     volumes:
       - node2-data:/app/data
 
@@ -83,6 +102,7 @@ services:
       TURING_MESH_ENABLED: "true"
       TURING_MESH_PORT: "5670"
       TURING_DB_PATH: /app/data/turing.db
+      TURING_NATS_URL: *nats-url
     volumes:
       - node3-data:/app/data
 
@@ -97,11 +117,13 @@ services:
       TURING_MESH_ENABLED: "true"
       TURING_MESH_PORT: "5670"
       TURING_DB_PATH: /app/data/turing.db
+      TURING_NATS_URL: *nats-url
     volumes:
       - node4-data:/app/data
 
 volumes:
   ollama-data:
+  nats-data:
   node1-data:
   node2-data:
   node3-data:
