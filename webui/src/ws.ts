@@ -4,18 +4,16 @@
  * /token-handoff, so no token has to live in JS.
  */
 
-export type Frame = Record<string, unknown> & { type: string };
-
-interface ConnectOptions {
+interface ConnectOptions<T> {
   url: string;
-  onFrame: (frame: Frame) => void;
+  onFrame: (frame: T) => void;
   onStatus?: (status: "open" | "closed" | "reconnecting") => void;
 }
 
 const MIN_DELAY_MS = 250;
 const MAX_DELAY_MS = 15_000;
 
-export function connectGatewayWS(opts: ConnectOptions): () => void {
+export function connectGatewayWS<T = unknown>(opts: ConnectOptions<T>): () => void {
   let ws: WebSocket | null = null;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let backoff = MIN_DELAY_MS;
@@ -30,7 +28,7 @@ export function connectGatewayWS(opts: ConnectOptions): () => void {
     };
     ws.onmessage = (event) => {
       try {
-        const frame = JSON.parse(event.data) as Frame;
+        const frame = JSON.parse(event.data) as T;
         opts.onFrame(frame);
       } catch {
         // ignore malformed frames; the gateway only emits JSON
