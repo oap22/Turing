@@ -63,18 +63,17 @@ class TuringBot(commands.Bot):
 
     async def on_message(self, message: discord.Message) -> None:
         """Respond to mentions and DMs."""
-        # Always log first — keeps every drop path observable (bug #141).
+        if message.author.bot:
+            return
+
+        # Log every human message that reaches us — keeps drop paths observable (bug #141).
         self.logger.debug(
             "bot.message_received",
             channel_id=getattr(message.channel, "id", None),
             author_id=getattr(message.author, "id", None),
-            author_is_bot=getattr(message.author, "bot", False),
             content_len=len(message.content or ""),
             mention_count=len(message.mentions or []),
         )
-
-        if message.author.bot:
-            return
 
         is_dm = isinstance(message.channel, discord.DMChannel)
         # `mentioned_in` covers user mentions, role mentions of the bot,
@@ -90,7 +89,7 @@ class TuringBot(commands.Bot):
         content = _strip_bot_mentions(message.content, bot_user_id)
 
         if not content:
-            self.logger.debug(
+            self.logger.warning(
                 "bot.message_dropped",
                 reason="empty_after_strip",
                 channel_id=getattr(message.channel, "id", None),

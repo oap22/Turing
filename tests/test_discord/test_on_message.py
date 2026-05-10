@@ -36,25 +36,60 @@ class TestStripBotMentions:
 
 
 @pytest.mark.asyncio
-async def test_on_message_logs_message_received_before_filters(
+async def test_on_message_logs_received_for_human_before_drop_paths(
     mock_config, monkeypatch
 ) -> None:
-    """Every message that reaches on_message must produce a `bot.message_received`
-    log entry before any early-return path, so silent drops are observable."""
+    """Every human message must produce `bot.message_received` before any drop
+    path (no-mention, empty-after-strip, etc.), so silent drops are observable.
+
+    Bot-author messages are filtered out before the log to avoid noise from
+    other bots in busy servers — that path is not what bug #141 was about."""
     from turing.discord_bot.bot import TuringBot
 
     bot = TuringBot(mock_config)
     captured: list[tuple[str, dict]] = []
 
-    def fake_debug(event: str, **kw) -> None:
-        captured.append((event, kw))
-
     bot.logger = MagicMock()
-    bot.logger.debug = fake_debug
+    bot.logger.debug = lambda evt, **kw: captured.append((evt, kw))
     bot.logger.info = lambda *a, **k: None
     bot.logger.warning = lambda *a, **k: None
 
-    # author is a bot -> should still log, then early-return
+    bot_user = MagicMock()
+    bot_user.id = 42
+    bot_user.mentioned_in = MagicMock(return_value=False)
+    monkeypatch.setattr(type(bot), "user", property(lambda self: bot_user))
+
+    # human message in a non-DM channel without a mention -> drops via process_commands,
+    # but must still log message_received first
+    msg = MagicMock()
+    msg.author.bot = False
+    msg.author.id = 7
+    msg.channel.id = 1
+    msg.channel.__class__ = MagicMock  # not a DMChannel
+    msg.content = "just chatting"
+    msg.mentions = []
+
+    monkeypatch.setattr(bot, "process_commands", AsyncMock())
+    await bot.on_message(msg)
+
+    assert any(evt == "bot.message_received" for evt, _ in captured), (
+        f"expected bot.message_received log, got {captured}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_message_skips_bot_authors_silently(mock_config, monkeypatch) -> None:
+    """Messages from other bots must early-return without producing a
+    `bot.message_received` log entry — busy servers would flood logs otherwise."""
+    from turing.discord_bot.bot import TuringBot
+
+    bot = TuringBot(mock_config)
+    captured: list[tuple[str, dict]] = []
+    bot.logger = MagicMock()
+    bot.logger.debug = lambda evt, **kw: captured.append((evt, kw))
+    bot.logger.info = lambda *a, **k: None
+    bot.logger.warning = lambda *a, **k: None
+
     msg = MagicMock()
     msg.author.bot = True
     msg.channel.id = 1
@@ -65,8 +100,8 @@ async def test_on_message_logs_message_received_before_filters(
     monkeypatch.setattr(bot, "process_commands", AsyncMock())
     await bot.on_message(msg)
 
-    assert any(evt == "bot.message_received" for evt, _ in captured), (
-        f"expected bot.message_received log, got {captured}"
+    assert not any(evt == "bot.message_received" for evt, _ in captured), (
+        f"bot-author message should not log received, got {captured}"
     )
 
 
@@ -125,8 +160,9 @@ async def test_on_message_logs_when_dropping_empty_content(
     bot = TuringBot(mock_config)
     captured: list[tuple[str, dict]] = []
     bot.logger = MagicMock()
-    bot.logger.debug = lambda evt, **kw: captured.append((evt, kw))
+    bot.logger.debug = lambda *a, **k: None
     bot.logger.info = lambda *a, **k: None
+    bot.logger.warning = lambda evt, **kw: captured.append((evt, kw))
 
     bot_user = MagicMock()
     bot_user.id = 42
@@ -146,5 +182,46 @@ async def test_on_message_logs_when_dropping_empty_content(
     await bot.on_message(msg)
 
     assert any(evt == "bot.message_dropped" for evt, _ in captured), (
-        f"expected bot.message_dropped log, got {captured}"
+        f"expected bot.message_dropped warning, got {captured}"
     )
+
+
+@pytest.mark.asyncio
+async def test_on_message_handles_dm_with_content(mock_config, monkeypatch) -> None:
+    """DM happy path: content reaches the agent without requiring a mention."""
+    import discord
+    from turing.discord_bot.bot import TuringBot
+
+    bot = TuringBot(mock_config)
+    bot.logger = MagicMock()
+
+    bot_user = MagicMock()
+    bot_user.id = 42
+    bot_user.mentioned_in = MagicMock(return_value=False)
+    monkeypatch.setattr(type(bot), "user", property(lambda self: bot_user))
+
+    agent = MagicMock()
+    agent.handle_message = AsyncMock(return_value="hi back")
+    bot.agent = agent
+
+    msg = MagicMock(spec=discord.Message)
+    msg.author.bot = False
+    msg.author.id = 7
+    msg.author.display_name = "alice"
+    msg.channel = MagicMock(spec=discord.DMChannel)
+    msg.channel.id = 99
+    msg.content = "hello there"
+    msg.mentions = []
+    msg.reply = AsyncMock()
+
+    typing_cm = MagicMock()
+    typing_cm.__aenter__ = AsyncMock()
+    typing_cm.__aexit__ = AsyncMock()
+    msg.channel.typing = MagicMock(return_value=typing_cm)
+
+    monkeypatch.setattr(bot, "process_commands", AsyncMock())
+    await bot.on_message(msg)
+
+    agent.handle_message.assert_awaited_once()
+    assert agent.handle_message.await_args.kwargs["message"] == "hello there"
+    msg.reply.assert_awaited()
