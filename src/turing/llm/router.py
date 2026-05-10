@@ -62,8 +62,11 @@ class LLMRouter:
     * **local_only** — always use the local provider.
     * **auto** — classify the message complexity and pick the best
       provider.  Falls back from local to cloud on errors or timeouts.
-      If tools are provided the cloud provider is always selected because
-      local Ollama models have limited tool-use support.
+      The classifier is given visibility into whether tools are attached;
+      if it judges the message tool-shaped or otherwise complex the
+      request goes to cloud (with tools).  Otherwise it is served locally
+      with the tool catalog stripped, since local Ollama models have
+      limited tool-use support and would not invoke them reliably anyway.
     """
 
     def __init__(
@@ -92,20 +95,26 @@ class LLMRouter:
     ) -> LLMResponse:
         """Route the request to the appropriate LLM provider and return the response."""
         provider, reason = self._select_provider(messages, tools)
+        label = _provider_label(provider, self._cloud, self._local)
+        # Local Ollama models do not reliably emit tool calls, so when we
+        # route to local we drop the tool catalog rather than send a
+        # confusing prompt the model will ignore.
+        effective_tools = tools if provider is self._cloud else None
         logger.info(
             "llm_route_decision",
-            provider=_provider_label(provider, self._cloud, self._local),
+            provider=label,
             reason=reason,
             routing_mode=self._routing_mode,
+            tools_attached=bool(effective_tools),
         )
 
-        label = _provider_label(provider, self._cloud, self._local)
         try:
             return await self._invoke_provider(
-                provider, label, messages, system, tools, max_tokens, temperature
+                provider, label, messages, system, effective_tools, max_tokens, temperature
             )
         except Exception:
-            # If the selected provider was local (auto mode), fall back to cloud.
+            # If the selected provider was local (auto mode), fall back to cloud
+            # — and restore the original tool catalog for the cloud retry.
             if provider is self._local and self._routing_mode == "auto":
                 logger.warning(
                     "llm_local_failed_falling_back_to_cloud",
@@ -150,10 +159,10 @@ class LLMRouter:
         if self._routing_mode == "local_only":
             return self._local, "routing_mode=local_only"
 
-        # auto mode
-        if tools:
-            return self._cloud, "tools_require_cloud"
-
+        # auto mode — let the classifier decide, even when tools are
+        # attached.  Tool presence is fed in as a signal so tool-shaped
+        # phrasing biases toward cloud, but pure chat with a tool catalog
+        # attached must still route locally (issue #160).
         last_user_message = self._extract_last_user_message(messages)
         complexity = self._classifier.classify(
             last_user_message,

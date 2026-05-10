@@ -175,10 +175,38 @@ class TestExplicitModes:
 
 
 class TestToolForcing:
-    """When tools are provided, cloud should always be selected in auto mode."""
+    """In auto mode the classifier decides; tools alone do not force cloud."""
 
     @pytest.mark.asyncio
-    async def test_tools_force_cloud_in_auto_mode(
+    async def test_chitchat_with_tools_routes_to_local_in_auto_mode(
+        self,
+        cloud_provider: AsyncMock,
+        local_provider: AsyncMock,
+        classifier: ComplexityClassifier,
+    ) -> None:
+        """Regression for #160: a plain greeting must not go to cloud just
+        because the agent's tool catalog is attached."""
+        tools = [
+            ToolDefinition(
+                name="run_command",
+                description="Run a shell command",
+                parameters={
+                    "type": "object",
+                    "properties": {"cmd": {"type": "string"}},
+                },
+            )
+        ]
+        router = LLMRouter(cloud_provider, local_provider, classifier, "auto")
+        response = await router.route([_user_msg("how are you doing")], tools=tools)
+        assert response.content == "local response"
+        local_provider.complete.assert_awaited_once()
+        cloud_provider.complete.assert_not_awaited()
+        # Tools must be stripped from the local call — Ollama tool support is unreliable.
+        local_kwargs = local_provider.complete.call_args.kwargs
+        assert local_kwargs.get("tools") in (None, [])
+
+    @pytest.mark.asyncio
+    async def test_tool_shaped_message_with_tools_routes_to_cloud(
         self,
         cloud_provider: AsyncMock,
         local_provider: AsyncMock,
@@ -195,7 +223,9 @@ class TestToolForcing:
             )
         ]
         router = LLMRouter(cloud_provider, local_provider, classifier, "auto")
-        response = await router.route([_user_msg("hello")], tools=tools)
+        response = await router.route(
+            [_user_msg("check the status of the disk and restart nginx")], tools=tools
+        )
         assert response.content == "cloud response"
         cloud_provider.complete.assert_awaited_once()
         local_provider.complete.assert_not_awaited()
