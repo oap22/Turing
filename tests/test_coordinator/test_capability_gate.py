@@ -439,8 +439,8 @@ class TestTokenIssuerWithOrchestratorContract:
         assert token.scope.issued_at_ms == 100_000
         # Orchestrator-issued token rejects every command (deny-by-default AC).
         verifier = CapabilityVerifier(trusted_issuers=[coord_signer.public_key])
-        from turing.coordinator.capability_token.token import ScopeViolation
+        from turing.coordinator.capability_token.token import ScopeViolationError
 
         for cmd in ["echo hi", "ls", "true"]:
-            with pytest.raises(ScopeViolation):
+            with pytest.raises(ScopeViolationError):
                 verifier.authorize(token, command=cmd, now_ms=200_000)

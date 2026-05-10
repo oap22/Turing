@@ -10,7 +10,7 @@ from __future__ import annotations
 from turing.learning.trainer.agent import TrainerPullAgent
 from turing.learning.trainer.config import TrainerConfig
 from turing.learning.trainer.dial_guard import (
-    InboundConnectionRefused,
+    InboundConnectionRefusedError,
     PullOnlySocketGuard,
 )
 from turing.learning.trainer.dpo_dataset_builder import (
@@ -35,7 +35,7 @@ __all__ = [
     "DPODatasetInfo",
     "DatasetInfo",
     "InMemoryObjectStore",
-    "InboundConnectionRefused",
+    "InboundConnectionRefusedError",
     "MLXLoraTrainer",
     "ObjectStore",
     "PullOnlySocketGuard",

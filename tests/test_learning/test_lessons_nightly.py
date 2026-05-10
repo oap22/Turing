@@ -80,12 +80,12 @@ async def test_run_nightly_extraction_per_specialty():
     assert added == 4
     assert {s for s, _ in seen_calls} == {"research-summarize", "critic"}
     # Lessons are stored with created_at_ms set and pinned_until_ms=None.
-    res_lessons = [
-        l for l in store.query(specialty="research-summarize", embedding=(0.0, 0.0, 0.0), k=10)
-    ]
+    res_lessons = list(
+        store.query(specialty="research-summarize", embedding=(0.0, 0.0, 0.0), k=10)
+    )
     assert len(res_lessons) == 2
-    assert all(l.created_at_ms == 1_000_000 for l in res_lessons)
-    assert all(l.pinned_until_ms is None for l in res_lessons)
+    assert all(lesson.created_at_ms == 1_000_000 for lesson in res_lessons)
+    assert all(lesson.pinned_until_ms is None for lesson in res_lessons)
 
 
 @pytest.mark.asyncio
@@ -163,8 +163,8 @@ async def test_extraction_runs_eviction_sweep():
         now_ms=now,
     )
     # The fresh lesson stays; the ancient one is gone.
-    remaining = [l for l in store.query(specialty="x", embedding=(0.0, 0.0), k=10)]
-    task_ids = {l.task_id for l in remaining}
+    remaining = list(store.query(specialty="x", embedding=(0.0, 0.0), k=10))
+    task_ids = {lesson.task_id for lesson in remaining}
     assert "new" in task_ids
     assert "ancient" not in task_ids
 

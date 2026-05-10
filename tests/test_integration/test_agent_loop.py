@@ -6,6 +6,8 @@ mocked LLM responses and mocked subprocess calls.
 
 from __future__ import annotations
 
+import contextlib
+from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -64,11 +66,9 @@ def embedding_model():
 async def vector_store(memory_store):
     """Create a VectorStore (may not have sqlite-vec extension)."""
     vs = VectorStore()
-    try:
+    # sqlite-vec may not be available in test environments
+    with contextlib.suppress(Exception):
         await vs.initialize(memory_store.db)
-    except Exception:
-        # sqlite-vec may not be available in test environments
-        pass
     return vs
 
 
@@ -87,7 +87,7 @@ def tool_registry():
 
         name = "shell"
         description = "Run shell commands"
-        parameters = {
+        parameters: ClassVar[dict] = {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "The command to run"},

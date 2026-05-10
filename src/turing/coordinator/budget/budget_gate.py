@@ -1,6 +1,6 @@
 """BudgetGate — pre-call interceptor for every cloud LLM call.
 
-Estimates the call's cost from token counts × the model's price. Refuses
+Estimates the call's cost from token counts x the model's price. Refuses
 the call when the estimate would push today's spend over the daily cap and
 signals the caller to fall back to a local model. The cap resets at local
 midnight automatically because the SpendTracker only counts records dated

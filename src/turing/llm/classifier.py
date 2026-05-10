@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
+from typing import ClassVar
 
 
 class Complexity(StrEnum):
@@ -21,7 +22,7 @@ class ComplexityClassifier:
     model or can be handled locally.
     """
 
-    COMPLEX_KEYWORDS: list[str] = [
+    COMPLEX_KEYWORDS: ClassVar[list[str]] = [
         "analyze",
         "explain",
         "debug",
@@ -44,7 +45,7 @@ class ComplexityClassifier:
         "diagnose",
     ]
 
-    TOOL_INDICATORS: list[str] = [
+    TOOL_INDICATORS: ClassVar[list[str]] = [
         "run",
         "execute",
         "check",
@@ -65,7 +66,7 @@ class ComplexityClassifier:
         "monitor",
     ]
 
-    CODE_PATTERNS: list[re.Pattern[str]] = [
+    CODE_PATTERNS: ClassVar[list[re.Pattern[str]]] = [
         re.compile(r"```"),  # fenced code blocks
         re.compile(r"def\s+\w+"),  # Python function definitions
         re.compile(r"class\s+\w+"),  # class definitions

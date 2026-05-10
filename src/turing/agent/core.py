@@ -74,6 +74,7 @@ class Agent:
         self.plugin_registry = plugin_registry
         self.executor = Executor(tool_registry, safety_gate, bot)
         self._interaction_count = 0
+        self._background_tasks: set[asyncio.Task] = set()
 
     def _build_system_prompt(self, context: AgentContext) -> str:
         """Build a dynamic system prompt incorporating all context sources."""
@@ -272,7 +273,9 @@ class Agent:
             self.config.learning_auto_extract
             and self._interaction_count % self.config.learning_extract_interval == 0
         ):
-            asyncio.create_task(self._extract_patterns(conv_id))
+            task = asyncio.create_task(self._extract_patterns(conv_id))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
         logger.info(
             "agent.response_complete",

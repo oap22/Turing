@@ -16,7 +16,7 @@ from turing.coordinator.capability_token.audit import GateAuditLog, GateAuditRow
 from turing.coordinator.capability_token.token import (
     CapabilityToken,
     CapabilityVerifier,
-    ScopeViolation,
+    ScopeViolationError,
     TokenSignatureError,
 )
 from turing.coordinator.lifecycle.lifecycle import SubtaskState
@@ -146,7 +146,7 @@ class Gate:
             decision = self._verifier.authorize(
                 token, command=request.args.get("command", ""), now_ms=self._now_ms()
             )
-        except ScopeViolation as exc:
+        except ScopeViolationError as exc:
             msg = str(exc)
             if "expired" in msg:
                 return _denied("expired")

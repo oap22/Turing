@@ -24,9 +24,11 @@ class TestWebSocketAuth:
             ws.receive_text()
 
     def test_ws_with_wrong_token_is_rejected(self, client: TestClient) -> None:
-        with pytest.raises(WebSocketDisconnect):
-            with client.websocket_connect("/ws", headers={"Authorization": "Bearer wrong"}) as ws:
-                ws.receive_text()
+        with (
+            pytest.raises(WebSocketDisconnect),
+            client.websocket_connect("/ws", headers={"Authorization": "Bearer wrong"}) as ws,
+        ):
+            ws.receive_text()
 
 
 class TestWebSocketHelloFrame:

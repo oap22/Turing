@@ -8,13 +8,13 @@ to cloud cannot quietly succeed.
 from __future__ import annotations
 
 
-class AutoResearchCloudRefused(RuntimeError):
+class AutoResearchCloudRefusedError(RuntimeError):
     """Raised when an auto-research path attempts a cloud LLM call."""
 
 
 class LocalOnlyBudgetGuard:
     def check(self, *, provider: str) -> None:
         if provider != "local":
-            raise AutoResearchCloudRefused(
+            raise AutoResearchCloudRefusedError(
                 f"auto-research paths must use provider='local', got {provider!r}"
             )

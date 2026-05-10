@@ -9,7 +9,7 @@ from turing.coordinator.capability_token import (
     CapabilityToken,
     CapabilityTokenIssuer,
     CapabilityVerifier,
-    ScopeViolation,
+    ScopeViolationError,
     TokenSignatureError,
 )
 from turing.transport.signer import MessageSigner
@@ -85,7 +85,7 @@ class TestAuthorize:
     def test_disallowed_command_rejected(self) -> None:
         coord = MessageSigner.generate()
         token = CapabilityTokenIssuer(signer=coord).issue(_scope(allowed_commands_regex=r"echo"))
-        with pytest.raises(ScopeViolation, match="command"):
+        with pytest.raises(ScopeViolationError, match="command"):
             self._verifier(coord.public_key).authorize(token, command="rm -rf /", now_ms=1)
 
     def test_fullmatch_rejects_partial_match(self) -> None:
@@ -94,13 +94,13 @@ class TestAuthorize:
         token = CapabilityTokenIssuer(signer=coord).issue(_scope(allowed_commands_regex=r"cat .*"))
         verifier = self._verifier(coord.public_key)
         verifier.authorize(token, command="cat foo", now_ms=1)
-        with pytest.raises(ScopeViolation, match="command"):
+        with pytest.raises(ScopeViolationError, match="command"):
             verifier.authorize(token, command="cat foo\n; rm -rf /", now_ms=1)
 
     def test_expired_token_rejected(self) -> None:
         coord = MessageSigner.generate()
         token = CapabilityTokenIssuer(signer=coord).issue(_scope(expires_at_ms=1000))
-        with pytest.raises(ScopeViolation, match="expired"):
+        with pytest.raises(ScopeViolationError, match="expired"):
             self._verifier(coord.public_key).authorize(token, command="echo hi", now_ms=2000)
 
     def test_v1_deny_by_default_regex_rejects_everything(self) -> None:
@@ -109,5 +109,5 @@ class TestAuthorize:
         token = CapabilityTokenIssuer(signer=coord).issue(_scope(allowed_commands_regex=r"(?!x)x"))
         verifier = self._verifier(coord.public_key)
         for cmd in ["echo hi", "ls", "true", "x", "", "anything"]:
-            with pytest.raises(ScopeViolation):
+            with pytest.raises(ScopeViolationError):
                 verifier.authorize(token, command=cmd, now_ms=1)

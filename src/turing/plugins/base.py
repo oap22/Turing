@@ -31,21 +31,21 @@ class Plugin(ABC):
         """Semantic version string for this plugin."""
         return "0.1.0"
 
-    async def setup(self, config: Any) -> None:
+    async def setup(self, config: Any) -> None:  # noqa: B027  # optional hook, not abstract
         """Called when the plugin is loaded.
 
         Override this method to perform initialization (e.g., connecting
         to external services, reading configuration, etc.).
         """
-        pass
+        ...
 
-    async def teardown(self) -> None:
+    async def teardown(self) -> None:  # noqa: B027  # optional hook, not abstract
         """Called when the plugin is unloaded.
 
         Override this method to perform cleanup (e.g., closing connections,
         flushing buffers, etc.).
         """
-        pass
+        ...
 
     def get_tools(self) -> list[Any]:
         """Return Tool instances provided by this plugin.

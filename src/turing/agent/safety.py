@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, ClassVar
 
 import structlog
 
@@ -55,7 +55,7 @@ class SafetyGate:
     call should be approved, denied, or flagged for confirmation.
     """
 
-    DENY_PATTERNS = [
+    DENY_PATTERNS: ClassVar[list[str]] = [
         r"rm\s+-rf\s+/(?!\w)",  # rm -rf /
         r"mkfs\.",  # Format filesystems
         r"dd\s+.*of=/dev/",  # Raw disk writes
@@ -110,13 +110,12 @@ class SafetyGate:
         # Step 2: Process tool deny for kill/manage actions.
         if tool_name == "process":
             action = arguments.get("action", "")
-            if action in ("kill_process", "manage_service"):
-                if not self._is_admin(user_id):
-                    return SafetyCheckResult(
-                        decision=SafetyDecision.NEEDS_CONFIRMATION,
-                        reason=f"Action '{action}' requires admin confirmation",
-                        risk_level="high",
-                    )
+            if action in ("kill_process", "manage_service") and not self._is_admin(user_id):
+                return SafetyCheckResult(
+                    decision=SafetyDecision.NEEDS_CONFIRMATION,
+                    reason=f"Action '{action}' requires admin confirmation",
+                    risk_level="high",
+                )
 
         # Step 3: Filesystem write path validation.
         if tool_name == "filesystem" and arguments.get("action") == "write_file":
