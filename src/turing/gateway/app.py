@@ -30,10 +30,11 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from turing.gateway.ring_buffer import RingBuffer
+    from turing.mesh.node import MeshNode
 
 DEFAULT_PAGE_LIMIT = 200
 
-PUBLIC_PATHS = frozenset({"/", "/healthz", "/token-handoff"})
+PUBLIC_PATHS = frozenset({"/", "/healthz", "/token-handoff", "/peers"})
 
 # Friendly landing payload returned on bare ``GET /`` when the caller is not
 # authenticated (or when no SPA bundle is mounted). Keeps the operator from
@@ -72,6 +73,7 @@ def create_app(
     node_name: str,
     spa_assets_dir: Path | None = None,
     ring_buffer: RingBuffer | None = None,
+    mesh_node: MeshNode | None = None,
 ) -> FastAPI:
     app = FastAPI(title="turing-gateway")
     app.state.start_time = time.monotonic()
@@ -81,6 +83,38 @@ def create_app(
     @app.get("/healthz")
     async def healthz() -> dict:
         return {"status": "ok"}
+
+    @app.get("/peers")
+    async def peers() -> dict:
+        """Return the current mesh peer view from this node's perspective.
+
+        Reads :class:`MeshNode.peers`, which the NATS-presence subscriber
+        keeps fresh (ADR-0008). Includes this node as the first entry so
+        the operator UI graph can render the full mesh without a second
+        request. Public so the fleet health check can hit it without
+        threading the bearer token through curl.
+        """
+        result: list[dict] = [
+            {
+                "node_id": getattr(mesh_node, "node_id", node_name) if mesh_node else node_name,
+                "node_name": node_name,
+                "self": True,
+                "capabilities": list(mesh_node.capabilities) if mesh_node else [],
+                "last_seen": None,
+            }
+        ]
+        if mesh_node is not None:
+            for peer in mesh_node.peers.values():
+                result.append(
+                    {
+                        "node_id": peer.node_id,
+                        "node_name": peer.name,
+                        "self": False,
+                        "capabilities": list(peer.capabilities),
+                        "last_seen": peer.last_seen,
+                    }
+                )
+        return {"peers": result, "count": len(result)}
 
     @app.get("/token-handoff")
     async def token_handoff(token: str = "") -> Response:

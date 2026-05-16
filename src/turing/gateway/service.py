@@ -19,6 +19,8 @@ from turing.gateway.spa import spa_assets_path
 if TYPE_CHECKING:
     import uvicorn
 
+    from turing.mesh.node import MeshNode
+
 logger = structlog.get_logger(__name__)
 
 
@@ -30,11 +32,13 @@ class GatewayService:
         bind: str,
         port: int,
         node_name: str,
+        mesh_node: MeshNode | None = None,
     ) -> None:
         self._token = token
         self._bind = bind
         self._port = port
         self._node_name = node_name
+        self._mesh_node = mesh_node
         self._task: asyncio.Task | None = None
         self._server: uvicorn.Server | None = None
 
@@ -58,6 +62,7 @@ class GatewayService:
             auth=GatewayAuth(token=self._token),
             node_name=self._node_name,
             spa_assets_dir=spa_assets_path(),
+            mesh_node=self._mesh_node,
         )
         config = uvicorn.Config(
             app,

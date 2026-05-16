@@ -66,7 +66,6 @@ services:
       TURING_ANTHROPIC_API_KEY: ${TURING_ANTHROPIC_API_KEY}
       TURING_OLLAMA_HOST: http://ollama:11434
       TURING_MESH_ENABLED: "true"
-      TURING_MESH_PORT: "5670"
       TURING_DB_PATH: /app/data/turing.db
       TURING_NATS_URL: *nats-url
       # Bind the HTTP gateway to all interfaces inside the container so
@@ -76,7 +75,6 @@ services:
     volumes:
       - node1-data:/app/data
     ports:
-      - "5670:5670"
       - "8765:8765"
 
   # ── Node 2 — local-only worker ────────────────────────────────────
@@ -88,7 +86,6 @@ services:
       TURING_OLLAMA_HOST: http://ollama:11434
       TURING_LLM_ROUTING_MODE: local
       TURING_MESH_ENABLED: "true"
-      TURING_MESH_PORT: "5670"
       TURING_DB_PATH: /app/data/turing.db
       TURING_NATS_URL: *nats-url
     volumes:
@@ -103,7 +100,6 @@ services:
       TURING_OLLAMA_HOST: http://ollama:11434
       TURING_LLM_ROUTING_MODE: local
       TURING_MESH_ENABLED: "true"
-      TURING_MESH_PORT: "5670"
       TURING_DB_PATH: /app/data/turing.db
       TURING_NATS_URL: *nats-url
     volumes:
@@ -118,7 +114,6 @@ services:
       TURING_OLLAMA_HOST: http://ollama:11434
       TURING_LLM_ROUTING_MODE: local
       TURING_MESH_ENABLED: "true"
-      TURING_MESH_PORT: "5670"
       TURING_DB_PATH: /app/data/turing.db
       TURING_NATS_URL: *nats-url
     volumes:

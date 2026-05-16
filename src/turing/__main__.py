@@ -98,19 +98,34 @@ async def _run(config: TuringConfig) -> None:
 
     safety_gate = SafetyGate(config, audit_store=memory_store)
 
-    # 6. Mesh (optional)
-    from turing.mesh.discovery import PeerDiscovery
+    # 6. Mesh (optional) — NATS-backed peer presence (ADR-0008)
     from turing.mesh.node import MeshNode
+    from turing.mesh.presence import PresenceService
+    from turing.transport.nats_bus import NatsBus
 
     mesh_node = None
-    discovery = None
+    presence: PresenceService | None = None
+    mesh_bus: NatsBus | None = None
     if config.mesh_enabled:
         mesh_node = MeshNode(config)
         mesh_node.capabilities = [t.name for t in tool_registry.get_all()]
         await mesh_node.start()
-        discovery = PeerDiscovery(mesh_node, config)
-        await discovery.start()
-        logger.info("mesh.started", node=config.node_name)
+        try:
+            mesh_bus = await NatsBus.connect(
+                url=config.nats_url,
+                tls_enabled=config.nats_tls_enabled,
+                nkey_seed=config.nats_nkey_seed,
+                lan_only=config.nats_lan_only,
+            )
+            presence = PresenceService(mesh_node, mesh_bus)
+            await presence.start()
+            logger.info("mesh.started", node=config.node_name)
+        except Exception as exc:
+            logger.warning(
+                "mesh.presence_unavailable",
+                error=str(exc),
+                msg="NATS bus unavailable; node will operate as a singleton",
+            )
 
     # 7. Agent
     from turing.agent.core import Agent
@@ -146,6 +161,7 @@ async def _run(config: TuringConfig) -> None:
             bind=config.gateway_bind,
             port=config.gateway_port,
             node_name=config.node_name,
+            mesh_node=mesh_node,
         )
         await gateway.start()
 
@@ -179,8 +195,11 @@ async def _run(config: TuringConfig) -> None:
         logger.info("turing.shutting_down")
         if gateway:
             await gateway.stop()
-        if discovery:
-            await discovery.stop()
+        if presence:
+            await presence.stop()
+        if mesh_bus:
+            with contextlib.suppress(Exception):
+                await mesh_bus.close()
         if mesh_node:
             await mesh_node.stop()
         await memory_store.close()
