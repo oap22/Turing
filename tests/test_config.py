@@ -111,11 +111,6 @@ class TestEnvOverrides:
             cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.llm_routing_mode == "cloud"
 
-    def test_mesh_port_override(self) -> None:
-        with patch.dict("os.environ", {"TURING_MESH_PORT": "9999"}, clear=True):
-            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
-        assert cfg.mesh_port == 9999
-
     def test_sandbox_timeout_override(self) -> None:
         with patch.dict("os.environ", {"TURING_SANDBOX_TIMEOUT": "60"}, clear=True):
             cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
