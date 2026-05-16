@@ -1,6 +1,18 @@
 # Turing
 Hybrid agentic orchestration and self improvement framework.
 
+## Local fleet
+
+Bring up the 4-node Docker Compose simulation (Ollama + NATS + 4 turing nodes):
+
+```bash
+./scripts/dev/fleet-up.sh    # requires a populated .env
+./scripts/dev/fleet-down.sh  # stop (preserves volumes; pass -v on `docker compose down` to nuke)
+```
+
+`fleet-up.sh` tails pi-alpha for ~10s so first-boot errors surface, then
+prints the gateway URL (default `http://localhost:8765/`).
+
 ## Operator UI
 
 Pi-alpha hosts an in-process gateway that serves a read-only observability
