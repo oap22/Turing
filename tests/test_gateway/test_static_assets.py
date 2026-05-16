@@ -44,9 +44,13 @@ class TestSpaServing:
         assert "turing" in r.text
         assert "text/html" in r.headers.get("content-type", "")
 
-    def test_root_without_token_returns_401(self, client: TestClient) -> None:
+    def test_root_without_token_returns_friendly_landing(self, client: TestClient) -> None:
+        # Bare ``/`` is intentionally public and returns a friendly landing
+        # payload — covered in detail by test_friendly_root.py. The SPA HTML
+        # is only served when auth succeeds.
         r = client.get("/")
-        assert r.status_code == 401
+        assert r.status_code == 200
+        assert r.json().get("service") == "turing-gateway"
 
     def test_static_asset_with_token_served(self, client: TestClient) -> None:
         r = client.get("/assets/main.js", headers={"Authorization": "Bearer secret-token"})
@@ -85,10 +89,11 @@ class TestTokenHandoff:
 
 
 class TestNoAssetsConfigured:
-    """When no spa_assets_dir is given, root returns a 404, not a crash."""
+    """When no spa_assets_dir is given, root returns the friendly landing."""
 
-    def test_root_without_assets_returns_404(self) -> None:
+    def test_root_without_assets_returns_landing(self) -> None:
         app = create_app(auth=GatewayAuth(token="secret-token"), node_name="pi-alpha")
         c = TestClient(app)
         r = c.get("/", headers={"Authorization": "Bearer secret-token"})
-        assert r.status_code == 404
+        assert r.status_code == 200
+        assert r.json().get("service") == "turing-gateway"
