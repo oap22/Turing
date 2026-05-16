@@ -75,7 +75,7 @@ Config → Logging → MemoryStore → EmbeddingModel → VectorStore → Memory
 
 ### Multi-Node Architecture
 
-Docker Compose simulates 4 Pi nodes on a shared network. Node 1 (pi-alpha) has Discord token + Anthropic key. Nodes 2-4 are `local_only` workers. Mesh discovery uses Pyre (Zyre UDP broadcast) on port 5670. Plugins are loaded from `plugins/` directory via `manifest.json`.
+Docker Compose simulates 4 Pi nodes on a shared network. Node 1 (pi-alpha) has Discord token + Anthropic key. Nodes 2-4 are `local_only` workers. Mesh peer presence rides on the shared NATS bus (subjects `mesh.presence.heartbeat` / `mesh.presence.leave`); see ADR-0008. Plugins are loaded from `plugins/` directory via `manifest.json`.
 
 ## Agent skills
 

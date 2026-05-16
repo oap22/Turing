@@ -70,8 +70,9 @@ class TuringConfig(BaseSettings):
     )
 
     # ── Mesh networking ──────────────────────────────────────────────────
-    mesh_enabled: bool = Field(default=False, description="Enable ZeroMQ mesh networking")
-    mesh_port: int = Field(default=5670, description="ZeroMQ mesh port")
+    # Per ADR-0008, peer presence rides on the shared NATS bus
+    # (subjects ``mesh.presence.*``); there is no separate mesh port.
+    mesh_enabled: bool = Field(default=False, description="Enable mesh peer presence")
 
     # ── Runtime bus (NATS) ───────────────────────────────────────────────
     nats_url: str = Field(

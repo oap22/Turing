@@ -33,7 +33,7 @@ sudo -u turing /home/turing/venv/bin/pip install --upgrade pip
 echo "[7/7] Configuring firewall..."
 sudo apt install -y ufw
 sudo ufw allow ssh
-sudo ufw allow 5670/udp  # Mesh discovery
+# Mesh presence rides on NATS (ADR-0008); no dedicated discovery port needed.
 sudo ufw --force enable
 
 # Systemd service
