@@ -127,6 +127,37 @@ class TestFallback:
         with pytest.raises(RuntimeError, match="API error"):
             await router.route([_user_msg("Analyze and explain the entire system architecture")])
 
+    @pytest.mark.asyncio
+    async def test_cloud_auth_failure_in_auto_mode_falls_back_to_local(
+        self,
+        cloud_provider: AsyncMock,
+        local_provider: AsyncMock,
+        classifier: ComplexityClassifier,
+    ) -> None:
+        """When cloud is unavailable due to missing/blank API key, the router
+        must fail open and route to local rather than raise. Regression for
+        the dev-simulator boot crash on nodes without an Anthropic key."""
+        import anthropic
+        import httpx
+
+        # Simulate the anthropic SDK rejecting the request because no API key
+        # is configured. anthropic raises AuthenticationError (a subclass of
+        # APIStatusError) in that case.
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx.Response(401, request=request)
+        cloud_provider.complete.side_effect = anthropic.AuthenticationError(
+            message="missing api key",
+            response=response,
+            body=None,
+        )
+        router = LLMRouter(cloud_provider, local_provider, classifier, "auto")
+        result = await router.route(
+            [_user_msg("Analyze and explain the entire system architecture")]
+        )
+        assert result.content == "local response"
+        cloud_provider.complete.assert_awaited_once()
+        local_provider.complete.assert_awaited_once()
+
 
 # ── explicit modes ───────────────────────────────────────────────────
 

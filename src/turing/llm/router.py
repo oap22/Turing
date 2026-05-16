@@ -135,7 +135,7 @@ class LLMRouter:
                 provider, label, messages, system, effective_tools, max_tokens, temperature
             )
             return primary
-        except Exception:
+        except Exception as exc:
             # If the selected provider was local (auto mode), fall back to cloud
             # — and restore the original tool catalog for the cloud retry.
             if provider is self._local and self._routing_mode == "auto":
@@ -147,6 +147,22 @@ class LLMRouter:
                     self._cloud, "cloud", messages, system, tools, max_tokens, temperature
                 )
                 return fallback
+            # If cloud failed because credentials are missing/invalid, fail open
+            # to local. The dev simulator boots nodes without an Anthropic key
+            # and crashing the turn is worse than serving a local response.
+            if (
+                provider is self._cloud
+                and self._routing_mode == "auto"
+                and _is_cloud_unavailable(exc)
+            ):
+                logger.warning(
+                    "llm_cloud_unavailable_failing_open_to_local",
+                    exc_info=True,
+                )
+                local_fallback: LLMResponse = await self._invoke_provider(
+                    self._local, "local", messages, system, None, max_tokens, temperature
+                )
+                return local_fallback
             raise
 
     @traced("llm.complete", payload=_llm_event_payload)
@@ -205,6 +221,24 @@ class LLMRouter:
             if msg.role.value == "user":
                 return msg.content
         return ""
+
+
+def _is_cloud_unavailable(exc: BaseException) -> bool:
+    """Return True if ``exc`` indicates the cloud provider is unreachable
+    because of missing credentials or auth failure.
+
+    We try to import anthropic lazily so the router stays usable in tests
+    that stub the cloud provider without the SDK installed.
+    """
+    try:
+        import anthropic
+    except ImportError:  # pragma: no cover - anthropic is a hard dep in prod
+        return False
+
+    # Some SDK versions surface a missing key as a plain TypeError/ValueError
+    # at construction time; the router caller (provider init) will raise
+    # before we get here, so we only need to handle runtime auth errors.
+    return isinstance(exc, anthropic.AuthenticationError | anthropic.PermissionDeniedError)
 
 
 def _provider_label(
