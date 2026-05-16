@@ -32,7 +32,7 @@ WORKDIR /app
 # ── Install Python dependencies first (layer caching) ───────────────
 # pyproject.toml force-includes webui/dist, so we need it present for
 # both the deps-only and the --no-deps install steps to succeed.
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md hatch_build.py ./
 COPY --from=webui-builder /webui/dist ./webui/dist
 RUN pip install --no-cache-dir . \
     && pip cache purge 2>/dev/null || true
