@@ -14,8 +14,17 @@ COPY webui/package.json webui/package-lock.json* ./
 # --legacy-peer-deps because @vitejs/plugin-react's published peer range
 # lags behind the vite 8 we use in devDependencies; the build itself
 # works fine.
+#
+# NOTE: `--include=optional` alone is NOT sufficient on Apple Silicon
+# (linux/arm64) — npm/cli#4828 can still skip the rollup native package
+# entry depending on how the optionalDependencies tree was resolved. To
+# make the build portable across both linux/amd64 and linux/arm64 hosts,
+# we additionally pull both rollup native binaries explicitly with
+# --force so the appropriate one is present at `npm run build` time.
 RUN rm -f package-lock.json \
-    && npm install --include=optional --no-audit --no-fund --legacy-peer-deps
+    && npm install --include=optional --no-audit --no-fund --legacy-peer-deps \
+    && npm install --no-save --no-audit --no-fund --legacy-peer-deps --force \
+        @rollup/rollup-linux-arm64-gnu @rollup/rollup-linux-x64-gnu
 COPY webui/ ./
 RUN npm run build
 
