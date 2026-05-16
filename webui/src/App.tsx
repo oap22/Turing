@@ -7,6 +7,7 @@ import { connectGatewayWS } from "./ws";
 
 const STALE_TICK_MS = 5_000;
 const HIGHLIGHT_MS = 1_500;
+const PEERS_POLL_MS = 10_000;
 
 export default function App() {
   const [state, dispatch] = useReducer(
@@ -50,6 +51,33 @@ export default function App() {
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), STALE_TICK_MS);
     return () => clearInterval(id);
+  }, []);
+
+  // Poll /peers so every mesh member shows up immediately on load and stays
+  // marked alive while NATS presence sees them, even when there's no trace
+  // activity flowing through this node's ring buffer.
+  useEffect(() => {
+    let cancelled = false;
+    async function poll() {
+      try {
+        const res = await fetch("/peers", { credentials: "same-origin" });
+        if (!res.ok) return;
+        const body = (await res.json()) as { peers?: Array<{ node_name?: string }> };
+        if (cancelled || !body.peers) return;
+        for (const p of body.peers) {
+          if (!p.node_name) continue;
+          dispatch({ type: "hello", node_name: p.node_name, uptime_s: 0 });
+        }
+      } catch {
+        // best-effort; the WS path also feeds the graph
+      }
+    }
+    poll();
+    const id = setInterval(poll, PEERS_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
   }, []);
   const visibleState = useMemo(() => markStale(state, now), [state, now]);
 

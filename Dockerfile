@@ -15,7 +15,12 @@ COPY webui/package.json webui/package-lock.json* ./
 # lags behind the vite 8 we use in devDependencies; the build itself
 # works fine.
 RUN rm -f package-lock.json \
-    && npm install --include=optional --no-audit --no-fund --legacy-peer-deps
+    && npm install --include=optional --no-audit --no-fund --legacy-peer-deps \
+    && ARCH=$(uname -m) \
+    && case "$ARCH" in \
+         x86_64)  npm install --no-save --no-audit --no-fund --legacy-peer-deps @rollup/rollup-linux-x64-gnu ;; \
+         aarch64) npm install --no-save --no-audit --no-fund --legacy-peer-deps @rollup/rollup-linux-arm64-gnu ;; \
+       esac
 COPY webui/ ./
 RUN npm run build
 
