@@ -11,6 +11,8 @@ Live integration is exercised under the `integration` marker; unit tests use
 
 from __future__ import annotations
 
+import ipaddress
+import socket
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -63,19 +65,34 @@ class NatsBus:
 def _is_lan_url(url: str) -> bool:
     """Return True for loopback / private / .local URLs.
 
-    Coarse check — full address parsing isn't needed; this is a defence-in-depth
-    flag, not a security boundary.
+    Defence-in-depth flag, not a security boundary. We accept any hostname
+    that either looks LAN-ish by name (`localhost`, `*.local`) or resolves
+    to an RFC1918 / loopback / link-local address. Resolving by name matters
+    for docker-compose, where service names like `nats` resolve to bridge
+    network addresses inside the private 172.16/12 range.
     """
-    prefixes = ("127.", "localhost", "10.", "192.168.")
     host = url.split("://", 1)[-1].split(":", 1)[0]
-    if any(host.startswith(m) for m in prefixes):
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".local"):
         return True
-    if host.endswith(".local"):
-        return True
-    if host.startswith("172."):
-        try:
-            second_octet = int(host.split(".")[1])
-        except (IndexError, ValueError):
+    # If host is already a literal IP, check directly; otherwise resolve.
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        resolved = _resolve_host(host)
+        if resolved is None:
             return False
-        return 16 <= second_octet <= 31
-    return False
+        try:
+            ip = ipaddress.ip_address(resolved)
+        except ValueError:
+            return False
+    return ip.is_private or ip.is_loopback or ip.is_link_local
+
+
+def _resolve_host(host: str) -> str | None:
+    """Resolve a hostname to an IP string, or None on failure."""
+    try:
+        return socket.gethostbyname(host)
+    except OSError:
+        return None
