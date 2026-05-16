@@ -4,10 +4,18 @@
 FROM node:20-slim AS webui-builder
 WORKDIR /webui
 COPY webui/package.json webui/package-lock.json* ./
+# Drop the committed lockfile inside the builder so npm can resolve the
+# platform-specific optional native deps for the build image's arch.
+# Works around npm/cli#4828: a package-lock.json captured on one platform
+# omits optional @rollup/rollup-<os>-<arch>-* entries needed on another,
+# causing `Cannot find module @rollup/rollup-linux-{arm64,x64}-gnu` at
+# `npm run build`. We accept slightly non-deterministic webui builds in
+# exchange for a simple fix; the webui is not a security-critical surface.
 # --legacy-peer-deps because @vitejs/plugin-react's published peer range
 # lags behind the vite 8 we use in devDependencies; the build itself
 # works fine.
-RUN npm install --no-audit --no-fund --legacy-peer-deps
+RUN rm -f package-lock.json \
+    && npm install --include=optional --no-audit --no-fund --legacy-peer-deps
 COPY webui/ ./
 RUN npm run build
 
@@ -32,7 +40,7 @@ WORKDIR /app
 # ── Install Python dependencies first (layer caching) ───────────────
 # pyproject.toml force-includes webui/dist, so we need it present for
 # both the deps-only and the --no-deps install steps to succeed.
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md hatch_build.py ./
 COPY --from=webui-builder /webui/dist ./webui/dist
 RUN pip install --no-cache-dir . \
     && pip cache purge 2>/dev/null || true
