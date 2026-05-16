@@ -8,12 +8,16 @@ the task. No extra threads, no new systemd unit.
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 
 import structlog
 
 from turing.gateway.app import create_app
 from turing.gateway.auth import GatewayAuth
 from turing.gateway.spa import spa_assets_path
+
+if TYPE_CHECKING:
+    import uvicorn
 
 logger = structlog.get_logger(__name__)
 
@@ -32,7 +36,7 @@ class GatewayService:
         self._port = port
         self._node_name = node_name
         self._task: asyncio.Task | None = None
-        self._server = None  # type: ignore[var-annotated]
+        self._server: uvicorn.Server | None = None
 
     async def start(self) -> None:
         if self._task is not None:

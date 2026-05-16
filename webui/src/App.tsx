@@ -20,13 +20,13 @@ export default function App() {
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
-    const stop = connectGatewayWS({
+    const stop = connectGatewayWS<Frame>({
       url: window.location.origin.replace(/^http/, "ws") + "/ws",
       onFrame: (frame) => {
-        dispatch(frame as Frame);
-        setDebugFrames((prev) => [...prev.slice(-499), frame as Frame]);
-        if ((frame as Record<string, unknown>).type === "message_trace") {
-          const f = frame as Record<string, unknown>;
+        dispatch(frame);
+        setDebugFrames((prev) => [...prev.slice(-499), frame]);
+        if (frame.type === "message_trace") {
+          const f = frame as unknown as Record<string, unknown>;
           setLiveTrace((prev) => [
             ...prev.slice(-499),
             {

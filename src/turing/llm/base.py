@@ -86,7 +86,7 @@ class LLMProvider(ABC):
         ...
 
     @abstractmethod
-    async def stream(
+    def stream(
         self,
         messages: list[Message],
         system: str = "",
