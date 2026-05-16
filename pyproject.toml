@@ -33,7 +33,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-embeddings = ["onnxruntime>=1.17"]
+embeddings = ["onnxruntime>=1.26.0"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
