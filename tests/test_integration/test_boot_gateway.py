@@ -116,9 +116,11 @@ async def test_boot_path_serves_spa_and_authenticates(tmp_path: Path) -> None:
                 r = await client.get(f"{base}/healthz")
                 assert r.status_code == 200
 
-                # / without cookie → 401
+                # / without cookie → friendly landing payload (was 401 before
+                # the friendly-root change; new operators get a real next step)
                 r = await client.get(f"{base}/")
-                assert r.status_code == 401
+                assert r.status_code == 200
+                assert r.json().get("service") == "turing-gateway"
 
                 # /token-handoff → 303 + Set-Cookie
                 r = await client.get(f"{base}/token-handoff?token={token}")

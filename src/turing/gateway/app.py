@@ -33,7 +33,17 @@ if TYPE_CHECKING:
 
 DEFAULT_PAGE_LIMIT = 200
 
-PUBLIC_PATHS = frozenset({"/healthz", "/token-handoff"})
+PUBLIC_PATHS = frozenset({"/", "/healthz", "/token-handoff"})
+
+# Friendly landing payload returned on bare ``GET /`` when the caller is not
+# authenticated (or when no SPA bundle is mounted). Keeps the operator from
+# staring at a raw 401 with no next step — points them at the token-handoff
+# route where the launcher's one-shot URL completes the login.
+_LANDING_PAYLOAD = {
+    "service": "turing-gateway",
+    "login": "/token-handoff?token=<your-token>",
+    "healthz": "/healthz",
+}
 
 
 class _BearerMiddleware(BaseHTTPMiddleware):
@@ -153,7 +163,16 @@ def create_app(
         index_path = Path(spa_assets_dir) / "index.html"
 
         @app.get("/", include_in_schema=False)
-        async def spa_index() -> Response:
+        async def spa_index(request: Request) -> Response:
+            # ``/`` is on PUBLIC_PATHS so the middleware lets unauthed callers
+            # through — but the SPA itself is privileged. Unauthed visitors
+            # get the friendly landing payload with a pointer to login;
+            # authed visitors get the real SPA bundle.
+            if not auth.check(
+                authorization_header=request.headers.get("Authorization"),
+                cookie_token=request.cookies.get(COOKIE_NAME),
+            ):
+                return JSONResponse(_LANDING_PAYLOAD)
             if not index_path.is_file():
                 return JSONResponse({"detail": "spa not built"}, status_code=404)
             return FileResponse(index_path, media_type="text/html")
@@ -165,5 +184,12 @@ def create_app(
             StaticFiles(directory=str(spa_assets_dir), html=False),
             name="spa-static",
         )
+    else:
+
+        @app.get("/", include_in_schema=False)
+        async def landing() -> Response:
+            # No SPA bundle present — every visitor (authed or not) gets the
+            # friendly landing payload. Beats the old 404/401 dead-ends.
+            return JSONResponse(_LANDING_PAYLOAD)
 
     return app
