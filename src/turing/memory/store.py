@@ -223,7 +223,7 @@ class MemoryStore:
         )
         rows = await cursor.fetchall()
         # Return in chronological order
-        return [dict(r) for r in reversed(rows)]
+        return [dict(r) for r in reversed(list(rows))]
 
     async def get_message_by_id(self, message_id: int) -> dict[str, Any] | None:
         """Fetch a single message by its id."""

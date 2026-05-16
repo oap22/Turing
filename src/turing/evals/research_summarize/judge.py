@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -79,7 +79,7 @@ _PROMPT = (
 class HaikuJudge:
     """Calls a `ClaudeProvider` configured for Haiku and parses the verdict."""
 
-    def __init__(self, provider, model: str = "claude-haiku-4-5"):
+    def __init__(self, provider: Any, model: str = "claude-haiku-4-5") -> None:
         self._provider = provider
         self._model = model
 
@@ -97,7 +97,8 @@ class HaikuJudge:
                 max_tokens=8,
                 temperature=0.0,
             )
-            return resp.content.strip().lower()
+            text: str = resp.content.strip().lower()
+            return text
 
         loop = asyncio.new_event_loop()
         try:

@@ -14,7 +14,7 @@ from turing.llm.base import (
     ToolDefinition,
 )
 from turing.llm.classifier import ComplexityClassifier
-from turing.llm.router import LLMRouter
+from turing.llm.router import LLMRouter, warn_if_local_only_disables_tools
 from turing.telemetry.bus import Telemetry, TelemetryEvent
 
 # ── fixtures ──────────────────────────────────────────────────────────
@@ -175,10 +175,38 @@ class TestExplicitModes:
 
 
 class TestToolForcing:
-    """When tools are provided, cloud should always be selected in auto mode."""
+    """In auto mode the classifier decides; tools alone do not force cloud."""
 
     @pytest.mark.asyncio
-    async def test_tools_force_cloud_in_auto_mode(
+    async def test_chitchat_with_tools_routes_to_local_in_auto_mode(
+        self,
+        cloud_provider: AsyncMock,
+        local_provider: AsyncMock,
+        classifier: ComplexityClassifier,
+    ) -> None:
+        """Regression for #160: a plain greeting must not go to cloud just
+        because the agent's tool catalog is attached."""
+        tools = [
+            ToolDefinition(
+                name="run_command",
+                description="Run a shell command",
+                parameters={
+                    "type": "object",
+                    "properties": {"cmd": {"type": "string"}},
+                },
+            )
+        ]
+        router = LLMRouter(cloud_provider, local_provider, classifier, "auto")
+        response = await router.route([_user_msg("how are you doing")], tools=tools)
+        assert response.content == "local response"
+        local_provider.complete.assert_awaited_once()
+        cloud_provider.complete.assert_not_awaited()
+        # Tools must be stripped from the local call — Ollama tool support is unreliable.
+        local_kwargs = local_provider.complete.call_args.kwargs
+        assert local_kwargs.get("tools") in (None, [])
+
+    @pytest.mark.asyncio
+    async def test_tool_shaped_message_with_tools_routes_to_cloud(
         self,
         cloud_provider: AsyncMock,
         local_provider: AsyncMock,
@@ -195,7 +223,9 @@ class TestToolForcing:
             )
         ]
         router = LLMRouter(cloud_provider, local_provider, classifier, "auto")
-        response = await router.route([_user_msg("hello")], tools=tools)
+        response = await router.route(
+            [_user_msg("check the status of the disk and restart nginx")], tools=tools
+        )
         assert response.content == "cloud response"
         cloud_provider.complete.assert_awaited_once()
         local_provider.complete.assert_not_awaited()
@@ -334,3 +364,42 @@ class TestTelemetry:
 
         err = next(e for e in captured if e.name == "llm.complete.error")
         assert err.error == "RuntimeError"
+
+
+class TestWarnIfLocalOnlyDisablesTools:
+    """Issue #158 — local_only routing silently disables tool use."""
+
+    def test_warns_when_local_only_with_tools(self) -> None:
+        import structlog
+
+        with structlog.testing.capture_logs() as cap:
+            emitted = warn_if_local_only_disables_tools("local_only", tool_count=5)
+        assert emitted is True
+        warns = [e for e in cap if e.get("event") == "llm.local_only_disables_tools"]
+        assert len(warns) == 1
+        assert warns[0]["log_level"] == "warning"
+        assert warns[0]["tool_count"] == 5
+
+    def test_silent_when_local_only_but_no_tools(self) -> None:
+        import structlog
+
+        with structlog.testing.capture_logs() as cap:
+            emitted = warn_if_local_only_disables_tools("local_only", tool_count=0)
+        assert emitted is False
+        assert not [e for e in cap if e.get("event") == "llm.local_only_disables_tools"]
+
+    def test_silent_when_auto_with_tools(self) -> None:
+        import structlog
+
+        with structlog.testing.capture_logs() as cap:
+            emitted = warn_if_local_only_disables_tools("auto", tool_count=5)
+        assert emitted is False
+        assert not [e for e in cap if e.get("event") == "llm.local_only_disables_tools"]
+
+    def test_silent_when_cloud_only_with_tools(self) -> None:
+        import structlog
+
+        with structlog.testing.capture_logs() as cap:
+            emitted = warn_if_local_only_disables_tools("cloud_only", tool_count=5)
+        assert emitted is False
+        assert not [e for e in cap if e.get("event") == "llm.local_only_disables_tools"]

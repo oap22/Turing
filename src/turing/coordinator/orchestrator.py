@@ -34,6 +34,8 @@ from turing.coordinator.lifecycle.lifecycle import SubtaskState
 from turing.coordinator.scheduler.scheduler import Subtask as SchedulerSubtask
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from turing.coordinator.capability_token import TokenIssuer
     from turing.coordinator.dispatch.client import SubtaskDispatchClient
     from turing.coordinator.lifecycle.episode_store import EpisodeStore
@@ -43,6 +45,7 @@ if TYPE_CHECKING:
         Subtask,
     )
     from turing.coordinator.registry import CapabilityRegistry
+    from turing.coordinator.registry.manifest import CapabilityManifest
     from turing.coordinator.scheduler.scheduler import Scheduler
 
 
@@ -142,7 +145,7 @@ class DAGOrchestrator:
         episode_store: EpisodeStore,
         worker_for_specialty: dict[str, WorkerClient],
         synthesizer: Synthesizer,
-        now_ms=_now_ms,
+        now_ms: Callable[[], int] = _now_ms,
         dispatch_client: SubtaskDispatchClient | None = None,
         scheduler: Scheduler | None = None,
         token_issuer: TokenIssuer | None = None,
@@ -217,7 +220,7 @@ class DAGOrchestrator:
                     # st was deferred — its dependencies (the new fragment
                     # subtasks) need to run first.
                     continue
-                outputs[st.output_key] = res
+                outputs[st.output_key] = str(res)
                 completed.add(st.id)
 
         leaf_outputs = {sid: outputs[live.subtasks[sid].output_key] for sid in live.leaves()}
@@ -345,7 +348,7 @@ class DAGOrchestrator:
         *,
         subtask: Subtask,
         sched_st: SchedulerSubtask,
-        initial_pick,
+        initial_pick: CapabilityManifest,
         resolved_inputs: dict[str, str],
         registry: CapabilityRegistry,
         live: _LiveDAG,
@@ -357,7 +360,7 @@ class DAGOrchestrator:
         deadline_ms = self._now_ms() + subtask.timeout_s * 1000
         tried: list[str] = []
 
-        pick = initial_pick
+        pick: CapabilityManifest | None = initial_pick
         last_error = "no worker available"
         last_outcome = SubtaskState.FAILED
 

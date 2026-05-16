@@ -19,6 +19,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from turing.coordinator.lifecycle.episode_store import EpisodeStore
     from turing.coordinator.lifecycle.lifecycle import SubtaskState
     from turing.learning.critic.queue import CriticQueue
@@ -30,7 +32,7 @@ def make_terminal_critic_hook(
     *,
     episode_store: EpisodeStore,
     critic_queue: CriticQueue,
-):
+) -> Callable[[str, SubtaskState], None]:
     """Return a callable suitable for ``TaskLifecycle(on_terminal=...)``."""
     enqueued: set[str] = set()
 
