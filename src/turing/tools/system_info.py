@@ -223,7 +223,10 @@ class SystemInfoTool(Tool):
         # Fallback to psutil sensors_temperatures.
         if not found_any:
             try:
-                temps = psutil.sensors_temperatures()
+                sensors_temperatures = getattr(psutil, "sensors_temperatures", None)
+                if sensors_temperatures is None:
+                    raise AttributeError("sensors_temperatures unavailable on this platform")
+                temps = sensors_temperatures()
                 if temps:
                     for sensor_name, entries in temps.items():
                         for entry in entries:

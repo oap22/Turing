@@ -66,7 +66,7 @@ def create_app(
     app = FastAPI(title="turing-gateway")
     app.state.start_time = time.monotonic()
     app.state.ring_buffer = ring_buffer
-    app.add_middleware(_BearerMiddleware, auth=auth)
+    app.add_middleware(_BearerMiddleware, auth=auth)  # type: ignore[arg-type]
 
     @app.get("/healthz")
     async def healthz() -> dict:

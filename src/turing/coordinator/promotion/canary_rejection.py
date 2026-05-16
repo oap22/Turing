@@ -92,7 +92,7 @@ def make_canary_rejected_handler(
     notifier: _Notifier,
     discord_post: Callable[[str], Awaitable[None]] | None,
     now_ms: Callable[[], int],
-):
+) -> Callable[[CanaryGateOutcome, str, str, str], Awaitable[None]]:
     """Return a coroutine matching `CanaryGateRunner.on_rejected` signature."""
 
     async def on_rejected(

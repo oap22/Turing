@@ -21,7 +21,9 @@ if TYPE_CHECKING:
 ExtractorFn = Callable[[str, Sequence[dict[str, Any]]], Awaitable[list[LessonCandidate]]]
 
 
-def make_extract_lessons_handler(extract_fn: ExtractorFn):
+def make_extract_lessons_handler(
+    extract_fn: ExtractorFn,
+) -> Callable[[SubtaskDispatch], Awaitable[dict[str, object]]]:
     """Build a kind handler returning JSON-encoded LessonCandidate list."""
 
     async def handle(envelope: SubtaskDispatch) -> dict[str, object]:

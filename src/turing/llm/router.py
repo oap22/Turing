@@ -22,6 +22,28 @@ logger = structlog.get_logger(__name__)
 RoutingMode = Literal["cloud_only", "local_only", "auto"]
 
 
+def warn_if_local_only_disables_tools(routing_mode: str, tool_count: int) -> bool:
+    """Emit a startup WARN when ``local_only`` routing makes tools unreachable.
+
+    Local Ollama models in this codebase don't surface ``tool_calls`` in their
+    responses, so when the router is forced to ``local_only`` every
+    tool-requiring request is silently answered as prose. The router enforces
+    "tools => cloud" only when ``routing_mode='auto'``; under ``local_only``
+    that escape hatch is disabled. See issue #158.
+
+    Returns True when the warning was emitted, False otherwise — handy for
+    tests and so callers can react if they want to.
+    """
+    if routing_mode == "local_only" and tool_count > 0:
+        logger.warning(
+            "llm.local_only_disables_tools",
+            tool_count=tool_count,
+            hint="set TURING_LLM_ROUTING_MODE=auto (or cloud) for tool calls to fire",
+        )
+        return True
+    return False
+
+
 def _llm_event_payload(
     kind: str,
     args: tuple[Any, ...],
@@ -62,8 +84,11 @@ class LLMRouter:
     * **local_only** — always use the local provider.
     * **auto** — classify the message complexity and pick the best
       provider.  Falls back from local to cloud on errors or timeouts.
-      If tools are provided the cloud provider is always selected because
-      local Ollama models have limited tool-use support.
+      The classifier is given visibility into whether tools are attached;
+      if it judges the message tool-shaped or otherwise complex the
+      request goes to cloud (with tools).  Otherwise it is served locally
+      with the tool catalog stripped, since local Ollama models have
+      limited tool-use support and would not invoke them reliably anyway.
     """
 
     def __init__(
@@ -92,28 +117,36 @@ class LLMRouter:
     ) -> LLMResponse:
         """Route the request to the appropriate LLM provider and return the response."""
         provider, reason = self._select_provider(messages, tools)
+        label = _provider_label(provider, self._cloud, self._local)
+        # Local Ollama models do not reliably emit tool calls, so when we
+        # route to local we drop the tool catalog rather than send a
+        # confusing prompt the model will ignore.
+        effective_tools = tools if provider is self._cloud else None
         logger.info(
             "llm_route_decision",
-            provider=_provider_label(provider, self._cloud, self._local),
+            provider=label,
             reason=reason,
             routing_mode=self._routing_mode,
+            tools_attached=bool(effective_tools),
         )
 
-        label = _provider_label(provider, self._cloud, self._local)
         try:
-            return await self._invoke_provider(
-                provider, label, messages, system, tools, max_tokens, temperature
+            primary: LLMResponse = await self._invoke_provider(
+                provider, label, messages, system, effective_tools, max_tokens, temperature
             )
+            return primary
         except Exception:
-            # If the selected provider was local (auto mode), fall back to cloud.
+            # If the selected provider was local (auto mode), fall back to cloud
+            # — and restore the original tool catalog for the cloud retry.
             if provider is self._local and self._routing_mode == "auto":
                 logger.warning(
                     "llm_local_failed_falling_back_to_cloud",
                     exc_info=True,
                 )
-                return await self._invoke_provider(
+                fallback: LLMResponse = await self._invoke_provider(
                     self._cloud, "cloud", messages, system, tools, max_tokens, temperature
                 )
+                return fallback
             raise
 
     @traced("llm.complete", payload=_llm_event_payload)
@@ -150,10 +183,10 @@ class LLMRouter:
         if self._routing_mode == "local_only":
             return self._local, "routing_mode=local_only"
 
-        # auto mode
-        if tools:
-            return self._cloud, "tools_require_cloud"
-
+        # auto mode — let the classifier decide, even when tools are
+        # attached.  Tool presence is fed in as a signal so tool-shaped
+        # phrasing biases toward cloud, but pure chat with a tool catalog
+        # attached must still route locally (issue #160).
         last_user_message = self._extract_last_user_message(messages)
         complexity = self._classifier.classify(
             last_user_message,

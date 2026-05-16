@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 import discord
 import structlog
@@ -31,11 +32,11 @@ class TuringBot(commands.Bot):
 
     def __init__(
         self,
-        config,
-        agent=None,
-        mesh_node=None,
-        memory_store=None,
-    ):
+        config: Any,
+        agent: Any = None,
+        mesh_node: Any = None,
+        memory_store: Any = None,
+    ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
         intents.members = True
@@ -98,13 +99,32 @@ class TuringBot(commands.Bot):
             return
 
         if self.agent:
-            async with message.channel.typing():
-                response = await self.agent.handle_message(
-                    message=content,
-                    channel_id=str(message.channel.id),
-                    user_id=str(message.author.id),
-                    user_name=message.author.display_name,
+            try:
+                async with message.channel.typing():
+                    response = await self.agent.handle_message(
+                        message=content,
+                        channel_id=str(message.channel.id),
+                        user_id=str(message.author.id),
+                        user_name=message.author.display_name,
+                    )
+            except Exception as exc:
+                # Bug #159: any unhandled provider error (credit exhaustion,
+                # rate limit, transient 5xx, etc.) used to propagate to
+                # discord.py's on_message handler — user got silence, logs
+                # got a multi-thousand-line traceback. Reply gracefully and
+                # log a single structured event instead.
+                self.logger.error(
+                    "bot.agent_error",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                    channel_id=getattr(message.channel, "id", None),
+                    author_id=getattr(message.author, "id", None),
                 )
+                await message.reply(
+                    "I'm having trouble reaching the LLM right now — please try again in a minute."
+                )
+                await self.process_commands(message)
+                return
 
             from .formatters import chunk_message
 
