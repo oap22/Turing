@@ -8,6 +8,10 @@ later (out of scope for #97).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 @dataclass(frozen=True)
@@ -34,7 +38,7 @@ class GateAuditLog:
     def append(self, row: GateAuditRow) -> None:
         self._rows.append(row)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[GateAuditRow]:
         return iter(self._rows)
 
     def __len__(self) -> int:

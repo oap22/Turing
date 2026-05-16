@@ -69,8 +69,8 @@ class SignedTransport:
                 return
 
             result = handler(message)
-            if hasattr(result, "__await__"):
-                await result  # type: ignore[func-returns-value]
+            if result is not None:
+                await result
 
         await self._bus.subscribe(subject, _on_bytes)
 
