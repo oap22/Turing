@@ -15,11 +15,20 @@ if [ ! -f .env ]; then
 fi
 
 echo "=== Turing fleet up ==="
-docker compose up -d
+# --build ensures we don't silently run a stale image that predates
+# recent source changes (e.g. the gateway feature).
+docker compose up -d --build
 
 echo
 echo "--- tailing turing-node-1 for 10s (Ctrl-C is safe; containers keep running) ---"
-timeout 10 docker compose logs -f turing-node-1 || true
+# Portable replacement for `timeout 10 ...` — `timeout` is GNU coreutils
+# and not present on macOS by default. Background the follow, sleep,
+# then kill the pid.
+docker compose logs -f turing-node-1 &
+LOG_PID=$!
+sleep 10
+kill "$LOG_PID" 2>/dev/null || true
+wait "$LOG_PID" 2>/dev/null || true
 
 # Pull gateway port from .env (fallback to default 8765 from .env.example).
 GATEWAY_PORT="$(grep -E '^TURING_GATEWAY_PORT=' .env | cut -d= -f2- | tr -d '"' || true)"
