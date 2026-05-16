@@ -1,3 +1,17 @@
+# ── Stage 1: build the webui SPA bundle ─────────────────────────────
+# pyproject.toml force-includes webui/dist into the wheel, so we must
+# produce it before the python install step.
+FROM node:20-slim AS webui-builder
+WORKDIR /webui
+COPY webui/package.json webui/package-lock.json* ./
+# --legacy-peer-deps because @vitejs/plugin-react's published peer range
+# lags behind the vite 8 we use in devDependencies; the build itself
+# works fine.
+RUN npm install --no-audit --no-fund --legacy-peer-deps
+COPY webui/ ./
+RUN npm run build
+
+# ── Stage 2: python runtime ─────────────────────────────────────────
 FROM python:3.11-slim AS base
 
 # Prevent Python from writing .pyc files and enable unbuffered output
@@ -16,7 +30,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # ── Install Python dependencies first (layer caching) ───────────────
+# pyproject.toml force-includes webui/dist, so we need it present for
+# both the deps-only and the --no-deps install steps to succeed.
 COPY pyproject.toml README.md ./
+COPY --from=webui-builder /webui/dist ./webui/dist
 RUN pip install --no-cache-dir . \
     && pip cache purge 2>/dev/null || true
 

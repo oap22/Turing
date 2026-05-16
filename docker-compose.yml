@@ -69,10 +69,15 @@ services:
       TURING_MESH_PORT: "5670"
       TURING_DB_PATH: /app/data/turing.db
       TURING_NATS_URL: *nats-url
+      # Bind the HTTP gateway to all interfaces inside the container so
+      # the host port mapping below is actually reachable. The default
+      # 127.0.0.1 is container-local.
+      TURING_GATEWAY_BIND: "0.0.0.0"
     volumes:
       - node1-data:/app/data
     ports:
       - "5670:5670"
+      - "8765:8765"
 
   # ── Node 2 — local-only worker ────────────────────────────────────
   turing-node-2:
