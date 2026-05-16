@@ -16,8 +16,7 @@ def test_env_py_documents_unsupported_alembic_check() -> None:
     text = Path("alembic/env.py").read_text()
     assert "target_metadata = None" in text
     assert "alembic check" in text, (
-        "alembic/env.py must explain why target_metadata is None — "
-        "see issue #145"
+        "alembic/env.py must explain why target_metadata is None — see issue #145"
     )
 
 
@@ -25,6 +24,5 @@ def test_readme_documents_alembic_check_unsupported() -> None:
     text = Path("README.md").read_text()
     assert "Database migrations" in text
     assert "alembic check" in text and "not supported" in text, (
-        "README.md must document that `alembic check` is unsupported — "
-        "see issue #145"
+        "README.md must document that `alembic check` is unsupported — see issue #145"
     )

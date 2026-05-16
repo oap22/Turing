@@ -121,8 +121,7 @@ class TuringBot(commands.Bot):
                     author_id=getattr(message.author, "id", None),
                 )
                 await message.reply(
-                    "I'm having trouble reaching the LLM right now — "
-                    "please try again in a minute."
+                    "I'm having trouble reaching the LLM right now — please try again in a minute."
                 )
                 await self.process_commands(message)
                 return

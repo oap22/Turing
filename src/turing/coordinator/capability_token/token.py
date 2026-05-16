@@ -123,7 +123,9 @@ class CapabilityVerifier:
         self.verify(token, now_ms=now_ms)
         scope = token.scope
         if now_ms >= scope.expires_at_ms:
-            raise ScopeViolationError(f"token expired: now={now_ms} >= expires_at={scope.expires_at_ms}")
+            raise ScopeViolationError(
+                f"token expired: now={now_ms} >= expires_at={scope.expires_at_ms}"
+            )
         if not re.fullmatch(scope.allowed_commands_regex, command):
             raise ScopeViolationError(
                 f"command {command!r} does not match allowed pattern "
