@@ -39,6 +39,7 @@ const rows: PeerSpecsRow[] = [
     node_id: "mbp-id",
     node_name: "mbp",
     self: false,
+    stale: false,
     specs: specs({
       model_name: "MacBookPro18,3",
       os: "darwin",
@@ -54,12 +55,14 @@ const rows: PeerSpecsRow[] = [
     node_id: "self-id",
     node_name: "pi-alpha",
     self: true,
+    stale: false,
     specs: specs(),
   },
   {
     node_id: "beta-id",
     node_name: "pi-beta",
     self: false,
+    stale: false,
     specs: specs({
       model_name: "Raspberry Pi 4 Model B Rev 1.2",
       cpu_percent: 20.5,
@@ -164,6 +167,7 @@ describe("<SpecsGrid>", () => {
             node_id: "old",
             node_name: "pi-old",
             self: false,
+            stale: false,
             specs: null,
           },
         ]}
@@ -173,6 +177,57 @@ describe("<SpecsGrid>", () => {
     expect(row.textContent?.match(/—/g)?.length ?? 0).toBeGreaterThanOrEqual(6);
   });
 
+  it("marks ok rows with severity=ok and no warn/danger classes", () => {
+    render(<SpecsGrid rows={rows} />);
+    const self = screen.getByTestId("specs-row-self-id");
+    expect(self.getAttribute("data-severity")).toBe("ok");
+  });
+
+  it("marks rows with warn-level CPU as severity=warn", () => {
+    const warnRow: PeerSpecsRow = {
+      node_id: "warn-id",
+      node_name: "pi-warn",
+      self: false,
+      stale: false,
+      specs: specs({ cpu_percent: 85 }), // > CPU_WARN, < CPU_DANGER
+    };
+    render(<SpecsGrid rows={[warnRow]} />);
+    const r = screen.getByTestId("specs-row-warn-id");
+    expect(r.getAttribute("data-severity")).toBe("warn");
+    expect(r.className).toContain("amber");
+  });
+
+  it("marks rows with danger-level temperature as severity=danger", () => {
+    const dangerRow: PeerSpecsRow = {
+      node_id: "hot-id",
+      node_name: "pi-hot",
+      self: false,
+      stale: false,
+      specs: specs({ temp_celsius: 90 }),
+    };
+    render(<SpecsGrid rows={[dangerRow]} />);
+    const r = screen.getByTestId("specs-row-hot-id");
+    expect(r.getAttribute("data-severity")).toBe("danger");
+    expect(r.className).toContain("rose");
+  });
+
+  it("dims stale rows but still renders their last-known values", () => {
+    const staleRow: PeerSpecsRow = {
+      node_id: "stale-id",
+      node_name: "pi-stale",
+      self: false,
+      stale: true,
+      specs: specs({ cpu_percent: 17.3, temp_celsius: 50.5 }),
+    };
+    render(<SpecsGrid rows={[staleRow]} />);
+    const r = screen.getByTestId("specs-row-stale-id");
+    expect(r.getAttribute("data-stale")).toBe("true");
+    expect(r.className).toContain("opacity-50");
+    // Values still present.
+    expect(r.textContent).toContain("17.3%");
+    expect(r.textContent).toContain("50.5°C");
+  });
+
   it("flags the grid as scrollable when peer count exceeds 6", () => {
     const many: PeerSpecsRow[] = [];
     for (let i = 0; i < 8; i++) {
@@ -180,6 +235,7 @@ describe("<SpecsGrid>", () => {
         node_id: `n${i}`,
         node_name: `node-${i}`,
         self: i === 0,
+        stale: false,
         specs: specs(),
       });
     }

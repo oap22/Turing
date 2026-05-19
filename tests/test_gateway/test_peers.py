@@ -158,6 +158,30 @@ class TestPeersIncludesSpecs:
         for p in body["peers"]:
             assert {"node_id", "node_name", "self", "capabilities", "last_seen"} <= p.keys()
 
+    def test_every_peer_carries_stale_boolean(self, client: TestClient) -> None:
+        body = client.get("/peers").json()
+        for p in body["peers"]:
+            assert "stale" in p
+            assert isinstance(p["stale"], bool)
+
+    def test_self_row_is_never_stale(self, client: TestClient) -> None:
+        body = client.get("/peers").json()
+        self_row = next(p for p in body["peers"] if p["self"])
+        assert self_row["stale"] is False
+
+    def test_fresh_peers_marked_not_stale(self, client: TestClient) -> None:
+        # The fixture builds peers via PeerInfo() which touches last_seen to
+        # the current time, so they should report stale=false.
+        body = client.get("/peers").json()
+        for p in body["peers"]:
+            if p["self"]:
+                continue
+            if p["node_id"] == "peer-old":
+                # Legacy peer is also fresh (recent add_peer); just present
+                # without specs. We're separately covering specs=None above.
+                continue
+            assert p["stale"] is False
+
     def test_field_types_match_schema(self, client: TestClient) -> None:
         body = client.get("/peers").json()
         row = next(p for p in body["peers"] if p["node_id"] == "peer-pi")

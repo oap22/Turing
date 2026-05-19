@@ -71,6 +71,7 @@ export default function App() {
             node_name?: string;
             self?: boolean;
             specs?: PeerSpecsRow["specs"];
+            stale?: boolean;
           }>;
         };
         if (cancelled || !body.peers) return;
@@ -83,6 +84,7 @@ export default function App() {
             node_name: p.node_name,
             self: Boolean(p.self),
             specs: p.specs ?? null,
+            stale: Boolean(p.stale),
           });
         }
         setSpecsRows(rows);
