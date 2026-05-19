@@ -1,15 +1,22 @@
 """Collect per-node specs for the fleet specs panel.
 
-Slice 1/3 (#215) defines the tracer subset: CPU% and temperature. Per-OS
-branching for temperature is the trickiest bit of the whole feature, so we
-shake it out first — multi-zone Jetson, single-zone Pi, no-clean-path Mac.
-Later slices grow the schema in place without breaking the wire format.
+Slice 1/3 (#215) introduced the tracer fields (cpu_percent, temp_celsius);
+slice 2/3 (#216) grows the schema to the full PRD shape — static hardware
+identity (model_name, os, arch, cpu_cores, ram_total_bytes, disk_total_bytes)
+plus the remaining live signals (mem_used_bytes, disk_used_bytes,
+uptime_seconds, loadavg). Static fields are cached on first call.
+
+Per-OS branches extend the slice-1 ones: ``/proc/device-tree/model`` on
+Linux for Pi/Jetson hardware identity, ``sysctl hw.model`` on Darwin.
 """
 
 from __future__ import annotations
 
 import glob
+import os
 import platform
+import subprocess
+import time
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -18,31 +25,66 @@ import psutil
 
 @dataclass
 class NodeSpecs:
-    """Tracer subset of per-node specs.
+    """Full per-node specs payload (#216 schema).
 
-    Future slices extend this with memory, disk, model identity, hardware
-    identity, etc. Missing/unknown fields are represented as ``None`` so
-    the schema can grow without breaking rolling upgrades.
+    Static fields are sampled once at startup and cached for subsequent
+    heartbeats; live fields are recollected each heartbeat. ``None`` /
+    ``"unknown"`` values are tolerated so unsupported platforms don't
+    drop the heartbeat — the UI shows an em-dash instead.
     """
 
+    # --- Static (cached after first call) ---
+    model_name: str
+    os: str
+    arch: str
+    cpu_cores: int
+    ram_total_bytes: int
+    disk_total_bytes: int
+
+    # --- Live (recollected per heartbeat) ---
     cpu_percent: float
+    mem_used_bytes: int
+    disk_used_bytes: int
     temp_celsius: float | None
+    uptime_seconds: int
+    loadavg_1m: float
+    loadavg_5m: float
+    loadavg_15m: float
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> NodeSpecs:
-        cpu = float(data.get("cpu_percent", 0.0))
         raw_temp = data.get("temp_celsius")
         temp = None if raw_temp is None else float(raw_temp)
-        return cls(cpu_percent=cpu, temp_celsius=temp)
+        return cls(
+            model_name=str(data.get("model_name", "unknown")),
+            os=str(data.get("os", "unknown")),
+            arch=str(data.get("arch", "unknown")),
+            cpu_cores=int(data.get("cpu_cores", 0)),
+            ram_total_bytes=int(data.get("ram_total_bytes", 0)),
+            disk_total_bytes=int(data.get("disk_total_bytes", 0)),
+            cpu_percent=float(data.get("cpu_percent", 0.0)),
+            mem_used_bytes=int(data.get("mem_used_bytes", 0)),
+            disk_used_bytes=int(data.get("disk_used_bytes", 0)),
+            temp_celsius=temp,
+            uptime_seconds=int(data.get("uptime_seconds", 0)),
+            loadavg_1m=float(data.get("loadavg_1m", 0.0)),
+            loadavg_5m=float(data.get("loadavg_5m", 0.0)),
+            loadavg_15m=float(data.get("loadavg_15m", 0.0)),
+        )
 
 
 # Pi 4 / Pi 5 expose CPU temperature here. Jetson exposes per-zone files
 # under ``thermal_zone*/temp`` (CPU, GPU, AO, etc.) — we take the max.
 _PI_THERMAL_ZONE = "/sys/class/thermal/thermal_zone0/temp"
 _THERMAL_ZONES_GLOB = "/sys/class/thermal/thermal_zone*/temp"
+_DEVICE_TREE_MODEL = "/proc/device-tree/model"
+
+# Disk usage targets the root filesystem — the only path guaranteed to
+# exist on every supported node.
+_DISK_PATH = "/"
 
 
 def _read_pi_temp() -> float | None:
@@ -100,15 +142,123 @@ def _collect_temperature(system: str) -> float | None:
     return _read_pi_temp()
 
 
-def collect_specs() -> NodeSpecs:
-    """Sample the current node's tracer specs.
+def _read_linux_model_name() -> str:
+    """Read the Pi / Jetson hardware identity from device-tree.
 
-    Safe to call from a presence heartbeat — bounded, no sudo, no shell.
-    The ``cpu_percent`` reading uses ``interval=None`` so it returns the
-    CPU usage since the *previous* call rather than blocking for a sample
-    window; the heartbeat loop calls this often enough that the value is
-    meaningful by the second tick.
+    The file is NUL-terminated; strip both nulls and whitespace.
     """
+    try:
+        with open(_DEVICE_TREE_MODEL) as fh:
+            raw = fh.read()
+    except OSError:
+        return "unknown"
+    return raw.replace("\x00", "").strip() or "unknown"
+
+
+def _read_darwin_model_name() -> str:
+    """Read the Mac hardware identity via ``sysctl hw.model``."""
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "hw.model"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    if result.returncode != 0:
+        return "unknown"
+    return result.stdout.strip() or "unknown"
+
+
+def _collect_model_name(system: str) -> str:
+    if system == "Linux":
+        return _read_linux_model_name()
+    if system == "Darwin":
+        return _read_darwin_model_name()
+    return "unknown"
+
+
+def _collect_loadavg() -> tuple[float, float, float]:
+    try:
+        one, five, fifteen = os.getloadavg()
+    except (OSError, AttributeError):
+        return (0.0, 0.0, 0.0)
+    return (float(one), float(five), float(fifteen))
+
+
+# Module-level cache for the static portion of NodeSpecs. Sampled once on
+# the first ``collect_specs`` call and reused thereafter — these values
+# don't change between heartbeats.
+_STATIC_CACHE: dict[str, Any] | None = None
+
+
+def _collect_static() -> dict[str, Any]:
+    global _STATIC_CACHE
+    if _STATIC_CACHE is not None:
+        return _STATIC_CACHE
+    system = platform.system()
+    machine = platform.machine() or "unknown"
+    cpu_cores = psutil.cpu_count(logical=True) or 0
+    ram_total = int(psutil.virtual_memory().total)
+    try:
+        disk_total = int(psutil.disk_usage(_DISK_PATH).total)
+    except OSError:
+        disk_total = 0
+    _STATIC_CACHE = {
+        "model_name": _collect_model_name(system),
+        "os": system.lower() if system else "unknown",
+        "arch": machine,
+        "cpu_cores": int(cpu_cores),
+        "ram_total_bytes": ram_total,
+        "disk_total_bytes": disk_total,
+    }
+    return _STATIC_CACHE
+
+
+def _reset_static_cache_for_tests() -> None:
+    """Test helper — drop the cached static block so the next call resamples."""
+    global _STATIC_CACHE
+    _STATIC_CACHE = None
+
+
+def collect_specs() -> NodeSpecs:
+    """Sample the current node's full specs.
+
+    Static fields are cached on first call. Safe to call from a presence
+    heartbeat — bounded, no sudo (the Darwin model-name path runs
+    ``sysctl`` once at startup), no long-running shell.
+    """
+    static = _collect_static()
     cpu_percent = float(psutil.cpu_percent(interval=None))
+    vm = psutil.virtual_memory()
+    mem_used = int(getattr(vm, "used", 0))
+    try:
+        disk = psutil.disk_usage(_DISK_PATH)
+        disk_used = int(disk.used)
+    except OSError:
+        disk_used = 0
     temp_celsius = _collect_temperature(platform.system())
-    return NodeSpecs(cpu_percent=cpu_percent, temp_celsius=temp_celsius)
+    try:
+        boot = float(psutil.boot_time())
+        uptime = max(0, int(time.time() - boot))
+    except Exception:
+        uptime = 0
+    one, five, fifteen = _collect_loadavg()
+    return NodeSpecs(
+        model_name=str(static["model_name"]),
+        os=str(static["os"]),
+        arch=str(static["arch"]),
+        cpu_cores=int(static["cpu_cores"]),
+        ram_total_bytes=int(static["ram_total_bytes"]),
+        disk_total_bytes=int(static["disk_total_bytes"]),
+        cpu_percent=cpu_percent,
+        mem_used_bytes=mem_used,
+        disk_used_bytes=disk_used,
+        temp_celsius=temp_celsius,
+        uptime_seconds=uptime,
+        loadavg_1m=one,
+        loadavg_5m=five,
+        loadavg_15m=fifteen,
+    )
