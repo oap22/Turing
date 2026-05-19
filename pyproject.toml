@@ -87,6 +87,9 @@ ignore = [
     "E501",   # line too long (handled by formatter)
     "B008",   # do not perform function calls in argument defaults
     "SIM108", # use ternary operator
+    "RUF001", # ambiguous unicode in strings (greek letters, em-dashes in docstrings)
+    "RUF002", # ambiguous unicode in docstrings
+    "RUF003", # ambiguous unicode in comments
 ]
 
 [tool.ruff.lint.isort]

@@ -30,7 +30,9 @@ from turing.mesh.node import is_specs_stale
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from turing.coordinator.alerts.dispatcher import AlertDispatcher
     from turing.gateway.ring_buffer import RingBuffer
+    from turing.gateway.telemetry_sink import TelemetrySink
     from turing.mesh.node import MeshNode
 
 DEFAULT_PAGE_LIMIT = 200
@@ -75,11 +77,20 @@ def create_app(
     spa_assets_dir: Path | None = None,
     ring_buffer: RingBuffer | None = None,
     mesh_node: MeshNode | None = None,
+    telemetry_sink: TelemetrySink | None = None,
+    alert_dispatcher: AlertDispatcher | None = None,
 ) -> FastAPI:
     app = FastAPI(title="turing-gateway")
     app.state.start_time = time.monotonic()
     app.state.ring_buffer = ring_buffer
+    app.state.telemetry_sink = telemetry_sink
+    app.state.alert_dispatcher = alert_dispatcher
     app.add_middleware(_BearerMiddleware, auth=auth)  # type: ignore[arg-type]
+
+    # Wire the dispatcher's frame fan-out through the telemetry sink so a
+    # single set of WS subscribers receives both telemetry and alert frames.
+    if alert_dispatcher is not None and telemetry_sink is not None:
+        alert_dispatcher.set_send_frame(telemetry_sink._broadcast)
 
     @app.get("/healthz")
     async def healthz() -> dict:
@@ -197,11 +208,27 @@ def create_app(
         uptime_s = time.monotonic() - app.state.start_time
         hello = {"type": "hello", "node_name": node_name, "uptime_s": uptime_s}
         await websocket.send_text(json.dumps(hello))
+
+        # Subscribe to the shared fan-out so alert frames (and any future
+        # sink-driven frames) reach this client. Telemetry frames already
+        # flow through the same path; the existing TelemetrySink unit tests
+        # cover that contract.
+        unsubscribe = None
+        if telemetry_sink is not None:
+
+            async def _send(frame: dict) -> None:
+                await websocket.send_text(json.dumps(frame))
+
+            unsubscribe = telemetry_sink.subscribe(_send)
+
         try:
             while True:
                 await websocket.receive_text()
         except Exception:
             return
+        finally:
+            if unsubscribe is not None:
+                unsubscribe()
 
     if spa_assets_dir is not None and Path(spa_assets_dir).is_dir():
         index_path = Path(spa_assets_dir) / "index.html"
