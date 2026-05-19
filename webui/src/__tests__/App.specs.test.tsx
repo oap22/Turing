@@ -42,6 +42,7 @@ const peersBody = {
       capabilities: [],
       last_seen: null,
       specs: specsFor("Raspberry Pi 5 Model B Rev 1.0", 47.5, 11.0),
+      stale: false,
     },
     {
       node_id: "mac-id",
@@ -50,6 +51,7 @@ const peersBody = {
       capabilities: [],
       last_seen: 0,
       specs: specsFor("MacBookPro18,3", null, 5.5),
+      stale: false,
     },
   ],
   count: 2,

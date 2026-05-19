@@ -13,6 +13,26 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger("turing.mesh.node")
 
+# Matches PresenceService.DEFAULT_STALE_AFTER (ADR-0008). Duplicated as a
+# module-level constant so ``is_specs_stale`` can be imported by the gateway
+# without dragging in the presence service.
+STALE_AFTER_SECONDS = 60.0
+
+
+def is_specs_stale(
+    peer: PeerInfo,
+    *,
+    now: float | None = None,
+    stale_after: float = STALE_AFTER_SECONDS,
+) -> bool:
+    """Return ``True`` when this peer's last heartbeat is older than the window.
+
+    Pure function with injectable ``now`` so the gateway/UI tests can pin
+    a deterministic timestamp instead of monkey-patching ``time.time``.
+    """
+    reference = now if now is not None else time.time()
+    return (reference - peer.last_seen) > stale_after
+
 
 @dataclass
 class PeerInfo:

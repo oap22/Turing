@@ -28,6 +28,10 @@ export interface PeerSpecsRow {
   node_name: string;
   self: boolean;
   specs: NodeSpecs | null;
+  // True when the gateway hasn't heard from this peer within the
+  // presence-staleness window (#217). Self-row is always false. Stale
+  // rows still render their last-known values, dimmed.
+  stale: boolean;
 }
 
 export const EM_DASH = "—";

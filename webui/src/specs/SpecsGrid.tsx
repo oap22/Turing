@@ -1,3 +1,4 @@
+import { severityFor, type Severity } from "./thresholds";
 import {
   EM_DASH,
   formatGiB,
@@ -5,6 +6,16 @@ import {
   formatUptime,
   type PeerSpecsRow,
 } from "./types";
+
+// Tailwind tokens for the three severity tiers. Kept in one place so the
+// test assertions can reference them directly.
+export const SEVERITY_CLASSES: Record<Severity, string> = {
+  ok: "text-neutral-200",
+  warn: "text-amber-300 bg-amber-900/20",
+  danger: "text-rose-300 bg-rose-900/30",
+};
+
+const STALE_CLASS = "opacity-50";
 
 export interface SpecsGridProps {
   rows: PeerSpecsRow[];
@@ -68,12 +79,23 @@ export default function SpecsGrid({ rows }: SpecsGridProps) {
           "space-y-0.5" + (scrolls ? " max-h-48 overflow-y-auto" : "")
         }
       >
-        {ordered.map((row) => (
+        {ordered.map((row) => {
+          const severity = severityFor(row.specs);
+          const classes = [
+            "grid grid-cols-[1.6fr_2.2fr_auto_auto_auto_auto_auto_auto] gap-x-3",
+            SEVERITY_CLASSES[severity],
+            row.stale ? STALE_CLASS : "",
+          ]
+            .filter(Boolean)
+            .join(" ");
+          return (
           <li
             key={row.node_id}
             data-testid={`specs-row-${row.node_id}`}
             data-self={row.self ? "true" : "false"}
-            className="grid grid-cols-[1.6fr_2.2fr_auto_auto_auto_auto_auto_auto] gap-x-3 text-neutral-200"
+            data-severity={severity}
+            data-stale={row.stale ? "true" : "false"}
+            className={classes}
             style={{ minHeight: "32px", alignItems: "center" }}
           >
             <span className="truncate">{row.node_name}</span>
@@ -97,7 +119,8 @@ export default function SpecsGrid({ rows }: SpecsGridProps) {
             </span>
             <span className="text-right tabular-nums">{fmtLoadavg(row.specs)}</span>
           </li>
-        ))}
+          );
+        })}
       </ol>
     </div>
   );
