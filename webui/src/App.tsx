@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useReducer, useState } from "react";
 import CallGraphCanvas from "./CallGraphCanvas";
 import { emptyState, markStale, reduce, type Frame } from "./graph/reducer";
+import SpecsGrid from "./specs/SpecsGrid";
+import type { PeerSpecsRow } from "./specs/types";
 import TracePane from "./trace/TracePane";
 import type { TraceEvent } from "./trace/types";
 import { connectGatewayWS } from "./ws";
@@ -19,6 +21,7 @@ export default function App() {
   const [highlightedEdge, setHighlightedEdge] = useState<string | null>(null);
   const [showDebug, setShowDebug] = useState(false);
   const [now, setNow] = useState(() => Date.now());
+  const [specsRows, setSpecsRows] = useState<PeerSpecsRow[]>([]);
 
   useEffect(() => {
     const stop = connectGatewayWS<Frame>({
@@ -62,12 +65,27 @@ export default function App() {
       try {
         const res = await fetch("/peers", { credentials: "same-origin" });
         if (!res.ok) return;
-        const body = (await res.json()) as { peers?: Array<{ node_name?: string }> };
+        const body = (await res.json()) as {
+          peers?: Array<{
+            node_id?: string;
+            node_name?: string;
+            self?: boolean;
+            specs?: PeerSpecsRow["specs"];
+          }>;
+        };
         if (cancelled || !body.peers) return;
+        const rows: PeerSpecsRow[] = [];
         for (const p of body.peers) {
           if (!p.node_name) continue;
           dispatch({ type: "hello", node_name: p.node_name, uptime_s: 0 });
+          rows.push({
+            node_id: p.node_id ?? p.node_name,
+            node_name: p.node_name,
+            self: Boolean(p.self),
+            specs: p.specs ?? null,
+          });
         }
+        setSpecsRows(rows);
       } catch {
         // best-effort; the WS path also feeds the graph
       }
@@ -109,11 +127,14 @@ export default function App() {
         </span>
       </header>
       <main className="flex flex-1 overflow-hidden">
-        <section className="flex-1 border-r border-neutral-800">
-          <CallGraphCanvas
-            state={visibleState}
-            highlightedEdge={highlightedEdge}
-          />
+        <section className="flex flex-1 flex-col border-r border-neutral-800">
+          <div className="flex-1 overflow-hidden">
+            <CallGraphCanvas
+              state={visibleState}
+              highlightedEdge={highlightedEdge}
+            />
+          </div>
+          <SpecsGrid rows={specsRows} />
         </section>
         <aside className="w-[520px] border-r border-neutral-800">
           <TracePane liveEvents={liveTrace} onSelect={onTraceSelect} />

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
+
+if TYPE_CHECKING:
+    from turing.specs.collector import NodeSpecs
 
 logger = structlog.get_logger("turing.mesh.node")
 
@@ -20,6 +23,9 @@ class PeerInfo:
     capabilities: list[str] = field(default_factory=list)
     last_seen: float = field(default_factory=time.time)
     address: str = ""
+    # Per-peer live specs (CPU%, temperature, ...). ``None`` for peers
+    # running an older build that pre-dates the specs panel slice.
+    specs: NodeSpecs | None = None
 
     @property
     def is_stale(self) -> bool:
@@ -45,6 +51,10 @@ class MeshNode:
         self._capabilities: list[str] = []
         self._peers: dict[str, PeerInfo] = {}
         self._running: bool = False
+        # Live self-row specs, refreshed by ``PresenceService._publish_heartbeat``
+        # so the gateway's ``/peers`` self-row reports current values without
+        # a second sample. ``None`` before the first heartbeat.
+        self._self_specs: NodeSpecs | None = None
 
     @property
     def node_name(self) -> str:
@@ -69,6 +79,14 @@ class MeshNode:
     def peers(self) -> dict[str, PeerInfo]:
         """Dictionary of known peers keyed by their node_id."""
         return dict(self._peers)
+
+    @property
+    def self_specs(self) -> NodeSpecs | None:
+        return self._self_specs
+
+    @self_specs.setter
+    def self_specs(self, value: NodeSpecs | None) -> None:
+        self._self_specs = value
 
     @property
     def is_running(self) -> bool:

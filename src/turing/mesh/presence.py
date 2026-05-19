@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from turing.mesh.node import MeshNode, PeerInfo
+from turing.specs.collector import NodeSpecs, collect_specs
 
 if TYPE_CHECKING:
     from turing.transport.bus import Bus
@@ -36,7 +37,9 @@ LEAVE_SUBJECT = "mesh.presence.leave"
 DEFAULT_HEARTBEAT_INTERVAL = 10.0
 DEFAULT_STALE_AFTER = 60.0
 
-SCHEMA_VERSION = 1
+# v2 bump: heartbeat payload gained the ``specs`` block (#215). Older nodes
+# publish v1 (no ``specs``); receivers register them with ``PeerInfo.specs = None``.
+SCHEMA_VERSION = 2
 
 
 class PresenceService:
@@ -149,17 +152,32 @@ class PresenceService:
         except asyncio.CancelledError:
             pass
 
+    def _sample_self_specs(self) -> NodeSpecs | None:
+        """Sample this node's live specs for the next heartbeat.
+
+        Isolated so tests can stub it out, and so a collector hiccup
+        (e.g. a transient /sys read failure) never sinks the heartbeat.
+        """
+        try:
+            return collect_specs()
+        except Exception:  # pragma: no cover — defensive
+            logger.warning("specs_collect_failed", exc_info=True)
+            return None
+
     async def _publish_heartbeat(self) -> None:
-        payload = json.dumps(
-            {
-                "schema_version": SCHEMA_VERSION,
-                "node_id": self._node.node_id,
-                "node_name": self._node.node_name,
-                "capabilities": self._node.capabilities,
-                "ts_ms": int(time.time() * 1000),
-            }
-        ).encode("utf-8")
-        await self._bus.publish(HEARTBEAT_SUBJECT, payload)
+        specs = self._sample_self_specs()
+        # Mirror self-specs onto the MeshNode so the gateway's ``/peers``
+        # self-row reflects live values without a second sample.
+        self._node.self_specs = specs
+        payload: dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION,
+            "node_id": self._node.node_id,
+            "node_name": self._node.node_name,
+            "capabilities": self._node.capabilities,
+            "ts_ms": int(time.time() * 1000),
+            "specs": specs.to_dict() if specs is not None else None,
+        }
+        await self._bus.publish(HEARTBEAT_SUBJECT, json.dumps(payload).encode("utf-8"))
 
     async def _on_heartbeat(self, raw: bytes) -> None:
         msg = self._decode(raw)
@@ -169,10 +187,23 @@ class PresenceService:
         if not node_id or node_id == self._node.node_id:
             # Ignore our own heartbeats and malformed messages.
             return
+        # Rolling-upgrade tolerance: peers running schema_version=1 send no
+        # ``specs`` key at all — register them with ``specs=None`` rather
+        # than dropping the heartbeat.
+        raw_specs = msg.get("specs")
+        parsed_specs: NodeSpecs | None
+        if isinstance(raw_specs, dict):
+            try:
+                parsed_specs = NodeSpecs.from_dict(raw_specs)
+            except (TypeError, ValueError):
+                parsed_specs = None
+        else:
+            parsed_specs = None
         peer = PeerInfo(
             node_id=str(node_id),
             name=str(msg.get("node_name", node_id)),
             capabilities=list(msg.get("capabilities", []) or []),
+            specs=parsed_specs,
         )
         self._node.add_peer(peer)
 

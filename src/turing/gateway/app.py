@@ -94,6 +94,7 @@ def create_app(
         request. Public so the fleet health check can hit it without
         threading the bearer token through curl.
         """
+        self_specs = getattr(mesh_node, "self_specs", None) if mesh_node else None
         result: list[dict] = [
             {
                 "node_id": getattr(mesh_node, "node_id", node_name) if mesh_node else node_name,
@@ -101,10 +102,12 @@ def create_app(
                 "self": True,
                 "capabilities": list(mesh_node.capabilities) if mesh_node else [],
                 "last_seen": None,
+                "specs": self_specs.to_dict() if self_specs is not None else None,
             }
         ]
         if mesh_node is not None:
             for peer in mesh_node.peers.values():
+                peer_specs = getattr(peer, "specs", None)
                 result.append(
                     {
                         "node_id": peer.node_id,
@@ -112,6 +115,7 @@ def create_app(
                         "self": False,
                         "capabilities": list(peer.capabilities),
                         "last_seen": peer.last_seen,
+                        "specs": peer_specs.to_dict() if peer_specs is not None else None,
                     }
                 )
         return {"peers": result, "count": len(result)}
