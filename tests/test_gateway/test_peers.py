@@ -1,9 +1,10 @@
 """Tests for ``GET /peers``.
 
-Specs-panel slice 1/3 (#215) extends the per-peer payload with a
-``specs`` block. The endpoint must report the self-row's live specs,
-forward peer specs verbatim, and continue to emit ``specs: null`` for
-peers whose heartbeat carried no specs block (rolling upgrade).
+Slice 1/3 (#215) introduced the ``specs`` block. Slice 2/3 (#216) grew
+it to the full PRD schema (static hardware identity + live signals).
+The endpoint must report every field on the self-row and forward peer
+specs verbatim, while continuing to emit ``specs: null`` for peers
+whose heartbeat carried no specs block (rolling upgrade).
 """
 
 from __future__ import annotations
@@ -19,6 +20,41 @@ from turing.mesh.node import MeshNode, PeerInfo
 from turing.specs.collector import NodeSpecs
 
 
+def _specs(
+    *,
+    model_name: str = "Raspberry Pi 5",
+    os_name: str = "linux",
+    arch: str = "aarch64",
+    cpu_cores: int = 4,
+    ram_total_bytes: int = 8 * 1024**3,
+    disk_total_bytes: int = 128 * 1024**3,
+    cpu_percent: float = 12.0,
+    mem_used_bytes: int = 2 * 1024**3,
+    disk_used_bytes: int = 10 * 1024**3,
+    temp_celsius: float | None = 48.0,
+    uptime_seconds: int = 3600,
+    loadavg_1m: float = 0.5,
+    loadavg_5m: float = 0.4,
+    loadavg_15m: float = 0.3,
+) -> NodeSpecs:
+    return NodeSpecs(
+        model_name=model_name,
+        os=os_name,
+        arch=arch,
+        cpu_cores=cpu_cores,
+        ram_total_bytes=ram_total_bytes,
+        disk_total_bytes=disk_total_bytes,
+        cpu_percent=cpu_percent,
+        mem_used_bytes=mem_used_bytes,
+        disk_used_bytes=disk_used_bytes,
+        temp_celsius=temp_celsius,
+        uptime_seconds=uptime_seconds,
+        loadavg_1m=loadavg_1m,
+        loadavg_5m=loadavg_5m,
+        loadavg_15m=loadavg_15m,
+    )
+
+
 def _make_mesh(self_specs: NodeSpecs | None) -> MeshNode:
     node = MeshNode(SimpleNamespace(node_id="self-id", node_name="pi-alpha"))
     node.capabilities = ["shell"]
@@ -26,26 +62,54 @@ def _make_mesh(self_specs: NodeSpecs | None) -> MeshNode:
     return node
 
 
+_FULL_SPEC_KEYS = frozenset(
+    {
+        "model_name",
+        "os",
+        "arch",
+        "cpu_cores",
+        "ram_total_bytes",
+        "disk_total_bytes",
+        "cpu_percent",
+        "mem_used_bytes",
+        "disk_used_bytes",
+        "temp_celsius",
+        "uptime_seconds",
+        "loadavg_1m",
+        "loadavg_5m",
+        "loadavg_15m",
+    }
+)
+
+
 class TestPeersIncludesSpecs:
     @pytest.fixture
     def client(self) -> TestClient:
-        mesh = _make_mesh(self_specs=NodeSpecs(cpu_percent=12.0, temp_celsius=48.0))
-        # Pi-style peer with full specs.
+        mesh = _make_mesh(self_specs=_specs())
         mesh.add_peer(
             PeerInfo(
                 node_id="peer-pi",
                 name="pi-beta",
                 capabilities=["search"],
-                specs=NodeSpecs(cpu_percent=20.5, temp_celsius=55.5),
+                specs=_specs(model_name="Raspberry Pi 4", cpu_percent=20.5, temp_celsius=55.5),
             )
         )
-        # Mac-style peer: temp is None.
+        # Mac peer: no temp.
         mesh.add_peer(
             PeerInfo(
                 node_id="peer-mac",
                 name="mbp",
                 capabilities=["judge"],
-                specs=NodeSpecs(cpu_percent=8.1, temp_celsius=None),
+                specs=_specs(
+                    model_name="MacBookPro18,3",
+                    os_name="darwin",
+                    arch="arm64",
+                    cpu_cores=10,
+                    ram_total_bytes=16 * 1024**3,
+                    disk_total_bytes=512 * 1024**3,
+                    cpu_percent=8.1,
+                    temp_celsius=None,
+                ),
             )
         )
         # Legacy peer: no specs at all (rolling upgrade).
@@ -57,20 +121,28 @@ class TestPeersIncludesSpecs:
         )
         return TestClient(app)
 
-    def test_self_row_carries_specs(self, client: TestClient) -> None:
+    def test_self_row_carries_full_specs(self, client: TestClient) -> None:
         body = client.get("/peers").json()
         self_row = next(p for p in body["peers"] if p["self"])
-        assert self_row["specs"] == {"cpu_percent": 12.0, "temp_celsius": 48.0}
+        assert set(self_row["specs"].keys()) == _FULL_SPEC_KEYS
+        assert self_row["specs"]["model_name"] == "Raspberry Pi 5"
+        assert self_row["specs"]["cpu_cores"] == 4
 
     def test_peer_with_full_specs(self, client: TestClient) -> None:
         body = client.get("/peers").json()
         row = next(p for p in body["peers"] if p["node_id"] == "peer-pi")
-        assert row["specs"] == {"cpu_percent": 20.5, "temp_celsius": 55.5}
+        assert set(row["specs"].keys()) == _FULL_SPEC_KEYS
+        assert row["specs"]["cpu_percent"] == 20.5
+        assert row["specs"]["temp_celsius"] == 55.5
+        # Bytes-precision: not megabytes/gigabytes.
+        assert row["specs"]["ram_total_bytes"] == 8 * 1024**3
 
     def test_mac_peer_has_null_temp(self, client: TestClient) -> None:
         body = client.get("/peers").json()
         row = next(p for p in body["peers"] if p["node_id"] == "peer-mac")
-        assert row["specs"] == {"cpu_percent": 8.1, "temp_celsius": None}
+        assert row["specs"]["temp_celsius"] is None
+        assert row["specs"]["os"] == "darwin"
+        assert row["specs"]["model_name"] == "MacBookPro18,3"
 
     def test_legacy_peer_specs_is_null(self, client: TestClient) -> None:
         body = client.get("/peers").json()
@@ -79,13 +151,31 @@ class TestPeersIncludesSpecs:
 
     def test_count_field_preserved(self, client: TestClient) -> None:
         body = client.get("/peers").json()
-        # self + three peers
         assert body["count"] == 4
 
     def test_existing_fields_unchanged(self, client: TestClient) -> None:
         body = client.get("/peers").json()
         for p in body["peers"]:
             assert {"node_id", "node_name", "self", "capabilities", "last_seen"} <= p.keys()
+
+    def test_field_types_match_schema(self, client: TestClient) -> None:
+        body = client.get("/peers").json()
+        row = next(p for p in body["peers"] if p["node_id"] == "peer-pi")
+        s = row["specs"]
+        assert isinstance(s["model_name"], str)
+        assert isinstance(s["os"], str)
+        assert isinstance(s["arch"], str)
+        assert isinstance(s["cpu_cores"], int)
+        assert isinstance(s["ram_total_bytes"], int)
+        assert isinstance(s["disk_total_bytes"], int)
+        assert isinstance(s["cpu_percent"], float)
+        assert isinstance(s["mem_used_bytes"], int)
+        assert isinstance(s["disk_used_bytes"], int)
+        assert isinstance(s["uptime_seconds"], int)
+        assert isinstance(s["loadavg_1m"], float)
+        assert isinstance(s["loadavg_5m"], float)
+        assert isinstance(s["loadavg_15m"], float)
+        assert s["temp_celsius"] is None or isinstance(s["temp_celsius"], float)
 
 
 class TestPeersWithNoMesh:
