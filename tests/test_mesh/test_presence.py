@@ -26,6 +26,26 @@ from turing.specs.collector import NodeSpecs
 from turing.transport.bus import InMemoryBus
 
 
+def _specs(cpu_percent: float = 0.0, temp_celsius: float | None = None) -> NodeSpecs:
+    """Build a NodeSpecs with sane defaults for the fields that aren't under test."""
+    return NodeSpecs(
+        model_name="test-host",
+        os="linux",
+        arch="aarch64",
+        cpu_cores=4,
+        ram_total_bytes=8 * 1024**3,
+        disk_total_bytes=128 * 1024**3,
+        cpu_percent=cpu_percent,
+        mem_used_bytes=0,
+        disk_used_bytes=0,
+        temp_celsius=temp_celsius,
+        uptime_seconds=0,
+        loadavg_1m=0.0,
+        loadavg_5m=0.0,
+        loadavg_15m=0.0,
+    )
+
+
 def _make_node(node_id: str, name: str, caps: list[str] | None = None) -> MeshNode:
     node = MeshNode(SimpleNamespace(node_id=node_id, node_name=name))
     node.capabilities = caps or []
@@ -136,7 +156,7 @@ class TestPresenceService:
         pres_a = PresenceService(node_a, bus, heartbeat_interval=0.05, stale_after=60.0)
         pres_b = PresenceService(node_b, bus, heartbeat_interval=0.05, stale_after=60.0)
 
-        pinned = NodeSpecs(cpu_percent=33.3, temp_celsius=49.5)
+        pinned = _specs(cpu_percent=33.3, temp_celsius=49.5)
         pres_a._sample_self_specs = lambda: pinned  # type: ignore[method-assign]
 
         await pres_a.start()
@@ -185,7 +205,7 @@ class TestPresenceService:
         bus = InMemoryBus()
         node_a = _make_node("a", "pi-alpha")
         pres_a = PresenceService(node_a, bus, heartbeat_interval=10.0, stale_after=60.0)
-        pres_a._sample_self_specs = lambda: NodeSpecs(  # type: ignore[method-assign]
+        pres_a._sample_self_specs = lambda: _specs(  # type: ignore[method-assign]
             cpu_percent=10.0, temp_celsius=None
         )
 
@@ -201,4 +221,8 @@ class TestPresenceService:
         assert captured, "no heartbeat captured"
         msg = json.loads(captured[-1].decode("utf-8"))
         assert msg["schema_version"] == SCHEMA_VERSION
-        assert msg["specs"] == {"cpu_percent": 10.0, "temp_celsius": None}
+        assert msg["specs"]["cpu_percent"] == 10.0
+        assert msg["specs"]["temp_celsius"] is None
+        # Static fields ride along on every heartbeat too.
+        assert msg["specs"]["model_name"] == "test-host"
+        assert msg["specs"]["cpu_cores"] == 4

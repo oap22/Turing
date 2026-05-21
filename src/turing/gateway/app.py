@@ -25,6 +25,7 @@ from starlette.responses import (
 from starlette.staticfiles import StaticFiles
 
 from turing.gateway.auth import COOKIE_NAME, GatewayAuth
+from turing.mesh.node import is_specs_stale
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -103,6 +104,10 @@ def create_app(
                 "capabilities": list(mesh_node.capabilities) if mesh_node else [],
                 "last_seen": None,
                 "specs": self_specs.to_dict() if self_specs is not None else None,
+                # The self-row is implicitly "live": we'd not be answering
+                # this request if the local process weren't running. The
+                # SPA needs a uniform schema, so we still surface the field.
+                "stale": False,
             }
         ]
         if mesh_node is not None:
@@ -116,6 +121,7 @@ def create_app(
                         "capabilities": list(peer.capabilities),
                         "last_seen": peer.last_seen,
                         "specs": peer_specs.to_dict() if peer_specs is not None else None,
+                        "stale": is_specs_stale(peer),
                     }
                 )
         return {"peers": result, "count": len(result)}

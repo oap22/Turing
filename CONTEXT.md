@@ -71,9 +71,12 @@ Every closed non-`REJECTED` episode is dispatched to the `judge`-specialty worke
 
 Coordinator hosts a vector index of the operator's Obsidian vault, refreshed by a filesystem watcher on every commit. Workers ground via `vault_query(query, k)`. Workers propose new notes via `vault_propose` → `vault/inbox/<task_id>/<slug>.md` with frontmatter (`source, task_id, specialty, confidence, critic_score`). Curated vs inbox is purely path-based — `vault/inbox/**` is the only writeable path.
 
-## Surfaces
+## Operator surfaces
 
-- **Discord** — only user-facing surface initially. One live-editing message per task with per-subtask thumbs-up/down threads. Reward attribution: subtask thumb → that episode (±1.0); main thumb → synthesis episode (±1.0) + fractional credit (±0.3) to subtasks whose `output_key ∈ synthesis.consumed_keys`; no feedback in 24h → `critic_fallback` reward in `[-0.3, +0.3]`. Rewards are *events* in `episode_rewards(episode_id, source, value, recorded_at)`; effective reward is `SUM(value)` per episode. Bot un-reactions during outages reconcile via cancellation rows on reconnect.
+Turing has two first-class operator surfaces today; each owns a distinct role.
+
+- **Webui** (`webui/`, served by the gateway). The fleet observability console. Three panes: a live call-graph of cross-node tool dispatch, a filterable message-trace pane, and the fleet specs panel (per-node CPU%, mem, disk, temp, uptime, loadavg with hardware identity). Rows colour-shift toward warn/danger as values approach hardware-risk thresholds and dim when a peer's last heartbeat is stale. The webui is what the operator opens to know whether the cluster is healthy; it is *not* the place where work gets directed.
+- **Discord** — the user-facing surface for *directing work*. One live-editing message per task with per-subtask thumbs-up/down threads. Reward attribution: subtask thumb → that episode (±1.0); main thumb → synthesis episode (±1.0) + fractional credit (±0.3) to subtasks whose `output_key ∈ synthesis.consumed_keys`; no feedback in 24h → `critic_fallback` reward in `[-0.3, +0.3]`. Rewards are *events* in `episode_rewards(episode_id, source, value, recorded_at)`; effective reward is `SUM(value)` per episode. Bot un-reactions during outages reconcile via cancellation rows on reconnect. (A later phase may collapse Discord's role into a webui chat pane; that move is tracked as a separate roadmap item, not part of Phase 0.)
 - **CLI / API** — out of scope for Phase 0.
 
 ## Issue tracker

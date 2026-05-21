@@ -1,9 +1,37 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import SpecsGrid from "../SpecsGrid";
-import type { PeerSpecsRow } from "../types";
+import {
+  formatGiB,
+  formatHardwareLabel,
+  formatUptime,
+  type NodeSpecs,
+  type PeerSpecsRow,
+} from "../types";
 
 afterEach(cleanup);
+
+const GIB = 1024 ** 3;
+
+function specs(overrides: Partial<NodeSpecs> = {}): NodeSpecs {
+  return {
+    model_name: "Raspberry Pi 5 Model B Rev 1.0",
+    os: "linux",
+    arch: "aarch64",
+    cpu_cores: 4,
+    ram_total_bytes: 8 * GIB,
+    disk_total_bytes: 128 * GIB,
+    cpu_percent: 12.0,
+    mem_used_bytes: 2 * GIB,
+    disk_used_bytes: 10 * GIB,
+    temp_celsius: 48.0,
+    uptime_seconds: 3600,
+    loadavg_1m: 0.5,
+    loadavg_5m: 0.4,
+    loadavg_15m: 0.3,
+    ...overrides,
+  };
+}
 
 const rows: PeerSpecsRow[] = [
   // Mac peer first to prove we sort and pin self.
@@ -11,21 +39,83 @@ const rows: PeerSpecsRow[] = [
     node_id: "mbp-id",
     node_name: "mbp",
     self: false,
-    specs: { cpu_percent: 8.1, temp_celsius: null },
+    stale: false,
+    specs: specs({
+      model_name: "MacBookPro18,3",
+      os: "darwin",
+      arch: "arm64",
+      cpu_cores: 10,
+      ram_total_bytes: 16 * GIB,
+      disk_total_bytes: 512 * GIB,
+      cpu_percent: 8.1,
+      temp_celsius: null,
+    }),
   },
   {
     node_id: "self-id",
     node_name: "pi-alpha",
     self: true,
-    specs: { cpu_percent: 12.0, temp_celsius: 48.0 },
+    stale: false,
+    specs: specs(),
   },
   {
     node_id: "beta-id",
     node_name: "pi-beta",
     self: false,
-    specs: { cpu_percent: 20.5, temp_celsius: 55.5 },
+    stale: false,
+    specs: specs({
+      model_name: "Raspberry Pi 4 Model B Rev 1.2",
+      cpu_percent: 20.5,
+      temp_celsius: 55.5,
+    }),
   },
 ];
+
+describe("formatGiB helper", () => {
+  it("rounds to whole GiB at >= 10", () => {
+    expect(formatGiB(128 * GIB)).toBe("128 GiB");
+  });
+  it("uses one decimal under 10 GiB", () => {
+    expect(formatGiB(8 * GIB)).toBe("8.0 GiB");
+  });
+  it("returns em-dash on null/invalid", () => {
+    expect(formatGiB(null)).toBe("—");
+    expect(formatGiB(0)).toBe("—");
+  });
+});
+
+describe("formatHardwareLabel helper", () => {
+  it("shortens Raspberry Pi model name and includes ram/cores", () => {
+    expect(
+      formatHardwareLabel(specs({ model_name: "Raspberry Pi 5 Model B Rev 1.0" })),
+    ).toBe("Pi 5 · 8.0 GiB · 4c");
+  });
+  it("shortens MacBook Pro model name", () => {
+    expect(
+      formatHardwareLabel(
+        specs({ model_name: "MacBookPro18,3", ram_total_bytes: 16 * GIB, cpu_cores: 10 }),
+      ),
+    ).toBe("MacBook Pro · 16 GiB · 10c");
+  });
+  it("returns em-dash for null specs", () => {
+    expect(formatHardwareLabel(null)).toBe("—");
+  });
+});
+
+describe("formatUptime helper", () => {
+  it("uses seconds under a minute", () => {
+    expect(formatUptime(30)).toBe("30s");
+  });
+  it("uses minutes under an hour", () => {
+    expect(formatUptime(60 * 5)).toBe("5m");
+  });
+  it("uses hours under a day", () => {
+    expect(formatUptime(60 * 60 * 5)).toBe("5h");
+  });
+  it("uses days otherwise", () => {
+    expect(formatUptime(60 * 60 * 24 * 3)).toBe("3d");
+  });
+});
 
 describe("<SpecsGrid>", () => {
   it("renders one row per peer including self", () => {
@@ -46,20 +136,30 @@ describe("<SpecsGrid>", () => {
     ]);
   });
 
+  it("renders hardware label inline with model, ram, and cores", () => {
+    render(<SpecsGrid rows={rows} />);
+    expect(screen.getByTestId("hw-self-id").textContent).toBe(
+      "Pi 5 · 8.0 GiB · 4c",
+    );
+    expect(screen.getByTestId("hw-mbp-id").textContent).toBe(
+      "MacBook Pro · 16 GiB · 10c",
+    );
+  });
+
   it("shows an em-dash in the temp column for Mac peers", () => {
     render(<SpecsGrid rows={rows} />);
     const mac = screen.getByTestId("specs-row-mbp-id");
     expect(mac.textContent).toContain("—");
   });
 
-  it("formats CPU% with one decimal", () => {
+  it("renders mem and disk usage as 'used / total (pct%)'", () => {
     render(<SpecsGrid rows={rows} />);
     const self = screen.getByTestId("specs-row-self-id");
-    expect(self.textContent).toContain("12.0%");
-    expect(self.textContent).toContain("48.0°C");
+    expect(self.textContent).toContain("2.0 GiB / 8.0 GiB");
+    expect(self.textContent).toContain("10 GiB / 128 GiB");
   });
 
-  it("renders em-dash for rows with no specs at all", () => {
+  it("renders em-dash for legacy rows with no specs", () => {
     render(
       <SpecsGrid
         rows={[
@@ -67,13 +167,86 @@ describe("<SpecsGrid>", () => {
             node_id: "old",
             node_name: "pi-old",
             self: false,
+            stale: false,
             specs: null,
           },
         ]}
       />,
     );
     const row = screen.getByTestId("specs-row-old");
-    // Both columns dashed.
-    expect(row.textContent?.match(/—/g)?.length).toBe(2);
+    expect(row.textContent?.match(/—/g)?.length ?? 0).toBeGreaterThanOrEqual(6);
+  });
+
+  it("marks ok rows with severity=ok and no warn/danger classes", () => {
+    render(<SpecsGrid rows={rows} />);
+    const self = screen.getByTestId("specs-row-self-id");
+    expect(self.getAttribute("data-severity")).toBe("ok");
+  });
+
+  it("marks rows with warn-level CPU as severity=warn", () => {
+    const warnRow: PeerSpecsRow = {
+      node_id: "warn-id",
+      node_name: "pi-warn",
+      self: false,
+      stale: false,
+      specs: specs({ cpu_percent: 85 }), // > CPU_WARN, < CPU_DANGER
+    };
+    render(<SpecsGrid rows={[warnRow]} />);
+    const r = screen.getByTestId("specs-row-warn-id");
+    expect(r.getAttribute("data-severity")).toBe("warn");
+    expect(r.className).toContain("amber");
+  });
+
+  it("marks rows with danger-level temperature as severity=danger", () => {
+    const dangerRow: PeerSpecsRow = {
+      node_id: "hot-id",
+      node_name: "pi-hot",
+      self: false,
+      stale: false,
+      specs: specs({ temp_celsius: 90 }),
+    };
+    render(<SpecsGrid rows={[dangerRow]} />);
+    const r = screen.getByTestId("specs-row-hot-id");
+    expect(r.getAttribute("data-severity")).toBe("danger");
+    expect(r.className).toContain("rose");
+  });
+
+  it("dims stale rows but still renders their last-known values", () => {
+    const staleRow: PeerSpecsRow = {
+      node_id: "stale-id",
+      node_name: "pi-stale",
+      self: false,
+      stale: true,
+      specs: specs({ cpu_percent: 17.3, temp_celsius: 50.5 }),
+    };
+    render(<SpecsGrid rows={[staleRow]} />);
+    const r = screen.getByTestId("specs-row-stale-id");
+    expect(r.getAttribute("data-stale")).toBe("true");
+    expect(r.className).toContain("opacity-50");
+    // Values still present.
+    expect(r.textContent).toContain("17.3%");
+    expect(r.textContent).toContain("50.5°C");
+  });
+
+  it("flags the grid as scrollable when peer count exceeds 6", () => {
+    const many: PeerSpecsRow[] = [];
+    for (let i = 0; i < 8; i++) {
+      many.push({
+        node_id: `n${i}`,
+        node_name: `node-${i}`,
+        self: i === 0,
+        stale: false,
+        specs: specs(),
+      });
+    }
+    render(<SpecsGrid rows={many} />);
+    const grid = screen.getByTestId("specs-grid");
+    expect(grid.getAttribute("data-scrolls")).toBe("true");
+  });
+
+  it("does not flag the grid as scrollable at 6 or fewer", () => {
+    render(<SpecsGrid rows={rows} />);
+    const grid = screen.getByTestId("specs-grid");
+    expect(grid.getAttribute("data-scrolls")).toBe("false");
   });
 });
