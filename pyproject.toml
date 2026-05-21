@@ -14,7 +14,7 @@ authors = [
 ]
 
 dependencies = [
-    "discord.py>=2.4",
+    "discord.py>=2.7.1",
     "anthropic>=0.102.0",
     "ollama>=0.4",
     "aiosqlite>=0.20",
