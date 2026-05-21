@@ -28,7 +28,11 @@ from turing.specs.collector import NodeSpecs
 from turing.transport.bus import InMemoryBus
 
 
-def _specs(cpu_percent: float = 0.0, temp_celsius: float | None = None) -> NodeSpecs:
+def _specs(
+    cpu_percent: float = 0.0,
+    temp_celsius: float | None = None,
+    disk_used_bytes: int = 0,
+) -> NodeSpecs:
     """Build a NodeSpecs with sane defaults for the fields that aren't under test."""
     return NodeSpecs(
         model_name="test-host",
@@ -39,7 +43,7 @@ def _specs(cpu_percent: float = 0.0, temp_celsius: float | None = None) -> NodeS
         disk_total_bytes=128 * 1024**3,
         cpu_percent=cpu_percent,
         mem_used_bytes=0,
-        disk_used_bytes=0,
+        disk_used_bytes=disk_used_bytes,
         temp_celsius=temp_celsius,
         uptime_seconds=0,
         loadavg_1m=0.0,
@@ -283,3 +287,54 @@ class TestPresenceAlertDispatcher:
         assert alert_frames[0]["state"] == "alerting"
         assert alert_frames[0]["node_id"] == "a"
         assert alert_frames[0]["severity"] == "danger"
+
+    async def test_three_full_disk_heartbeats_emit_one_disk_alert_frame(self) -> None:
+        """Test γ (DISK presence integration): heartbeats crossing DISK_DANGER
+        drive a ``disk_pct`` alert frame through the presence → dispatcher path."""
+        bus = InMemoryBus()
+        node_a = _make_node("a", "pi-alpha")
+        node_b = _make_node("b", "pi-beta")
+
+        frames: list[dict] = []
+
+        async def stub_sink(frame: dict) -> None:
+            frames.append(frame)
+
+        dispatcher = AlertDispatcher(
+            AlertEngine(now_ms=lambda: 1_700_000_000_000), send_frame=stub_sink
+        )
+
+        pres_a = PresenceService(node_a, bus, heartbeat_interval=1.0)
+        pres_b = PresenceService(
+            node_b,
+            bus,
+            heartbeat_interval=1.0,
+            alert_dispatcher=dispatcher,
+        )
+        await pres_a.start()
+        await pres_b.start()
+        try:
+            # 97 % of a 128 GiB disk → past DISK_DANGER (95 %).
+            full_specs = _specs(disk_used_bytes=int(0.97 * 128 * 1024**3))
+            for _ in range(3):
+                payload = json.dumps(
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "node_id": "a",
+                        "node_name": "pi-alpha",
+                        "capabilities": [],
+                        "ts_ms": int(time.time() * 1000),
+                        "specs": full_specs.to_dict(),
+                    }
+                ).encode("utf-8")
+                await bus.publish(HEARTBEAT_SUBJECT, payload)
+                await asyncio.sleep(0.02)
+        finally:
+            await pres_a.stop()
+            await pres_b.stop()
+
+        disk_frames = [f for f in frames if f.get("field") == "disk_pct"]
+        assert len(disk_frames) == 1, f"expected 1 disk_pct frame, got {disk_frames}"
+        assert disk_frames[0]["state"] == "alerting"
+        assert disk_frames[0]["severity"] == "danger"
+        assert disk_frames[0]["node_id"] == "a"

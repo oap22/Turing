@@ -66,6 +66,39 @@ describe("AlertBanner", () => {
     expect(screen.getByText("pi-gamma")).toBeInTheDocument();
     expect(screen.getByText("83.4°C (>82.0°C)")).toBeInTheDocument();
   });
+
+  it("renders a disk_pct row with percentage formatting", () => {
+    render(
+      <AlertBanner
+        alerts={[
+          alert({
+            field: "disk_pct",
+            severity: "danger",
+            value: 96.4,
+            threshold: 95.0,
+          }),
+        ]}
+      />,
+    );
+    const row = screen.getByTestId("alert-row");
+    expect(row.getAttribute("data-severity")).toBe("danger");
+    // DISK renders rounded integer percentages, not degrees.
+    expect(screen.getByText("96% (>95%)")).toBeInTheDocument();
+  });
+
+  it("renders TEMP and DISK rows together, one per (peer, field)", () => {
+    render(
+      <AlertBanner
+        alerts={[
+          alert({ field: "temp_celsius", severity: "warn", value: 76.4, threshold: 75.0 }),
+          alert({ field: "disk_pct", severity: "danger", value: 96.0, threshold: 95.0 }),
+        ]}
+      />,
+    );
+    expect(screen.getAllByTestId("alert-row")).toHaveLength(2);
+    expect(screen.getByText("76.4°C (>75.0°C)")).toBeInTheDocument();
+    expect(screen.getByText("96% (>95%)")).toBeInTheDocument();
+  });
 });
 
 describe("reducer", () => {
@@ -103,5 +136,14 @@ describe("golden frame parity", () => {
     const f = golden.cleared as AlertFrame;
     expect(f.state).toBe("cleared");
     expect(f.node_id).toBe("pi-beta");
+  });
+
+  it("disk_alerting fixture round-trips into AlertFrame", () => {
+    const f = golden.disk_alerting as AlertFrame;
+    expect(f.type).toBe("alert");
+    expect(f.field).toBe("disk_pct");
+    expect(f.state).toBe("alerting");
+    expect(f.severity).toBe("danger");
+    expect(f.threshold).toBe(95.0);
   });
 });

@@ -10,7 +10,9 @@ function formatValueAndThreshold(a: Alert): string {
   if (a.field === "temp_celsius") {
     return `${a.value.toFixed(1)}°C (>${a.threshold.toFixed(1)}°C)`;
   }
-  // Future fields (disk_pct, etc.) format in slice 2; fall through safely.
+  if (a.field === "disk_pct") {
+    return `${Math.round(a.value)}% (>${Math.round(a.threshold)}%)`;
+  }
   return `${a.value} (>${a.threshold})`;
 }
 

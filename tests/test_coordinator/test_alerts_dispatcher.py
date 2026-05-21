@@ -22,6 +22,14 @@ def _peer(temp_celsius: float | None) -> Any:
     return SimpleNamespace(node_id="pi-beta", name="pi-beta", specs=specs)
 
 
+def _disk_peer(disk_used_bytes: int, disk_total_bytes: int) -> Any:
+    specs = SimpleNamespace(
+        disk_used_bytes=disk_used_bytes,
+        disk_total_bytes=disk_total_bytes,
+    )
+    return SimpleNamespace(node_id="pi-gamma", name="pi-gamma", specs=specs)
+
+
 @pytest.mark.asyncio
 async def test_alerting_and_cleared_each_emit_exactly_one_frame() -> None:
     frames: list[dict] = []
@@ -96,3 +104,43 @@ async def test_observe_swallows_sink_errors() -> None:
     for _ in range(3):
         await dispatcher.observe(_peer(80.0))
     # Surviving the loop is the assertion.
+
+
+@pytest.mark.asyncio
+async def test_disk_danger_emits_one_alert_frame() -> None:
+    """A peer past DISK_DANGER fires exactly one ``disk_pct`` frame."""
+    frames: list[dict] = []
+
+    async def sink(frame: dict) -> None:
+        frames.append(frame)
+
+    dispatcher = AlertDispatcher(AlertEngine(now_ms=lambda: 1_700_000_000_000), send_frame=sink)
+    # 96 / 100 bytes → 96 % disk usage → danger. N_DANGER = 2.
+    hot = _disk_peer(disk_used_bytes=96, disk_total_bytes=100)
+    await dispatcher.observe(hot)
+    assert frames == []
+    await dispatcher.observe(hot)
+    assert len(frames) == 1
+    assert frames[0]["field"] == "disk_pct"
+    assert frames[0]["severity"] == "danger"
+    assert frames[0]["state"] == "alerting"
+    assert frames[0]["value"] == 96.0
+    assert frames[0]["threshold"] == 95.0
+
+
+@pytest.mark.asyncio
+async def test_zero_disk_total_never_alerts() -> None:
+    """Test δ: ``disk_total_bytes == 0`` is the collector's sentinel for
+    'collection failed on this platform' — it must never produce a disk
+    alert, no matter how large ``disk_used_bytes`` is."""
+    frames: list[dict] = []
+
+    async def sink(frame: dict) -> None:
+        frames.append(frame)
+
+    dispatcher = AlertDispatcher(send_frame=sink)
+    peer = _disk_peer(disk_used_bytes=10**12, disk_total_bytes=0)
+    for _ in range(10):
+        await dispatcher.observe(peer)
+    assert frames == []
+    assert dispatcher.engine.state_of("pi-gamma", "disk_pct").value == "clear"

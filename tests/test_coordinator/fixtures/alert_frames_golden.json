@@ -20,5 +20,16 @@
     "threshold": 82.0,
     "state": "cleared",
     "fired_at_ms": 1700000060000
+  },
+  "disk_alerting": {
+    "type": "alert",
+    "node_id": "pi-gamma",
+    "node_name": "pi-gamma",
+    "field": "disk_pct",
+    "severity": "danger",
+    "value": 96.0,
+    "threshold": 95.0,
+    "state": "alerting",
+    "fired_at_ms": 1700000000000
   }
 }
