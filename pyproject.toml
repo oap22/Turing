@@ -27,7 +27,7 @@ dependencies = [
     "tokenizers>=0.15",
     "numpy>=2.4.6",
     "cryptography>=42.0",
-    "nats-py>=2.6",
+    "nats-py>=2.14.0",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.47.0",
 ]
