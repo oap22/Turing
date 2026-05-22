@@ -27,6 +27,10 @@ Severity = Literal["ok", "warn", "danger"]
 Field = Literal["temp_celsius", "disk_pct"]
 AlertEventState = Literal["alerting", "cleared"]
 
+# The set of fields the engine knows how to grade. The snooze endpoint
+# rejects anything outside it (catches typos like ``disk_used``).
+KNOWN_FIELDS: frozenset[str] = frozenset({"temp_celsius", "disk_pct"})
+
 
 class AlertState(enum.StrEnum):
     clear = "clear"
@@ -38,7 +42,9 @@ class AlertState(enum.StrEnum):
 class Alert:
     """A single alert frame — the WS payload shape (sans ``type`` discriminator).
 
-    Slice 1 schema, deliberately minimal. ``snoozed_until_ms`` lands in slice 3.
+    ``snoozed_until_ms`` is ``None`` on a normal ``alerting`` / ``cleared``
+    edge; it carries an epoch-ms expiry only on a snooze ``update`` frame
+    (state ``alerting``, emitted when the operator snoozes an active alert).
     """
 
     node_id: str
@@ -49,6 +55,7 @@ class Alert:
     threshold: float
     state: AlertEventState
     fired_at_ms: int
+    snoozed_until_ms: int | None = None
 
     def to_frame(self) -> dict[str, Any]:
         """Serialise as the ``type: \"alert\"`` WebSocket frame."""

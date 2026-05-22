@@ -3,13 +3,18 @@
 The dispatcher is the single place that translates a heartbeat into an
 ``alert`` frame on the wire. It samples the relevant fields off ``PeerInfo``,
 runs them through the engine, and on any emitted event calls ``send_frame``
-(typically the gateway's telemetry-sink broadcast). Discord, snooze, and
-reachability live in later slices and intentionally do not appear here.
+(typically the gateway's telemetry-sink broadcast).
+
+It also owns the per-``(peer, field)`` snooze map: while a key is snoozed
+the engine keeps grading silently but no frames go out for it. The snooze
+map is plain in-memory state — a coordinator restart clears every snooze,
+by design (PRD #228). Discord fallback lands in slice 4.
 """
 
 from __future__ import annotations
 
 import contextlib
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -22,6 +27,8 @@ from turing.coordinator.alerts.types import (
     DISK_WARN,
     TEMP_DANGER,
     TEMP_WARN,
+    Alert,
+    AlertState,
     Field,
     Severity,
     disk_percent,
@@ -35,6 +42,10 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 SendFrame = Callable[[dict], Awaitable[None]]
+
+# Hardcoded snooze window — PRD #228 keeps this fixed until an operator
+# asks for a configurable one.
+DEFAULT_SNOOZE_MS = 4 * 60 * 60 * 1000
 
 # warn / danger threshold pair per alertable field. The engine is fed the
 # warn threshold; ``observe`` swaps in the danger threshold when the fired
@@ -54,6 +65,11 @@ class AlertDispatcher:
     ) -> None:
         self._engine = engine or AlertEngine()
         self._send_frame: SendFrame | None = send_frame
+        # (node_id, field) -> epoch-ms expiry. In-memory only, by design.
+        self._snoozes: dict[tuple[str, Field], int] = {}
+        # Most recent ``alerting`` event per key, so ``snooze`` can replay
+        # it as a dimming ``update`` frame without re-deriving the reading.
+        self._last_alert: dict[tuple[str, Field], Alert] = {}
 
     @property
     def engine(self) -> AlertEngine:
@@ -81,6 +97,7 @@ class AlertDispatcher:
         specs = getattr(peer, "specs", None)
         if specs is None:
             return
+        now = now_ms if now_ms is not None else int(time.time() * 1000)
         for field, severity, value in self._sample(specs):
             warn_threshold, danger_threshold = _THRESHOLDS[field]
             _, event = self._engine.step(
@@ -97,11 +114,63 @@ class AlertDispatcher:
             # alert's *fired* severity so the banner renders the right one.
             threshold = danger_threshold if event.severity == "danger" else warn_threshold
             event = replace(event, threshold=threshold)
-            if self._send_frame is None:
-                logger.debug("alert_drop_no_sink", node_id=peer.node_id, field=field)
+            key = (peer.node_id, field)
+            # Remember the latest alerting edge even when it's suppressed —
+            # ``snooze`` replays it as the dimming ``update`` frame.
+            if event.state == "alerting":
+                self._last_alert[key] = event
+            # A live snooze swallows both ``alerting`` and ``cleared`` edges
+            # for this key; the engine state still advanced above.
+            if self._is_snoozed(key, now):
+                logger.debug("alert_suppressed_snoozed", node_id=peer.node_id, field=field)
                 continue
-            with contextlib.suppress(Exception):
-                await self._send_frame(event.to_frame())
+            await self._emit(event)
+
+    async def snooze(
+        self,
+        node_id: str,
+        field: Field,
+        now_ms: int,
+        duration_ms: int = DEFAULT_SNOOZE_MS,
+    ) -> int:
+        """Snooze a ``(peer, field)`` for ``duration_ms`` and return the expiry.
+
+        While snoozed, ``observe`` keeps grading but emits no frames for the
+        key. If the key is *already* ``alerting``, one ``update`` frame goes
+        out immediately (state ``alerting``, non-null ``snoozed_until_ms``)
+        so the SPA can dim the row without waiting for the next heartbeat.
+        """
+        expiry = now_ms + duration_ms
+        self._snoozes[(node_id, field)] = expiry
+        if self._engine.state_of(node_id, field) == AlertState.alerting:
+            cached = self._last_alert.get((node_id, field))
+            if cached is not None:
+                await self._emit(replace(cached, snoozed_until_ms=expiry))
+        return expiry
+
+    def snoozed_until(self, node_id: str, field: Field) -> int | None:
+        """Raw snooze expiry for a key, or ``None`` if it is not snoozed.
+
+        Returns the stored value verbatim — callers compare against their
+        own clock. A fresh dispatcher has an empty map (in-memory by design).
+        """
+        return self._snoozes.get((node_id, field))
+
+    def _is_snoozed(self, key: tuple[str, Field], now_ms: int) -> bool:
+        expiry = self._snoozes.get(key)
+        if expiry is None:
+            return False
+        if expiry <= now_ms:
+            del self._snoozes[key]  # expired — drop it so the key resumes
+            return False
+        return True
+
+    async def _emit(self, event: Alert) -> None:
+        if self._send_frame is None:
+            logger.debug("alert_drop_no_sink", node_id=event.node_id, field=event.field)
+            return
+        with contextlib.suppress(Exception):
+            await self._send_frame(event.to_frame())
 
     @staticmethod
     def _sample(specs: object) -> list[tuple[Field, Severity, float]]:

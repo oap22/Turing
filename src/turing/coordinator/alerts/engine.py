@@ -55,6 +55,14 @@ class AlertEngine:
     def state_of(self, node_id: str, field: Field) -> AlertState:
         return self._counters.get((node_id, field), _Counter()).state
 
+    def has_state(self, node_id: str, field: Field) -> bool:
+        """True once the engine has graded at least one heartbeat for this key.
+
+        The snooze endpoint uses this to 404 unknown ``(peer, field)`` pairs:
+        ``state_of`` can't tell "never seen" apart from "seen and clear".
+        """
+        return (node_id, field) in self._counters
+
     def step(
         self,
         node_id: str,

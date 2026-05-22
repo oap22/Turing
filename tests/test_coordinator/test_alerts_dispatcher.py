@@ -30,6 +30,22 @@ def _disk_peer(disk_used_bytes: int, disk_total_bytes: int) -> Any:
     return SimpleNamespace(node_id="pi-gamma", name="pi-gamma", specs=specs)
 
 
+def _full_peer(
+    node_id: str,
+    *,
+    temp_celsius: float | None = None,
+    disk_used_bytes: int = 0,
+    disk_total_bytes: int = 100,
+) -> Any:
+    """A peer carrying both alertable fields, for snooze cross-field tests."""
+    specs = SimpleNamespace(
+        temp_celsius=temp_celsius,
+        disk_used_bytes=disk_used_bytes,
+        disk_total_bytes=disk_total_bytes,
+    )
+    return SimpleNamespace(node_id=node_id, name=node_id, specs=specs)
+
+
 @pytest.mark.asyncio
 async def test_alerting_and_cleared_each_emit_exactly_one_frame() -> None:
     frames: list[dict] = []
@@ -144,3 +160,85 @@ async def test_zero_disk_total_never_alerts() -> None:
         await dispatcher.observe(peer)
     assert frames == []
     assert dispatcher.engine.state_of("pi-gamma", "disk_pct").value == "clear"
+
+
+_NOW = 1_700_000_000_000
+_FOUR_H_MS = 4 * 60 * 60 * 1000
+
+
+@pytest.mark.asyncio
+async def test_snooze_suppresses_only_its_field() -> None:
+    """Test β (snooze suppresses frames): a snooze swallows both the
+    alerting and cleared edges for its (peer, field); a different field on
+    the same peer keeps firing; after expiry the next transition emits."""
+    frames: list[dict] = []
+
+    async def sink(frame: dict) -> None:
+        frames.append(frame)
+
+    dispatcher = AlertDispatcher(AlertEngine(now_ms=lambda: _NOW), send_frame=sink)
+
+    # Snooze TEMP on pi-beta before it ever alerts → no update frame.
+    expiry = await dispatcher.snooze("pi-beta", "temp_celsius", _NOW)
+    assert frames == []
+
+    # Within the window: TEMP danger×3 (alerting edge) + DISK danger×3.
+    for _ in range(3):
+        await dispatcher.observe(_full_peer("pi-beta", temp_celsius=85.0, disk_used_bytes=99), _NOW)
+    # TEMP suppressed; DISK (not snoozed) fired exactly once.
+    assert [f["field"] for f in frames] == ["disk_pct"]
+    assert frames[0]["state"] == "alerting"
+
+    # TEMP ok×3 → cleared edge, also swallowed by the live snooze.
+    for _ in range(3):
+        await dispatcher.observe(_full_peer("pi-beta", temp_celsius=20.0, disk_used_bytes=99), _NOW)
+    assert [f["field"] for f in frames] == ["disk_pct"]
+
+    # After expiry: re-drive TEMP into alerting — the frame now lands.
+    after = expiry + 1
+    for _ in range(3):
+        await dispatcher.observe(
+            _full_peer("pi-beta", temp_celsius=85.0, disk_used_bytes=99), after
+        )
+    temp_frames = [f for f in frames if f["field"] == "temp_celsius"]
+    assert len(temp_frames) == 1
+    assert temp_frames[0]["state"] == "alerting"
+
+
+@pytest.mark.asyncio
+async def test_snooze_of_active_alert_emits_update_frame() -> None:
+    """Test β (snooze of active alert emits update): snoozing an already
+    ``alerting`` key emits one ``update`` frame — state alerting, non-null
+    ``snoozed_until_ms`` matching the dispatcher's stored expiry."""
+    frames: list[dict] = []
+
+    async def sink(frame: dict) -> None:
+        frames.append(frame)
+
+    dispatcher = AlertDispatcher(AlertEngine(now_ms=lambda: _NOW), send_frame=sink)
+    for _ in range(3):
+        await dispatcher.observe(_peer(85.0), _NOW)
+    assert len(frames) == 1
+    assert frames[0]["state"] == "alerting"
+
+    expiry = await dispatcher.snooze("pi-beta", "temp_celsius", _NOW)
+    assert len(frames) == 2
+    update = frames[1]
+    assert update["type"] == "alert"
+    assert update["state"] == "alerting"
+    assert update["field"] == "temp_celsius"
+    assert update["snoozed_until_ms"] == expiry
+    assert expiry == _NOW + _FOUR_H_MS
+
+
+@pytest.mark.asyncio
+async def test_snooze_map_is_in_memory_only() -> None:
+    """Test β (in-memory only, by-construction): a fresh dispatcher carries
+    no snoozes — locks the contract against an accidental SQLite store."""
+    d1 = AlertDispatcher(AlertEngine(now_ms=lambda: _NOW))
+    await d1.snooze("pi-beta", "temp_celsius", _NOW)
+    assert d1.snoozed_until("pi-beta", "temp_celsius") is not None
+
+    # Throw d1 away; a brand-new dispatcher knows nothing of its snooze.
+    d2 = AlertDispatcher(AlertEngine(now_ms=lambda: _NOW))
+    assert d2.snoozed_until("pi-beta", "temp_celsius") is None

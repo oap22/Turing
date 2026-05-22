@@ -46,6 +46,7 @@ const danger: AlertFrame = {
   threshold: 82.0,
   state: "alerting",
   fired_at_ms: 1700000000000,
+  snoozed_until_ms: null,
 };
 
 describe("App — alerts integration", () => {

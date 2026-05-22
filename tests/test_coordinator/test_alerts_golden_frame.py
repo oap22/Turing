@@ -63,6 +63,25 @@ def test_cleared_frame_matches_golden() -> None:
     assert _build_cleared().to_frame() == expected
 
 
+def _build_snoozed() -> Alert:
+    return Alert(
+        node_id="pi-beta",
+        node_name="pi-beta",
+        field="temp_celsius",
+        severity="danger",
+        value=83.4,
+        threshold=82.0,
+        state="alerting",
+        fired_at_ms=1_700_000_000_000,
+        snoozed_until_ms=1_700_014_400_000,
+    )
+
+
 def test_disk_alerting_frame_matches_golden() -> None:
     expected = json.loads(_FIXTURE.read_text())["disk_alerting"]
     assert _build_disk_alerting().to_frame() == expected
+
+
+def test_snoozed_update_frame_matches_golden() -> None:
+    expected = json.loads(_FIXTURE.read_text())["snoozed"]
+    assert _build_snoozed().to_frame() == expected

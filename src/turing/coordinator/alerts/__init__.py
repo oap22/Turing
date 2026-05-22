@@ -8,11 +8,12 @@ can render a persistent banner.
 Discord fallback and snooze land in later slices.
 """
 
-from turing.coordinator.alerts.dispatcher import AlertDispatcher
+from turing.coordinator.alerts.dispatcher import DEFAULT_SNOOZE_MS, AlertDispatcher
 from turing.coordinator.alerts.engine import AlertEngine
 from turing.coordinator.alerts.types import (
     DISK_DANGER,
     DISK_WARN,
+    KNOWN_FIELDS,
     TEMP_DANGER,
     TEMP_WARN,
     Alert,
@@ -25,8 +26,10 @@ from turing.coordinator.alerts.types import (
 )
 
 __all__ = [
+    "DEFAULT_SNOOZE_MS",
     "DISK_DANGER",
     "DISK_WARN",
+    "KNOWN_FIELDS",
     "TEMP_DANGER",
     "TEMP_WARN",
     "Alert",
