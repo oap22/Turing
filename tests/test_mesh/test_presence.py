@@ -15,6 +15,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from turing.coordinator.alerts.dispatcher import AlertDispatcher
+from turing.coordinator.alerts.engine import AlertEngine
 from turing.mesh.node import MeshNode
 from turing.mesh.presence import (
     HEARTBEAT_SUBJECT,
@@ -226,3 +228,58 @@ class TestPresenceService:
         # Static fields ride along on every heartbeat too.
         assert msg["specs"]["model_name"] == "test-host"
         assert msg["specs"]["cpu_cores"] == 4
+
+
+@pytest.mark.asyncio
+class TestPresenceAlertDispatcher:
+    async def test_three_hot_heartbeats_emit_exactly_one_alert_frame(self) -> None:
+        bus = InMemoryBus()
+        node_a = _make_node("a", "pi-alpha")
+        node_b = _make_node("b", "pi-beta")
+
+        frames: list[dict] = []
+
+        async def stub_sink(frame: dict) -> None:
+            frames.append(frame)
+
+        dispatcher = AlertDispatcher(
+            AlertEngine(now_ms=lambda: 1_700_000_000_000), send_frame=stub_sink
+        )
+
+        pres_a = PresenceService(node_a, bus, heartbeat_interval=1.0)
+        pres_b = PresenceService(
+            node_b,
+            bus,
+            heartbeat_interval=1.0,
+            alert_dispatcher=dispatcher,
+        )
+        await pres_a.start()
+        await pres_b.start()
+        try:
+            # Hand-publish three "hot" heartbeats *from* node_a so pres_b's
+            # _on_heartbeat path feeds the dispatcher.
+            hot_specs = _specs(temp_celsius=83.0)
+            for _ in range(3):
+                payload = json.dumps(
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "node_id": "a",
+                        "node_name": "pi-alpha",
+                        "capabilities": [],
+                        "ts_ms": int(time.time() * 1000),
+                        "specs": hot_specs.to_dict(),
+                    }
+                ).encode("utf-8")
+                await bus.publish(HEARTBEAT_SUBJECT, payload)
+                await asyncio.sleep(0.02)
+        finally:
+            await pres_a.stop()
+            await pres_b.stop()
+
+        # N_DANGER=2 → second hot heartbeat trips the engine; further hot
+        # heartbeats while alerting emit no additional frames.
+        alert_frames = [f for f in frames if f.get("type") == "alert"]
+        assert len(alert_frames) == 1, f"expected 1 alert frame, got {alert_frames}"
+        assert alert_frames[0]["state"] == "alerting"
+        assert alert_frames[0]["node_id"] == "a"
+        assert alert_frames[0]["severity"] == "danger"

@@ -1,4 +1,12 @@
 import { useEffect, useMemo, useReducer, useState } from "react";
+import AlertBanner from "./alerts/AlertBanner";
+import {
+  applyAlert,
+  emptyAlerts,
+  listAlerts,
+  type AlertsState,
+} from "./alerts/reducer";
+import type { AlertFrame } from "./alerts/types";
 import CallGraphCanvas from "./CallGraphCanvas";
 import { emptyState, markStale, reduce, type Frame } from "./graph/reducer";
 import SpecsGrid from "./specs/SpecsGrid";
@@ -6,6 +14,13 @@ import type { PeerSpecsRow } from "./specs/types";
 import TracePane from "./trace/TracePane";
 import type { TraceEvent } from "./trace/types";
 import { connectGatewayWS } from "./ws";
+
+type AlertAction = { kind: "frame"; frame: AlertFrame };
+
+function alertsReducer(state: AlertsState, action: AlertAction): AlertsState {
+  if (action.kind === "frame") return applyAlert(state, action.frame);
+  return state;
+}
 
 const STALE_TICK_MS = 5_000;
 const HIGHLIGHT_MS = 1_500;
@@ -16,6 +31,8 @@ export default function App() {
     (s: ReturnType<typeof emptyState>, f: Frame) => reduce(s, f),
     emptyState(),
   );
+  const [alertsState, alertsDispatch] = useReducer(alertsReducer, emptyAlerts());
+  const alerts = useMemo(() => listAlerts(alertsState), [alertsState]);
   const [debugFrames, setDebugFrames] = useState<Frame[]>([]);
   const [liveTrace, setLiveTrace] = useState<TraceEvent[]>([]);
   const [highlightedEdge, setHighlightedEdge] = useState<string | null>(null);
@@ -27,6 +44,11 @@ export default function App() {
     const stop = connectGatewayWS<Frame>({
       url: window.location.origin.replace(/^http/, "ws") + "/ws",
       onFrame: (frame) => {
+        if ((frame as { type?: string }).type === "alert") {
+          alertsDispatch({ kind: "frame", frame: frame as unknown as AlertFrame });
+          setDebugFrames((prev) => [...prev.slice(-499), frame]);
+          return;
+        }
         dispatch(frame);
         setDebugFrames((prev) => [...prev.slice(-499), frame]);
         if (frame.type === "message_trace") {
@@ -122,6 +144,7 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col">
+      <AlertBanner alerts={alerts} />
       <header className="border-b border-neutral-800 px-4 py-2 text-sm font-semibold">
         turing — fleet observability
         <span className="ml-2 text-xs font-normal text-neutral-500">

@@ -25,6 +25,7 @@ from turing.mesh.node import MeshNode, PeerInfo
 from turing.specs.collector import NodeSpecs, collect_specs
 
 if TYPE_CHECKING:
+    from turing.coordinator.alerts.dispatcher import AlertDispatcher
     from turing.transport.bus import Bus
 
 logger = structlog.get_logger("turing.mesh.presence")
@@ -52,11 +53,13 @@ class PresenceService:
         *,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         stale_after: float = DEFAULT_STALE_AFTER,
+        alert_dispatcher: AlertDispatcher | None = None,
     ) -> None:
         self._node = node
         self._bus = bus
         self._heartbeat_interval = heartbeat_interval
         self._stale_after = stale_after
+        self._alert_dispatcher = alert_dispatcher
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._prune_task: asyncio.Task[None] | None = None
         self._running = False
@@ -206,6 +209,12 @@ class PresenceService:
             specs=parsed_specs,
         )
         self._node.add_peer(peer)
+        if self._alert_dispatcher is not None:
+            now_ms = int(time.time() * 1000)
+            try:
+                await self._alert_dispatcher.observe(peer, now_ms)
+            except Exception:  # pragma: no cover — dispatcher swallows internally
+                logger.warning("alert_dispatcher_observe_failed", exc_info=True)
 
     async def _on_leave(self, raw: bytes) -> None:
         msg = self._decode(raw)
