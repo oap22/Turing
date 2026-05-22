@@ -19,6 +19,8 @@ from turing.gateway.spa import spa_assets_path
 if TYPE_CHECKING:
     import uvicorn
 
+    from turing.coordinator.alerts.dispatcher import AlertDispatcher
+    from turing.gateway.telemetry_sink import TelemetrySink
     from turing.mesh.node import MeshNode
 
 logger = structlog.get_logger(__name__)
@@ -33,12 +35,16 @@ class GatewayService:
         port: int,
         node_name: str,
         mesh_node: MeshNode | None = None,
+        telemetry_sink: TelemetrySink | None = None,
+        alert_dispatcher: AlertDispatcher | None = None,
     ) -> None:
         self._token = token
         self._bind = bind
         self._port = port
         self._node_name = node_name
         self._mesh_node = mesh_node
+        self._telemetry_sink = telemetry_sink
+        self._alert_dispatcher = alert_dispatcher
         self._task: asyncio.Task | None = None
         self._server: uvicorn.Server | None = None
 
@@ -63,6 +69,8 @@ class GatewayService:
             node_name=self._node_name,
             spa_assets_dir=spa_assets_path(),
             mesh_node=self._mesh_node,
+            telemetry_sink=self._telemetry_sink,
+            alert_dispatcher=self._alert_dispatcher,
         )
         config = uvicorn.Config(
             app,

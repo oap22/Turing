@@ -38,6 +38,12 @@ class TuringConfig(BaseSettings):
         default="!turing",
         description="Prefix for bot commands",
     )
+    discord_operator_user_id: int | None = Field(
+        default=None,
+        validation_alias="TURING_OPERATOR_DISCORD_ID",
+        description="Discord user ID that receives hardware-safety alert DMs "
+        "when the SPA is unreachable; unset disables the Discord fallback",
+    )
 
     # ── Anthropic (cloud LLM) ────────────────────────────────────────────
     anthropic_api_key: str = Field(default="", description="Anthropic API key")

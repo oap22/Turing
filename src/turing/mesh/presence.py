@@ -68,6 +68,15 @@ class PresenceService:
     def is_running(self) -> bool:
         return self._running
 
+    def set_alert_dispatcher(self, dispatcher: AlertDispatcher | None) -> None:
+        """Late-bind the hardware-safety alert dispatcher.
+
+        The boot sequence builds the dispatcher after the Discord bot exists
+        (slice 4) — later than ``PresenceService`` is constructed — so it is
+        attached here rather than passed to ``__init__``.
+        """
+        self._alert_dispatcher = dispatcher
+
     async def start(self) -> None:
         if self._running:
             logger.warning("presence_already_running")

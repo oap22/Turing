@@ -7,11 +7,17 @@ import contextlib
 import signal
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import structlog
 
 from turing.config import TuringConfig
 from turing.logging import setup_logging
+
+if TYPE_CHECKING:
+    from turing.coordinator.alerts.dispatcher import AlertDispatcher
+    from turing.gateway.ring_buffer import RingBuffer
+    from turing.gateway.telemetry_sink import TelemetrySink
 
 logger = structlog.get_logger("turing")
 
@@ -151,7 +157,51 @@ async def _run(config: TuringConfig) -> None:
     # Give executor reference to bot for confirmation views
     executor.bot = bot
 
-    # 8b. Operator UI gateway (pi-alpha only)
+    # 8b. Hardware-safety alerts (PRD #228) — build the alert dispatcher and
+    # wire it into mesh presence + the gateway. Built here, after the bot
+    # exists, so the Discord DM fallback can reach a live bot.
+    alert_dispatcher: AlertDispatcher | None = None
+    telemetry_sink: TelemetrySink | None = None
+    alerts_ring_buffer: RingBuffer | None = None
+    if config.mesh_enabled and presence is not None:
+        from turing.coordinator.alerts.discord_client import DiscordAlertClient
+        from turing.coordinator.alerts.dispatcher import AlertDispatcher, ReachabilityClock
+
+        discord_client = DiscordAlertClient(bot, config.discord_operator_user_id)
+        if config.discord_operator_user_id is None:
+            logger.warning(
+                "alerts.discord_fallback_disabled",
+                msg="TURING_OPERATOR_DISCORD_ID unset; hardware-safety alert DMs disabled",
+            )
+        reachability_clock: ReachabilityClock | None = None
+        if config.gateway_enabled:
+            from turing.gateway.ring_buffer import RingBuffer, RingBufferConfig
+            from turing.gateway.telemetry_sink import TelemetrySink
+
+            # In-memory buffer — this sink serves purely as the gateway's WS
+            # fan-out hub for alert frames; alert history is not persisted.
+            alerts_ring_buffer = RingBuffer(
+                RingBufferConfig(
+                    path=Path(":memory:"),
+                    retention_seconds=3600,
+                    max_bytes=16 * 1024 * 1024,
+                )
+            )
+            await alerts_ring_buffer.open()
+            sink = TelemetrySink(buffer=alerts_ring_buffer)
+            telemetry_sink = sink
+
+            def _spa_last_send() -> int | None:
+                return sink.last_send_ms
+
+            reachability_clock = _spa_last_send
+        alert_dispatcher = AlertDispatcher(
+            discord_client=discord_client,
+            reachability_clock=reachability_clock,
+        )
+        presence.set_alert_dispatcher(alert_dispatcher)
+
+    # 8c. Operator UI gateway (pi-alpha only)
     gateway = None
     if config.gateway_enabled:
         from turing.gateway.service import GatewayService
@@ -162,6 +212,8 @@ async def _run(config: TuringConfig) -> None:
             port=config.gateway_port,
             node_name=config.node_name,
             mesh_node=mesh_node,
+            telemetry_sink=telemetry_sink,
+            alert_dispatcher=alert_dispatcher,
         )
         await gateway.start()
 
@@ -197,6 +249,9 @@ async def _run(config: TuringConfig) -> None:
             await gateway.stop()
         if presence:
             await presence.stop()
+        if alerts_ring_buffer is not None:
+            with contextlib.suppress(Exception):
+                await alerts_ring_buffer.close()
         if mesh_bus:
             with contextlib.suppress(Exception):
                 await mesh_bus.close()

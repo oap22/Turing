@@ -15,6 +15,7 @@ flaky browser cannot break the rest of the fan-out.
 from __future__ import annotations
 
 import contextlib
+import time
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -37,6 +38,16 @@ class TelemetrySink:
         self._buffer = buffer
         self._subscribers: list[WSSendFn] = []
         self._gaps = GapDetector(reorder_window=reorder_window)
+        # Epoch-ms of the last successful push to a subscriber. ``None``
+        # until the first push — the alerts subsystem reads this as the
+        # SPA-reachability signal (None ⇒ unreachable; see PRD #228).
+        self._last_send_ms: int | None = None
+
+    @property
+    def last_send_ms(self) -> int | None:
+        """Epoch-ms of the most recent *successful* frame push to a WS
+        subscriber, or ``None`` if no frame has ever been pushed."""
+        return self._last_send_ms
 
     def subscribe(self, send: WSSendFn) -> Unsubscribe:
         self._subscribers.append(send)
@@ -142,6 +153,9 @@ class TelemetrySink:
                 await send(frame)
             except Exception:
                 logger.warning("telemetry_sink_send_failed", exc_info=True)
+            else:
+                # Only successful pushes count toward SPA reachability.
+                self._last_send_ms = int(time.time() * 1000)
 
 
 def _stream_from_event_type(event_type: str) -> str:

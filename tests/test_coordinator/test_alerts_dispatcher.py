@@ -242,3 +242,139 @@ async def test_snooze_map_is_in_memory_only() -> None:
     # Throw d1 away; a brand-new dispatcher knows nothing of its snooze.
     d2 = AlertDispatcher(AlertEngine(now_ms=lambda: _NOW))
     assert d2.snoozed_until("pi-beta", "temp_celsius") is None
+
+
+class _FakeDiscord:
+    """Records DM attempts; optionally raises to exercise failure isolation."""
+
+    def __init__(self, *, raises: bool = False) -> None:
+        self.calls: list[str] = []
+        self._raises = raises
+
+    async def dm_operator(self, content: str) -> None:
+        self.calls.append(content)
+        if self._raises:
+            raise RuntimeError("429 rate limited")
+
+
+@pytest.mark.asyncio
+async def test_discord_fallback_engaged_when_spa_stale() -> None:
+    """Test α (fallback engaged when stale)."""
+    discord = _FakeDiscord()
+    dispatcher = AlertDispatcher(
+        AlertEngine(now_ms=lambda: _NOW),
+        discord_client=discord,
+        reachability_clock=lambda: _NOW - 120_000,
+    )
+    for _ in range(3):
+        await dispatcher.observe(_peer(85.0), _NOW)
+    assert discord.calls == ["⚠ pi-beta TEMP danger: 85.0°C (>82.0°C)"]
+
+
+@pytest.mark.asyncio
+async def test_discord_fallback_engaged_when_reachability_none() -> None:
+    """Test α (fallback engaged when None — bootstrap-as-unreachable)."""
+    discord = _FakeDiscord()
+    dispatcher = AlertDispatcher(
+        AlertEngine(now_ms=lambda: _NOW),
+        discord_client=discord,
+        reachability_clock=lambda: None,
+    )
+    for _ in range(3):
+        await dispatcher.observe(_peer(85.0), _NOW)
+    assert len(discord.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_discord_fallback_skipped_when_spa_fresh() -> None:
+    """Test α (fallback skipped when fresh): a recent SPA push suppresses DM."""
+    discord = _FakeDiscord()
+    dispatcher = AlertDispatcher(
+        AlertEngine(now_ms=lambda: _NOW),
+        discord_client=discord,
+        reachability_clock=lambda: _NOW - 30_000,
+    )
+    for _ in range(3):
+        await dispatcher.observe(_peer(85.0), _NOW)
+    assert discord.calls == []
+
+
+@pytest.mark.asyncio
+async def test_discord_cleared_never_dms() -> None:
+    """Test α (cleared never DMs): DM fires on the alerting edge only."""
+    discord = _FakeDiscord()
+    dispatcher = AlertDispatcher(
+        AlertEngine(now_ms=lambda: _NOW),
+        discord_client=discord,
+        reachability_clock=lambda: _NOW - 120_000,
+    )
+    for _ in range(3):
+        await dispatcher.observe(_peer(85.0), _NOW)  # alerting edge
+    assert len(discord.calls) == 1
+    for _ in range(3):
+        await dispatcher.observe(_peer(20.0), _NOW)  # cleared edge
+    assert len(discord.calls) == 1  # cleared did not DM
+
+
+@pytest.mark.asyncio
+async def test_discord_snooze_suppresses_dm() -> None:
+    """Test α (snooze suppresses Discord too)."""
+    discord = _FakeDiscord()
+    dispatcher = AlertDispatcher(
+        AlertEngine(now_ms=lambda: _NOW),
+        discord_client=discord,
+        reachability_clock=lambda: None,
+    )
+    await dispatcher.snooze("pi-beta", "temp_celsius", _NOW)
+    for _ in range(5):
+        await dispatcher.observe(_peer(85.0), _NOW)
+    assert discord.calls == []
+
+
+@pytest.mark.asyncio
+async def test_discord_failure_isolated_from_engine() -> None:
+    """Test α (Discord failure isolation): a raising dm_operator never
+    propagates out of observe; SPA frames still emit in order."""
+    discord = _FakeDiscord(raises=True)
+    frames: list[dict] = []
+
+    async def sink(frame: dict) -> None:
+        frames.append(frame)
+
+    dispatcher = AlertDispatcher(
+        AlertEngine(now_ms=lambda: _NOW),
+        send_frame=sink,
+        discord_client=discord,
+        reachability_clock=lambda: None,
+    )
+    for _ in range(3):
+        await dispatcher.observe(_peer(85.0), _NOW)  # alerting
+    for _ in range(3):
+        await dispatcher.observe(_peer(20.0), _NOW)  # cleared
+    for _ in range(3):
+        await dispatcher.observe(_peer(85.0), _NOW)  # re-alert
+
+    # The engine's SPA frames are unaffected by the Discord failures.
+    assert [f["state"] for f in frames] == ["alerting", "cleared", "alerting"]
+    # dm_operator was attempted on each alerting edge and raised each time;
+    # surviving the loop is the isolation guarantee.
+    assert len(discord.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_no_discord_client_is_a_silent_noop() -> None:
+    """Test β (config gate, dispatcher side): with no discord_client the
+    alerting edge drives no Discord interaction and never raises."""
+    frames: list[dict] = []
+
+    async def sink(frame: dict) -> None:
+        frames.append(frame)
+
+    dispatcher = AlertDispatcher(
+        AlertEngine(now_ms=lambda: _NOW),
+        send_frame=sink,
+        reachability_clock=lambda: None,
+    )
+    for _ in range(3):
+        await dispatcher.observe(_peer(85.0), _NOW)
+    assert [f["state"] for f in frames] == ["alerting"]

@@ -17,7 +17,7 @@ import contextlib
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import structlog
 
@@ -42,10 +42,24 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 SendFrame = Callable[[dict], Awaitable[None]]
+ReachabilityClock = Callable[[], "int | None"]
 
 # Hardcoded snooze window — PRD #228 keeps this fixed until an operator
 # asks for a configurable one.
 DEFAULT_SNOOZE_MS = 4 * 60 * 60 * 1000
+
+# SPA-reachability window. If the gateway has not pushed a frame within this
+# many ms, the SPA is treated as unreachable and the alerting edge also
+# escapes to Discord. A ``None`` last-send (no SPA has ever connected) is
+# unreachable too — see PRD #228's bootstrap-as-unreachable decision.
+REACHABLE_WINDOW_MS = 90_000
+
+
+class DiscordClient(Protocol):
+    """Structural type for the Discord DM fallback — see ``discord_client.py``."""
+
+    async def dm_operator(self, content: str) -> None: ...
+
 
 # warn / danger threshold pair per alertable field. The engine is fed the
 # warn threshold; ``observe`` swaps in the danger threshold when the fired
@@ -55,6 +69,9 @@ _THRESHOLDS: dict[Field, tuple[float, float]] = {
     "disk_pct": (DISK_WARN, DISK_DANGER),
 }
 
+# Field labels for the one-line Discord summary.
+_FIELD_LABEL: dict[Field, str] = {"temp_celsius": "TEMP", "disk_pct": "DISK"}
+
 
 class AlertDispatcher:
     def __init__(
@@ -62,6 +79,8 @@ class AlertDispatcher:
         engine: AlertEngine | None = None,
         *,
         send_frame: SendFrame | None = None,
+        discord_client: DiscordClient | None = None,
+        reachability_clock: ReachabilityClock | None = None,
     ) -> None:
         self._engine = engine or AlertEngine()
         self._send_frame: SendFrame | None = send_frame
@@ -70,6 +89,10 @@ class AlertDispatcher:
         # Most recent ``alerting`` event per key, so ``snooze`` can replay
         # it as a dimming ``update`` frame without re-deriving the reading.
         self._last_alert: dict[tuple[str, Field], Alert] = {}
+        # Discord DM fallback for the closed-laptop case. ``None`` disables it.
+        self._discord_client = discord_client
+        # Returns the gateway's last successful WS push (epoch-ms), or None.
+        self._reachability_clock = reachability_clock
 
     @property
     def engine(self) -> AlertEngine:
@@ -120,11 +143,15 @@ class AlertDispatcher:
             if event.state == "alerting":
                 self._last_alert[key] = event
             # A live snooze swallows both ``alerting`` and ``cleared`` edges
-            # for this key; the engine state still advanced above.
+            # for this key — and the Discord fallback below with them; the
+            # engine state still advanced above.
             if self._is_snoozed(key, now):
                 logger.debug("alert_suppressed_snoozed", node_id=peer.node_id, field=field)
                 continue
             await self._emit(event)
+            # Only the alerting edge can escape to Discord — never cleared.
+            if event.state == "alerting":
+                await self._maybe_dm(event, now)
 
     async def snooze(
         self,
@@ -172,6 +199,31 @@ class AlertDispatcher:
         with contextlib.suppress(Exception):
             await self._send_frame(event.to_frame())
 
+    async def _maybe_dm(self, event: Alert, now_ms: int) -> None:
+        """Escalate an ``alerting`` edge to Discord when the SPA is unreachable.
+
+        The SPA counts as unreachable when there is no ``reachability_clock``,
+        when the clock returns ``None`` (no SPA has ever connected — the
+        bootstrap case), or when its last successful push is older than
+        ``REACHABLE_WINDOW_MS``. A ``dm_operator`` that raises is caught here
+        so a Discord failure never propagates out of ``observe``.
+        """
+        if self._discord_client is None:
+            return
+        if self._reachability_clock is not None:
+            last_send_ms = self._reachability_clock()
+            if last_send_ms is not None and now_ms - last_send_ms <= REACHABLE_WINDOW_MS:
+                return  # SPA pushed recently — it will surface the banner itself
+        try:
+            await self._discord_client.dm_operator(_summarize(event))
+        except Exception:
+            logger.warning(
+                "alert_discord_dm_failed",
+                node_id=event.node_id,
+                field=event.field,
+                exc_info=True,
+            )
+
     @staticmethod
     def _sample(specs: object) -> list[tuple[Field, Severity, float]]:
         """Read each alertable field off a peer's specs.
@@ -197,3 +249,18 @@ class AlertDispatcher:
                 dpct if dpct is not None else 0.0,
             ),
         ]
+
+
+def _summarize(event: Alert) -> str:
+    """One-line operator summary for a Discord DM.
+
+    e.g. ``⚠ pi-beta TEMP danger: 87.4°C (>82.0°C)``.
+    """
+    label = _FIELD_LABEL.get(event.field, event.field.upper())
+    if event.field == "temp_celsius":
+        reading = f"{event.value:.1f}°C (>{event.threshold:.1f}°C)"
+    elif event.field == "disk_pct":
+        reading = f"{round(event.value)}% (>{round(event.threshold)}%)"
+    else:  # pragma: no cover — defensive; only two fields exist
+        reading = f"{event.value} (>{event.threshold})"
+    return f"⚠ {event.node_name} {label} {event.severity}: {reading}"
