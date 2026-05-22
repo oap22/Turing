@@ -105,6 +105,12 @@ class TuringConfig(BaseSettings):
         default_factory=lambda: ["/tmp", "/home/turing/data"],
         description="Filesystem paths the sandbox may write to",
     )
+    allowed_plugins: list[str] | None = Field(
+        default=None,
+        description="Allow-list of plugin names permitted to load from plugins/. "
+        "Loading a plugin runs arbitrary code; unset loads every plugin found "
+        "(plugins/ is a fully trusted code location). Env: TURING_ALLOWED_PLUGINS.",
+    )
 
     # ── Telemetry ────────────────────────────────────────────────────────
     telemetry_prompt_sample_max_bytes: int = Field(

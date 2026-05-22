@@ -168,12 +168,25 @@ class TestSandboxing:
             assert "ro-bind" in wrapped
             assert "echo test" in wrapped
 
-    async def test_sandbox_fallback_no_bwrap(self, sandboxed_shell_tool: ShellTool):
-        """Test graceful fallback when bwrap is not installed."""
+    async def test_sandbox_fails_closed_no_bwrap(self, sandboxed_shell_tool: ShellTool):
+        """When sandboxing is enabled but bwrap is missing, fail closed —
+        never run the command unsandboxed (issue #240)."""
         with patch("turing.tools.shell.shutil.which", return_value=None):
+            with pytest.raises(RuntimeError, match="bubblewrap"):
+                sandboxed_shell_tool._wrap_with_sandbox("echo test")
+            # execute() turns the raise into a denial rather than running.
+            result = await sandboxed_shell_tool.execute(command="echo test")
+            assert result.success is False
+            assert "bubblewrap" in result.error
+
+    async def test_sandbox_clears_env_and_narrows_binds(self, sandboxed_shell_tool: ShellTool):
+        """The hardened sandbox clears the env and does not bind the whole FS."""
+        with patch("turing.tools.shell.shutil.which", return_value="/usr/bin/bwrap"):
             wrapped = sandboxed_shell_tool._wrap_with_sandbox("echo test")
-            # Should return the original command without bwrap.
-            assert wrapped == "echo test"
+        assert "--clearenv" in wrapped
+        # The old `--ro-bind / /` whole-host mount is gone.
+        assert "--ro-bind / /" not in wrapped
+        assert "--unshare-net" in wrapped
 
     async def test_no_sandbox_when_disabled(self, shell_tool: ShellTool):
         """Test that sandbox is not used when disabled."""

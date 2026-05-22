@@ -6,9 +6,10 @@ runs them through the engine, and on any emitted event calls ``send_frame``
 (typically the gateway's telemetry-sink broadcast).
 
 It also owns the per-``(peer, field)`` snooze map: while a key is snoozed
-the engine keeps grading silently but no frames go out for it. The snooze
-map is plain in-memory state — a coordinator restart clears every snooze,
-by design (PRD #228). Discord fallback lands in slice 4.
+the engine keeps grading but the ``alerting`` edge (and its Discord
+escalation) is suppressed — a ``cleared`` edge always goes out so a
+resolved alert still clears the banner. The snooze map is plain in-memory
+state — a coordinator restart clears every snooze, by design (PRD #228).
 """
 
 from __future__ import annotations
@@ -138,16 +139,17 @@ class AlertDispatcher:
             threshold = danger_threshold if event.severity == "danger" else warn_threshold
             event = replace(event, threshold=threshold)
             key = (peer.node_id, field)
-            # Remember the latest alerting edge even when it's suppressed —
-            # ``snooze`` replays it as the dimming ``update`` frame.
             if event.state == "alerting":
+                # Remember the latest alerting edge even when it's suppressed
+                # — ``snooze`` replays it as the dimming ``update`` frame.
                 self._last_alert[key] = event
-            # A live snooze swallows both ``alerting`` and ``cleared`` edges
-            # for this key — and the Discord fallback below with them; the
-            # engine state still advanced above.
-            if self._is_snoozed(key, now):
-                logger.debug("alert_suppressed_snoozed", node_id=peer.node_id, field=field)
-                continue
+                # A live snooze silences the ``alerting`` edge — and its
+                # Discord escalation — for this key. A ``cleared`` edge is
+                # good news and is never suppressed, so the banner row
+                # always clears even while the key is snoozed.
+                if self._is_snoozed(key, now):
+                    logger.debug("alert_suppressed_snoozed", node_id=peer.node_id, field=field)
+                    continue
             await self._emit(event)
             # Only the alerting edge can escape to Discord — never cleared.
             if event.state == "alerting":
@@ -162,10 +164,13 @@ class AlertDispatcher:
     ) -> int:
         """Snooze a ``(peer, field)`` for ``duration_ms`` and return the expiry.
 
-        While snoozed, ``observe`` keeps grading but emits no frames for the
-        key. If the key is *already* ``alerting``, one ``update`` frame goes
-        out immediately (state ``alerting``, non-null ``snoozed_until_ms``)
-        so the SPA can dim the row without waiting for the next heartbeat.
+        While snoozed, ``observe`` keeps grading but suppresses the
+        ``alerting`` edge (and its Discord escalation) for the key. A
+        ``cleared`` edge is never suppressed — a resolved alert always
+        clears the banner row. If the key is *already* ``alerting``, one
+        ``update`` frame goes out immediately (state ``alerting``, non-null
+        ``snoozed_until_ms``) so the SPA can dim the row without waiting for
+        the next heartbeat.
         """
         expiry = now_ms + duration_ms
         self._snoozes[(node_id, field)] = expiry
