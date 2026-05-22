@@ -167,10 +167,11 @@ _FOUR_H_MS = 4 * 60 * 60 * 1000
 
 
 @pytest.mark.asyncio
-async def test_snooze_suppresses_only_its_field() -> None:
-    """Test β (snooze suppresses frames): a snooze swallows both the
-    alerting and cleared edges for its (peer, field); a different field on
-    the same peer keeps firing; after expiry the next transition emits."""
+async def test_snooze_suppresses_alerting_but_not_cleared() -> None:
+    """Test β (snooze suppresses frames): a snooze silences the *alerting*
+    edge for its (peer, field) while a different field keeps firing; a
+    ``cleared`` edge is never suppressed (a resolved alert always clears the
+    banner); after expiry the alerting edge fires again."""
     frames: list[dict] = []
 
     async def sink(frame: dict) -> None:
@@ -182,27 +183,28 @@ async def test_snooze_suppresses_only_its_field() -> None:
     expiry = await dispatcher.snooze("pi-beta", "temp_celsius", _NOW)
     assert frames == []
 
-    # Within the window: TEMP danger×3 (alerting edge) + DISK danger×3.
+    # Within the window: TEMP danger×3 (alerting edge — suppressed) +
+    # DISK danger×3 (not snoozed — fires once).
     for _ in range(3):
         await dispatcher.observe(_full_peer("pi-beta", temp_celsius=85.0, disk_used_bytes=99), _NOW)
-    # TEMP suppressed; DISK (not snoozed) fired exactly once.
-    assert [f["field"] for f in frames] == ["disk_pct"]
-    assert frames[0]["state"] == "alerting"
+    assert [(f["field"], f["state"]) for f in frames] == [("disk_pct", "alerting")]
 
-    # TEMP ok×3 → cleared edge, also swallowed by the live snooze.
+    # TEMP recovers: ok×3 → cleared edge. A cleared is good news and is NOT
+    # suppressed by the live snooze — the banner row must clear.
     for _ in range(3):
         await dispatcher.observe(_full_peer("pi-beta", temp_celsius=20.0, disk_used_bytes=99), _NOW)
-    assert [f["field"] for f in frames] == ["disk_pct"]
+    temp_frames = [f for f in frames if f["field"] == "temp_celsius"]
+    assert len(temp_frames) == 1
+    assert temp_frames[0]["state"] == "cleared"
 
-    # After expiry: re-drive TEMP into alerting — the frame now lands.
+    # After expiry: re-drive TEMP into alerting — the alerting edge lands.
     after = expiry + 1
     for _ in range(3):
         await dispatcher.observe(
             _full_peer("pi-beta", temp_celsius=85.0, disk_used_bytes=99), after
         )
-    temp_frames = [f for f in frames if f["field"] == "temp_celsius"]
-    assert len(temp_frames) == 1
-    assert temp_frames[0]["state"] == "alerting"
+    temp_alerting = [f for f in frames if f["field"] == "temp_celsius" and f["state"] == "alerting"]
+    assert len(temp_alerting) == 1
 
 
 @pytest.mark.asyncio
