@@ -2,15 +2,36 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, ClassVar
+from typing import Any
 
 import structlog
 
 from turing.telemetry import traced
+from turing.telemetry.redactor import redact
+from turing.tools.command_safety import check_denylist, classify_command_risk
+
+
+def _redact_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of tool arguments with secrets scrubbed (issue #240).
+
+    Tool arguments can carry tokens or passwords; routing every string value
+    through the telemetry redactor keeps them out of both the structlog
+    stream and the persisted SQLite audit trail.
+    """
+
+    def _scrub(value: Any) -> Any:
+        if isinstance(value, str):
+            return redact(value)
+        if isinstance(value, dict):
+            return {k: _scrub(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_scrub(v) for v in value]
+        return value
+
+    return {key: _scrub(val) for key, val in arguments.items()}
 
 
 def _safety_event_payload(kind, args, kwargs, result, exc):  # type: ignore[no-untyped-def]
@@ -53,24 +74,16 @@ class SafetyGate:
     Applies deny-list pattern matching for shell commands, risk-level
     assessments, and admin privilege checks to determine whether a tool
     call should be approved, denied, or flagged for confirmation.
-    """
 
-    DENY_PATTERNS: ClassVar[list[str]] = [
-        r"rm\s+-rf\s+/(?!\w)",  # rm -rf /
-        r"mkfs\.",  # Format filesystems
-        r"dd\s+.*of=/dev/",  # Raw disk writes
-        r":\(\)\{.*\|.*&",  # Fork bombs
-        r"chmod\s+-R\s+777\s+/",  # World-writable root
-        r">\s*/dev/sd",  # Overwrite disks
-        r"shutdown|reboot|halt|poweroff",  # System power
-        r"userdel|useradd|passwd",  # User management
-    ]
+    The deny-list and shell risk classification both live in the shared
+    :mod:`turing.tools.command_safety` module so the shell tool and this
+    gate can never drift out of sync (issue #240).
+    """
 
     def __init__(self, config: Any, audit_store: Any | None = None) -> None:
         self.config = config
         self.audit_store = audit_store
         self.logger = structlog.get_logger("turing.safety")
-        self._compiled_patterns = [re.compile(p, re.IGNORECASE) for p in self.DENY_PATTERNS]
 
     @traced("safety.check", payload=_safety_event_payload)
     async def check(
@@ -143,16 +156,13 @@ class SafetyGate:
         )
 
     def _check_denylist(self, command: str) -> tuple[bool, str]:
-        """Check if command matches any deny pattern.
+        """Check if command matches any shared deny pattern.
 
         Returns:
             A tuple ``(is_denied, reason)``.  ``is_denied`` is ``True``
             when the command matches a blocked pattern.
         """
-        for pattern in self._compiled_patterns:
-            if pattern.search(command):
-                return True, f"Command blocked by safety rule: {pattern.pattern}"
-        return False, ""
+        return check_denylist(command)
 
     def _get_tool_risk(self, tool_name: str, arguments: dict[str, Any]) -> str:
         """Determine the effective risk level based on tool and action."""
@@ -164,33 +174,12 @@ class SafetyGate:
             return "low"
 
         if tool_name == "shell":
-            # Check if command matches safe prefixes.
-            command = arguments.get("command", "").strip()
-            safe_prefixes = (
-                "echo",
-                "cat",
-                "ls",
-                "pwd",
-                "whoami",
-                "date",
-                "uptime",
-                "hostname",
-                "uname",
-                "df",
-                "free",
-                "head",
-                "tail",
-                "wc",
-                "grep",
-                "find",
-                "which",
-                "id",
-                "ps",
-            )
-            for prefix in safe_prefixes:
-                if command.startswith(prefix):
-                    return "medium"
-            return "high"
+            # Parse-based classification — a command is only MEDIUM when
+            # every pipeline segment is a known read-only builtin. A shell
+            # metacharacter can no longer downgrade a destructive command
+            # via a "safe" prefix (issue #237).
+            command = arguments.get("command", "")
+            return classify_command_risk(command)
 
         if tool_name == "process":
             action = arguments.get("action", "")
@@ -225,13 +214,17 @@ class SafetyGate:
         review.  Otherwise, the action is logged via structlog only.
         """
         timestamp = datetime.now(tz=UTC).isoformat()
+        # Tool arguments can carry tokens or passwords — scrub them before
+        # they reach the structlog stream or the persisted audit store
+        # (issue #240, finding 6).
+        redacted_arguments = _redact_arguments(arguments)
 
         self.logger.info(
             "audit_log",
             timestamp=timestamp,
             user_id=user_id,
             tool_name=tool_name,
-            arguments=arguments,
+            arguments=redacted_arguments,
             result_preview=result[:200] if result else "",
             risk_level=risk_level,
             approved=approved,
@@ -246,7 +239,7 @@ class SafetyGate:
                     user_id=user_id,
                     action="tool_call",
                     tool_name=tool_name,
-                    arguments=arguments,
+                    arguments=redacted_arguments,
                     result=result,
                     risk_level=risk_level,
                     approved=approved,

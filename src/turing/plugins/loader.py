@@ -1,4 +1,12 @@
-"""Plugin loader for discovering and instantiating plugins from the filesystem."""
+"""Plugin loader for discovering and instantiating plugins from the filesystem.
+
+Trust boundary (issue #239): :meth:`PluginLoader.load_plugin` calls
+``importlib`` ``exec_module``, which runs arbitrary Python from ``plugins/``
+with full process privileges during startup. ``plugins/`` is therefore a
+**fully trusted code location** — treat it exactly like ``src/``. The optional
+``TURING_ALLOWED_PLUGINS`` allow-list (config ``allowed_plugins``) narrows
+which plugin directories may load; see :meth:`PluginLoader._enforce_allowlist`.
+"""
 
 from __future__ import annotations
 
@@ -98,10 +106,15 @@ class PluginLoader:
             An instantiated Plugin object.
 
         Raises:
+            PermissionError: If a ``TURING_ALLOWED_PLUGINS`` allow-list is
+                configured and this plugin is not on it.
             ImportError: If the module cannot be loaded.
             AttributeError: If the class is not found in the module.
             TypeError: If the class is not a Plugin subclass.
         """
+        # Enforce the allow-list *before* anything from the plugin runs.
+        self._enforce_allowlist(manifest)
+
         module_name, class_name = manifest.entry_point.split(":", 1)
 
         # Build the module path from the plugin directory.
@@ -144,6 +157,24 @@ class PluginLoader:
             class_name=class_name,
         )
         return instance
+
+    def _enforce_allowlist(self, manifest: PluginManifest) -> None:
+        """Refuse to load a plugin outside the configured allow-list.
+
+        ``load_plugin`` runs arbitrary code via ``exec_module``. When
+        ``TURING_ALLOWED_PLUGINS`` (config ``allowed_plugins``) is set, only
+        the named plugins may load. When it is unset the allow-list is
+        inactive — every plugin in ``plugins/`` loads, since that directory
+        is a fully trusted code location.
+        """
+        allowed = getattr(self._config, "allowed_plugins", None) if self._config else None
+        if allowed is None:
+            return
+        if manifest.name not in allowed:
+            raise PermissionError(
+                f"Plugin '{manifest.name}' is not in the TURING_ALLOWED_PLUGINS "
+                f"allow-list; refusing to execute its code"
+            )
 
     def _parse_manifest(self, manifest_file: Path, plugin_dir: Path) -> PluginManifest:
         """Parse a manifest.json file into a PluginManifest."""

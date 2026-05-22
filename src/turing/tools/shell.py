@@ -3,75 +3,26 @@
 from __future__ import annotations
 
 import asyncio
-import re
+import shlex
 import shutil
+from pathlib import Path
 from typing import Any
 
 import structlog
 
 from turing.tools.base import RiskLevel, Tool, ToolResult
+from turing.tools.command_safety import check_denylist, classify_command_risk
 
 logger = structlog.get_logger("turing.tools.shell")
 
 # Maximum output length before truncation (characters).
 MAX_OUTPUT_LENGTH = 4000
 
-# Commands considered safe enough for MEDIUM risk instead of HIGH.
-SAFE_COMMAND_PREFIXES = (
-    "echo",
-    "cat",
-    "ls",
-    "pwd",
-    "whoami",
-    "date",
-    "uptime",
-    "hostname",
-    "uname",
-    "df",
-    "du",
-    "free",
-    "head",
-    "tail",
-    "wc",
-    "sort",
-    "uniq",
-    "grep",
-    "find",
-    "which",
-    "env",
-    "printenv",
-    "id",
-    "ps",
-    "top",
-    "htop",
-    "ip",
-    "ifconfig",
-    "ping",
-    "dig",
-    "nslookup",
-    "traceroute",
-    "ss",
-    "netstat",
-    "lsblk",
-    "lscpu",
-    "lsusb",
-    "dmesg",
-    "journalctl",
-    "systemctl status",
-    "vcgencmd",
-)
-
-# Deny patterns -- commands that are never allowed.
-DENY_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"rm\s+-rf\s+/(?!\w)", re.IGNORECASE),
-    re.compile(r"mkfs", re.IGNORECASE),
-    re.compile(r"dd\s+.*of=/dev/", re.IGNORECASE),
-    re.compile(r":\(\)\{.*\|.*&\s*\};:", re.IGNORECASE),
-    re.compile(r"chmod\s+-R\s+777\s+/", re.IGNORECASE),
-    re.compile(r">\s*/dev/sd", re.IGNORECASE),
-    re.compile(r"curl.*\|\s*(bash|sh)", re.IGNORECASE),
-    re.compile(r"wget.*\|\s*(bash|sh)", re.IGNORECASE),
-]
+# Filesystem locations bound read-only into the bubblewrap sandbox so commands
+# can find their binaries and shared libraries. Home directories, /root, and
+# the project tree are deliberately NOT bound — that keeps ``.env``, SSH keys,
+# and the rest of the host out of a sandboxed command's reach (issue #240).
+_SANDBOX_RO_PATHS = ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc")
 
 
 class ShellTool(Tool):
@@ -108,24 +59,24 @@ class ShellTool(Tool):
         return RiskLevel.HIGH
 
     def get_command_risk(self, command: str) -> RiskLevel:
-        """Determine the risk level of a specific command."""
-        stripped = command.strip()
-        for prefix in SAFE_COMMAND_PREFIXES:
-            if stripped.startswith(prefix):
-                return RiskLevel.MEDIUM
-        return RiskLevel.HIGH
+        """Determine the risk level of a specific command.
+
+        Classification is parse-based (see :mod:`turing.tools.command_safety`):
+        a command is only MEDIUM when every pipeline segment is a known
+        read-only builtin. A shell metacharacter can no longer downgrade a
+        destructive command via a "safe" prefix.
+        """
+        tier = classify_command_risk(command)
+        return RiskLevel.MEDIUM if tier == "medium" else RiskLevel.HIGH
 
     def check_denylist(self, command: str) -> tuple[bool, str]:
-        """Check whether the command matches any deny pattern.
+        """Check whether the command matches any shared deny pattern.
 
         Returns:
             A tuple of (is_denied, reason).  ``is_denied`` is True when the
             command matches a blocked pattern.
         """
-        for pattern in DENY_PATTERNS:
-            if pattern.search(command):
-                return True, f"Command blocked by deny pattern: {pattern.pattern}"
-        return False, ""
+        return check_denylist(command)
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         """Execute a shell command.
@@ -144,7 +95,13 @@ class ShellTool(Tool):
             return ToolResult(success=False, output="", error=reason)
 
         # --- Build final command (with optional sandbox) ---
-        final_command = self._wrap_with_sandbox(command)
+        try:
+            final_command = self._wrap_with_sandbox(command)
+        except RuntimeError as exc:
+            # Sandbox required but unavailable — fail closed, never run
+            # the command unsandboxed.
+            logger.warning("shell_sandbox_unavailable", command=command, error=str(exc))
+            return ToolResult(success=False, output="", error=str(exc))
 
         # --- Execute ---
         try:
@@ -195,38 +152,45 @@ class ShellTool(Tool):
             return ToolResult(success=False, output="", error=f"Failed to execute command: {exc}")
 
     def _wrap_with_sandbox(self, command: str) -> str:
-        """Optionally wrap the command with bubblewrap if sandboxing is enabled."""
+        """Wrap the command with a hardened bubblewrap invocation.
+
+        Fails **closed**: when sandboxing is enabled but ``bwrap`` is not
+        installed, raises :class:`RuntimeError` instead of running the
+        command unsandboxed (``execute`` turns that into a denial).
+
+        The sandbox binds only the OS directories a command needs to run
+        (read-only), mounts a fresh ``/tmp``, drops the network, and clears
+        the environment — so neither host secrets (``.env``, SSH keys, the
+        project tree) nor inherited API keys are reachable inside it.
+        """
         if not self._sandbox_enabled:
             return command
 
         bwrap_path = shutil.which("bwrap")
         if bwrap_path is None:
-            logger.warning(
-                "bwrap_not_found",
-                msg="Bubblewrap not available, executing without sandbox",
+            raise RuntimeError(
+                "sandbox_enabled is set but bubblewrap (bwrap) is not installed; "
+                "refusing to run the command unsandboxed"
             )
-            return command
 
-        # Build bwrap invocation with restricted filesystem access.
-        bwrap_args = [
-            bwrap_path,
-            "--ro-bind",
-            "/",
-            "/",
-            "--tmpfs",
-            "/tmp",
-            "--dev",
-            "/dev",
-            "--proc",
-            "/proc",
+        bwrap_args: list[str] = [bwrap_path]
+        # Bind only the OS locations that exist — binding a missing path
+        # makes bwrap abort.
+        for ro_path in _SANDBOX_RO_PATHS:
+            if Path(ro_path).exists():
+                bwrap_args += ["--ro-bind", ro_path, ro_path]
+        bwrap_args += [
+            "--tmpfs", "/tmp",
+            "--dev", "/dev",
+            "--proc", "/proc",
+            "--chdir", "/tmp",
             "--unshare-net",
             "--die-with-parent",
+            "--clearenv",
+            "--setenv", "PATH", "/usr/bin:/bin:/usr/sbin:/sbin",
+            "--setenv", "HOME", "/tmp",
             "--",
-            "sh",
-            "-c",
-            command,
-        ]
+            "sh", "-c", command,
+        ]  # fmt: skip
         # Shell-quote each argument for safe embedding.
-        import shlex
-
         return " ".join(shlex.quote(arg) for arg in bwrap_args)
