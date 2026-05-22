@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -145,3 +146,39 @@ class TestSinkFansOutToClients:
         sink.subscribe(good)
         await sink.on_mesh_message(_telemetry_message())
         assert good_frames  # still received frames
+
+
+class TestSinkLastSendMs:
+    """The alerts subsystem reads ``last_send_ms`` as the SPA-reachability
+    signal: None means no SPA has ever connected (treated as unreachable)."""
+
+    @pytest.mark.asyncio
+    async def test_last_send_ms_is_none_before_any_push(self, buffer: RingBuffer) -> None:
+        sink = TelemetrySink(buffer=buffer)
+        assert sink.last_send_ms is None
+
+    @pytest.mark.asyncio
+    async def test_successful_push_bumps_last_send_ms(self, buffer: RingBuffer) -> None:
+        sink = TelemetrySink(buffer=buffer)
+
+        async def send(f: dict) -> None:
+            return None
+
+        sink.subscribe(send)
+        before = int(time.time() * 1000)
+        await sink.on_mesh_message(_telemetry_message())
+        after = int(time.time() * 1000)
+        assert sink.last_send_ms is not None
+        assert before <= sink.last_send_ms <= after
+
+    @pytest.mark.asyncio
+    async def test_failed_push_does_not_bump_last_send_ms(self, buffer: RingBuffer) -> None:
+        sink = TelemetrySink(buffer=buffer)
+
+        async def bad(f: dict) -> None:
+            raise RuntimeError("client gone")
+
+        sink.subscribe(bad)
+        await sink.on_mesh_message(_telemetry_message())
+        # Only a failing subscriber — no push succeeded, so it stays None.
+        assert sink.last_send_ms is None

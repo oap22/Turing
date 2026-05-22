@@ -10,6 +10,8 @@ import pytest
 
 from turing.coordinator.alerts.engine import AlertEngine
 from turing.coordinator.alerts.types import (
+    DISK_DANGER,
+    DISK_WARN,
     TEMP_DANGER,
     TEMP_WARN,
     Alert,
@@ -123,3 +125,76 @@ def test_alert_event_carries_severity_and_threshold(severity: str, threshold: fl
     assert ev is not None
     assert ev.severity == severity
     assert ev.threshold == threshold
+
+
+class TestAlertEngineDiskField:
+    """Test α (DISK engine): the state machine behaves identically for the
+    ``disk_pct`` field — the engine is field-agnostic, keyed by (peer, field)."""
+
+    def test_disk_warn_thrice_alerts_once(self) -> None:
+        eng = _engine()
+        events: list[Alert | None] = []
+        for _ in range(3):
+            _, ev = eng.step("p", "disk_pct", "warn", value=88.0, threshold=DISK_WARN)
+            events.append(ev)
+        non_none = [e for e in events if e is not None]
+        assert len(non_none) == 1
+        assert non_none[0].field == "disk_pct"
+        assert non_none[0].severity == "warn"
+        assert non_none[0].state == "alerting"
+
+    def test_disk_danger_twice_alerts_once(self) -> None:
+        eng = _engine()
+        ev1 = eng.step("p", "disk_pct", "danger", value=96.0, threshold=DISK_DANGER)[1]
+        ev2 = eng.step("p", "disk_pct", "danger", value=96.0, threshold=DISK_DANGER)[1]
+        assert ev1 is None
+        assert ev2 is not None
+        assert ev2.field == "disk_pct"
+        assert ev2.severity == "danger"
+
+    def test_disk_alerting_then_three_ok_clears(self) -> None:
+        eng = _engine()
+        for _ in range(3):
+            eng.step("p", "disk_pct", "warn", value=88.0, threshold=DISK_WARN)
+        assert eng.state_of("p", "disk_pct") == AlertState.alerting
+        for _ in range(2):
+            _, ev = eng.step("p", "disk_pct", "ok", value=10.0, threshold=DISK_WARN)
+            assert ev is None
+        state, ev = eng.step("p", "disk_pct", "ok", value=10.0, threshold=DISK_WARN)
+        assert state == AlertState.clear
+        assert ev is not None
+        assert ev.state == "cleared"
+
+
+def test_multi_field_independence() -> None:
+    """Test α (multi-field independence): one peer, two fields, two state
+    machines. DISK trips at danger×2, TEMP at warn×3; each clears on its own."""
+    eng = _engine()
+    temp_events: list[Alert] = []
+    disk_events: list[Alert] = []
+
+    # Three interleaved heartbeats — each steps both fields.
+    for _ in range(3):
+        _, te = eng.step("p", "temp_celsius", "warn", value=78.0, threshold=TEMP_WARN)
+        _, de = eng.step("p", "disk_pct", "danger", value=96.0, threshold=DISK_WARN)
+        if te is not None:
+            temp_events.append(te)
+        if de is not None:
+            disk_events.append(de)
+
+    assert len(temp_events) == 1, "TEMP should fire exactly once (warn×3)"
+    assert temp_events[0].field == "temp_celsius"
+    assert temp_events[0].severity == "warn"
+    assert len(disk_events) == 1, "DISK should fire exactly once (danger×2)"
+    assert disk_events[0].field == "disk_pct"
+    assert disk_events[0].severity == "danger"
+
+    # Each field clears independently after its own 3 ok heartbeats.
+    for _ in range(2):
+        _, te = eng.step("p", "temp_celsius", "ok", value=40.0, threshold=TEMP_WARN)
+        _, de = eng.step("p", "disk_pct", "ok", value=10.0, threshold=DISK_WARN)
+        assert te is None and de is None
+    _, te = eng.step("p", "temp_celsius", "ok", value=40.0, threshold=TEMP_WARN)
+    _, de = eng.step("p", "disk_pct", "ok", value=10.0, threshold=DISK_WARN)
+    assert te is not None and te.state == "cleared" and te.field == "temp_celsius"
+    assert de is not None and de.state == "cleared" and de.field == "disk_pct"

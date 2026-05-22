@@ -13,9 +13,9 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
-from fastapi import FastAPI, Query, Request, Response, WebSocket
+from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import (
     FileResponse,
@@ -24,6 +24,7 @@ from starlette.responses import (
 )
 from starlette.staticfiles import StaticFiles
 
+from turing.coordinator.alerts.types import KNOWN_FIELDS
 from turing.gateway.auth import COOKIE_NAME, GatewayAuth
 from turing.mesh.node import is_specs_stale
 
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from turing.coordinator.alerts.dispatcher import AlertDispatcher
+    from turing.coordinator.alerts.types import Field
     from turing.gateway.ring_buffer import RingBuffer
     from turing.gateway.telemetry_sink import TelemetrySink
     from turing.mesh.node import MeshNode
@@ -195,6 +197,28 @@ def create_app(
         events = rows[:limit]
         next_offset = (int(offset) + limit) if has_more else None
         return {"events": events, "next_offset": next_offset}
+
+    @app.post("/alerts/{node_id}/{field}/snooze")
+    async def snooze_alert(node_id: str, field: str) -> dict:
+        """Snooze an active alert for a ``(peer, field)`` pair.
+
+        Bearer-gated by the middleware. Returns ``{snoozed_until_ms}``;
+        404s an unknown field (catches typos like ``disk_used``) or a
+        ``(peer, field)`` the alert engine has never graded.
+        """
+        if alert_dispatcher is None:
+            raise HTTPException(status_code=503, detail="alerts subsystem not enabled")
+        if field not in KNOWN_FIELDS:
+            raise HTTPException(status_code=404, detail=f"unknown alert field: {field}")
+        field_typed = cast("Field", field)
+        if not alert_dispatcher.engine.has_state(node_id, field_typed):
+            raise HTTPException(
+                status_code=404,
+                detail=f"no alert state for {node_id}/{field}",
+            )
+        now_ms = int(time.time() * 1000)
+        snoozed_until_ms = await alert_dispatcher.snooze(node_id, field_typed, now_ms)
+        return {"snoozed_until_ms": snoozed_until_ms}
 
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:

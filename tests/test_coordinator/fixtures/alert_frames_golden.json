@@ -8,7 +8,8 @@
     "value": 83.4,
     "threshold": 82.0,
     "state": "alerting",
-    "fired_at_ms": 1700000000000
+    "fired_at_ms": 1700000000000,
+    "snoozed_until_ms": null
   },
   "cleared": {
     "type": "alert",
@@ -19,6 +20,31 @@
     "value": 50.0,
     "threshold": 82.0,
     "state": "cleared",
-    "fired_at_ms": 1700000060000
+    "fired_at_ms": 1700000060000,
+    "snoozed_until_ms": null
+  },
+  "disk_alerting": {
+    "type": "alert",
+    "node_id": "pi-gamma",
+    "node_name": "pi-gamma",
+    "field": "disk_pct",
+    "severity": "danger",
+    "value": 96.0,
+    "threshold": 95.0,
+    "state": "alerting",
+    "fired_at_ms": 1700000000000,
+    "snoozed_until_ms": null
+  },
+  "snoozed": {
+    "type": "alert",
+    "node_id": "pi-beta",
+    "node_name": "pi-beta",
+    "field": "temp_celsius",
+    "severity": "danger",
+    "value": 83.4,
+    "threshold": 82.0,
+    "state": "alerting",
+    "fired_at_ms": 1700000000000,
+    "snoozed_until_ms": 1700014400000
   }
 }
