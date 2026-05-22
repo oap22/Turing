@@ -53,15 +53,18 @@ def check_denylist(command: str) -> tuple[bool, str]:
 # these. Anything else — including ``find -exec``/``-delete``, output
 # redirects, command substitution, and unparseable input — stays HIGH.
 #
-# Deliberately excluded: ``env`` (it execs its argument — a generic command
-# runner), and ``sort`` / ``uniq`` (both can write a file via ``-o`` / an
-# output-path argument). A command runner or a file writer is not read-only.
+# Deliberately excluded because they are not read-only:
+#   - ``env``  — execs its argument (a generic command runner);
+#   - ``ip``   — ``ip netns exec`` runs an arbitrary command, and
+#                ``ip link/addr/route ...`` reconfigure the network;
+#   - ``ifconfig`` — reconfigures interfaces (can sever a remote node);
+#   - ``sort`` / ``uniq`` — write a file via ``-o`` / an output-path arg.
 SAFE_COMMANDS: frozenset[str] = frozenset(
     {
         "echo", "cat", "ls", "pwd", "whoami", "date", "uptime", "hostname",
         "uname", "df", "du", "free", "head", "tail", "wc", "grep", "egrep",
         "fgrep", "which", "printenv", "id", "ps", "lsblk", "lscpu", "lsusb",
-        "ip", "ifconfig", "ss", "netstat", "true",
+        "ss", "netstat", "true",
     }
 )  # fmt: skip
 

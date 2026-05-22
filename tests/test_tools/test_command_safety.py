@@ -137,6 +137,19 @@ class TestSafeCommandAbuse:
         # `sort -o` and `uniq OUTFILE` write files — not read-only.
         assert classify_command_risk(command) == "high"
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "ip netns exec ns rm -rf /home/victim",  # ip runs arbitrary commands
+            "ip link set eth0 down",  # ip reconfigures the network
+            "ifconfig eth0 down",  # ifconfig severs the interface
+        ],
+    )
+    def test_network_reconfig_commands_are_high(self, command: str) -> None:
+        # `ip` / `ifconfig` are not read-only — `ip netns exec` is arbitrary
+        # code execution, and both can reconfigure (and sever) networking.
+        assert classify_command_risk(command) == "high"
+
 
 class TestFindExec:
     """Issue #237 — `find` is safe only without -exec / -delete."""
