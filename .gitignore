@@ -13,4 +13,5 @@ data/
 models/
 .env
 .claude/
+.gitnexus/
 20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.txt

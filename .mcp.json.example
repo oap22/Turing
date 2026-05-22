@@ -1,0 +1,9 @@
+{
+  "_comment": "Activate with: cp .mcp.json.example .mcp.json  — then restart Claude Code. Registers GitNexus as a project-scoped MCP server. Run `gitnexus analyze` once to build the .gitnexus/ index.",
+  "mcpServers": {
+    "gitnexus": {
+      "command": "npx",
+      "args": ["-y", "gitnexus@latest", "mcp"]
+    }
+  }
+}
