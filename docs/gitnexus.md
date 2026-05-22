@@ -9,20 +9,22 @@ risk (`detect_changes`).
 
 ```bash
 npm install -g gitnexus                              # requires Node LTS
-GITNEXUS_SKIP_OPTIONAL_GRAMMARS=1 gitnexus analyze   # builds the .gitnexus/ index
+GITNEXUS_SKIP_OPTIONAL_GRAMMARS=1 gitnexus analyze --skip-agents-md   # builds the .gitnexus/ index
 cp .mcp.json.example .mcp.json                       # register the MCP server (project-scoped)
 ```
 
 Restart Claude Code afterwards so it picks up `.mcp.json`.
 
 - `.gitnexus/` (the index) and `.mcp.json` are git-ignored — each developer builds locally.
-- `gitnexus analyze` also maintains a `<!-- gitnexus:start -->` block in `CLAUDE.md` and an
-  `AGENTS.md`; both are committed so the team shares the same guidance.
+- Always pass `--skip-agents-md`. Without it, `analyze` rewrites volatile symbol counts into
+  the `<!-- gitnexus:start -->` block of `CLAUDE.md` / `AGENTS.md`, producing a noisy diff on
+  every run. Those files are already committed with the guidance block — they don't need
+  per-run updates.
 
 ## Day-to-day
 
 ```bash
-gitnexus analyze                 # re-index after pulling changes (incremental)
+gitnexus analyze --skip-agents-md   # re-index after pulling changes (incremental)
 gitnexus query "<concept>"       # find execution flows
 gitnexus impact "<symbol>" --direction upstream   # what breaks if I change this
 gitnexus detect-changes          # map git diff to affected flows + risk level
