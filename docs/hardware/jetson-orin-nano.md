@@ -1,9 +1,13 @@
-# Jetson Orin Nano — Hardware Setup
+# Jetson Orin Nano — Worker Node Setup
 
 End-to-end provisioning for a single NVIDIA Jetson Orin Nano running a Turing
-node. Follow this doc once per device. Multi-node orchestration (mesh, NATS,
-peer discovery) is intentionally **out of scope** and will live in a separate
-`orchestration.md` once the new orchestrator design is settled.
+**worker** node. Follow this doc once per Jetson.
+
+The coordinator (Discord bot, Anthropic budget gate, operator UI gateway)
+runs on pi-alpha and is **out of scope** here — Jetsons are local-only
+workers. Multi-node orchestration (mesh, NATS, peer discovery) is also out
+of scope and will live in `orchestration.md` once the new orchestrator design
+is settled.
 
 ---
 
@@ -18,9 +22,8 @@ What you end up with after following this doc:
 - Python 3.11 installed via `uv` (deadsnakes has no aarch64 builds), in a per-user venv.
 - Ollama installed with GPU acceleration, `llama3.2:3b` pulled and ready.
 - ONNX `all-MiniLM-L6-v2` embedding model fetched for semantic memory.
-- The Turing agent running under `systemd`, autostarted on boot, sandboxed
-  via `bubblewrap`, mesh disabled, with a transitional Discord bot wired up
-  so you can verify the loop end-to-end.
+- The Turing worker running under `systemd`, autostarted on boot, sandboxed
+  via `bubblewrap`, mesh disabled — local-only, no Discord, no cloud LLM.
 
 ### Prerequisites
 
@@ -31,9 +34,27 @@ Before you start:
   during first-boot setup — referred to below as `allen`; substitute your
   own).
 - A GitHub account with access to `oap22/Turing`.
-- An Anthropic API key (https://console.anthropic.com).
-- A Discord account (you'll create the bot in Appendix A — *transitional*).
 - A Tailscale account (free tier is fine).
+
+### Quick start (automated)
+
+A script automates every phase below. SSH into the Jetson as the
+sudo-capable user, clone the repo to a scratch location, and run it:
+
+```bash
+git clone https://github.com/oap22/Turing.git /tmp/turing-bootstrap
+bash /tmp/turing-bootstrap/scripts/setup-jetson.sh
+```
+
+It will prompt for the hostname (e.g. `jetson-1`) and hand off to
+Tailscale and `gh auth login` for their interactive auth flows. Everything
+else — packages, `uv`, Ollama, `jtop`, the `turing` user, clone, venv,
+embedding model, `.env`, systemd — runs unattended and is idempotent
+(re-run safely).
+
+The rest of this doc is the manual walkthrough — read it once to
+understand what the script does, or follow it step-by-step if you'd
+rather not run a script blind.
 
 ### Phases
 
@@ -42,10 +63,10 @@ Before you start:
 3. Deploy the code (as `turing`)
 4. Configure `.env`
 5. Install & start the systemd service
-6. End-to-end verification with Discord
+6. Verify the worker came up cleanly
 7. Operating the node
 
-Plus two appendices: creating the Discord bot, and troubleshooting.
+Plus one appendix: troubleshooting.
 
 ---
 
@@ -123,6 +144,21 @@ Verify Ollama is up:
 systemctl status ollama         # should be active (running)
 ollama --version
 ```
+
+### 1.6 jtop (Jetson telemetry)
+
+`jtop` (from `jetson-stats`) is the standard interactive monitor for the
+Jetson — CPU/GPU/memory/thermals/power in one TUI. Handy for confirming
+GPU acceleration during model runs and for ongoing health checks.
+
+```bash
+sudo apt install -y python3-pip
+sudo pip3 install -U jetson-stats
+sudo systemctl restart jtop.service
+```
+
+You may need to log out and back in once for group membership to take
+effect. Then run `jtop` from any shell.
 
 ---
 
@@ -251,27 +287,43 @@ mkdir -p ~/turing/data
 As `turing`, in `~/turing`.
 
 ```bash
+cd ~/turing
 cp .env.example .env
+sudo apt install -y nano   # if not already installed
 nano .env
 ```
 
-Set these fields (everything else can keep its default):
+The `.env` has two categories of fields for a Jetson worker. Everything
+coordinator-related (Discord, Anthropic, gateway) stays empty — those live
+on pi-alpha.
+
+#### A. Per-device — set fresh on every Jetson
 
 ```bash
-TURING_NODE_NAME=jetson-1
-TURING_DISCORD_TOKEN=<paste from Appendix A>
-TURING_DISCORD_ADMIN_IDS=[<your Discord numeric user ID>]
-TURING_ANTHROPIC_API_KEY=sk-ant-...
+TURING_NODE_NAME=jetson-1   # must be unique across the fleet (jetson-1, jetson-2, …)
+```
+
+#### B. Shared — copy the same value to every Jetson
+
+```bash
 TURING_OLLAMA_MODEL=llama3.2:3b
 TURING_EMBEDDING_MODEL_PATH=/home/turing/turing/models/all-MiniLM-L6-v2
 TURING_DB_PATH=/home/turing/turing/data/turing.db
 TURING_ALLOWED_WRITE_PATHS=["/tmp","/home/turing/turing/data"]
 TURING_SANDBOX_ENABLED=true
-TURING_MESH_ENABLED=false
+TURING_LLM_ROUTING_MODE=local   # workers never call the cloud directly
+TURING_MESH_ENABLED=false       # leave false until the new orchestrator ships
+TURING_GATEWAY_ENABLED=false    # operator UI lives on pi-alpha only
 TURING_ENV=production
 ```
 
-Save and lock down permissions — this file holds two API tokens:
+> **Leave these empty on Jetson workers:** `TURING_DISCORD_TOKEN`,
+> `TURING_ANTHROPIC_API_KEY`, `TURING_GATEWAY_TOKEN`. They belong on
+> pi-alpha (the coordinator). Putting a Discord token on a worker fights
+> the coordinator's bot session; putting an Anthropic key on a worker
+> bypasses the single budget gate.
+
+Save and lock down permissions:
 
 ```bash
 chmod 600 ~/turing/.env
@@ -322,32 +374,34 @@ sudo journalctl -u turing -f
 ```
 
 In the logs you should see (roughly, JSON-formatted): config loaded, memory
-store initialised, embedding model loaded, both LLM providers ready, tools
-registered, sandbox enabled, **mesh disabled**, Discord bot connected.
+store initialised, embedding model loaded, Ollama provider ready, tools
+registered, sandbox enabled, **mesh disabled**, **Discord disabled**.
 
 If you see `Vector search disabled` — Phase 3.3 didn't land the files in the
-right place. See Appendix B.
+right place. See Appendix A.
 
 ---
 
-## Phase 6 — End-to-end verification (Discord)
+## Phase 6 — Verify the worker came up cleanly
 
-> Discord is the verification channel **only because the native operator
-> interface doesn't have a chat input yet**. Once it does, delete the bot
-> application and remove `TURING_DISCORD_TOKEN` from `.env`.
+A Jetson worker has no user-facing surface of its own — verification is
+log-based plus a reboot test.
 
-1. Confirm the bot shows online in your test Discord server.
-2. In any channel the bot can see, send:
+1. `sudo systemctl status turing` shows `active (running)` with no recent
+   restarts.
+2. `sudo journalctl -u turing -n 200 --no-pager` shows a clean startup:
+   config loaded, embedding model loaded, Ollama reachable, tool registry
+   populated, no tracebacks.
+3. Confirm Ollama is using the GPU:
+   ```bash
+   ollama run llama3.2:3b "say hi"
+   # In another terminal: tegrastats — GPU utilisation should spike.
    ```
-   !turing hello
-   ```
-3. Watch `journalctl -u turing -f` — you should see the message arrive,
-   context build (4 parallel retrievals), an LLM call (cloud, since tools
-   are present), and a reply written back to Discord.
-4. Reboot the Jetson (`sudo reboot`) and repeat step 2 once it's back.
-   Confirms `systemd enable` worked and Ollama comes up before Turing.
+4. Reboot the Jetson (`sudo reboot`). After it comes back, repeat step 1.
+   Confirms `systemctl enable` worked and Ollama starts before Turing.
 
-If all three pass, the node is provisioned.
+If all four pass, the worker is provisioned. End-to-end task verification
+happens from pi-alpha once orchestration is wired up.
 
 ---
 
@@ -366,58 +420,18 @@ Common commands, all from your `allen` shell.
 | Swap Ollama model | `sudo -u turing ollama pull <name>`, edit `.env`, restart |
 | Check GPU use | `tegrastats` or `nvidia-smi` |
 
-### Repeating this doc for jetsons 2 and 3
+### Repeating this doc for additional Jetsons
 
 Every step works unchanged. The only per-device differences:
 
-- Hostname in 1.1 (`jetson-2`, `jetson-3`)
+- Hostname in 1.1 (`jetson-2`, `jetson-3`, …)
 - SSH key comment in 2.3 (`jetson-2-turing`, etc.) — and add each key
   separately to GitHub so you can revoke per-device
 - `TURING_NODE_NAME` in Phase 4
 
-You do **not** need to create a second Discord bot — one bot, all three
-nodes. (When orchestration lands, only one node will actually own the bot
-session.)
-
 ---
 
-## Appendix A — Creating the Discord bot (transitional)
-
-Skip if you already have a bot token. **Delete this appendix once the native
-operator interface ships.**
-
-### A.1 Create the application
-
-1. Go to https://discord.com/developers/applications
-2. **New Application** → name it `Turing` (or anything; only you see this)
-3. Left sidebar → **Bot**
-4. Under **Privileged Gateway Intents**, enable:
-   - **MESSAGE CONTENT INTENT** (required — without this the bot sees empty
-     message bodies)
-   - **SERVER MEMBERS INTENT** (optional, useful later)
-5. Under the bot username, click **Reset Token** → **Yes** → copy the token.
-   This is your `TURING_DISCORD_TOKEN`. **You can only see it once.**
-
-### A.2 Invite the bot to a server
-
-1. Left sidebar → **OAuth2** → **URL Generator**
-2. Scopes: check **bot**
-3. Bot Permissions: check **Send Messages**, **Read Message History**,
-   **View Channels**
-4. Copy the generated URL at the bottom, open it in a browser, select a
-   server you own (create a private test server if you don't have one),
-   authorise.
-
-### A.3 Get your Discord user ID
-
-1. In Discord, **Settings → Advanced → Developer Mode: ON**
-2. Right-click your own name anywhere → **Copy User ID**
-3. That numeric string is your `TURING_DISCORD_ADMIN_IDS` entry. Wrap it in
-   the JSON list: `TURING_DISCORD_ADMIN_IDS=[123456789012345678]`.
-
----
-
-## Appendix B — Troubleshooting
+## Appendix A — Troubleshooting
 
 ### `Vector search disabled` in logs
 
@@ -449,10 +463,8 @@ sudo journalctl -u turing -n 100 --no-pager
 
 Most common causes:
 - `.env` missing or unreadable by `turing` → `ls -la /home/turing/turing/.env`
-- Missing API key → grep for `Anthropic` in the error
 - Ollama not running → `systemctl status ollama`
-- Port collision on the embedded webui gateway (only matters if you flip
-  `TURING_GATEWAY_ENABLED=true`)
+- Embedding model files in the wrong location (see the first entry above)
 
 ### Sandbox (`bubblewrap`) failures
 
@@ -465,12 +477,6 @@ bwrap --bind / / true             # should exit 0
 
 On some hardened kernels `bwrap` needs `kernel.unprivileged_userns_clone=1`.
 JetPack's default kernel is fine; only an issue if you've customised sysctl.
-
-### Discord bot is online but doesn't reply
-
-Almost always the **MESSAGE CONTENT INTENT** was not enabled in the Discord
-Developer Portal (Appendix A.1, step 4). The bot sees an empty `content`
-string, so the prefix doesn't match. Toggle it on, no code change needed.
 
 ### Tailscale name doesn't resolve
 
