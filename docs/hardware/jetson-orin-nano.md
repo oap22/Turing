@@ -205,22 +205,23 @@ dependencies, etc. all compile or download for aarch64.
 The agent uses `all-MiniLM-L6-v2` (ONNX form) for semantic memory search.
 There is no fetch script in the repo today — do it manually.
 
+Pull the two files directly with `curl` — avoids the moving target of
+`huggingface-cli` / `hf` CLI flag changes, and lands them exactly where
+the agent expects them.
+
 ```bash
-uv pip install --python ~/venv/bin/python "huggingface_hub[cli]"
 mkdir -p ~/turing/models/all-MiniLM-L6-v2
-~/venv/bin/huggingface-cli download Xenova/all-MiniLM-L6-v2 \
-    onnx/model.onnx tokenizer.json \
-    --local-dir ~/turing/models/all-MiniLM-L6-v2
-# Move model.onnx out of the onnx/ subdir into the model dir root
-mv ~/turing/models/all-MiniLM-L6-v2/onnx/model.onnx \
-   ~/turing/models/all-MiniLM-L6-v2/model.onnx
+curl -L -o ~/turing/models/all-MiniLM-L6-v2/model.onnx \
+    https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx
+curl -L -o ~/turing/models/all-MiniLM-L6-v2/tokenizer.json \
+    https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/tokenizer.json
 ```
 
-Verify both files exist:
+Verify both files exist and are non-trivial in size (model.onnx is ~90 MB):
 
 ```bash
-ls ~/turing/models/all-MiniLM-L6-v2/
-# Expected: model.onnx  tokenizer.json  onnx/
+ls -lh ~/turing/models/all-MiniLM-L6-v2/
+# Expected: model.onnx (~90M)  tokenizer.json (~700K)
 ```
 
 ### 3.4 Pull the local LLM
