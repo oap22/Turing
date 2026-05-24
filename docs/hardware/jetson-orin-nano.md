@@ -15,7 +15,7 @@ What you end up with after following this doc:
   by a stable hostname (e.g. `jetson-1`).
 - A dedicated unprivileged `turing` Linux user that owns the codebase, venv,
   data, and the running service. Not in the `sudo` group.
-- Python 3.11 from the deadsnakes PPA, in a per-user venv.
+- Python 3.11 installed via `uv` (deadsnakes has no aarch64 builds), in a per-user venv.
 - Ollama installed with GPU acceleration, `llama3.2:3b` pulled and ready.
 - ONNX `all-MiniLM-L6-v2` embedding model fetched for semantic memory.
 - The Turing agent running under `systemd`, autostarted on boot, sandboxed
@@ -76,27 +76,32 @@ at `jetson-1` (Tailscale's MagicDNS) regardless of physical network.
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-sudo apt install -y build-essential libsqlite3-dev bubblewrap curl git \
-                    software-properties-common
+sudo apt install -y build-essential libsqlite3-dev bubblewrap curl git
 ```
 
 `bubblewrap` is required for the agent's tool sandbox.
 
-### 1.4 Python 3.11 via deadsnakes
+### 1.4 Python 3.11 via `uv`
 
-JetPack 6's stock Python is 3.10; Turing requires 3.11.
+JetPack 6's stock Python is 3.10; Turing requires 3.11. The deadsnakes PPA
+does **not** publish `python3.11` for arm64/aarch64, so `apt install
+python3.11` fails on Jetson with "Unable to locate package". Use `uv`
+instead — it installs a prebuilt standalone Python 3.11 for aarch64.
+
+Install `uv` system-wide so both `allen` and `turing` can use it:
 
 ```bash
-sudo add-apt-repository -y ppa:deadsnakes/ppa
-sudo apt update
-sudo apt install -y python3.11 python3.11-venv python3.11-dev
+curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin sh
 ```
 
 Verify:
 
 ```bash
-python3.11 --version   # Python 3.11.x
+uv --version
 ```
+
+The actual Python 3.11 install happens per-user in Phase 3.2 (uv caches
+it under `~/.local/share/uv/python`).
 
 ### 1.5 Ollama (GPU-accelerated)
 
@@ -176,11 +181,17 @@ cd ~/turing
 ### 3.2 Create the venv and install Turing
 
 ```bash
-python3.11 -m venv ~/venv
+uv python install 3.11
+uv venv --python 3.11 ~/venv
 ~/venv/bin/pip install --upgrade pip wheel
 ~/venv/bin/pip install hatchling
 ~/venv/bin/pip install -e ~/turing
 ```
+
+`uv python install 3.11` downloads a prebuilt aarch64 Python 3.11 into
+`~/.local/share/uv/python` (no compilation). `uv venv` then creates a
+standard venv at `~/venv` whose `python` and `pip` work exactly like a
+`python3.11 -m venv`-created one.
 
 This takes several minutes — `onnxruntime`, `numpy`, `sentence-transformers`
 dependencies, etc. all compile or download for aarch64.
