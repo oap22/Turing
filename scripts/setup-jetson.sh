@@ -41,7 +41,9 @@ require_jetson() {
     [[ "$arch" == "aarch64" ]] || die "Not a Jetson: arch is $arch, expected aarch64."
     [[ -r /proc/device-tree/model ]] || die "Not a Jetson: /proc/device-tree/model missing."
     model="$(tr -d '\0' </proc/device-tree/model)"
-    [[ "$model" =~ [Jj]etson ]] \
+    # Jetson devices report e.g. "NVIDIA Orin Nano Developer Kit" or
+    # "NVIDIA Jetson AGX Orin". Accept any NVIDIA Tegra/Orin/Xavier/Jetson board.
+    [[ "$model" =~ ^NVIDIA && "$model" =~ ([Jj]etson|Orin|Xavier|Tegra) ]] \
         || die "Not a Jetson: device model is '$model'. This script is Jetson-only."
     echo "  detected: $model"
 }
