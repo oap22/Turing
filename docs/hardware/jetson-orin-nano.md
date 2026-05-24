@@ -76,7 +76,7 @@ at `jetson-1` (Tailscale's MagicDNS) regardless of physical network.
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-sudo apt install -y build-essential libsqlite3-dev bubblewrap curl git
+sudo apt install -y build-essential libsqlite3-dev bubblewrap curl git zstd
 ```
 
 `bubblewrap` is required for the agent's tool sandbox.
@@ -108,6 +108,10 @@ it under `~/.local/share/uv/python`).
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
 ```
+
+The installer extracts its tarball with `zstd`, so `zstd` must already be
+installed (covered in 1.3 above) — otherwise the script fails with
+"requires zstd for extraction" on Debian/Ubuntu/JetPack.
 
 The installer detects the Tegra/CUDA stack on Jetson and installs the GPU
 runtime automatically. It also creates and starts a systemd service for
@@ -182,10 +186,10 @@ cd ~/turing
 
 ```bash
 uv python install 3.11
-uv venv --python 3.11 ~/venv
-~/venv/bin/pip install --upgrade pip wheel
-~/venv/bin/pip install hatchling
-~/venv/bin/pip install -e ~/turing
+uv venv --python 3.11 --seed ~/venv
+uv pip install --python ~/venv/bin/python --upgrade pip wheel
+uv pip install --python ~/venv/bin/python hatchling
+uv pip install --python ~/venv/bin/python -e ~/turing
 ```
 
 `uv python install 3.11` downloads a prebuilt aarch64 Python 3.11 into
@@ -202,7 +206,7 @@ The agent uses `all-MiniLM-L6-v2` (ONNX form) for semantic memory search.
 There is no fetch script in the repo today — do it manually.
 
 ```bash
-~/venv/bin/pip install "huggingface_hub[cli]"
+uv pip install --python ~/venv/bin/python "huggingface_hub[cli]"
 mkdir -p ~/turing/models/all-MiniLM-L6-v2
 ~/venv/bin/huggingface-cli download Xenova/all-MiniLM-L6-v2 \
     onnx/model.onnx tokenizer.json \
@@ -356,7 +360,7 @@ Common commands, all from your `allen` shell.
 | Logs (follow) | `sudo journalctl -u turing -f` |
 | Restart | `sudo systemctl restart turing` |
 | Stop / start | `sudo systemctl stop turing` / `start` |
-| Update code | `sudo -u turing bash -c 'cd ~/turing && git pull && ~/venv/bin/pip install -e .'` then `sudo systemctl restart turing` |
+| Update code | `sudo -u turing bash -c 'cd ~/turing && git pull && uv pip install --python ~/venv/bin/python -e .'` then `sudo systemctl restart turing` |
 | Edit config | `sudo -u turing nano /home/turing/turing/.env` then restart |
 | Swap Ollama model | `sudo -u turing ollama pull <name>`, edit `.env`, restart |
 | Check GPU use | `tegrastats` or `nvidia-smi` |
