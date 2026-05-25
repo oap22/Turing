@@ -143,7 +143,20 @@ log "Phase 3.1 — GitHub authentication for the turing user"
 if ! sudo -u turing -H gh auth status >/dev/null 2>&1; then
     echo "  launching 'gh auth login' as turing."
     echo "  Choose: GitHub.com → SSH → generate a new key (title: ${HOSTNAME_NEW}-turing) → Login with web browser."
-    sudo -u turing -H gh auth login
+    echo "  Headless Jetson note: gh will try to open a browser and fail — that's fine."
+    echo "  Copy the one-time code it prints, open https://github.com/login/device on any"
+    echo "  other machine, and paste the code there. gh will detect the login and continue."
+    # Don't let a browser-open failure (xdg-open missing) kill the whole script.
+    sudo -u turing -H gh auth login || true
+    # Some users finish auth in a separate terminal — re-poll until we see a session,
+    # or give up after a short wait so the user can intervene.
+    for _ in 1 2 3 4 5 6; do
+        sudo -u turing -H gh auth status >/dev/null 2>&1 && break
+        echo "  waiting for gh auth to complete (re-checking in 10s)…"
+        sleep 10
+    done
+    sudo -u turing -H gh auth status >/dev/null 2>&1 \
+        || die "gh auth still not configured. Run 'sudo -u turing -H gh auth login' manually, then re-run this script."
     sudo -u turing -H gh auth setup-git
 else
     echo "  already authenticated, skipping"
@@ -179,7 +192,11 @@ fi
 ls -lh "$EMBEDDING_DIR"
 
 log "Phase 3.5 — Pull Ollama model ($OLLAMA_MODEL)"
-as_turing "ollama pull $OLLAMA_MODEL"
+if ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$OLLAMA_MODEL"; then
+    echo "  already pulled, skipping"
+else
+    as_turing "ollama pull $OLLAMA_MODEL"
+fi
 
 log "Phase 3.6 — Data directory"
 as_turing "mkdir -p ~/turing/data"
@@ -187,13 +204,11 @@ as_turing "mkdir -p ~/turing/data"
 # ── Phase 4: .env ────────────────────────────────────────────────────
 log "Phase 4 — Write .env (worker profile)"
 ENV_PATH=/home/turing/turing/.env
+# Keep an existing .env so re-runs don't clobber local edits (Discord tokens,
+# tweaked sandbox paths, etc.). To regenerate it, delete the file and re-run.
 if [[ -f "$ENV_PATH" ]]; then
-    if confirm "  $ENV_PATH already exists. Overwrite?"; then
-        REWRITE_ENV=1
-    else
-        REWRITE_ENV=0
-        echo "  keeping existing .env"
-    fi
+    echo "  already present, keeping (delete $ENV_PATH to regenerate)"
+    REWRITE_ENV=0
 else
     REWRITE_ENV=1
 fi
@@ -237,7 +252,9 @@ fi
 
 # ── Phase 5: systemd ─────────────────────────────────────────────────
 log "Phase 5 — Install and start the systemd service"
-sudo tee /etc/systemd/system/turing.service >/dev/null <<'SERVICE'
+UNIT_PATH=/etc/systemd/system/turing.service
+UNIT_TMP="$(mktemp)"
+cat >"$UNIT_TMP" <<'SERVICE'
 [Unit]
 Description=Turing AI Assistant (worker)
 After=network.target ollama.service
@@ -256,11 +273,24 @@ EnvironmentFile=/home/turing/turing/.env
 WantedBy=multi-user.target
 SERVICE
 
-sudo systemctl daemon-reload
-sudo systemctl enable turing
-sudo systemctl restart turing
+if [[ -f "$UNIT_PATH" ]] && sudo cmp -s "$UNIT_TMP" "$UNIT_PATH"; then
+    echo "  unit file unchanged, skipping rewrite"
+    rm -f "$UNIT_TMP"
+    UNIT_CHANGED=0
+else
+    sudo install -m 644 "$UNIT_TMP" "$UNIT_PATH"
+    rm -f "$UNIT_TMP"
+    sudo systemctl daemon-reload
+    UNIT_CHANGED=1
+fi
 
-sleep 3
+sudo systemctl enable turing >/dev/null 2>&1 || true
+if [[ "$UNIT_CHANGED" == "1" ]] || ! sudo systemctl is-active --quiet turing; then
+    sudo systemctl restart turing
+    sleep 3
+else
+    echo "  service already active, leaving it running"
+fi
 sudo systemctl status turing --no-pager || true
 
 # ── Done ─────────────────────────────────────────────────────────────
