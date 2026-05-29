@@ -6,12 +6,12 @@ Domain language and load-bearing decisions for the Turing multi-edge research cl
 
 A personal AI cluster that runs domain research overnight and grows an Obsidian vault into a smarter knowledge base over time. The target expertise area is **AI/ML** — the workers are being fine-tuned into AI/ML "mini-experts". Homogeneous edge hardware (4× Jetson Orin Nano Super, 8 GB) fronted by an always-on Surface Pro coordinator, plus pull-only access to an H100/DGX training node. Local-first by design; cloud (Claude API) reserved for hard tiers under a hard $10/day budget.
 
-The current `main` is a single-agent Discord bot with mesh hooks. The PRD (#1) reshapes it into a coordinator + worker cluster with episodes, critic, and a self-improvement pipeline. ADRs in `docs/adr/` lock the boundaries before code moves. **ADR 0009 retargets the fleet to Jetson-only + Surface/WSL2 and defines the Phase 0 human-curated research flywheel — read it alongside this file.**
+`main` is a coordinator + worker cluster with episodes, critic, and a self-improvement pipeline — the PRD (#1) reshape, landed across ADRs 0001–0010. The original single-agent Discord bot has been **retired** (ADR 0010): the webui is now the operator surface and ntfy carries closed-laptop alerts. ADRs in `docs/adr/` lock the boundaries before code moves. **ADR 0009 retargets the fleet to Jetson-only + Surface/WSL2 and defines the Phase 0 human-curated research flywheel — read it alongside this file.**
 
 ## Topology
 
-- **Coordinator** — single always-on node (**Surface Pro, 16 GB, Windows + WSL2 Ubuntu**). Owns: task lifecycle, scheduler, capability registry, planner, budget gate, vault index, Discord bot, episode store, critic queue dispatch, adapter registry. Runs **no local LLM inference** — it is orchestration + diagnostics + the operator's morning-review host. Runs in **WSL2** to preserve the Linux safety model (shell gate, deny-list, `systemd`); see ADR 0009 for the power-settings and mirrored-networking requirements.
-- **Worker** — 4× **Jetson Orin Nano Super (8 GB)**, homogeneous. Owns: executor (the agent loop), capability advertiser, tool router, low-risk tool execution. Run quantized local models (~3–8 B at Q4 within 8 GB shared memory). Workers never run Discord, never hold the shell safety gate.
+- **Coordinator** — single always-on node (**Surface Pro, 16 GB, Windows + WSL2 Ubuntu**). Owns: task lifecycle, scheduler, capability registry, planner, budget gate, vault index, gateway (webui + queue/chat API), alerts dispatcher (ntfy), episode store, critic queue dispatch, adapter registry. Runs **no local LLM inference** — it is orchestration + diagnostics + the operator's morning-review host. Runs in **WSL2** to preserve the Linux safety model (shell gate, deny-list, `systemd`); see ADR 0009 for the power-settings and mirrored-networking requirements.
+- **Worker** — 4× **Jetson Orin Nano Super (8 GB)**, homogeneous. Owns: executor (the agent loop), capability advertiser, tool router, low-risk tool execution. Run quantized local models (~3–8 B at Q4 within 8 GB shared memory). Workers never run the coordinator services (gateway, scheduler, planner), never hold the shell safety gate.
 - **Training facility** — H100/DGX. Pull-only via `turing-trainer` systemd unit subscribed to coordinator NATS. No inbound dial. Never joins runtime mesh. **The only place fine-tuning happens** (the 8 GB Jetsons cannot train).
 - **Node assignments** — Surface Pro = coordinator (the old "Surface Pro excluded" line is reversed by ADR 0009); 4× Jetson Orin Nano Super = workers; H100/DGX = pull-only trainer. **No Pis, no MacBook Pro** — both retired from the fleet.
 
@@ -25,7 +25,8 @@ The current `main` is a single-agent Discord bot with mesh hooks. The PRD (#1) r
 
 ```
 transport/          NATS client wrapper, MessageSigner, Pyre discovery shim
-coordinator/        lifecycle, scheduler, registry, planner, budget, vault index, Discord bot
+coordinator/        lifecycle, scheduler, registry, planner, budget, vault index, alerts (ntfy)
+gateway/            FastAPI webui host — queue-manager + chat panes, WS frames, alerts SPA
 worker/             executor, capability advertiser, tool router
 learning/critic/    async critic queue, Haiku calibration, drift detector (Phase 0: human morning curation; automated judge = cloud-API, deferred)
 learning/trainer/   CUDA LoRA SFT (H100/DGX), DPO entry points, dataset builder
@@ -59,7 +60,7 @@ In Phase 0 the **critic is the operator's morning curation** (see "Operator surf
 
 **The research flywheel (ADR 0009).** Seed AI/ML questions → workers draft answers grounded in fetched external sources → cloud Claude polishes the keepers → operator curates in the morning → curated (question, reasoning, answer) pairs **accumulate** with real seed/source data → H100 trains a LoRA from base each cycle → adapter pushed to workers → repeat. Guardrails are non-negotiable and literature-backed (see ADR 0009): knowledge must enter from outside the student model; **accumulate, never replace** training data; capture reasoning not just answer style; re-train from base each cycle (don't stack adapters); expect **1–3 useful rounds then re-evaluate** (the loop saturates); LoRA on all linear layers with few epochs; **eval-gate on diversity + distribution tails, not mean accuracy alone**; dedup the question frontier. Question expansion uses in-depth + in-breadth + an explicit elimination step; the frontier is **human-gated** in Phase 0, relaxed toward autonomous-with-caps only as trust grows.
 
-**Promotion gate.** Offline ≥2pp held-out improvement → `STAGED` in `AdapterRegistry`. K=1 round-robin canary worker re-runs the held-out eval at quantization; pass = `score ≥ prior_live_canary_score − 0.5pp` → fleet rollout to LIVE. Fail → permanent `REJECTED`, canary reverts, worst-failed cases written to `hard_examples` for next-cycle training, Discord notify with per-specialty regression rate.
+**Promotion gate.** Offline ≥2pp held-out improvement → `STAGED` in `AdapterRegistry`. K=1 round-robin canary worker re-runs the held-out eval at quantization; pass = `score ≥ prior_live_canary_score − 0.5pp` → fleet rollout to LIVE. Fail → permanent `REJECTED`, canary reverts, worst-failed cases written to `hard_examples` for next-cycle training; a rejection notice with the per-specialty 30-day regression rate feeds the morning-review flow and surfaces in the webui.
 
 ## Safety boundaries
 
@@ -67,7 +68,7 @@ In Phase 0 the **critic is the operator's morning curation** (see "Operator surf
 - Workers execute low-risk tools locally: `vault_query`, `workspace_io`, `web_fetch` (allowlist), specialty tools.
 - Adapters verified by SHA256 + Ed25519 signature on load. Mismatched-base or tampered adapters refused.
 - Cross-DAG outputs wrapped in `<untrusted_data>` blocks to mitigate indirect prompt injection.
-- **$10/day cloud budget**, hard cap. `BudgetGate` pre-call estimate, refusal at cap, midnight reset, fallback signal. Every Discord task reply shows remaining budget.
+- **$10/day cloud budget**, hard cap. `BudgetGate` pre-call estimate, refusal at cap, midnight reset, fallback signal. Remaining budget is surfaced through the webui (`format_remaining_budget`).
 
 ## Vault
 
