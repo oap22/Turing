@@ -67,8 +67,14 @@ log "Turing Jetson worker setup"
 echo "This will provision the current Jetson as a Turing worker node."
 echo "Coordinator-only services (Discord, Anthropic, gateway) are NOT installed."
 
-read -r -p "Hostname for this Jetson (e.g. jetson-1): " HOSTNAME_NEW
-[[ -n "$HOSTNAME_NEW" ]] || die "Hostname is required."
+# Re-runs must not re-prompt for a value that's already been set. Seed the
+# default from the current static hostname so the operator can press Enter
+# (or run unattended / piped from /dev/null) and keep what's already there.
+# `|| true` keeps `set -e` happy when stdin is closed (EOF on re-run).
+HOSTNAME_CURRENT="$(hostnamectl --static)"
+read -r -p "Hostname for this Jetson (e.g. jetson-1) [${HOSTNAME_CURRENT}]: " HOSTNAME_NEW || true
+HOSTNAME_NEW="${HOSTNAME_NEW:-$HOSTNAME_CURRENT}"
+[[ -n "$HOSTNAME_NEW" ]] || die "Hostname is required (no current hostname to fall back to)."
 NODE_NAME="$HOSTNAME_NEW"
 
 # ── Phase 1: system provisioning ─────────────────────────────────────
