@@ -365,54 +365,16 @@ async def test_ntfy_failure_isolated_from_engine() -> None:
 
 @pytest.mark.asyncio
 async def test_snooze_survives_ntfy_failure() -> None:
-    """A failed ntfy push must not clear or bypass the snooze.
+    """A raising ntfy push on a live alerting edge must not clear or corrupt
+    the snooze map or the engine's in-memory state.
 
-    The snooze is evaluated upstream in ``observe`` (before any transport
-    call), so a raising ``ntfy_push`` can never clear the snooze map or let
-    the suppressed ``alerting`` edge slip through. Here the key is snoozed,
-    the SPA is unreachable (so the fallback path is live), and the only way
-    ntfy is reached at all is the *update* frame's path — which it is not on
-    a fresh snooze. We assert: no alerting frame escapes, ntfy is never
-    pushed (snooze suppressed the edge before the transport), and the snooze
-    map still holds afterwards."""
-    ntfy = _FakeNtfy(raises=True)
-    frames: list[dict] = []
-
-    async def sink(frame: dict) -> None:
-        frames.append(frame)
-
-    dispatcher = AlertDispatcher(
-        AlertEngine(now_ms=lambda: _NOW),
-        send_frame=sink,
-        ntfy_client=ntfy,
-        reachability_clock=lambda: None,  # unreachable → fallback path is live
-    )
-
-    # Snooze TEMP on pi-beta before it ever alerts.
-    expiry = await dispatcher.snooze("pi-beta", "temp_celsius", _NOW)
-
-    # Drive into alerting. The snooze suppresses the alerting edge upstream,
-    # so neither a frame nor an ntfy push goes out — and the raising client
-    # is never even reached on this path.
-    for _ in range(5):
-        await dispatcher.observe(_peer(85.0), _NOW)
-
-    # No alerting frame escaped (snooze suppressed it).
-    assert [f for f in frames if f["field"] == "temp_celsius"] == []
-    # ntfy was not pushed — the snooze short-circuited before the transport.
-    assert ntfy.calls == []
-    # The snooze map survived the whole run, unchanged.
-    assert dispatcher.snoozed_until("pi-beta", "temp_celsius") == expiry
-
-
-@pytest.mark.asyncio
-async def test_snooze_survives_ntfy_failure_on_active_alert() -> None:
-    """A raising ntfy push on the alerting edge must not clear the snooze.
-
-    This drives the failure through the *transport* itself: the key alerts
-    first (one push attempt, which raises), then the operator snoozes the
-    active alert. The raised error is swallowed by the dispatcher and the
-    snooze map is wholly unaffected — a later heartbeat still sees the snooze."""
+    This drives the failure through the *transport* itself. The key alerts
+    while *not* snoozed, so ``observe`` reaches ``_maybe_push`` and the raising
+    ``ntfy_push`` actually fires (one attempt, which raises and is swallowed —
+    failure isolation). The operator then snoozes the active alert. We assert
+    the swallowed failure left everything intact: the snooze is recorded
+    despite the earlier raise, the engine still reads ``alerting``, and a later
+    heartbeat keeps respecting the snooze (no new push, no escaped frame)."""
     ntfy = _FakeNtfy(raises=True)
     frames: list[dict] = []
 
@@ -430,18 +392,21 @@ async def test_snooze_survives_ntfy_failure_on_active_alert() -> None:
     # swallowed (failure isolation). The engine state is now ``alerting``.
     for _ in range(3):
         await dispatcher.observe(_peer(85.0), _NOW)
-    assert len(ntfy.calls) == 1
+    assert len(ntfy.calls) == 1  # the raising push was attempted
     assert [f["state"] for f in frames] == ["alerting"]
+    assert dispatcher.engine.state_of("pi-beta", "temp_celsius").value == "alerting"
 
     # Now snooze the active alert. The snooze is recorded regardless of the
     # earlier transport failure.
     expiry = await dispatcher.snooze("pi-beta", "temp_celsius", _NOW)
+    assert dispatcher.snoozed_until("pi-beta", "temp_celsius") == expiry
 
     # The snooze map holds, and a fresh heartbeat keeps respecting it: no new
     # alerting frame, no new push (the alerting edge stays suppressed).
     for _ in range(5):
         await dispatcher.observe(_peer(85.0), _NOW)
     assert dispatcher.snoozed_until("pi-beta", "temp_celsius") == expiry
+    assert dispatcher.engine.state_of("pi-beta", "temp_celsius").value == "alerting"
     assert len(ntfy.calls) == 1  # no further push after the snooze
     # Only the original alerting + the snooze update frame exist.
     assert [f["state"] for f in frames] == ["alerting", "alerting"]

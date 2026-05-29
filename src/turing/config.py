@@ -38,6 +38,8 @@ class TuringConfig(BaseSettings):
         default="!turing",
         description="Prefix for bot commands",
     )
+    # TODO(slice D): remove with Discord teardown — dead after ADR-0010 §2
+    # swapped the closed-laptop fallback to ntfy (see operator_ntfy_topic).
     discord_operator_user_id: int | None = Field(
         default=None,
         validation_alias="TURING_OPERATOR_DISCORD_ID",
