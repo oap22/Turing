@@ -35,6 +35,13 @@ from turing.learning.trainer.sft_dataset_builder import (
     SFTExample,
     candidates_from_rows,
 )
+from turing.learning.trainer.teacher_ab import (
+    NoTeacherArmsError,
+    TeacherABHarness,
+    TeacherABReport,
+    TeacherArmResult,
+    TeacherCandidate,
+)
 from turing.learning.trainer.torch_dpo_trainer import TorchDPOTrainer
 
 __all__ = [
@@ -45,6 +52,7 @@ __all__ = [
     "DatasetReplaceError",
     "InMemoryObjectStore",
     "InboundConnectionRefusedError",
+    "NoTeacherArmsError",
     "ObjectStore",
     "PullOnlySocketGuard",
     "RealLoraTrainer",
@@ -52,6 +60,10 @@ __all__ = [
     "SFTDatasetInfo",
     "SFTExample",
     "StubTrainer",
+    "TeacherABHarness",
+    "TeacherABReport",
+    "TeacherArmResult",
+    "TeacherCandidate",
     "TorchDPOTrainer",
     "Trainer",
     "TrainerConfig",
