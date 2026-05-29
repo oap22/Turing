@@ -6,10 +6,14 @@ runs them through the engine, and on any emitted event calls ``send_frame``
 (typically the gateway's telemetry-sink broadcast).
 
 It also owns the per-``(peer, field)`` snooze map: while a key is snoozed
-the engine keeps grading but the ``alerting`` edge (and its Discord
+the engine keeps grading but the ``alerting`` edge (and its ntfy
 escalation) is suppressed — a ``cleared`` edge always goes out so a
 resolved alert still clears the banner. The snooze map is plain in-memory
 state — a coordinator restart clears every snooze, by design (PRD #228).
+
+Per ADR-0010 §2 the closed-laptop fallback transport is ntfy (self-hosted on
+the Surface coordinator), replacing the retired Discord-DM fallback; the
+trigger condition and snooze semantics are unchanged.
 """
 
 from __future__ import annotations
@@ -51,15 +55,15 @@ DEFAULT_SNOOZE_MS = 4 * 60 * 60 * 1000
 
 # SPA-reachability window. If the gateway has not pushed a frame within this
 # many ms, the SPA is treated as unreachable and the alerting edge also
-# escapes to Discord. A ``None`` last-send (no SPA has ever connected) is
+# escapes to ntfy. A ``None`` last-send (no SPA has ever connected) is
 # unreachable too — see PRD #228's bootstrap-as-unreachable decision.
 REACHABLE_WINDOW_MS = 90_000
 
 
-class DiscordClient(Protocol):
-    """Structural type for the Discord DM fallback — see ``discord_client.py``."""
+class NtfyClient(Protocol):
+    """Structural type for the ntfy push fallback — see ``ntfy_client.py``."""
 
-    async def dm_operator(self, content: str) -> None: ...
+    async def ntfy_push(self, content: str) -> None: ...
 
 
 # warn / danger threshold pair per alertable field. The engine is fed the
@@ -70,7 +74,7 @@ _THRESHOLDS: dict[Field, tuple[float, float]] = {
     "disk_pct": (DISK_WARN, DISK_DANGER),
 }
 
-# Field labels for the one-line Discord summary.
+# Field labels for the one-line ntfy summary.
 _FIELD_LABEL: dict[Field, str] = {"temp_celsius": "TEMP", "disk_pct": "DISK"}
 
 
@@ -80,7 +84,7 @@ class AlertDispatcher:
         engine: AlertEngine | None = None,
         *,
         send_frame: SendFrame | None = None,
-        discord_client: DiscordClient | None = None,
+        ntfy_client: NtfyClient | None = None,
         reachability_clock: ReachabilityClock | None = None,
     ) -> None:
         self._engine = engine or AlertEngine()
@@ -90,8 +94,8 @@ class AlertDispatcher:
         # Most recent ``alerting`` event per key, so ``snooze`` can replay
         # it as a dimming ``update`` frame without re-deriving the reading.
         self._last_alert: dict[tuple[str, Field], Alert] = {}
-        # Discord DM fallback for the closed-laptop case. ``None`` disables it.
-        self._discord_client = discord_client
+        # ntfy push fallback for the closed-laptop case. ``None`` disables it.
+        self._ntfy_client = ntfy_client
         # Returns the gateway's last successful WS push (epoch-ms), or None.
         self._reachability_clock = reachability_clock
 
@@ -144,16 +148,16 @@ class AlertDispatcher:
                 # — ``snooze`` replays it as the dimming ``update`` frame.
                 self._last_alert[key] = event
                 # A live snooze silences the ``alerting`` edge — and its
-                # Discord escalation — for this key. A ``cleared`` edge is
+                # ntfy escalation — for this key. A ``cleared`` edge is
                 # good news and is never suppressed, so the banner row
                 # always clears even while the key is snoozed.
                 if self._is_snoozed(key, now):
                     logger.debug("alert_suppressed_snoozed", node_id=peer.node_id, field=field)
                     continue
             await self._emit(event)
-            # Only the alerting edge can escape to Discord — never cleared.
+            # Only the alerting edge can escape to ntfy — never cleared.
             if event.state == "alerting":
-                await self._maybe_dm(event, now)
+                await self._maybe_push(event, now)
 
     async def snooze(
         self,
@@ -165,7 +169,7 @@ class AlertDispatcher:
         """Snooze a ``(peer, field)`` for ``duration_ms`` and return the expiry.
 
         While snoozed, ``observe`` keeps grading but suppresses the
-        ``alerting`` edge (and its Discord escalation) for the key. A
+        ``alerting`` edge (and its ntfy escalation) for the key. A
         ``cleared`` edge is never suppressed — a resolved alert always
         clears the banner row. If the key is *already* ``alerting``, one
         ``update`` frame goes out immediately (state ``alerting``, non-null
@@ -204,26 +208,28 @@ class AlertDispatcher:
         with contextlib.suppress(Exception):
             await self._send_frame(event.to_frame())
 
-    async def _maybe_dm(self, event: Alert, now_ms: int) -> None:
-        """Escalate an ``alerting`` edge to Discord when the SPA is unreachable.
+    async def _maybe_push(self, event: Alert, now_ms: int) -> None:
+        """Escalate an ``alerting`` edge to ntfy when the SPA is unreachable.
 
         The SPA counts as unreachable when there is no ``reachability_clock``,
         when the clock returns ``None`` (no SPA has ever connected — the
         bootstrap case), or when its last successful push is older than
-        ``REACHABLE_WINDOW_MS``. A ``dm_operator`` that raises is caught here
-        so a Discord failure never propagates out of ``observe``.
+        ``REACHABLE_WINDOW_MS``. An ``ntfy_push`` that raises is caught here
+        so an ntfy failure never propagates out of ``observe`` — and, crucially,
+        never clears or bypasses the snooze map (the snooze was already
+        evaluated upstream in ``observe``).
         """
-        if self._discord_client is None:
+        if self._ntfy_client is None:
             return
         if self._reachability_clock is not None:
             last_send_ms = self._reachability_clock()
             if last_send_ms is not None and now_ms - last_send_ms <= REACHABLE_WINDOW_MS:
                 return  # SPA pushed recently — it will surface the banner itself
         try:
-            await self._discord_client.dm_operator(_summarize(event))
+            await self._ntfy_client.ntfy_push(_summarize(event))
         except Exception:
             logger.warning(
-                "alert_discord_dm_failed",
+                "alert_ntfy_push_failed",
                 node_id=event.node_id,
                 field=event.field,
                 exc_info=True,
@@ -257,7 +263,7 @@ class AlertDispatcher:
 
 
 def _summarize(event: Alert) -> str:
-    """One-line operator summary for a Discord DM.
+    """One-line operator summary for an ntfy push.
 
     e.g. ``⚠ pi-beta TEMP danger: 87.4°C (>82.0°C)``.
     """
