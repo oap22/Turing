@@ -96,6 +96,18 @@ class TuringConfig(BaseSettings):
         default=Path("./models/all-MiniLM-L6-v2"),
         description="Path to the ONNX embedding model directory",
     )
+    vault_root: Path = Field(
+        default=Path("/home/turing/vault"),
+        description=(
+            "Working-tree root of the vault git repository. The vault watcher "
+            "diffs each new commit against its parent and reindexes only the "
+            "changed markdown files (ADR 0010 §4)."
+        ),
+    )
+    vault_poll_interval_seconds: float = Field(
+        default=5.0,
+        description="Seconds the vault watcher sleeps between git HEAD polls",
+    )
 
     # ── Mesh networking ──────────────────────────────────────────────────
     # Per ADR-0008, peer presence rides on the shared NATS bus

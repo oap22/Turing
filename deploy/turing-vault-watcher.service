@@ -1,0 +1,41 @@
+[Unit]
+Description=Turing vault watcher (git-commit-driven reindex of the vault vector index)
+Documentation=https://github.com/oap22/Turing
+# Runs inside WSL2 Ubuntu on the Surface coordinator, alongside
+# turing-coordinator and turing-gateway (ADR 0010 §6). On each new commit it
+# diffs against the parent and reindexes only the changed markdown files; the
+# coordinator commits on curated promotions, so the commit log is the
+# reward-signal audit trail. See docs/operator/vault-git-workflow.md.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=turing
+Group=turing
+WorkingDirectory=/var/lib/turing
+EnvironmentFile=/etc/turing/coordinator.env
+ExecStart=/usr/local/bin/turing-vault-watcher
+
+# Read-only daemon: it shells out to git and reads markdown under the vault
+# working tree (/home/turing/vault), but never writes the tree itself —
+# promotions are committed by the coordinator unit. ProtectHome=read-only so
+# the vault under /home/turing stays readable while the rest of /home is hidden.
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+NoNewPrivileges=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/turing
+
+# Per ADR 0010 §6, every coordinator unit restarts unconditionally so reboots
+# and transient git/fs hiccups self-heal.
+Restart=always
+RestartSec=10s
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Install]
+WantedBy=multi-user.target
