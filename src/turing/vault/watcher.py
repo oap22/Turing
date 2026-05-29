@@ -15,6 +15,14 @@ makes the reindex boundary exactly the operator's curation boundary (a commit).
 Single-writer invariant: the coordinator's git is the *only* writer to the
 WSL2 working tree. External Obsidian Sync of the same vault is incompatible —
 see ``docs/operator/vault-git-workflow.md``.
+
+Scope note — ADR 0010 §4 AC#3 (coordinator *auto-commits* on curated
+promotion) is intentionally **not** implemented here. This watcher is the
+read-side: it consumes whatever the git log already contains. The write-side
+(turning a curation "accept" into a vault commit) lives in the curation
+surface — Slice C (queue manager) / Slice E (chat pane) — and is deferred to
+that work. The single-writer invariant above is exactly what makes that split
+safe: only one component ever writes the working tree.
 """
 
 from __future__ import annotations
@@ -86,6 +94,20 @@ class VaultWatcher:
     def poll_once(self) -> str | None:
         """Catch the index up to ``HEAD``; return the SHA now indexed (or None).
 
+        Two catch-up regimes, both keyed off how far behind the cursor is:
+
+        * **Cold start with no cursor** (``last_indexed_sha is None``): the
+          index is empty and the working tree may carry arbitrary history (a
+          fresh clone of a repo with N commits). Index the *whole current
+          tree* in one pass by diffing the empty tree against ``HEAD`` — not
+          ``HEAD^..HEAD``, which would index only the newest commit's files
+          and leave every older note unindexed.
+        * **Advance from a known cursor**: ``HEAD`` may have jumped several
+          commits (a ``git pull`` landing a batch). Replay *every* commit in
+          ``last_indexed..HEAD`` in author order so no intermediate commit's
+          changes are dropped — applying only ``HEAD``'s parent-diff would
+          skip the files touched solely by the intervening commits.
+
         If ``HEAD`` is unchanged since the last applied commit this is a no-op
         and returns the unchanged SHA. On an empty repository (no commits yet)
         it returns ``None`` without touching the index.
@@ -95,7 +117,17 @@ class VaultWatcher:
             return self._last_indexed_sha
         if head == self._last_indexed_sha:
             return head
-        self.reindex_commit(head)
+
+        if self._last_indexed_sha is None:
+            # Cold start: snapshot the entire tree at HEAD in a single diff.
+            self._apply(self._diff_against(_EMPTY_TREE, head))
+            self._last_indexed_sha = head
+            return head
+
+        # Cursor advanced (possibly by more than one commit). Replay each
+        # commit's parent-diff in order so a batch fetch indexes every commit.
+        for sha in self._commits_between(self._last_indexed_sha, head):
+            self.reindex_commit(sha)
         return head
 
     def reindex_commit(self, sha: str) -> CommitDiff:
@@ -160,6 +192,23 @@ class VaultWatcher:
         )
         return result.returncode == 0 and bool(result.stdout.strip())
 
+    def _commits_between(self, base: str, head: str) -> list[str]:
+        """List commit SHAs in ``base..head``, oldest first.
+
+        ``git rev-list --reverse base..head`` excludes ``base`` itself and
+        yields the new commits in apply order, so a multi-commit advance
+        (e.g. a ``git pull`` that fast-forwards several commits) is replayed
+        commit-by-commit rather than collapsing to a single ``HEAD`` diff.
+        """
+        result = subprocess.run(
+            ["git", "rev-list", "--reverse", f"{base}..{head}"],
+            cwd=self._root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return [line for line in result.stdout.splitlines() if line]
+
     def _diff_against_parent(self, sha: str) -> CommitDiff:
         """Parse ``git diff --name-status`` for one commit into a CommitDiff.
 
@@ -168,12 +217,19 @@ class VaultWatcher:
         with spaces or unicode survive intact; renames/copies emit a third NUL
         field (the new path) which we read explicitly.
         """
-        if self._has_parent(sha):
-            range_args = [f"{sha}^", sha]
-        else:
-            range_args = [_EMPTY_TREE, sha]
+        base = f"{sha}^" if self._has_parent(sha) else _EMPTY_TREE
+        return self._diff_against(base, sha)
+
+    def _diff_against(self, base: str, head: str) -> CommitDiff:
+        """Parse ``git diff --name-status base head`` into a :class:`CommitDiff`.
+
+        ``-z`` gives NUL-delimited records so paths with spaces or unicode
+        survive intact; renames/copies emit a third NUL field (the new path)
+        which the parser reads explicitly. Diffing :data:`_EMPTY_TREE` against
+        a commit yields its whole tree as additions — the cold-start path.
+        """
         result = subprocess.run(
-            ["git", "diff", "--name-status", "-z", *range_args],
+            ["git", "diff", "--name-status", "-z", base, head],
             cwd=self._root,
             capture_output=True,
             text=True,

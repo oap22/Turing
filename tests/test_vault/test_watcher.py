@@ -264,6 +264,106 @@ def test_poll_once_applies_only_the_newest_commit_delta(
     assert set(index.snapshot()) == {"notes/a.md", "notes/b.md"}
 
 
+# ── cold start with pre-existing history ─────────────────────────────────────
+
+
+def test_cold_start_with_history_indexes_whole_tree(repo: Path, index: VaultIndex) -> None:
+    """A fresh watcher on a clone that already has multiple commits must index
+    the ENTIRE current tree on the first poll — not just the newest commit's
+    changed files.
+
+    This is the clone case: someone `git clone`s a vault with history, then the
+    watcher starts cold (`last_indexed_sha is None`). Crucially this test does
+    NOT poll per-commit while building the history — it commits a multi-commit
+    history first, THEN starts the watcher and polls exactly once. A
+    per-commit-poll test would mask the bug because the index would have been
+    populated incrementally as each commit landed.
+    """
+    # Build several commits' worth of history with the watcher absent.
+    _write(repo, "notes/python.md", "python async tips")
+    _commit_all(repo, "first")
+    _write(repo, "notes/cooking.md", "roast vegetables")
+    _commit_all(repo, "second")
+    _write(repo, "notes/python.md", "python async tips updated")
+    _write(repo, "notes/travel.md", "kyoto in autumn")
+    head = _commit_all(repo, "third")
+
+    # Watcher starts cold, with no recorded cursor — exactly a fresh clone.
+    watcher = VaultWatcher(vault_root=repo, index=index)
+    indexed = watcher.poll_once()
+
+    assert indexed == head
+    # All three notes that exist at HEAD are indexed, including the one only
+    # touched in the first commit (cooking was added in commit 2, python in 1).
+    assert set(index.snapshot()) == {
+        "notes/python.md",
+        "notes/cooking.md",
+        "notes/travel.md",
+    }
+    # And the indexed text reflects HEAD, not whatever an intermediate commit held.
+    assert index.snapshot()["notes/python.md"] == "python async tips updated"
+
+
+# ── batched (multi-commit) advance ───────────────────────────────────────────
+
+
+def test_multi_commit_advance_indexes_all_changed_files(
+    repo: Path, index: VaultIndex, watcher: VaultWatcher
+) -> None:
+    """When HEAD jumps several commits at once (a `git pull` landing a batch),
+    a single poll must reindex EVERY commit's changes across the batch — not
+    just HEAD^..HEAD, which would drop every intermediate commit's files.
+
+    The watcher is caught up to the first commit, then THREE more commits land
+    before the next poll. The test polls exactly once after the batch (no
+    per-commit polling in between), which is what surfaces the bug.
+    """
+    _write(repo, "notes/a.md", "alpha")
+    watcher.poll_once()  # cursor now at commit 1
+
+    # Three commits land before the next poll (simulating a pull/fetch batch).
+    _write(repo, "notes/b.md", "bravo")  # added in commit 2
+    _commit_all(repo, "second")
+    _write(repo, "notes/c.md", "charlie")  # added in commit 3
+    (repo / "notes" / "a.md").unlink()  # a.md deleted in commit 3
+    _commit_all(repo, "third")
+    _write(repo, "notes/d.md", "delta")  # added in commit 4
+    _write(repo, "notes/b.md", "bravo edited")  # b.md modified in commit 4
+    head = _commit_all(repo, "fourth")
+
+    indexed = watcher.poll_once()
+
+    assert indexed == head
+    # b/c/d all present (each added in a different intermediate commit),
+    # a removed (deleted mid-batch). HEAD^..HEAD alone would have indexed only
+    # d.md + the b.md edit and missed c.md entirely.
+    snap = index.snapshot()
+    assert set(snap) == {"notes/b.md", "notes/c.md", "notes/d.md"}
+    assert snap["notes/b.md"] == "bravo edited"  # final state across the batch
+
+
+def test_multi_commit_advance_from_resumed_cursor(repo: Path) -> None:
+    """Same batch-advance guarantee starting from a persisted cursor (restart):
+    a watcher resumed at an old SHA replays every commit up to HEAD on one poll.
+    """
+    _write(repo, "notes/a.md", "alpha")
+    first = _commit_all(repo, "first")
+    _write(repo, "notes/b.md", "bravo")
+    _commit_all(repo, "second")
+    _write(repo, "notes/c.md", "charlie")
+    head = _commit_all(repo, "third")
+
+    index = VaultIndex(embedder=DeterministicHashEmbedder(dims=32))
+    watcher = VaultWatcher(vault_root=repo, index=index, last_indexed_sha=first)
+
+    indexed = watcher.poll_once()
+
+    assert indexed == head
+    # b.md (commit 2) and c.md (commit 3) both land; a.md was already past the
+    # cursor so it is not replayed but also not present (resumed past it).
+    assert set(index.snapshot()) == {"notes/b.md", "notes/c.md"}
+
+
 # ── empty repository ───────────────────────────────────────────────────────
 
 
