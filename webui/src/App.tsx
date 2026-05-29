@@ -9,16 +9,30 @@ import {
 import type { AlertFrame } from "./alerts/types";
 import CallGraphCanvas from "./CallGraphCanvas";
 import { emptyState, markStale, reduce, type Frame } from "./graph/reducer";
+import QueuePane from "./queue/QueuePane";
+import {
+  applyQueueFrame,
+  emptyQueue,
+  listQueue,
+  type QueueState,
+} from "./queue/reducer";
 import SpecsGrid from "./specs/SpecsGrid";
 import type { PeerSpecsRow } from "./specs/types";
 import TracePane from "./trace/TracePane";
 import type { TraceEvent } from "./trace/types";
-import { connectGatewayWS } from "./ws";
+import { connectGatewayWS, type QueueFrame } from "./ws";
 
 type AlertAction = { kind: "frame"; frame: AlertFrame };
 
 function alertsReducer(state: AlertsState, action: AlertAction): AlertsState {
   if (action.kind === "frame") return applyAlert(state, action.frame);
+  return state;
+}
+
+type QueueReducerAction = { kind: "frame"; frame: QueueFrame };
+
+function queueReducer(state: QueueState, action: QueueReducerAction): QueueState {
+  if (action.kind === "frame") return applyQueueFrame(state, action.frame);
   return state;
 }
 
@@ -33,6 +47,8 @@ export default function App() {
   );
   const [alertsState, alertsDispatch] = useReducer(alertsReducer, emptyAlerts());
   const alerts = useMemo(() => listAlerts(alertsState), [alertsState]);
+  const [queueState, queueDispatch] = useReducer(queueReducer, emptyQueue());
+  const queueItems = useMemo(() => listQueue(queueState), [queueState]);
   const [debugFrames, setDebugFrames] = useState<Frame[]>([]);
   const [liveTrace, setLiveTrace] = useState<TraceEvent[]>([]);
   const [highlightedEdge, setHighlightedEdge] = useState<string | null>(null);
@@ -44,7 +60,13 @@ export default function App() {
     const stop = connectGatewayWS<Frame>({
       url: window.location.origin.replace(/^http/, "ws") + "/ws",
       onFrame: (frame) => {
-        if ((frame as { type?: string }).type === "alert") {
+        const frameType = (frame as { type?: string }).type;
+        if (frameType === "queue.snapshot" || frameType === "queue.delta") {
+          queueDispatch({ kind: "frame", frame: frame as unknown as QueueFrame });
+          setDebugFrames((prev) => [...prev.slice(-499), frame]);
+          return;
+        }
+        if (frameType === "alert") {
           alertsDispatch({ kind: "frame", frame: frame as unknown as AlertFrame });
           setDebugFrames((prev) => [...prev.slice(-499), frame]);
           return;
@@ -151,6 +173,9 @@ export default function App() {
           press ` to toggle debug stream
         </span>
       </header>
+      <section className="h-[42%] min-h-[260px] border-b border-neutral-800">
+        <QueuePane items={queueItems} />
+      </section>
       <main className="flex flex-1 overflow-hidden">
         <section className="flex flex-1 flex-col border-r border-neutral-800">
           <div className="flex-1 overflow-hidden">
