@@ -50,11 +50,21 @@ from turing.learning.trainer.teacher_ab import (
     TeacherArmResult,
     TeacherCandidate,
 )
+from turing.learning.trainer.teacher_ab_budget import (
+    AllTeachersOverBudgetError,
+    BudgetedTeacher,
+    BudgetedTeacherAB,
+    BudgetedTeacherABReport,
+)
 from turing.learning.trainer.torch_dpo_trainer import TorchDPOTrainer
 
 __all__ = [
     "ALL_LINEAR_TARGET_MODULES",
     "MAX_USEFUL_ROUNDS",
+    "AllTeachersOverBudgetError",
+    "BudgetedTeacher",
+    "BudgetedTeacherAB",
+    "BudgetedTeacherABReport",
     "CudaLoraTrainer",
     "DPODatasetBuilder",
     "DPODatasetInfo",
