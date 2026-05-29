@@ -207,6 +207,7 @@ async def _run(config: TuringConfig) -> None:
         import time as _time
 
         from turing.coordinator.episode_rewards import EpisodeRewardsStore
+        from turing.gateway.chat_manager import ChatManager
         from turing.gateway.queue_manager import QueueManager
         from turing.gateway.service import GatewayService
 
@@ -216,9 +217,19 @@ async def _run(config: TuringConfig) -> None:
         # magnitudes identical to the Discord path. Frame fan-out rides the
         # telemetry sink, the same path alert frames use.
         rewards_store = EpisodeRewardsStore()
+        _gateway_broadcast = telemetry_sink._broadcast if telemetry_sink is not None else None
         queue_manager = QueueManager(
             rewards=rewards_store,
-            broadcast=(telemetry_sink._broadcast if telemetry_sink is not None else None),
+            broadcast=_gateway_broadcast,
+            now_ms=lambda: int(_time.time() * 1000),
+        )
+        # The chat pane is the secondary, ad-hoc surface (ADR 0010 §1, Slice E).
+        # It REUSES Slice C's reward emitter: ChatManager shares the same
+        # rewards_store and delegates per-subtask thumbs to a QueueManager, so a
+        # chat thumb is byte-identical to a queue curation in episode_rewards.
+        chat_manager = ChatManager(
+            rewards=rewards_store,
+            broadcast=_gateway_broadcast,
             now_ms=lambda: int(_time.time() * 1000),
         )
 
@@ -231,6 +242,7 @@ async def _run(config: TuringConfig) -> None:
             telemetry_sink=telemetry_sink,
             alert_dispatcher=alert_dispatcher,
             queue_manager=queue_manager,
+            chat_manager=chat_manager,
         )
         await gateway.start()
 

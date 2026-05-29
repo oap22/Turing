@@ -15,6 +15,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import type { QueueItem } from "../../ws";
 import QueuePane from "../QueuePane";
+import { REWARD_DECISION_CASES } from "./rewardDecisionCases";
 
 afterEach(cleanup);
 
@@ -43,13 +44,8 @@ function item(overrides: Partial<QueueItem> = {}): QueueItem {
 describe("QueuePane reward-decision surface", () => {
   // The reward sign each operator decision writes, paired with the Tailwind
   // accent the curated card must carry — the visible echo of the magnitude.
-  const cases = [
-    { decision: "accept" as const, sign: "+1.0", accent: /emerald/ },
-    { decision: "reject" as const, sign: "-1.0", accent: /rose/ },
-    { decision: "edit" as const, sign: "+0.3", accent: /amber/ },
-  ];
-
-  for (const { decision, sign, accent } of cases) {
+  // Shared with the chat pane's reward surface via `rewardDecisionCases`.
+  for (const { decision, sign, accent } of REWARD_DECISION_CASES) {
     it(`records ${decision} (${sign}) on the curated card with its accent`, () => {
       render(
         <QueuePane

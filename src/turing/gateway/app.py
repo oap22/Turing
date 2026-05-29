@@ -26,6 +26,10 @@ from starlette.staticfiles import StaticFiles
 
 from turing.coordinator.alerts.types import KNOWN_FIELDS
 from turing.gateway.auth import COOKIE_NAME, GatewayAuth
+from turing.gateway.chat_manager import (
+    ChatSessionNotFoundError,
+    ChatSubtaskNotFoundError,
+)
 from turing.gateway.queue_manager import QueueItemNotFoundError
 from turing.mesh.node import is_specs_stale
 
@@ -34,6 +38,7 @@ if TYPE_CHECKING:
 
     from turing.coordinator.alerts.dispatcher import AlertDispatcher
     from turing.coordinator.alerts.types import Field
+    from turing.gateway.chat_manager import ChatManager
     from turing.gateway.queue_manager import QueueManager
     from turing.gateway.ring_buffer import RingBuffer
     from turing.gateway.telemetry_sink import TelemetrySink
@@ -84,6 +89,7 @@ def create_app(
     telemetry_sink: TelemetrySink | None = None,
     alert_dispatcher: AlertDispatcher | None = None,
     queue_manager: QueueManager | None = None,
+    chat_manager: ChatManager | None = None,
 ) -> FastAPI:
     app = FastAPI(title="turing-gateway")
     app.state.start_time = time.monotonic()
@@ -91,6 +97,7 @@ def create_app(
     app.state.telemetry_sink = telemetry_sink
     app.state.alert_dispatcher = alert_dispatcher
     app.state.queue_manager = queue_manager
+    app.state.chat_manager = chat_manager
     app.add_middleware(_BearerMiddleware, auth=auth)  # type: ignore[arg-type]
 
     # Wire the dispatcher's frame fan-out through the telemetry sink so a
@@ -280,6 +287,75 @@ def create_app(
             raise HTTPException(status_code=404, detail="unknown queue item") from exc
         return item.to_frame()
 
+    # ── Chat pane (ADR 0010 Slice E) ─────────────────────────────────────────
+    #
+    # The webui's secondary, ad-hoc work-direction surface. The operator submits
+    # a free-form prompt; the coordinator plans a DAG; subtasks stream back into
+    # the same thread; per-subtask thumbs write ``episode_rewards`` REUSING Slice
+    # C's emitter (the ChatManager delegates to a QueueManager over the shared
+    # store — no new reward path). Like the queue routes, every mutation fans a
+    # ``chat.delta`` out through the telemetry sink; all routes are bearer-gated;
+    # an unknown session/subtask 404s; a missing manager 503s.
+
+    def _require_chat() -> ChatManager:
+        if chat_manager is None:
+            raise HTTPException(status_code=503, detail="chat manager not enabled")
+        return chat_manager
+
+    @app.get("/api/chat")
+    async def get_chat() -> dict:
+        """Full chat-session snapshot for initial paint (WS layers deltas on top)."""
+        return _require_chat().snapshot_frame()
+
+    @app.post("/api/chat/submit")
+    async def submit_chat(
+        prompt: str = Body(..., embed=True),
+        session_id: str | None = Body(default=None, embed=True),
+        specialty: str = Body(default="research", embed=True),
+    ) -> dict:
+        """Open an ad-hoc chat thread for ``prompt``.
+
+        The coordinator plans the DAG and streams subtasks back over the WS;
+        this endpoint just records the thread and returns its session. A
+        client-supplied ``session_id`` makes the submit idempotent on retry;
+        absent one, the gateway mints a time-based id.
+        """
+        chat = _require_chat()
+        sid = session_id or f"chat-{int(time.time() * 1000)}"
+        session = await chat.submit(session_id=sid, prompt=prompt, specialty=specialty)
+        return session.to_frame()
+
+    @app.post("/api/chat/{session_id}/{subtask_id}/accept")
+    async def accept_subtask(session_id: str, subtask_id: str) -> dict:
+        """Thumb-up a streamed subtask: +1.0 reward to its episode."""
+        try:
+            subtask = await _require_chat().accept(session_id, subtask_id)
+        except (ChatSessionNotFoundError, ChatSubtaskNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail="unknown chat subtask") from exc
+        return subtask.to_frame()
+
+    @app.post("/api/chat/{session_id}/{subtask_id}/reject")
+    async def reject_subtask(session_id: str, subtask_id: str) -> dict:
+        """Thumb-down a streamed subtask: −1.0 reward to its episode."""
+        try:
+            subtask = await _require_chat().reject(session_id, subtask_id)
+        except (ChatSessionNotFoundError, ChatSubtaskNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail="unknown chat subtask") from exc
+        return subtask.to_frame()
+
+    @app.post("/api/chat/{session_id}/{subtask_id}/edit")
+    async def edit_subtask(
+        session_id: str, subtask_id: str, corrected_answer: str = Body(..., embed=True)
+    ) -> dict:
+        """Edit a streamed subtask: capture the correction; +0.3 partial reward."""
+        try:
+            subtask = await _require_chat().edit(
+                session_id, subtask_id, corrected_answer=corrected_answer
+            )
+        except (ChatSessionNotFoundError, ChatSubtaskNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail="unknown chat subtask") from exc
+        return subtask.to_frame()
+
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:
         if not auth.check(
@@ -298,6 +374,11 @@ def create_app(
         # and then layers live ``queue.delta`` frames on top.
         if queue_manager is not None:
             await websocket.send_text(json.dumps(queue_manager.snapshot_frame()))
+
+        # Same contract for the chat pane (Slice E): a ``chat.snapshot`` on
+        # connect, then live ``chat.delta`` frames over the shared fan-out.
+        if chat_manager is not None:
+            await websocket.send_text(json.dumps(chat_manager.snapshot_frame()))
 
         # Subscribe to the shared fan-out so alert frames (and any future
         # sink-driven frames) reach this client. Telemetry frames already
