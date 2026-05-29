@@ -1,0 +1,36 @@
+# turing-coordinator.service — the live coordinator workload (ADR-0010 §6).
+#
+# This is the primary of the three turing-* units on the Surface/WSL2
+# coordinator. It runs `python -m turing`, which on the coordinator carries the
+# agent loop, scheduler, planner, budget gate, and the alerts dispatcher (and,
+# because .env.coordinator sets TURING_GATEWAY_ENABLED=true, the in-process
+# webui gateway today — the standalone turing-gateway split lands with the
+# gateway-only entrypoint in a later slice; see turing-gateway.service).
+#
+# Installed/started by scripts/setup-coordinator.sh Phase 7. Restart=always so
+# it rides through Windows Update reboots (ADR-0010 §7). It is the ONLY unit
+# that fires a cold-start ntfy push (ExecStartPost below) so a reboot is
+# observable without three duplicate notifications.
+
+[Unit]
+Description=Turing coordinator (agent loop, scheduler, planner, budget gate, alerts)
+After=network-online.target nats-server.service ntfy.service tailscaled.service
+Wants=network-online.target nats-server.service ntfy.service
+
+[Service]
+Type=simple
+User=turing
+WorkingDirectory=/home/turing/turing
+ExecStart=/home/turing/venv/bin/python -m turing
+# Cold-start observability (ADR-0010 §6): one best-effort ntfy push on (re)start.
+# Reads TURING_COORDINATOR_NTFY_BASE_URL + TURING_OPERATOR_NTFY_TOPIC from the
+# EnvironmentFile below; a no-op (curl skipped) if either is unset, matching
+# NtfyAlertClient's config gate. Never blocks or fails the unit (- prefix + the
+# guard), so a missing/closed ntfy can't wedge the coordinator on boot.
+ExecStartPost=-/bin/sh -c 'test -n "$TURING_COORDINATOR_NTFY_BASE_URL" && test -n "$TURING_OPERATOR_NTFY_TOPIC" && curl -fsS -m 10 -d "coordinator back online ($(hostname)) at $(date -Is)" "${TURING_COORDINATOR_NTFY_BASE_URL%/}/${TURING_OPERATOR_NTFY_TOPIC}" >/dev/null || true'
+Restart=always
+RestartSec=10
+EnvironmentFile=/home/turing/turing/.env.coordinator
+
+[Install]
+WantedBy=multi-user.target
