@@ -21,7 +21,9 @@
 # Two operator hand-offs Phase 5 produces (FIRST run only):
 #   • 4 worker NATS seeds + the coordinator NATS URL are PRINTED ONCE for you to
 #     paste into each Jetson's .env (TURING_NATS_NKEY_SEED / TURING_NATS_URL).
-#     They are not re-printed on re-run — capture them when they appear.
+#     They are not re-printed on re-run, but are kept (root, 0600) as a recovery
+#     safety net under /etc/turing/nats/workers/ — capture them when they appear,
+#     and shred that dir once every Jetson is provisioned.
 #
 # Everything else is automated.
 
@@ -296,6 +298,31 @@ else
    the cold-start ntfy ping also TURING_COORDINATOR_NTFY_BASE_URL + TURING_OPERATOR_NTFY_TOPIC."
 fi
 
+log "Phase 4.2 — Coordinator role flags → .env.coordinator"
+# `python -m turing` (turing-coordinator.service) conditionally starts the mesh
+# node, the alerts dispatcher, and the in-process webui gateway off these two
+# flags (src/turing/__main__.py steps 6/8/8b). Without them the coordinator
+# boots the agent loop alone — no NATS peer presence, no ntfy alert fan-out, no
+# webui — and the turing-gateway.service in-process gateway the docs advertise
+# never actually serves. They live in the bootstrap for production, but a hand
+# -staged bootstrap may omit them, so set the coordinator's defaults here.
+# (The alerts dispatcher has no separate flag — it activates whenever mesh is on
+#  and presence connects; see __main__.py step 8.)
+# Idempotent: rewrite an existing line, else append. The file is turing-owned
+# 0600, so edit it as turing. Never downgrade a value the operator set to true.
+set_coord_flag() {
+    # $1 = key, $2 = value to ensure when the key is absent
+    local key="$1" value="$2"
+    if as_turing "grep -q '^${key}=' '$ENV_COORDINATOR'" 2>/dev/null; then
+        echo "  ${key} already set, keeping operator's value"
+    else
+        as_turing "printf '%s=%s\n' '$key' '$value' >> '$ENV_COORDINATOR'"
+        echo "  appended ${key}=${value}"
+    fi
+}
+set_coord_flag TURING_MESH_ENABLED true
+set_coord_flag TURING_GATEWAY_ENABLED true
+
 # ── Phase 5: NATS nkey auth + TLS, LAN-only ──────────────────────────
 # First run only: generate 5 user nkey pairs (1 coordinator + 4 worker), store
 # the coordinator seed under /etc/turing/nats/ (root, 0600), bake the worker
@@ -303,11 +330,20 @@ fi
 # coordinator NATS URL once for manual paste into each Jetson's .env
 # (ADR 0010 §5/§9). Re-runs detect the existing coordinator key and skip
 # generation entirely — seeds are never regenerated or re-printed.
+#
+# SEED-DURABILITY ORDERING (recon #3): $COORD_SEED_FILE is BOTH the
+# coordinator's seed AND the re-run sentinel (the `sudo test -f` guard below).
+# It is therefore written LAST — only after the worker seeds are persisted
+# durably under $WORKER_SEED_DIR, the TLS cert is minted, nats-server.conf is
+# rendered, and the coordinator seed/URL are in .env.coordinator. If any of
+# those steps fails, the sentinel is still absent, so a re-run re-generates and
+# re-prints rather than tripping the guard with the worker seeds already lost.
 log "Phase 5.1 — NATS key material directory"
 sudo mkdir -p -m 755 "$NATS_ETC_DIR"
 
 COORD_SEED_FILE="$NATS_ETC_DIR/coordinator.seed"
 COORD_PUB_FILE="$NATS_ETC_DIR/coordinator.nkey"          # public key (U...)
+WORKER_SEED_DIR="$NATS_ETC_DIR/workers"                  # durable worker-seed safety net
 NATS_TLS_CERT="$NATS_ETC_DIR/nats-server.crt"
 NATS_TLS_KEY="$NATS_ETC_DIR/nats-server.key"
 
@@ -341,23 +377,33 @@ else
     fi
     nk -version 2>/dev/null || nk --version 2>/dev/null || true
 
-    # Generate the coordinator pair into the protected dir, then derive its
+    # Generate the coordinator pair into a TEMP seed file (NOT the sentinel
+    # path yet — see the durability note in the Phase 5 header). Derive its
     # public key from the seed. umask 077 keeps every seed 0600 from birth.
     echo "  generating coordinator + ${WORKER_COUNT} worker nkey pairs"
     sudo install -d -m 700 "$NATS_ETC_DIR"
-    sudo bash -c "umask 077 && nk -gen user > '$COORD_SEED_FILE'"
-    sudo bash -c "nk -inkey '$COORD_SEED_FILE' -pubout > '$COORD_PUB_FILE'"
-    sudo chmod 600 "$COORD_SEED_FILE"
+    COORD_SEED_TMP="$NATS_ETC_DIR/.coordinator.seed.tmp"
+    sudo bash -c "umask 077 && nk -gen user > '$COORD_SEED_TMP'"
+    sudo bash -c "nk -inkey '$COORD_SEED_TMP' -pubout > '$COORD_PUB_FILE'"
+    sudo chmod 600 "$COORD_SEED_TMP"
     sudo chmod 644 "$COORD_PUB_FILE"
     COORD_PUB="$(sudo cat "$COORD_PUB_FILE")"
+    COORD_SEED="$(sudo cat "$COORD_SEED_TMP")"
 
     # Worker pairs: keep public keys for the server config; collect seeds to
-    # print once. Worker seeds are NOT persisted on the coordinator — they live
-    # only on the matching Jetson once pasted, minimising blast radius here.
+    # print once. Worker seeds are persisted durably under $WORKER_SEED_DIR
+    # (root, 0600) BEFORE the sentinel is written, so an interrupted run never
+    # strands them — a re-run that finds the sentinel absent regenerates and
+    # re-prints. They still never leave the coordinator's protected dir; the
+    # operator pastes them onto each Jetson and may shred the dir afterwards.
+    sudo install -d -m 700 "$WORKER_SEED_DIR"
     WORKER_PUBS=()
     WORKER_SEEDS=()
-    for _ in $(seq 1 "$WORKER_COUNT"); do
-        wseed="$(sudo bash -c 'umask 077 && nk -gen user')"
+    for n in $(seq 1 "$WORKER_COUNT"); do
+        wseed_file="$WORKER_SEED_DIR/worker-${n}.seed"
+        sudo bash -c "umask 077 && nk -gen user > '$wseed_file'"
+        sudo chmod 600 "$wseed_file"
+        wseed="$(sudo cat "$wseed_file")"
         wpub="$(printf '%s\n' "$wseed" | sudo nk -inkey /dev/stdin -pubout)"
         WORKER_PUBS+=("$wpub")
         WORKER_SEEDS+=("$wseed")
@@ -368,9 +414,15 @@ else
     # in a Tailscale-issued cert later — the config path stays the same.
     if ! sudo test -f "$NATS_TLS_CERT"; then
         echo "  minting self-signed TLS cert for nats-server (CN=$NATS_HOST)"
+        # subjectAltName is required: modern TLS clients (the workers' NATS
+        # client) verify the hostname against the SAN, not the CN, so a cert
+        # without it fails the handshake (ADR 0010 §5 "TLS + nkey from day one").
+        # Cover the Tailnet DNS name workers dial plus loopback for local checks.
         sudo openssl req -x509 -newkey rsa:2048 -nodes \
             -keyout "$NATS_TLS_KEY" -out "$NATS_TLS_CERT" \
-            -days 3650 -subj "/CN=${NATS_HOST}" >/dev/null 2>&1 \
+            -days 3650 -subj "/CN=${NATS_HOST}" \
+            -addext "subjectAltName=DNS:${NATS_HOST},DNS:localhost,IP:127.0.0.1" \
+            >/dev/null 2>&1 \
             || die "openssl cert generation failed (is openssl installed?)."
         sudo chmod 600 "$NATS_TLS_KEY"
         sudo chmod 644 "$NATS_TLS_CERT"
@@ -384,9 +436,11 @@ else
     {
         echo "# nats-server.conf — generated by setup-coordinator.sh (ADR 0010 §5)."
         echo "# LAN-only (listen on the Tailnet/loopback interface), TLS + nkey auth."
-        echo "# Worker access is by PUBLIC nkey; the matching seed lives only on the"
-        echo "# Jetson it was pasted into. Regenerate by deleting $COORD_SEED_FILE and"
-        echo "# re-running setup-coordinator.sh (this re-issues ALL seeds)."
+        echo "# Worker access is by PUBLIC nkey; the matching seeds are pasted onto each"
+        echo "# Jetson and kept (root, 0600) as a recovery safety net under"
+        echo "# $WORKER_SEED_DIR (shred it once every worker is provisioned)."
+        echo "# Regenerate by deleting $COORD_SEED_FILE and re-running"
+        echo "# setup-coordinator.sh (this re-issues ALL seeds)."
         echo "listen: \"0.0.0.0:${NATS_PORT}\""
         echo ""
         echo "tls {"
@@ -411,9 +465,32 @@ else
     sudo systemctl enable nats-server >/dev/null 2>&1 || true
     sudo systemctl restart nats-server || warn "nats-server failed to start — check: sudo journalctl -u nats-server -n50"
 
-    # Print the operator hand-off ONCE. This is the only time these seeds exist
-    # in plaintext on a terminal; capture them now.
-    log "Phase 5.4 — WORKER NATS SEEDS (paste into each Jetson .env — shown ONCE)"
+    # Phase 5.3b — coordinator's OWN seed + URL → .env.coordinator. Without
+    # these, `python -m turing` reads config.nats_nkey_seed=None / the localhost
+    # default URL and cannot authenticate to its own bus when TURING_MESH_ENABLED
+    # is on (Phase 4.2) — mesh presence + the alerts dispatcher silently degrade
+    # to singleton. Same idempotent rewrite-or-append the vault path uses; the
+    # file is turing-owned 0600, so edit it as turing.
+    log "Phase 5.3b — Coordinator NATS seed + URL → .env.coordinator"
+    if as_turing "grep -q '^TURING_NATS_NKEY_SEED=' '$ENV_COORDINATOR'" 2>/dev/null; then
+        as_turing "sed -i 's#^TURING_NATS_NKEY_SEED=.*#TURING_NATS_NKEY_SEED=$COORD_SEED#' '$ENV_COORDINATOR'"
+        echo "  updated TURING_NATS_NKEY_SEED"
+    else
+        as_turing "printf 'TURING_NATS_NKEY_SEED=%s\n' '$COORD_SEED' >> '$ENV_COORDINATOR'"
+        echo "  appended TURING_NATS_NKEY_SEED"
+    fi
+    if as_turing "grep -q '^TURING_NATS_URL=' '$ENV_COORDINATOR'" 2>/dev/null; then
+        as_turing "sed -i 's#^TURING_NATS_URL=.*#TURING_NATS_URL=$NATS_URL#' '$ENV_COORDINATOR'"
+        echo "  updated TURING_NATS_URL=$NATS_URL"
+    else
+        as_turing "printf 'TURING_NATS_URL=%s\n' '$NATS_URL' >> '$ENV_COORDINATOR'"
+        echo "  appended TURING_NATS_URL=$NATS_URL"
+    fi
+
+    # Print the operator hand-off. The worker seeds are already durable under
+    # $WORKER_SEED_DIR (so this print is recoverable if the terminal scrolls),
+    # but the print is still the primary capture surface — paste them now.
+    log "Phase 5.4 — WORKER NATS SEEDS (paste into each Jetson .env)"
     cat <<EOF
 
   Coordinator NATS URL (paste as TURING_NATS_URL on every worker):
@@ -423,12 +500,25 @@ EOF
     for idx in "${!WORKER_SEEDS[@]}"; do
         printf '  worker %d  TURING_NATS_NKEY_SEED=%s\n' "$((idx + 1))" "${WORKER_SEEDS[$idx]}"
     done
-    cat <<'EOF'
+    cat <<EOF
 
   On each Jetson set BOTH fields in /home/turing/turing/.env (setup-jetson.sh
   Phase 4, slice H), then restart the worker:  sudo systemctl restart turing
-  These seeds are NOT stored on the coordinator and will NOT be re-printed.
+  Safety net: these seeds are also saved (root, 0600) under
+    ${WORKER_SEED_DIR}/worker-N.seed
+  Re-run does NOT re-print them; recover from that dir if you missed a paste,
+  then shred it once every Jetson is provisioned:  sudo rm -rf ${WORKER_SEED_DIR}
 EOF
+
+    # Phase 5.5 — commit the sentinel LAST. Every durable artifact above (worker
+    # seeds, TLS cert, nats-server.conf, coordinator seed/URL in .env) now
+    # exists, so promoting the temp coordinator seed to its final path is the
+    # single atomic step that arms the re-run guard. A failure before here
+    # leaves the sentinel absent → a re-run regenerates cleanly (recon #3).
+    log "Phase 5.5 — Commit coordinator seed sentinel (arms the re-run guard)"
+    sudo mv "$COORD_SEED_TMP" "$COORD_SEED_FILE"
+    sudo chmod 600 "$COORD_SEED_FILE"
+    echo "  $COORD_SEED_FILE written — re-runs now skip key generation"
 fi
 
 # ── Phase 6: vault git repo + watcher path ───────────────────────────
