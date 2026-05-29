@@ -14,7 +14,6 @@ authors = [
 ]
 
 dependencies = [
-    "discord.py>=2.7.1",
     "anthropic>=0.102.0",
     "ollama>=0.4",
     "aiosqlite>=0.20",
@@ -49,6 +48,7 @@ dev = [
 [project.scripts]
 turing = "turing.__main__:main"
 turing-ui = "turing.launcher:main"
+turing-vault-watcher = "turing.vault.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/turing"]

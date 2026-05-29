@@ -18,10 +18,10 @@ class TestDefaults:
     def test_default_node_name(self, mock_config: TuringConfig) -> None:
         assert mock_config.node_name == "test-node"
 
-    def test_default_command_prefix(self) -> None:
+    def test_default_admin_user_ids_empty(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
             cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
-        assert cfg.discord_command_prefix == "!turing"
+        assert cfg.admin_user_ids == []
 
     def test_default_ollama_host(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
@@ -96,11 +96,6 @@ class TestEnvOverrides:
             cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.node_name == "custom-node"
 
-    def test_discord_token_override(self) -> None:
-        with patch.dict("os.environ", {"TURING_DISCORD_TOKEN": "tok-abc"}, clear=True):
-            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
-        assert cfg.discord_token == "tok-abc"
-
     def test_anthropic_key_override(self) -> None:
         with patch.dict("os.environ", {"TURING_ANTHROPIC_API_KEY": "sk-test"}, clear=True):
             cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
@@ -127,14 +122,14 @@ class TestEnvOverrides:
         assert cfg.env == "production"
         assert cfg.is_production is True
 
-    def test_admin_ids_override(self) -> None:
+    def test_admin_user_ids_override(self) -> None:
         with patch.dict(
             "os.environ",
-            {"TURING_DISCORD_ADMIN_IDS": "[123, 456]"},
+            {"TURING_ADMIN_USER_IDS": '["123", "456"]'},
             clear=True,
         ):
             cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
-        assert cfg.discord_admin_ids == [123, 456]
+        assert cfg.admin_user_ids == ["123", "456"]
 
     def test_allowed_write_paths_override(self) -> None:
         with patch.dict(
@@ -144,6 +139,24 @@ class TestEnvOverrides:
         ):
             cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.allowed_write_paths == ["/var/data", "/opt/out"]
+
+
+class TestOperatorNtfyTopic:
+    """The ntfy closed-laptop alert fallback topic (ADR-0010 §2)."""
+
+    def test_default_is_none(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.operator_ntfy_topic is None
+
+    def test_set_via_env_alias(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"TURING_OPERATOR_NTFY_TOPIC": "turing-alerts-allen"},
+            clear=True,
+        ):
+            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.operator_ntfy_topic == "turing-alerts-allen"
 
 
 class TestNodeIdAutoGeneration:

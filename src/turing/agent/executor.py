@@ -12,7 +12,6 @@ from turing.tools.base import ToolResult
 
 if TYPE_CHECKING:
     from turing.agent.safety import SafetyGate
-    from turing.discord_bot.bot import TuringBot
     from turing.llm.base import ToolCall
     from turing.tools.base import ToolRegistry
 
@@ -26,11 +25,9 @@ class Executor:
         self,
         tool_registry: ToolRegistry,
         safety_gate: SafetyGate,
-        bot: TuringBot | None = None,
     ) -> None:
         self.tool_registry = tool_registry
         self.safety_gate = safety_gate
-        self.bot = bot
 
     async def execute_tool_call(
         self,
@@ -43,7 +40,9 @@ class Executor:
         Flow:
         1. Safety gate check
         2. If DENIED: return error ToolResult
-        3. If NEEDS_CONFIRMATION: send Discord confirmation view, wait for result
+        3. If NEEDS_CONFIRMATION: deny by default (fail-safe). The interactive
+           confirmation surface moved off Discord with ADR 0010; the webui chat
+           pane will reintroduce an approval affordance in a follow-on slice.
         4. If APPROVED: execute tool, audit log, return result
         """
         tool_name = tool_call.name
@@ -85,32 +84,29 @@ class Executor:
             )
 
         # Step 3: Handle NEEDS_CONFIRMATION
+        # The Discord button confirmation flow was retired with ADR 0010. Until
+        # the webui chat pane reintroduces an approval affordance, an action
+        # requiring confirmation is denied by default — the same fail-safe the
+        # old path took when no surface could solicit a decision.
         if safety_result.decision == SafetyDecision.NEEDS_CONFIRMATION:
-            confirmed = await self._request_confirmation(
-                tool_name=tool_name,
-                arguments=arguments,
-                user_id=user_id,
-                channel_id=channel_id,
+            logger.info(
+                "executor.tool_confirmation_unavailable",
+                tool=tool_name,
                 reason=safety_result.reason,
             )
-            if not confirmed:
-                logger.info(
-                    "executor.tool_confirmation_denied",
-                    tool=tool_name,
-                )
-                await self._log_action(
-                    user_id=user_id,
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    result="User denied confirmation",
-                    risk_level=safety_result.risk_level,
-                    approved=False,
-                )
-                return ToolResult(
-                    success=False,
-                    output="",
-                    error="Action was not confirmed by user.",
-                )
+            await self._log_action(
+                user_id=user_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                result="Confirmation surface unavailable; denied by default",
+                risk_level=safety_result.risk_level,
+                approved=False,
+            )
+            return ToolResult(
+                success=False,
+                output="",
+                error="Action requires confirmation but no operator surface is available.",
+            )
 
         # Step 4: Execute the tool
         start_time = time.monotonic()
@@ -163,62 +159,6 @@ class Executor:
             result = await self.execute_tool_call(tc, user_id, channel_id)
             results.append((tc, result))
         return results
-
-    async def _request_confirmation(
-        self,
-        tool_name: str,
-        arguments: dict[str, Any],
-        user_id: str,
-        channel_id: str,
-        reason: str,
-    ) -> bool:
-        """Request confirmation from the user via Discord.
-
-        If no bot is available or the channel cannot be found, the action is
-        denied by default.
-        """
-        if self.bot is None:
-            logger.warning("executor.no_bot_for_confirmation", tool=tool_name)
-            return False
-
-        try:
-            # Build a description of the action
-            args_summary = ", ".join(f"{k}={v!r}" for k, v in list(arguments.items())[:5])
-            action_desc = f"{tool_name}({args_summary})"
-            if len(action_desc) > 200:
-                action_desc = action_desc[:197] + "..."
-
-            from turing.discord_bot.views import ConfirmActionView
-
-            view = ConfirmActionView(
-                action_description=action_desc,
-                authorized_user_id=int(user_id),
-                timeout=60.0,
-            )
-
-            # Find the channel and send the confirmation
-            channel = self.bot.get_channel(int(channel_id))
-            if channel is None:
-                logger.warning(
-                    "executor.channel_not_found",
-                    channel_id=channel_id,
-                )
-                return False
-
-            await channel.send(  # type: ignore[union-attr]
-                f"**Confirmation required**: {reason}\nAction: `{action_desc}`",
-                view=view,
-            )
-
-            return await view.wait_for_result()
-
-        except Exception as exc:
-            logger.error(
-                "executor.confirmation_error",
-                error=str(exc),
-                tool=tool_name,
-            )
-            return False
 
     async def _log_action(
         self,

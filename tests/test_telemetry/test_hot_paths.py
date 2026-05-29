@@ -78,7 +78,7 @@ class TestSafetyGateTraced:
         captured: list[TelemetryEvent] = []
         tel.add_sink(captured.append)
 
-        config = MagicMock(discord_admin_ids=[])
+        config = MagicMock(admin_user_ids=[])
         gate = SafetyGate(config=config)
         await gate.check(
             tool_name="shell",

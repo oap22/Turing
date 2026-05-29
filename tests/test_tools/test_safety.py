@@ -13,7 +13,7 @@ from turing.agent.safety import SafetyDecision, SafetyGate
 def config():
     """Create a mock config."""
     cfg = MagicMock()
-    cfg.discord_admin_ids = [12345, 67890]
+    cfg.admin_user_ids = [12345, 67890]
     cfg.sandbox_enabled = False
     cfg.allowed_write_paths = ["/tmp"]
     return cfg
@@ -145,7 +145,7 @@ class TestAdminOverride:
 
     async def test_admin_shell_approved(self, safety_gate: SafetyGate):
         """Test that admins can execute high-risk shell commands."""
-        # 12345 is in the discord_admin_ids list.
+        # 12345 is in the admin_user_ids list.
         result = await safety_gate.check("shell", {"command": "apt install vim"}, "12345")
         assert result.decision == SafetyDecision.APPROVED
 

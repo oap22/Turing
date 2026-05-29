@@ -194,9 +194,13 @@ class SafetyGate:
         return "high"
 
     def _is_admin(self, user_id: str) -> bool:
-        """Check whether the user is an admin."""
-        admin_ids = getattr(self.config, "discord_admin_ids", [])
-        # discord_admin_ids may be list[int] or list[str]; compare as strings.
+        """Check whether the user is an admin.
+
+        Admins come from the surface-agnostic ``admin_user_ids`` config list
+        (ADR 0010 retired the Discord-specific admin list). Entries may be
+        ``int`` or ``str``; comparison is done as strings.
+        """
+        admin_ids = getattr(self.config, "admin_user_ids", [])
         return str(user_id) in [str(aid) for aid in admin_ids]
 
     async def log_action(

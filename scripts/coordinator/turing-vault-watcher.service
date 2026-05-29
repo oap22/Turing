@@ -1,0 +1,34 @@
+# turing-vault-watcher.service — git/fs watcher + vector index (ADR-0010 §6).
+#
+# Third unit of the coordinator process layout. Watches the vault git repo at
+# /home/turing/vault (cloned + configured by setup-coordinator.sh Phase 6),
+# diffs the last commit, and reindexes changed files into the vector store
+# (ADR-0010 §4). The "diff last commit, reindex changed files" implementation
+# is slice I; its dedicated entrypoint (`python -m turing.worker.vault_watcher`)
+# is not on PATH yet.
+#
+# Installed/enabled/started now per ADR-0010 §6 (three units, each
+# Restart=always) as a guarded wrapper: it execs the watcher entrypoint when it
+# exists, and until then holds as a clean long-running no-op (logging once why)
+# so the unit is genuinely active without crash-looping a missing module. It
+# does NOT fire the cold-start ntfy push (only the coordinator unit does).
+
+[Unit]
+Description=Turing vault watcher (git/fs watch + vector index)
+After=network-online.target turing-coordinator.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=turing
+WorkingDirectory=/home/turing/turing
+# Run the dedicated vault-watcher entrypoint if/when it lands (slice I);
+# otherwise hold as a clean no-op so Restart=always doesn't crash-loop. The
+# probe is a plain file-existence test on the module file (no import).
+ExecStart=/bin/sh -c 'if /home/turing/venv/bin/python -c "import turing.worker,os,sys; sys.exit(0 if os.path.exists(os.path.join(os.path.dirname(turing.worker.__file__),\"vault_watcher.py\")) else 1)" 2>/dev/null; then exec /home/turing/venv/bin/python -m turing.worker.vault_watcher; else echo "turing-vault-watcher: dedicated entrypoint not present yet (vault watcher impl is slice I); holding. Activates when the watcher lands."; exec sleep infinity; fi'
+Restart=always
+RestartSec=10
+EnvironmentFile=/home/turing/turing/.env.coordinator
+
+[Install]
+WantedBy=multi-user.target

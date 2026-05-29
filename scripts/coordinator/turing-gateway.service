@@ -1,0 +1,36 @@
+# turing-gateway.service — webui static + WebSocket + chat/queue API (ADR-0010 §6).
+#
+# Part of the three-unit coordinator process layout. The gateway currently runs
+# IN-PROCESS inside turing-coordinator.service (TURING_GATEWAY_ENABLED=true in
+# .env.coordinator), so a dedicated standalone gateway entrypoint is not on PATH
+# yet — the gateway/coordinator process split is follow-on work (the webui
+# chat-pane slice E + a `python -m turing.gateway` entrypoint).
+#
+# To honour ADR-0010 §6 — three units, each Restart=always, installed and
+# enabled now — this unit is installed/enabled/started by Phase 7 as a guarded
+# wrapper: it execs the dedicated gateway entrypoint the moment it exists, and
+# until then holds as a clean long-running no-op (logging once why) so the unit
+# is genuinely active without crash-looping a missing module or starting a
+# second full agent. It does NOT fire the cold-start ntfy push (only the
+# coordinator unit does).
+
+[Unit]
+Description=Turing gateway (webui static + WebSocket + chat/queue API)
+After=network-online.target turing-coordinator.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=turing
+WorkingDirectory=/home/turing/turing
+# Run the dedicated gateway entrypoint if/when it lands; otherwise hold as a
+# clean no-op so Restart=always doesn't crash-loop and the coordinator's
+# in-process gateway keeps serving the webui in the meantime. The probe is a
+# plain file-existence test on the module's __main__.py (no heavyweight import).
+ExecStart=/bin/sh -c 'if /home/turing/venv/bin/python -c "import turing.gateway,os,sys; sys.exit(0 if os.path.exists(os.path.join(os.path.dirname(turing.gateway.__file__),\"__main__.py\")) else 1)" 2>/dev/null; then exec /home/turing/venv/bin/python -m turing.gateway; else echo "turing-gateway: dedicated entrypoint not present yet (gateway runs in-process under turing-coordinator); holding. Activates when the gateway split lands."; exec sleep infinity; fi'
+Restart=always
+RestartSec=10
+EnvironmentFile=/home/turing/turing/.env.coordinator
+
+[Install]
+WantedBy=multi-user.target

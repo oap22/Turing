@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 __all__ = [
+    "CommitDiff",
     "DeterministicHashEmbedder",
     "Embedder",
     "InvalidFrontmatterError",
@@ -16,6 +17,7 @@ __all__ = [
     "VaultHit",
     "VaultIndex",
     "VaultProposer",
+    "VaultWatcher",
 ]
 
 
@@ -28,6 +30,10 @@ def __getattr__(name: str) -> Any:
         from turing.vault import index
 
         return getattr(index, name)
+    if name in ("CommitDiff", "VaultWatcher"):
+        from turing.vault import watcher
+
+        return getattr(watcher, name)
     if name in (
         "InvalidFrontmatterError",
         "InvalidProposalPathError",

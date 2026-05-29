@@ -34,7 +34,7 @@ def _make_config() -> MagicMock:
     config.mesh_enabled = False
     config.learning_auto_extract = False
     config.learning_extract_interval = 100
-    config.discord_admin_ids = [42]
+    config.admin_user_ids = [42]
     config.sandbox_enabled = False
     config.sandbox_timeout = 30
     config.allowed_write_paths = ["/tmp"]

@@ -150,28 +150,23 @@ async def _run(config: TuringConfig) -> None:
     )
     agent.executor = executor
 
-    # 8. Discord Bot
-    from turing.discord_bot.bot import TuringBot
-
-    bot = TuringBot(config, agent=agent, mesh_node=mesh_node, memory_store=memory_store)
-    # Give executor reference to bot for confirmation views
-    executor.bot = bot
-
-    # 8b. Hardware-safety alerts (PRD #228) — build the alert dispatcher and
-    # wire it into mesh presence + the gateway. Built here, after the bot
-    # exists, so the Discord DM fallback can reach a live bot.
+    # 8. Hardware-safety alerts (PRD #228) — build the alert dispatcher and
+    # wire it into mesh presence + the gateway. Per ADR-0010 §2 the closed-laptop
+    # fallback transport is ntfy (self-hosted on the Surface coordinator),
+    # replacing the retired Discord-DM fallback.
     alert_dispatcher: AlertDispatcher | None = None
     telemetry_sink: TelemetrySink | None = None
     alerts_ring_buffer: RingBuffer | None = None
     if config.mesh_enabled and presence is not None:
-        from turing.coordinator.alerts.discord_client import DiscordAlertClient
         from turing.coordinator.alerts.dispatcher import AlertDispatcher, ReachabilityClock
+        from turing.coordinator.alerts.ntfy_client import NtfyAlertClient
 
-        discord_client = DiscordAlertClient(bot, config.discord_operator_user_id)
-        if config.discord_operator_user_id is None:
+        ntfy_client = NtfyAlertClient(config.coordinator_ntfy_base_url, config.operator_ntfy_topic)
+        if config.operator_ntfy_topic is None or config.coordinator_ntfy_base_url is None:
             logger.warning(
-                "alerts.discord_fallback_disabled",
-                msg="TURING_OPERATOR_DISCORD_ID unset; hardware-safety alert DMs disabled",
+                "alerts.ntfy_fallback_disabled",
+                msg="TURING_OPERATOR_NTFY_TOPIC / TURING_COORDINATOR_NTFY_BASE_URL unset; "
+                "hardware-safety alert pushes disabled",
             )
         reachability_clock: ReachabilityClock | None = None
         if config.gateway_enabled:
@@ -196,15 +191,42 @@ async def _run(config: TuringConfig) -> None:
 
             reachability_clock = _spa_last_send
         alert_dispatcher = AlertDispatcher(
-            discord_client=discord_client,
+            ntfy_client=ntfy_client,
             reachability_clock=reachability_clock,
         )
         presence.set_alert_dispatcher(alert_dispatcher)
 
-    # 8c. Operator UI gateway (pi-alpha only)
+    # 8b. Operator UI gateway (pi-alpha only)
     gateway = None
     if config.gateway_enabled:
+        import time as _time
+
+        from turing.coordinator.episode_rewards import EpisodeRewardsStore
+        from turing.gateway.chat_manager import ChatManager
+        from turing.gateway.queue_manager import QueueManager
         from turing.gateway.service import GatewayService
+
+        # The webui question-queue manager is the primary work-direction
+        # surface (ADR 0010 §1) that replaces the retired Discord task bot. Its
+        # curation decisions write to the shared episode-rewards store with
+        # magnitudes identical to the Discord path. Frame fan-out rides the
+        # telemetry sink, the same path alert frames use.
+        rewards_store = EpisodeRewardsStore()
+        _gateway_broadcast = telemetry_sink._broadcast if telemetry_sink is not None else None
+        queue_manager = QueueManager(
+            rewards=rewards_store,
+            broadcast=_gateway_broadcast,
+            now_ms=lambda: int(_time.time() * 1000),
+        )
+        # The chat pane is the secondary, ad-hoc surface (ADR 0010 §1, Slice E).
+        # It REUSES Slice C's reward emitter: ChatManager shares the same
+        # rewards_store and delegates per-subtask thumbs to a QueueManager, so a
+        # chat thumb is byte-identical to a queue curation in episode_rewards.
+        chat_manager = ChatManager(
+            rewards=rewards_store,
+            broadcast=_gateway_broadcast,
+            now_ms=lambda: int(_time.time() * 1000),
+        )
 
         gateway = GatewayService(
             token=config.gateway_token,
@@ -214,6 +236,8 @@ async def _run(config: TuringConfig) -> None:
             mesh_node=mesh_node,
             telemetry_sink=telemetry_sink,
             alert_dispatcher=alert_dispatcher,
+            queue_manager=queue_manager,
+            chat_manager=chat_manager,
         )
         await gateway.start()
 
@@ -231,17 +255,11 @@ async def _run(config: TuringConfig) -> None:
         loop.add_signal_handler(sig, _signal_handler)
 
     try:
-        bot_task = asyncio.create_task(bot.start_bot())
-        shutdown_task = asyncio.create_task(shutdown_event.wait())
-
-        _done, pending = await asyncio.wait(
-            [bot_task, shutdown_task],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        # Cancel remaining tasks
-        for task in pending:
-            task.cancel()
+        # The coordinator/gateway/mesh run as long-lived background services
+        # (ADR 0010 §6). With the Discord task bot retired there is no
+        # foreground client to await — the process stays up until a signal
+        # sets the shutdown event.
+        await shutdown_event.wait()
     finally:
         # Cleanup
         logger.info("turing.shutting_down")
@@ -258,8 +276,6 @@ async def _run(config: TuringConfig) -> None:
         if mesh_node:
             await mesh_node.stop()
         await memory_store.close()
-        if not bot.is_closed():
-            await bot.close()
         logger.info("turing.stopped")
 
 

@@ -15,7 +15,6 @@ from turing.telemetry import traced
 if TYPE_CHECKING:
     from turing.agent.safety import SafetyGate
     from turing.config import TuringConfig
-    from turing.discord_bot.bot import TuringBot
     from turing.llm.router import LLMRouter
     from turing.memory.retriever import MemoryRetriever
     from turing.memory.store import MemoryStore
@@ -62,7 +61,6 @@ class Agent:
         safety_gate: SafetyGate,
         mesh_node: MeshNode | None = None,
         plugin_registry: PluginRegistry | None = None,
-        bot: TuringBot | None = None,
     ) -> None:
         self.config = config
         self.llm_router = llm_router
@@ -72,7 +70,7 @@ class Agent:
         self.safety_gate = safety_gate
         self.mesh_node = mesh_node
         self.plugin_registry = plugin_registry
-        self.executor = Executor(tool_registry, safety_gate, bot)
+        self.executor = Executor(tool_registry, safety_gate)
         self._interaction_count = 0
         self._background_tasks: set[asyncio.Task] = set()
 

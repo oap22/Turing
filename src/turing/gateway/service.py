@@ -20,6 +20,8 @@ if TYPE_CHECKING:
     import uvicorn
 
     from turing.coordinator.alerts.dispatcher import AlertDispatcher
+    from turing.gateway.chat_manager import ChatManager
+    from turing.gateway.queue_manager import QueueManager
     from turing.gateway.telemetry_sink import TelemetrySink
     from turing.mesh.node import MeshNode
 
@@ -37,6 +39,8 @@ class GatewayService:
         mesh_node: MeshNode | None = None,
         telemetry_sink: TelemetrySink | None = None,
         alert_dispatcher: AlertDispatcher | None = None,
+        queue_manager: QueueManager | None = None,
+        chat_manager: ChatManager | None = None,
     ) -> None:
         self._token = token
         self._bind = bind
@@ -45,6 +49,8 @@ class GatewayService:
         self._mesh_node = mesh_node
         self._telemetry_sink = telemetry_sink
         self._alert_dispatcher = alert_dispatcher
+        self._queue_manager = queue_manager
+        self._chat_manager = chat_manager
         self._task: asyncio.Task | None = None
         self._server: uvicorn.Server | None = None
 
@@ -71,6 +77,8 @@ class GatewayService:
             mesh_node=self._mesh_node,
             telemetry_sink=self._telemetry_sink,
             alert_dispatcher=self._alert_dispatcher,
+            queue_manager=self._queue_manager,
+            chat_manager=self._chat_manager,
         )
         config = uvicorn.Config(
             app,
