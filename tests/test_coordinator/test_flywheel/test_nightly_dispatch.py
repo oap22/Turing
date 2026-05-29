@@ -10,7 +10,11 @@ import json
 
 import pytest
 
-from turing.coordinator.dispatch import SubtaskDispatchClient, TaskResult
+from turing.coordinator.dispatch import (
+    SubtaskDispatchClient,
+    SubtaskTimeoutError,
+    TaskResult,
+)
 from turing.coordinator.flywheel import (
     NightlyDispatcher,
     QuestionQueue,
@@ -192,24 +196,34 @@ async def test_each_closed_subtask_writes_an_episode(transports) -> None:
     assert queue.get("q1").dispatched_at_ms is not None
 
 
-@pytest.mark.asyncio
-async def test_timeout_records_failed_episode_and_marks_dispatched(transports) -> None:
-    _, coord, _worker = transports  # no worker subscribes → dispatch times out
+class _TimeoutClient:
+    """Stub dispatch client whose every dispatch times out.
 
+    Drives the dispatcher's timeout path deterministically — relying on a real
+    0.05s wall-clock bus timeout is fragile under a loaded event loop when other
+    async tests run first.
+    """
+
+    now_ms = staticmethod(lambda: 0)
+
+    async def dispatch(self, envelope, *, worker_id=None, deadline_ms, grace_s=30.0):
+        raise SubtaskTimeoutError("forced timeout for test")
+
+
+@pytest.mark.asyncio
+async def test_timeout_records_failed_episode_and_marks_dispatched() -> None:
     queue = QuestionQueue()
     queue.add(ResearchQuestion("q-dead", "unanswerable in time", SPECIALTY, created_at_ms=1))
     queue.approve("q-dead")
 
     episodes = EpisodeStore()
-    now = lambda: 1_700_000_000_000  # noqa: E731  fixed clock → deadline already past
-    client = SubtaskDispatchClient(transport=coord, sender_id="coordinator", now_ms=now)
     dispatcher = NightlyDispatcher(
         queue=queue,
-        dispatch_client=client,
+        dispatch_client=_TimeoutClient(),
         episode_store=episodes,
         registry=_registry("w1"),
-        now_ms=now,
-        deadline_ms=0,  # deadline == now → tiny grace inside the client
+        now_ms=_now_ms_factory(),
+        deadline_ms=0,
         grace_s=0.05,
     )
 
