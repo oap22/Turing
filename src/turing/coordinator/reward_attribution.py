@@ -1,8 +1,10 @@
-"""Reward attribution from Discord thumbs feedback (slice 15/26, #17).
+"""Reward attribution from operator thumbs feedback (slice 15/26, #17).
 
-Three pure functions that map a feedback event to a list of
-:class:`RewardAssignment` rows. The caller (a Discord cog or background
-task) is responsible for persisting these into the episode store.
+Three pure, source-agnostic functions that map a feedback event to a list of
+:class:`RewardAssignment` rows. The caller (the webui queue/chat reward
+emitter or a background task) is responsible for persisting these into the
+episode store. ADR 0010 moved the input surface off Discord; the attribution
+logic is unchanged.
 
 Routing rules (PRD lifecycle, story 4):
 

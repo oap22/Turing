@@ -22,7 +22,7 @@ def _make_mock_config() -> MagicMock:
     config.mesh_enabled = False
     config.learning_auto_extract = False
     config.learning_extract_interval = 5
-    config.discord_admin_ids = []
+    config.admin_user_ids = []
     return config
 
 

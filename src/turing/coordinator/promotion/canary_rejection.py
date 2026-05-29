@@ -1,12 +1,13 @@
-"""Canary REJECTED side-effects: hard-examples writeback + Discord notify.
+"""Canary REJECTED side-effects: hard-examples writeback + rejection notice.
 
 Issue #118 follow-up. Wires `CanaryGateRunner.on_rejected` to:
 
   * `archive_failed_training` — convert each failed_case from the worker's
     eval payload into a `HardExample` row + post the existing notifier
     summary (one-liner from `hard_examples.py`).
-  * A formatted multi-line Discord message body for the live-DAG channel
-    so the operator sees the regression context at a glance.
+  * A formatted multi-line rejection notice (regression context at a glance).
+    ADR 0010 retired the Discord live-DAG channel; the notice is logged for
+    the morning-review flow and will surface in the webui in a follow-on slice.
 
 The 30-day regression-rate count is read from a `RejectionLog` — a tiny
 stateful sidecar so the runner doesn't have to inflate `AdapterRegistry`
@@ -18,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import structlog
+
 from turing.coordinator.promotion.hard_examples import (
     archive_failed_training,
 )
@@ -28,6 +31,8 @@ if TYPE_CHECKING:
     from turing.coordinator.lifecycle.episode_store import EpisodeStore
     from turing.coordinator.promotion.canary_gate_runner import CanaryGateOutcome
     from turing.coordinator.promotion.hard_examples import _Notifier
+
+logger = structlog.get_logger("turing.coordinator.promotion.canary_rejection")
 
 REGRESSION_HORIZON_MS = 30 * 24 * 60 * 60 * 1000
 
@@ -69,7 +74,7 @@ def format_rejection_notice(
     prior_version: str | None,
     regressions_30d: int,
 ) -> str:
-    """ADR 0007 §3 message body for the live-DAG channel."""
+    """ADR 0007 §3 rejection-notice body (logged for morning review)."""
     delta = f"{outcome.delta_pp:+.2f}pp" if outcome.delta_pp is not None else "n/a"
     canary_score = f"{outcome.score:.2f}" if outcome.score is not None else "n/a"
     prior_score = "n/a"
@@ -90,7 +95,6 @@ def make_canary_rejected_handler(
     episode_store: EpisodeStore,
     rejection_log: RejectionLog,
     notifier: _Notifier,
-    discord_post: Callable[[str], Awaitable[None]] | None,
     now_ms: Callable[[], int],
 ) -> Callable[[CanaryGateOutcome, str, str, str], Awaitable[None]]:
     """Return a coroutine matching `CanaryGateRunner.on_rejected` signature."""
@@ -113,19 +117,21 @@ def make_canary_rejected_handler(
                 notifier=notifier,
             )
 
-        if discord_post is not None:
-            count = rejection_log.count_within(
-                specialty=specialty, now_ms=ts, horizon_ms=REGRESSION_HORIZON_MS
-            )
-            body = format_rejection_notice(
-                name=name,
-                version=version,
-                specialty=specialty,
-                outcome=outcome,
-                prior_name=None,
-                prior_version=None,
-                regressions_30d=count,
-            )
-            await discord_post(body)
+        # ADR 0010 retired the Discord live-DAG channel; the rejection notice
+        # is logged for the morning-review flow and will surface in the webui
+        # in a follow-on slice.
+        count = rejection_log.count_within(
+            specialty=specialty, now_ms=ts, horizon_ms=REGRESSION_HORIZON_MS
+        )
+        body = format_rejection_notice(
+            name=name,
+            version=version,
+            specialty=specialty,
+            outcome=outcome,
+            prior_name=None,
+            prior_version=None,
+            regressions_30d=count,
+        )
+        logger.info("canary.rejected_notice", name=name, version=version, body=body)
 
     return on_rejected

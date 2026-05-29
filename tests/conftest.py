@@ -69,7 +69,6 @@ def mock_config(tmp_path: Path) -> TuringConfig:
         {
             "TURING_NODE_NAME": "test-node",
             "TURING_NODE_ID": "00000000-0000-0000-0000-000000000001",
-            "TURING_DISCORD_TOKEN": "test-discord-token",
             "TURING_ANTHROPIC_API_KEY": "test-anthropic-key",
             "TURING_DB_PATH": str(db_path),
             "TURING_EMBEDDING_MODEL_PATH": str(embedding_path),
