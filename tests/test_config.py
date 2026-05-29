@@ -146,6 +146,24 @@ class TestEnvOverrides:
         assert cfg.allowed_write_paths == ["/var/data", "/opt/out"]
 
 
+class TestOperatorNtfyTopic:
+    """The ntfy closed-laptop alert fallback topic (ADR-0010 §2)."""
+
+    def test_default_is_none(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.operator_ntfy_topic is None
+
+    def test_set_via_env_alias(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"TURING_OPERATOR_NTFY_TOPIC": "turing-alerts-allen"},
+            clear=True,
+        ):
+            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.operator_ntfy_topic == "turing-alerts-allen"
+
+
 class TestNodeIdAutoGeneration:
     """The node_id field must be auto-generated when left empty."""
 
