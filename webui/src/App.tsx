@@ -8,6 +8,13 @@ import {
 } from "./alerts/reducer";
 import type { AlertFrame } from "./alerts/types";
 import CallGraphCanvas from "./CallGraphCanvas";
+import ChatPane from "./chat/ChatPane";
+import {
+  applyChatFrame,
+  emptyChat,
+  listChat,
+  type ChatState,
+} from "./chat/reducer";
 import { emptyState, markStale, reduce, type Frame } from "./graph/reducer";
 import QueuePane from "./queue/QueuePane";
 import {
@@ -20,7 +27,7 @@ import SpecsGrid from "./specs/SpecsGrid";
 import type { PeerSpecsRow } from "./specs/types";
 import TracePane from "./trace/TracePane";
 import type { TraceEvent } from "./trace/types";
-import { connectGatewayWS, type QueueFrame } from "./ws";
+import { connectGatewayWS, type ChatFrame, type QueueFrame } from "./ws";
 
 type AlertAction = { kind: "frame"; frame: AlertFrame };
 
@@ -33,6 +40,13 @@ type QueueReducerAction = { kind: "frame"; frame: QueueFrame };
 
 function queueReducer(state: QueueState, action: QueueReducerAction): QueueState {
   if (action.kind === "frame") return applyQueueFrame(state, action.frame);
+  return state;
+}
+
+type ChatReducerAction = { kind: "frame"; frame: ChatFrame };
+
+function chatReducer(state: ChatState, action: ChatReducerAction): ChatState {
+  if (action.kind === "frame") return applyChatFrame(state, action.frame);
   return state;
 }
 
@@ -49,6 +63,8 @@ export default function App() {
   const alerts = useMemo(() => listAlerts(alertsState), [alertsState]);
   const [queueState, queueDispatch] = useReducer(queueReducer, emptyQueue());
   const queueItems = useMemo(() => listQueue(queueState), [queueState]);
+  const [chatState, chatDispatch] = useReducer(chatReducer, emptyChat());
+  const chatSessions = useMemo(() => listChat(chatState), [chatState]);
   const [debugFrames, setDebugFrames] = useState<Frame[]>([]);
   const [liveTrace, setLiveTrace] = useState<TraceEvent[]>([]);
   const [highlightedEdge, setHighlightedEdge] = useState<string | null>(null);
@@ -63,6 +79,11 @@ export default function App() {
         const frameType = (frame as { type?: string }).type;
         if (frameType === "queue.snapshot" || frameType === "queue.delta") {
           queueDispatch({ kind: "frame", frame: frame as unknown as QueueFrame });
+          setDebugFrames((prev) => [...prev.slice(-499), frame]);
+          return;
+        }
+        if (frameType === "chat.snapshot" || frameType === "chat.delta") {
+          chatDispatch({ kind: "frame", frame: frame as unknown as ChatFrame });
           setDebugFrames((prev) => [...prev.slice(-499), frame]);
           return;
         }
@@ -186,8 +207,11 @@ export default function App() {
           </div>
           <SpecsGrid rows={specsRows} />
         </section>
-        <aside className="w-[520px] border-r border-neutral-800">
+        <aside className="w-[420px] border-r border-neutral-800">
           <TracePane liveEvents={liveTrace} onSelect={onTraceSelect} />
+        </aside>
+        <aside className="w-[360px] border-r border-neutral-800">
+          <ChatPane sessions={chatSessions} />
         </aside>
         {showDebug && (
           <aside className="w-[480px] overflow-auto bg-neutral-950 p-2 font-mono text-xs">
