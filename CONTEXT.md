@@ -71,7 +71,7 @@ In Phase 0 the **critic is the operator's morning curation** (see "Operator surf
 
 ## Vault
 
-Coordinator hosts a vector index of the operator's Obsidian vault, refreshed by a filesystem watcher on every commit. Workers ground via `vault_query(query, k)`. Workers propose new notes via `vault_propose` → `vault/inbox/<task_id>/<slug>.md` with frontmatter (`source, task_id, specialty, confidence, critic_score`). Curated vs inbox is purely path-based — `vault/inbox/**` is the only writeable path.
+The vault is a **private git repository** (ADR 0010 §4). The coordinator commits on curated promotions, so the commit log is the reward-signal audit trail. `turing-vault-watcher.service` hosts a vector index of the operator's Obsidian vault and reindexes by **diffing each new commit against its parent and reindexing only the changed markdown files** (added/modified re-embedded, deleted dropped, renames handled) — no full resweep. The coordinator's WSL2 working tree is the **single writer**; the Mac and other devices are pull-only git remotes, and external Obsidian Sync of the same vault is incompatible. See `docs/operator/vault-git-workflow.md`. Workers ground via `vault_query(query, k)`. Workers propose new notes via `vault_propose` → `vault/inbox/<task_id>/<slug>.md` with frontmatter (`source, task_id, specialty, confidence, critic_score`). Curated vs inbox is purely path-based — `vault/inbox/**` is the only writeable path.
 
 ## Operator surfaces
 
