@@ -8,7 +8,8 @@ torch.
 
 The output blob is a checkpoint the existing TrainerPublisher (slice 23)
 signs into a manifest the AdapterRegistry verifies — same chain as the
-MLX trainer (slice 24), different backend.
+Phase B CUDA LoRA SFT trainer, different backend. Both now live on the
+H100/DGX (ADR 0009); the distinction is SFT (Phase B) vs DPO (Phase C).
 """
 
 from __future__ import annotations

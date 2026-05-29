@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from turing.learning.trainer.agent import TrainerPullAgent
 from turing.learning.trainer.config import TrainerConfig
+from turing.learning.trainer.cuda_lora_trainer import CudaLoraTrainer
 from turing.learning.trainer.dial_guard import (
     InboundConnectionRefusedError,
     PullOnlySocketGuard,
@@ -19,7 +20,6 @@ from turing.learning.trainer.dpo_dataset_builder import (
 )
 from turing.learning.trainer.job import TrainingJob, TrainingJobValidationError
 from turing.learning.trainer.job_builder import DatasetInfo, TrainingJobBuilder
-from turing.learning.trainer.mlx_trainer import MLXLoraTrainer
 from turing.learning.trainer.object_store import InMemoryObjectStore, ObjectStore
 from turing.learning.trainer.publisher import TrainerPublisher
 from turing.learning.trainer.runner import (
@@ -31,12 +31,12 @@ from turing.learning.trainer.runner import (
 from turing.learning.trainer.torch_dpo_trainer import TorchDPOTrainer
 
 __all__ = [
+    "CudaLoraTrainer",
     "DPODatasetBuilder",
     "DPODatasetInfo",
     "DatasetInfo",
     "InMemoryObjectStore",
     "InboundConnectionRefusedError",
-    "MLXLoraTrainer",
     "ObjectStore",
     "PullOnlySocketGuard",
     "RealLoraTrainer",

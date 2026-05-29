@@ -117,7 +117,7 @@ check_untyped_defs = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["mlx_lm", "onnxruntime", "tokenizers", "trl", "torch", "torch.*"]
+module = ["onnxruntime", "tokenizers", "trl", "torch", "torch.*", "peft"]
 ignore_missing_imports = true
 
 [tool.coverage.run]
