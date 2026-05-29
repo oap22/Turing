@@ -102,8 +102,9 @@ ntfy --version
 ```
 
 The package creates the `ntfy` service user that the unit in this repo runs
-as, and a stock `/etc/ntfy/server.yml`. We replace the package's own unit
-with the repo's config-as-code unit in Phase 3.
+as, and a stock `/etc/ntfy/server.yml`. We overwrite that stock config with the
+repo's `scripts/coordinator/server.yml` in Phase 2, and replace the package's
+own unit with the repo's config-as-code unit in Phase 3.
 
 > **Idempotent re-install.** Re-running these commands is safe: `apt install`
 > on an already-installed package is a no-op, and the keyring/source writes
@@ -121,21 +122,37 @@ per-operator topic.
 
 ### 2.1 ntfy server config
 
-Edit `/etc/ntfy/server.yml`. The two settings that matter for the Tailnet-only
-posture:
+The server config is config-as-code at `scripts/coordinator/server.yml` in this
+repo — install it to `/etc/ntfy/server.yml` (the path
+`scripts/coordinator/ntfy.service` loads via `--config`) and edit `base-url` to
+your tailnet name:
+
+```bash
+sudo install -m 644 scripts/coordinator/server.yml /etc/ntfy/server.yml
+sudoedit /etc/ntfy/server.yml   # set base-url to the WSL2 tailnet name
+```
+
+The two settings that matter for the Tailnet-only posture:
 
 ```yaml
-# /etc/ntfy/server.yml
+# /etc/ntfy/server.yml (tracked at scripts/coordinator/server.yml)
 base-url: "http://surface.<your-tailnet>.ts.net"   # the WSL2 tailnet name
 listen-http: ":8090"                               # the port the firewall admits
-# cache + auth are optional for a single-operator topic; see ntfy docs.
 ```
 
 `listen-http` is the port the Windows Firewall rule in Phase 4 opens. ntfy's
 default is `:80`; we use a non-privileged custom port (`:8090` here) so the
 `ntfy` service user can bind it without `CAP_NET_BIND_SERVICE` and so the
 firewall rule is narrowly scoped. **Use the same port in both places** — the
-`server.yml` `listen-http` and the firewall `LocalPort` in Phase 4.
+`server.yml` `listen-http` and the firewall `LocalPort` in Phase 4. Because the
+port contract lives in the tracked template, the firewall rule and the smoke
+test can be audited against one source of truth.
+
+> **Plaintext HTTP on `:8090` is intentional.** Tailscale/WireGuard encrypts all
+> transport over the `100.64.0.0/10` CGNAT range, so the listener never faces the
+> open internet and the topic name is the only access control. Enabling ntfy TLS
+> is an optional hardening step (see the ntfy docs); the firewall scoping in
+> Phase 4 is what keeps the plaintext listener tailnet-only.
 
 ### 2.2 Coordinator `.env`
 
@@ -162,7 +179,7 @@ Install it idempotently — mirroring the `setup-jetson.sh` install pattern
 ```bash
 UNIT_SRC=scripts/coordinator/ntfy.service
 UNIT_DST=/etc/systemd/system/ntfy.service
-if sudo cmp -s "$UNIT_SRC" "$UNIT_DST" 2>/dev/null; then
+if [[ -f "$UNIT_DST" ]] && sudo cmp -s "$UNIT_SRC" "$UNIT_DST"; then
     echo "unit unchanged, skipping"
 else
     sudo install -m 644 "$UNIT_SRC" "$UNIT_DST"
@@ -313,3 +330,5 @@ without mirrored-networking support the fallback is NAT mode plus a
   (`setup-coordinator.sh` folds in the ntfy install).
 - PRD #228 — hardware-safety alerts state machine and 90 s sink-stale trigger.
 - `scripts/coordinator/ntfy.service` — the config-as-code systemd unit.
+- `scripts/coordinator/server.yml` — the config-as-code ntfy server config
+  (`base-url`, `listen-http :8090`, cache) the unit loads via `--config`.

@@ -1,0 +1,26 @@
+# ntfy server config — closed-laptop hardware-safety alert push for Turing.
+#
+# Config-as-code template for /etc/ntfy/server.yml on the Surface coordinator.
+# scripts/coordinator/ntfy.service runs `ntfy serve --config /etc/ntfy/server.yml`,
+# so this is the file that ExecStart loads. Install it alongside the unit
+# (Phase 2/3 of docs/coordinator-ntfy.md) and edit base-url to your tailnet name.
+#
+# Plaintext HTTP on :8090 is intentional: Tailscale/WireGuard encrypts all
+# transport over the 100.64.0.0/10 CGNAT range, so the listener never sees the
+# open internet, and the topic name is the only access control. Enabling ntfy
+# TLS is an optional hardening step (see ntfy docs / docs/coordinator-ntfy.md).
+
+# The WSL2 tailnet name the operator's phone and the Jetsons resolve. Edit this.
+base-url: "http://surface.<your-tailnet>.ts.net"
+
+# The port the Windows Firewall rule (Phase 4) admits. ntfy's default is :80;
+# a non-privileged custom port lets the ntfy service user bind without
+# CAP_NET_BIND_SERVICE and keeps the firewall rule narrowly scoped.
+# Keep this in sync with the firewall LocalPort in docs/coordinator-ntfy.md.
+listen-http: ":8090"
+
+# Message cache — a small SQLite-backed buffer so a phone that was offline when
+# the alert fired still receives it on reconnect. 12h is plenty for a
+# single-operator hardware-safety topic.
+cache-file: "/var/cache/ntfy/cache.db"
+cache-duration: "12h"
