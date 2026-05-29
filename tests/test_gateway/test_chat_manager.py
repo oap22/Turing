@@ -10,12 +10,15 @@ mirroring ``test_queue_manager.py``.
 
 from __future__ import annotations
 
+import pytest
+
 from turing.coordinator.episode_rewards import EpisodeRewardsStore, RewardSource
 from turing.coordinator.flywheel.morning_curation import CurationDecision
 from turing.gateway.chat_manager import (
     ChatManager,
     ChatSessionNotFoundError,
     ChatSubtaskNotFoundError,
+    ChatSubtaskNotRewardableError,
     ChatSubtaskStatus,
 )
 
@@ -205,6 +208,36 @@ async def test_idempotent_thumb_does_not_double_write() -> None:
     events = rewards.events_for("ep1")
     assert len(events) == 1
     assert events[0].value == 1.0
+
+
+async def test_thumb_on_errored_subtask_raises_and_writes_no_reward() -> None:
+    """An ERROR subtask is not rewardable: every thumb raises and writes nothing."""
+    rewards = EpisodeRewardsStore()
+    mgr = _manager(rewards=rewards)
+    await mgr.submit(session_id="s1", prompt="p")
+    await mgr.plan_subtask("s1", subtask_id="st1", specialty="research", episode_id="ep1")
+    await mgr.fail("s1", "st1", error="worker exploded")
+    with pytest.raises(ChatSubtaskNotRewardableError):
+        await mgr.accept("s1", "st1")
+    with pytest.raises(ChatSubtaskNotRewardableError):
+        await mgr.reject("s1", "st1")
+    with pytest.raises(ChatSubtaskNotRewardableError):
+        await mgr.edit("s1", "st1", corrected_answer="x")
+    # The subtask stays ERROR and no reward row exists for the failed episode.
+    assert mgr.get_session("s1").subtasks[0].status is ChatSubtaskStatus.ERROR
+    assert rewards.events_for("ep1") == []
+
+
+async def test_thumb_on_pending_subtask_raises_not_rewardable() -> None:
+    """A still-streaming/never-completed subtask has no draft to reward."""
+    rewards = EpisodeRewardsStore()
+    mgr = _manager(rewards=rewards)
+    await mgr.submit(session_id="s1", prompt="p")
+    await mgr.plan_subtask("s1", subtask_id="st1", specialty="research", episode_id="ep1")
+    await mgr.stream("s1", "st1", chunk="partial", done=False)  # STREAMING, not COMPLETED
+    with pytest.raises(ChatSubtaskNotRewardableError):
+        await mgr.accept("s1", "st1")
+    assert rewards.events_for("ep1") == []
 
 
 async def test_thumb_without_episode_writes_no_reward() -> None:

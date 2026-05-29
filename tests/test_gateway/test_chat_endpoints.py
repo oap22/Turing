@@ -67,6 +67,26 @@ def _seed_completed(
     anyio.run(_go)
 
 
+def _seed_errored(
+    manager: ChatManager,
+    *,
+    session_id: str = "s1",
+    subtask_id: str = "st1",
+    episode_id: str = "ep1",
+) -> None:
+    """Synchronously drive a subtask to ERROR (the worker failed)."""
+    import anyio
+
+    async def _go() -> None:
+        await manager.submit(session_id=session_id, prompt="p")
+        await manager.plan_subtask(
+            session_id, subtask_id=subtask_id, specialty="research", episode_id=episode_id
+        )
+        await manager.fail(session_id, subtask_id, error="worker exploded")
+
+    anyio.run(_go)
+
+
 # ── auth ─────────────────────────────────────────────────────────────────────
 
 
@@ -164,6 +184,28 @@ def test_edit_endpoint_with_corrected_answer_writes_fractional_reward() -> None:
     assert body["decision"] == "edit"
     assert body["corrected_answer"] == "Rayleigh scattering."
     assert rewards.events_for("ep1")[0].value == 0.3
+
+
+def test_thumb_on_errored_subtask_is_rejected_and_writes_no_reward() -> None:
+    """A thumb on a worker-failed (ERROR) subtask 4xxs and lands no reward row.
+
+    Slice D makes this endpoint the sole reward source, so a failed episode must
+    not be handed a +1.0 via a direct or replayed POST. Guards all three thumbs.
+    """
+    rewards = EpisodeRewardsStore()
+    mgr = _manager(rewards)
+    _seed_errored(mgr)
+    client = _client(mgr)
+    assert client.post("/api/chat/s1/st1/accept", headers=_HEADERS).status_code == 409
+    assert client.post("/api/chat/s1/st1/reject", headers=_HEADERS).status_code == 409
+    assert (
+        client.post(
+            "/api/chat/s1/st1/edit", headers=_HEADERS, json={"corrected_answer": "x"}
+        ).status_code
+        == 409
+    )
+    # No curation/synthesis row was written for the failed episode.
+    assert rewards.events_for("ep1") == []
 
 
 def test_unknown_session_returns_404() -> None:

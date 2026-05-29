@@ -29,6 +29,7 @@ from turing.gateway.auth import COOKIE_NAME, GatewayAuth
 from turing.gateway.chat_manager import (
     ChatSessionNotFoundError,
     ChatSubtaskNotFoundError,
+    ChatSubtaskNotRewardableError,
 )
 from turing.gateway.queue_manager import QueueItemNotFoundError
 from turing.mesh.node import is_specs_stale
@@ -332,6 +333,8 @@ def create_app(
             subtask = await _require_chat().accept(session_id, subtask_id)
         except (ChatSessionNotFoundError, ChatSubtaskNotFoundError) as exc:
             raise HTTPException(status_code=404, detail="unknown chat subtask") from exc
+        except ChatSubtaskNotRewardableError as exc:
+            raise HTTPException(status_code=409, detail="subtask not rewardable") from exc
         return subtask.to_frame()
 
     @app.post("/api/chat/{session_id}/{subtask_id}/reject")
@@ -341,6 +344,8 @@ def create_app(
             subtask = await _require_chat().reject(session_id, subtask_id)
         except (ChatSessionNotFoundError, ChatSubtaskNotFoundError) as exc:
             raise HTTPException(status_code=404, detail="unknown chat subtask") from exc
+        except ChatSubtaskNotRewardableError as exc:
+            raise HTTPException(status_code=409, detail="subtask not rewardable") from exc
         return subtask.to_frame()
 
     @app.post("/api/chat/{session_id}/{subtask_id}/edit")
@@ -354,6 +359,8 @@ def create_app(
             )
         except (ChatSessionNotFoundError, ChatSubtaskNotFoundError) as exc:
             raise HTTPException(status_code=404, detail="unknown chat subtask") from exc
+        except ChatSubtaskNotRewardableError as exc:
+            raise HTTPException(status_code=409, detail="subtask not rewardable") from exc
         return subtask.to_frame()
 
     @app.websocket("/ws")

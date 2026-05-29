@@ -152,6 +152,18 @@ class ChatSubtaskNotFoundError(KeyError):
     """Raised when an operation targets a subtask id absent from its session."""
 
 
+class ChatSubtaskNotRewardableError(ValueError):
+    """Raised when a thumb targets a subtask that is not in a rewardable state.
+
+    Only a ``COMPLETED`` subtask (a finished worker draft awaiting curation) can
+    receive a reward. A ``PENDING``/``STREAMING`` subtask has no draft yet, and an
+    ``ERROR`` subtask failed — neither may be thumbed, so a worker-failed episode
+    cannot be handed a +1.0 via a direct or replayed POST. ``CURATED`` is handled
+    separately as an idempotent no-op (a redelivered thumb), not an error. Slice D
+    will make this endpoint the sole reward source, so the guard is load-bearing.
+    """
+
+
 class ChatManager:
     """In-memory projection of ad-hoc chat threads + reward delegation.
 
@@ -349,6 +361,13 @@ class ChatManager:
         # reward. Mirrors the queue manager's CURATED guard.
         if subtask.status is ChatSubtaskStatus.CURATED:
             return subtask
+        # Only a COMPLETED draft is rewardable. Reject a thumb on a PENDING /
+        # STREAMING (no draft yet) or ERROR (worker failed) subtask so a failed
+        # episode cannot be handed a reward via a direct or replayed POST — the
+        # queue surface only curates from DRAFTED for the same reason, and Slice D
+        # makes this the sole reward source.
+        if subtask.status is not ChatSubtaskStatus.COMPLETED:
+            raise ChatSubtaskNotRewardableError(subtask_id)
         await self._delegate_reward(subtask, decision, corrected_answer=corrected_answer)
         updated = replace(
             subtask,
@@ -379,6 +398,15 @@ class ChatManager:
         the shared store and emits no queue frame — the chat frame is fanned out
         separately by ``_commit``. A subtask with no ``episode_id`` (never ran)
         writes no reward, matching the queue manager's guard.
+
+        Cross-surface idempotency (by design, not a bug): the chat delegate and
+        the live :class:`QueueManager` share one :class:`EpisodeRewardsStore`, and
+        ``_already_rewarded`` keys solely on ``episode_id``. So a chat thumb and a
+        queue curation on the *same* ``episode_id`` resolve to the same guard key —
+        whichever lands first writes the reward; the second silently no-ops rather
+        than double-writing. This is safe because ``episode_id`` is unique per run
+        (one episode is surfaced on one surface), so the collision is theoretical;
+        the guard simply makes the reward write idempotent across both surfaces.
         """
         item_id = f"chat:{subtask.session_id}:{subtask.id}"
         item = QueueItem(
