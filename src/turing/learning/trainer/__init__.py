@@ -20,6 +20,14 @@ from turing.learning.trainer.dpo_dataset_builder import (
 )
 from turing.learning.trainer.job import TrainingJob, TrainingJobValidationError
 from turing.learning.trainer.job_builder import DatasetInfo, TrainingJobBuilder
+from turing.learning.trainer.lora_recipe import (
+    ALL_LINEAR_TARGET_MODULES,
+    MAX_USEFUL_ROUNDS,
+    InvalidRecipeError,
+    LoraRecipe,
+    RoundCapExceededError,
+    RoundCapGuard,
+)
 from turing.learning.trainer.object_store import InMemoryObjectStore, ObjectStore
 from turing.learning.trainer.publisher import TrainerPublisher
 from turing.learning.trainer.runner import (
@@ -45,6 +53,8 @@ from turing.learning.trainer.teacher_ab import (
 from turing.learning.trainer.torch_dpo_trainer import TorchDPOTrainer
 
 __all__ = [
+    "ALL_LINEAR_TARGET_MODULES",
+    "MAX_USEFUL_ROUNDS",
     "CudaLoraTrainer",
     "DPODatasetBuilder",
     "DPODatasetInfo",
@@ -52,10 +62,14 @@ __all__ = [
     "DatasetReplaceError",
     "InMemoryObjectStore",
     "InboundConnectionRefusedError",
+    "InvalidRecipeError",
+    "LoraRecipe",
     "NoTeacherArmsError",
     "ObjectStore",
     "PullOnlySocketGuard",
     "RealLoraTrainer",
+    "RoundCapExceededError",
+    "RoundCapGuard",
     "SFTDatasetBuilder",
     "SFTDatasetInfo",
     "SFTExample",
