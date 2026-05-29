@@ -22,6 +22,14 @@ mirroring the rest of the coordinator's state stores (``EpisodeStore``,
 
 from __future__ import annotations
 
+from turing.coordinator.flywheel.frontier import (
+    EvolutionAxis,
+    EvolvedQuestion,
+    FrontierResult,
+    QuestionFrontier,
+    default_eliminator,
+    rouge_l,
+)
 from turing.coordinator.flywheel.generalist import (
     AI_ML_GENERALIST,
     GENERALIST_FLEET_SIZE,
@@ -57,9 +65,12 @@ __all__ = [
     "GENERALIST_FLEET_SIZE",
     "PROPOSED_FRAGMENT_KEY",
     "CurationDecision",
+    "CurationRecord",
+    "EvolutionAxis",
+    "EvolvedQuestion",
+    "FrontierResult",
     "GeneralistAdapterRollout",
     "GeneralistFleet",
-    "CurationRecord",
     "InboxDraft",
     "MorningCuration",
     "NightlyDispatcher",
@@ -67,12 +78,15 @@ __all__ = [
     "ProposalStatus",
     "ProposedQuestion",
     "ProposedQueue",
+    "QuestionFrontier",
     "QuestionQueue",
     "ResearchQuestion",
     "SFTCandidate",
+    "default_eliminator",
     "parse_inbox_draft",
     "proposals_from_result",
     "proposals_to_fragment",
     "replicate_to_fleet",
+    "rouge_l",
     "specialty_eval_dir",
 ]
