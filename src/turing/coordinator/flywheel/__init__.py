@@ -22,6 +22,14 @@ mirroring the rest of the coordinator's state stores (``EpisodeStore``,
 
 from __future__ import annotations
 
+from turing.coordinator.flywheel.generalist import (
+    AI_ML_GENERALIST,
+    GENERALIST_FLEET_SIZE,
+    GeneralistAdapterRollout,
+    GeneralistFleet,
+    replicate_to_fleet,
+    specialty_eval_dir,
+)
 from turing.coordinator.flywheel.morning_curation import (
     CurationDecision,
     CurationRecord,
@@ -45,8 +53,12 @@ from turing.coordinator.flywheel.proposed_queue import (
 from turing.coordinator.flywheel.question_queue import QuestionQueue, ResearchQuestion
 
 __all__ = [
+    "AI_ML_GENERALIST",
+    "GENERALIST_FLEET_SIZE",
     "PROPOSED_FRAGMENT_KEY",
     "CurationDecision",
+    "GeneralistAdapterRollout",
+    "GeneralistFleet",
     "CurationRecord",
     "InboxDraft",
     "MorningCuration",
@@ -61,4 +73,6 @@ __all__ = [
     "parse_inbox_draft",
     "proposals_from_result",
     "proposals_to_fragment",
+    "replicate_to_fleet",
+    "specialty_eval_dir",
 ]
