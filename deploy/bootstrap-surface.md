@@ -56,7 +56,7 @@ writes `/etc/wsl.conf`, etc.
 | 2 | `wsl --set-default-version 2`; install Ubuntu (`--no-launch`) | `wsl --list --quiet` contains the distro → skip |
 | 3 | Write `C:\Users\<you>\.wslconfig` with `[wsl2] networkingMode=mirrored` + `[experimental] hostAddressLoopback=true` | byte-compare existing file → skip if identical |
 | 4 | Write `/etc/wsl.conf` inside the distro with `[boot] systemd=true` | `grep` for `systemd=true` inside the distro → skip |
-| 5 | Power plan: no sleep/hibernate (AC + DC), do-nothing on lid close | `powercfg` re-assert is inherently a no-op |
+| 5 | Power plan: no sleep/hibernate (AC + DC), do-nothing on lid close (dot-sources `deploy/scripts/surface-power.ps1`, the canonical source) | `powercfg` re-assert is inherently a no-op |
 | 6 | Firewall inbound for NATS/gateway/ntfy, scoped to the Tailnet subnet | rule exists **and** remote scope matches → skip; re-scope if drifted |
 | 7 | Task Scheduler `Turing WSL2 Boot`: `wsl -d Ubuntu` at startup, restart-on-exit | task exists → re-assert definition (idempotent) |
 

@@ -63,6 +63,58 @@ function Test-Admin {
     return $p.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 }
 
+# Canonicalize a single IPv4 firewall RemoteAddress so re-runs compare equal
+# regardless of how Windows stores/reads it back. Get-NetFirewallAddressFilter
+# normalizes an IPv4 CIDR (e.g. "100.64.0.0/10") into a start-end range
+# ("100.64.0.0-100.127.255.255"), so a string compare against the raw CIDR
+# would always miss and trigger a needless delete+recreate. We reduce both the
+# stored value and the configured subnet to a "start-end" pair of 32-bit ints
+# and compare those. A bare CIDR, an explicit range, and a single IP all reduce
+# to the same canonical form. Non-IPv4 / keyword scopes (Any, LocalSubnet, IPv6)
+# fall through unchanged so they still compare by string.
+function Get-CanonicalAddress {
+    param([string]$Address)
+    $a = $Address.Trim()
+    # All arithmetic is done in [long] (int64) and truncated to 32 bits with
+    # `-band 0xFFFFFFFF`; Windows PowerShell 5.1's shift operators do not accept
+    # [uint32], so we stay in signed-wide types and mask down at the end.
+    $u32 = [long]0xFFFFFFFF
+    # IPv4 dotted-quad -> 32-bit value (big-endian, network order).
+    $toInt = {
+        param($dotted)
+        $bytes = [System.Net.IPAddress]::Parse($dotted).GetAddressBytes()
+        [array]::Reverse($bytes)
+        [System.BitConverter]::ToUInt32($bytes, 0)
+    }
+    # Explicit range: "start-end".
+    if ($a -match '^\s*(\d{1,3}(?:\.\d{1,3}){3})\s*-\s*(\d{1,3}(?:\.\d{1,3}){3})\s*$') {
+        try {
+            return "$(& $toInt $matches[1])-$(& $toInt $matches[2])"
+        } catch { return $a }
+    }
+    # CIDR: "a.b.c.d/len".
+    if ($a -match '^\s*(\d{1,3}(?:\.\d{1,3}){3})\s*/\s*(\d{1,2})\s*$') {
+        try {
+            $ip  = [long](& $toInt $matches[1])
+            $len = [int]$matches[2]
+            if ($len -lt 0 -or $len -gt 32) { return $a }
+            $mask = if ($len -eq 0) { [long]0 } else { ([long]([long]$u32 -shl (32 - $len))) -band $u32 }
+            $netStart = $ip -band $mask
+            $netEnd   = ($netStart -bor (-bnot $mask)) -band $u32
+            return "$netStart-$netEnd"
+        } catch { return $a }
+    }
+    # Single IPv4 host -> degenerate range start==end.
+    if ($a -match '^\s*(\d{1,3}(?:\.\d{1,3}){3})\s*$') {
+        try {
+            $ip = [long](& $toInt $matches[1])
+            return "$ip-$ip"
+        } catch { return $a }
+    }
+    # Keyword / IPv6 / anything else: compare verbatim.
+    return $a
+}
+
 # Port map: name -> @(protocol, ports[]). ntfy serves both 80 and 443.
 $PortMap = [ordered]@{
     "NATS"    = @{ Protocol = "TCP"; Ports = @(4222) }
@@ -120,14 +172,18 @@ Write-Step "2. WSL2 default version + $DistroName distro"
 & wsl.exe --set-default-version 2 2>$null | Out-Null
 
 # wsl --list --quiet returns installed distro names. Older builds may emit
-# UTF-16; normalize before matching.
-$installed = @()
-try {
-    $raw = & wsl.exe --list --quiet 2>$null
-    $installed = $raw | ForEach-Object { ($_ -replace "`0", "").Trim() } | Where-Object { $_ }
-} catch {
-    $installed = @()
+# UTF-16; normalize before matching. Wrapped in a helper so we can re-probe
+# after the install below — capturing $installed once would go stale the moment
+# step 2 installs the distro, making step 4 wrongly skip /etc/wsl.conf.
+function Get-InstalledDistros {
+    try {
+        $raw = & wsl.exe --list --quiet 2>$null
+        return @($raw | ForEach-Object { ($_ -replace "`0", "").Trim() } | Where-Object { $_ })
+    } catch {
+        return @()
+    }
 }
+$installed = Get-InstalledDistros
 if ($installed -contains $DistroName) {
     Write-Skip "$DistroName already installed"
 } else {
@@ -141,6 +197,10 @@ if ($installed -contains $DistroName) {
         # interactive launch if the operator ever runs `wsl -d Ubuntu` by hand.
         & wsl.exe --install -d $DistroName --no-launch
         Write-Did "$DistroName install requested"
+        # Re-probe so step 4 sees the freshly-installed distro and writes
+        # /etc/wsl.conf in this same pass — no second run needed when no reboot
+        # was required.
+        $installed = Get-InstalledDistros
     }
 }
 
@@ -213,17 +273,29 @@ rm -f "$tmp"
 # ── 5. Power plan — never sleep on AC ────────────────────────────────
 Write-Step "5. Power plan — never sleep, do-nothing on lid (ADR 0010 §7)"
 # A coordinator that sleeps takes the whole fleet's brain offline. powercfg is
-# inherently idempotent — re-asserting the same value is a no-op — so we set
-# unconditionally and report. AC is the operating posture; we also pin DC so a
-# brief unplug does not put the host to sleep mid-episode.
-powercfg /change standby-timeout-ac 0
-powercfg /change standby-timeout-dc 0
-powercfg /change hibernate-timeout-ac 0
-powercfg /change hibernate-timeout-dc 0
-powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
-powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
-powercfg /setactive SCHEME_CURRENT
-Write-Did "no sleep/hibernate timeouts; lid-close = do nothing"
+# inherently idempotent — re-asserting the same value is a no-op. deploy/scripts/
+# surface-power.ps1 is the single source of truth for the powercfg invocations
+# and the SUB_BUTTONS/LIDACTION GUIDs; dot-source it rather than duplicating that
+# logic here so the two never drift. The path is resolved relative to this
+# script: scripts/bootstrap-surface.ps1 -> ../deploy/scripts/surface-power.ps1.
+$surfacePower = Join-Path $PSScriptRoot "..\deploy\scripts\surface-power.ps1"
+if (Test-Path $surfacePower) {
+    . $surfacePower
+    Write-Did "applied power policy via deploy/scripts/surface-power.ps1"
+} else {
+    # Fallback if invoked from a context where the repo layout is not intact
+    # (e.g. the script was copied standalone). Keep in sync with the canonical
+    # deploy/scripts/surface-power.ps1.
+    Write-Note "surface-power.ps1 not found next to repo layout; applying power policy inline."
+    powercfg /change standby-timeout-ac 0
+    powercfg /change standby-timeout-dc 0
+    powercfg /change hibernate-timeout-ac 0
+    powercfg /change hibernate-timeout-dc 0
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
+    powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
+    powercfg /setactive SCHEME_CURRENT
+    Write-Did "no sleep/hibernate timeouts; lid-close = do nothing"
+}
 
 # ── 6. Firewall — inbound coordinator ports, Tailnet-scoped ──────────
 Write-Step "6. Windows Firewall — inbound NATS/gateway/ntfy, scoped to $TailnetSubnet"
@@ -236,10 +308,15 @@ foreach ($svc in $PortMap.Keys) {
         if ($existingRule) {
             # Verify the scope is still correct; if the remote address drifted,
             # re-create the rule so re-runs converge rather than leaving a stale
-            # over-broad rule in place.
+            # over-broad rule in place. Compare canonicalized forms: Windows reads
+            # a stored CIDR back as a start-end range, so a raw string compare
+            # against $TailnetSubnet would always miss and force a delete+recreate
+            # on every run. Get-CanonicalAddress reduces both sides to the same
+            # "start-end" int pair, so a correctly-scoped rule is a true no-op.
             $af = $existingRule | Get-NetFirewallAddressFilter
             $remote = @($af.RemoteAddress)
-            $needsFix = -not ($remote.Count -eq 1 -and $remote[0] -eq $TailnetSubnet)
+            $wantCanonical = Get-CanonicalAddress $TailnetSubnet
+            $needsFix = -not ($remote.Count -eq 1 -and (Get-CanonicalAddress $remote[0]) -eq $wantCanonical)
             if ($needsFix) {
                 Write-Host "    re-scoping $ruleName -> $TailnetSubnet"
                 $existingRule | Remove-NetFirewallRule
