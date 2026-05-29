@@ -28,6 +28,13 @@ from turing.learning.trainer.runner import (
     Trainer,
     TrainingResult,
 )
+from turing.learning.trainer.sft_dataset_builder import (
+    DatasetReplaceError,
+    SFTDatasetBuilder,
+    SFTDatasetInfo,
+    SFTExample,
+    candidates_from_rows,
+)
 from turing.learning.trainer.torch_dpo_trainer import TorchDPOTrainer
 
 __all__ = [
@@ -35,11 +42,15 @@ __all__ = [
     "DPODatasetBuilder",
     "DPODatasetInfo",
     "DatasetInfo",
+    "DatasetReplaceError",
     "InMemoryObjectStore",
     "InboundConnectionRefusedError",
     "ObjectStore",
     "PullOnlySocketGuard",
     "RealLoraTrainer",
+    "SFTDatasetBuilder",
+    "SFTDatasetInfo",
+    "SFTExample",
     "StubTrainer",
     "TorchDPOTrainer",
     "Trainer",
@@ -50,4 +61,5 @@ __all__ = [
     "TrainingJobBuilder",
     "TrainingJobValidationError",
     "TrainingResult",
+    "candidates_from_rows",
 ]
