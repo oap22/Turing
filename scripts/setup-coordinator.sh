@@ -93,10 +93,16 @@ else
 fi
 
 log "Phase 1.3 — System packages"
+# Everything Phase 1 invokes that isn't a base/coreutils/systemd tool must be
+# declared here, because `set -euo pipefail` aborts the whole run on the first
+# missing binary — and Phase 1 runs before the turing user/repo exist. A fresh
+# WSL2 Ubuntu rootfs is minimal: curl (1.2/1.4/1.5/3.x) and gnupg (gpg, 1.6's
+# apt-key dearmor) are frequently absent; git (3.1) and ca-certificates (TLS
+# for every curl) likewise. nats-server's .deb is fetched via curl + dpkg (base).
 sudo apt-get update
 sudo apt-get install -y \
     build-essential libsqlite3-dev bubblewrap curl git zstd \
-    nano python3-pip ca-certificates
+    nano python3-pip ca-certificates gnupg
 
 log "Phase 1.4 — uv (for Python 3.11)"
 if ! command -v uv >/dev/null 2>&1; then
@@ -215,6 +221,8 @@ as_turing "uv pip install --python ~/venv/bin/python hatchling"
 as_turing "uv pip install --python ~/venv/bin/python -e ~/turing"
 
 log "Phase 3.3 — Embedding model"
+# Re-download only files that are absent or empty; `-s` (non-empty) treats a
+# truncated/0-byte file from an interrupted run as missing (matches setup-jetson.sh).
 as_turing "mkdir -p $EMBEDDING_DIR"
 if [[ ! -s "$EMBEDDING_DIR/model.onnx" ]]; then
     as_turing "curl -fL -o $EMBEDDING_DIR/model.onnx $EMBEDDING_BASE/onnx/model.onnx"
