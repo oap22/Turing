@@ -4,6 +4,66 @@
  * /token-handoff, so no token has to live in JS.
  */
 
+// ── Question-queue frames (ADR 0010 Slice C) ────────────────────────────────
+//
+// The webui queue pane's wire contract with `turing-gateway`. Mirrors the
+// Python `QueueManager.snapshot_frame()` / `_emit_delta()` output and the
+// `QueueItem.to_frame()` shape exactly. The gateway sends one `queue.snapshot`
+// on WS connect, then a `queue.delta` per mutation; the pane replaces state on
+// a snapshot and upserts the single item on a delta.
+
+export type QueueStatus =
+  | "proposed"
+  | "approved"
+  | "in-flight"
+  | "drafted"
+  | "curated";
+
+export type QueueDecision = "accept" | "reject" | "edit";
+
+// The transition that produced a delta. `add` is the initial insert; the
+// curation actions double as the decision name.
+export type QueueAction =
+  | "add"
+  | "approve"
+  | "dispatch"
+  | "draft"
+  | QueueDecision;
+
+export interface QueueItem {
+  id: string;
+  prompt: string;
+  specialty: string;
+  status: QueueStatus;
+  origin_task_id: string | null;
+  origin_question_id: string | null;
+  proposed_by: string;
+  episode_id: string | null;
+  consumed_upstreams: string[];
+  created_at_ms: number;
+  approved_at_ms: number | null;
+  dispatched_at_ms: number | null;
+  drafted_at_ms: number | null;
+  curated_at_ms: number | null;
+  decision: QueueDecision | null;
+  corrected_answer: string | null;
+}
+
+export interface QueueSnapshotFrame {
+  type: "queue.snapshot";
+  items: QueueItem[];
+  timestamp_ms: number;
+}
+
+export interface QueueDeltaFrame {
+  type: "queue.delta";
+  action: QueueAction;
+  item: QueueItem;
+  timestamp_ms: number;
+}
+
+export type QueueFrame = QueueSnapshotFrame | QueueDeltaFrame;
+
 interface ConnectOptions<T> {
   url: string;
   onFrame: (frame: T) => void;

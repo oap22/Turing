@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response, WebSocket
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import (
     FileResponse,
@@ -26,6 +26,7 @@ from starlette.staticfiles import StaticFiles
 
 from turing.coordinator.alerts.types import KNOWN_FIELDS
 from turing.gateway.auth import COOKIE_NAME, GatewayAuth
+from turing.gateway.queue_manager import QueueItemNotFoundError
 from turing.mesh.node import is_specs_stale
 
 if TYPE_CHECKING:
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
 
     from turing.coordinator.alerts.dispatcher import AlertDispatcher
     from turing.coordinator.alerts.types import Field
+    from turing.gateway.queue_manager import QueueManager
     from turing.gateway.ring_buffer import RingBuffer
     from turing.gateway.telemetry_sink import TelemetrySink
     from turing.mesh.node import MeshNode
@@ -81,12 +83,14 @@ def create_app(
     mesh_node: MeshNode | None = None,
     telemetry_sink: TelemetrySink | None = None,
     alert_dispatcher: AlertDispatcher | None = None,
+    queue_manager: QueueManager | None = None,
 ) -> FastAPI:
     app = FastAPI(title="turing-gateway")
     app.state.start_time = time.monotonic()
     app.state.ring_buffer = ring_buffer
     app.state.telemetry_sink = telemetry_sink
     app.state.alert_dispatcher = alert_dispatcher
+    app.state.queue_manager = queue_manager
     app.add_middleware(_BearerMiddleware, auth=auth)  # type: ignore[arg-type]
 
     # Wire the dispatcher's frame fan-out through the telemetry sink so a
@@ -220,6 +224,62 @@ def create_app(
         snoozed_until_ms = await alert_dispatcher.snooze(node_id, field_typed, now_ms)
         return {"snoozed_until_ms": snoozed_until_ms}
 
+    # ── Question-queue manager (ADR 0010 Slice C) ────────────────────────────
+    #
+    # The webui's primary work-direction surface. Reads serve the initial
+    # snapshot; the four POSTs drive the human-gated frontier. approve / accept
+    # / reject / edit write to ``episode_rewards`` with magnitudes identical to
+    # the retired Discord surface (the QueueManager owns the emitter). Every
+    # mutation fans a ``queue.delta`` frame out through the telemetry sink, so
+    # the bearer-gated WS subscribers stay in sync. All routes are bearer-gated
+    # by ``_BearerMiddleware``; a missing item 404s.
+
+    def _require_queue() -> QueueManager:
+        if queue_manager is None:
+            raise HTTPException(status_code=503, detail="queue manager not enabled")
+        return queue_manager
+
+    @app.get("/api/queue")
+    async def get_queue() -> dict:
+        """Full queue snapshot for initial paint (WS layers deltas on top)."""
+        return _require_queue().snapshot_frame()
+
+    @app.post("/api/queue/approve/{item_id}")
+    async def approve_question(item_id: str) -> dict:
+        """proposed → approved. No reward (approval is not a decision yet)."""
+        try:
+            item = await _require_queue().approve(item_id)
+        except QueueItemNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="unknown queue item") from exc
+        return item.to_frame()
+
+    @app.post("/api/queue/accept/{item_id}")
+    async def accept_question(item_id: str) -> dict:
+        """Curate-accept the worker draft: +1.0 reward to the episode."""
+        try:
+            item = await _require_queue().accept(item_id)
+        except QueueItemNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="unknown queue item") from exc
+        return item.to_frame()
+
+    @app.post("/api/queue/reject/{item_id}")
+    async def reject_question(item_id: str) -> dict:
+        """Curate-reject the worker draft: −1.0 reward to the episode."""
+        try:
+            item = await _require_queue().reject(item_id)
+        except QueueItemNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="unknown queue item") from exc
+        return item.to_frame()
+
+    @app.post("/api/queue/edit/{item_id}")
+    async def edit_question(item_id: str, corrected_answer: str = Body(..., embed=True)) -> dict:
+        """Curate-edit: capture the operator's correction; +0.3 partial reward."""
+        try:
+            item = await _require_queue().edit(item_id, corrected_answer=corrected_answer)
+        except QueueItemNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="unknown queue item") from exc
+        return item.to_frame()
+
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:
         if not auth.check(
@@ -232,6 +292,12 @@ def create_app(
         uptime_s = time.monotonic() - app.state.start_time
         hello = {"type": "hello", "node_name": node_name, "uptime_s": uptime_s}
         await websocket.send_text(json.dumps(hello))
+
+        # Seed the queue pane with a full snapshot before any deltas, so a
+        # freshly-connected client renders the current frontier immediately
+        # and then layers live ``queue.delta`` frames on top.
+        if queue_manager is not None:
+            await websocket.send_text(json.dumps(queue_manager.snapshot_frame()))
 
         # Subscribe to the shared fan-out so alert frames (and any future
         # sink-driven frames) reach this client. Telemetry frames already

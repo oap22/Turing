@@ -204,7 +204,23 @@ async def _run(config: TuringConfig) -> None:
     # 8c. Operator UI gateway (pi-alpha only)
     gateway = None
     if config.gateway_enabled:
+        import time as _time
+
+        from turing.coordinator.episode_rewards import EpisodeRewardsStore
+        from turing.gateway.queue_manager import QueueManager
         from turing.gateway.service import GatewayService
+
+        # The webui question-queue manager is the primary work-direction
+        # surface (ADR 0010 §1) that replaces the retired Discord task bot. Its
+        # curation decisions write to the shared episode-rewards store with
+        # magnitudes identical to the Discord path. Frame fan-out rides the
+        # telemetry sink, the same path alert frames use.
+        rewards_store = EpisodeRewardsStore()
+        queue_manager = QueueManager(
+            rewards=rewards_store,
+            broadcast=(telemetry_sink._broadcast if telemetry_sink is not None else None),
+            now_ms=lambda: int(_time.time() * 1000),
+        )
 
         gateway = GatewayService(
             token=config.gateway_token,
@@ -214,6 +230,7 @@ async def _run(config: TuringConfig) -> None:
             mesh_node=mesh_node,
             telemetry_sink=telemetry_sink,
             alert_dispatcher=alert_dispatcher,
+            queue_manager=queue_manager,
         )
         await gateway.start()
 
