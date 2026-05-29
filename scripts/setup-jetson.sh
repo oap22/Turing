@@ -13,6 +13,21 @@
 #   2. `gh auth login` (run as the `turing` user) — choose SSH protocol,
 #      let gh generate a key, paste the one-time device code in a browser
 #
+# Phase 4 also asks for two NATS fields on a FRESH install (ADR 0010 §9):
+#   • TURING_NATS_URL       — the coordinator's NATS URL over the Tailnet
+#   • TURING_NATS_NKEY_SEED — this worker's nkey seed
+# Both come from the coordinator bringup: `scripts/setup-coordinator.sh`
+# (ADR 0010 §5, Slice G2) generates 5 nkey pairs at first run and PRINTS, for
+# each Jetson, that worker's seed and the coordinator NATS URL. Copy the pair
+# for this device and paste them at the Phase 4 prompts here — this is a manual
+# hand-off; the seeds are never transmitted automatically. For non-interactive
+# / re-imaging runs, export them first instead of typing:
+#   TURING_NATS_URL=nats://surface.<tailnet>.ts.net:4222 \
+#   TURING_NATS_NKEY_SEED=SUA... \
+#       bash scripts/setup-jetson.sh </dev/null
+# Re-runs preserve whatever is already in .env (same policy as every other
+# field); delete the .env to regenerate from scratch.
+#
 # Everything else is automated.
 
 set -euo pipefail
@@ -76,6 +91,34 @@ read -r -p "Hostname for this Jetson (e.g. jetson-1) [${HOSTNAME_CURRENT}]: " HO
 HOSTNAME_NEW="${HOSTNAME_NEW:-$HOSTNAME_CURRENT}"
 [[ -n "$HOSTNAME_NEW" ]] || die "Hostname is required (no current hostname to fall back to)."
 NODE_NAME="$HOSTNAME_NEW"
+
+# ── NATS connection (ADR 0010 §9) ────────────────────────────────────
+# The worker dials the coordinator's NATS bus and authenticates with its own
+# nkey seed. Both values are issued by the coordinator's first-run output
+# (scripts/setup-coordinator.sh, Slice G2 Phase 5) and pasted here by hand.
+#
+# Resolution mirrors the .env policy used for every other field:
+#   • Re-run (.env already present): keep whatever is in .env — never prompt,
+#     never clobber. Delete the .env to regenerate from scratch.
+#   • Fresh install: take the values from the environment if exported
+#     (non-interactive re-imaging), otherwise prompt. `|| true` keeps `set -e`
+#     happy when stdin is closed (EOF / piped from /dev/null).
+# The non-empty guard fires only on a fresh install, so an unattended re-run of
+# an already-provisioned box can never be blocked by a missing prompt answer.
+ENV_PATH=/home/turing/turing/.env
+if [[ -f "$ENV_PATH" ]]; then
+    echo "  .env present — keeping existing TURING_NATS_URL / TURING_NATS_NKEY_SEED"
+else
+    NATS_URL_DEFAULT="${TURING_NATS_URL:-}"
+    read -r -p "Coordinator NATS URL (e.g. nats://surface.<tailnet>.ts.net:4222) [${NATS_URL_DEFAULT}]: " NATS_URL_NEW || true
+    NATS_URL_NEW="${NATS_URL_NEW:-$NATS_URL_DEFAULT}"
+    [[ -n "$NATS_URL_NEW" ]] || die "TURING_NATS_URL is required on a fresh install (see the coordinator's Phase 5 output)."
+
+    NATS_NKEY_SEED_DEFAULT="${TURING_NATS_NKEY_SEED:-}"
+    read -r -p "This worker's NATS nkey seed (SU...) [${NATS_NKEY_SEED_DEFAULT:+<set>}]: " NATS_NKEY_SEED_NEW || true
+    NATS_NKEY_SEED_NEW="${NATS_NKEY_SEED_NEW:-$NATS_NKEY_SEED_DEFAULT}"
+    [[ -n "$NATS_NKEY_SEED_NEW" ]] || die "TURING_NATS_NKEY_SEED is required on a fresh install (paste this worker's seed from the coordinator's Phase 5 output)."
+fi
 
 # ── Phase 1: system provisioning ─────────────────────────────────────
 log "Phase 1.1 — Set hostname to $HOSTNAME_NEW"
@@ -209,9 +252,10 @@ as_turing "mkdir -p ~/turing/data"
 
 # ── Phase 4: .env ────────────────────────────────────────────────────
 log "Phase 4 — Write .env (worker profile)"
-ENV_PATH=/home/turing/turing/.env
-# Keep an existing .env so re-runs don't clobber local edits (Discord tokens,
-# tweaked sandbox paths, etc.). To regenerate it, delete the file and re-run.
+# ENV_PATH is set in the prompts section above (the NATS resolve needs it to
+# decide prompt-vs-preserve). Keep an existing .env so re-runs don't clobber
+# local edits (NATS seed, tweaked sandbox paths, etc.). To regenerate it,
+# delete the file and re-run.
 if [[ -f "$ENV_PATH" ]]; then
     echo "  already present, keeping (delete $ENV_PATH to regenerate)"
     REWRITE_ENV=0
@@ -233,6 +277,12 @@ TURING_LOG_LEVEL=INFO
 TURING_LLM_ROUTING_MODE=local
 TURING_OLLAMA_HOST=http://localhost:11434
 TURING_OLLAMA_MODEL=$OLLAMA_MODEL
+
+# Runtime bus (NATS) — dialled into the coordinator over the Tailnet.
+# Issued by the coordinator's first-run output (Slice G2 Phase 5), pasted at
+# the Phase 4 prompts. The systemd unit refuses to start if either is empty.
+TURING_NATS_URL=$NATS_URL_NEW
+TURING_NATS_NKEY_SEED=$NATS_NKEY_SEED_NEW
 
 # Memory / data
 TURING_DB_PATH=/home/turing/turing/data/turing.db
@@ -270,10 +320,21 @@ Requires=ollama.service
 Type=simple
 User=turing
 WorkingDirectory=/home/turing/turing
+EnvironmentFile=/home/turing/turing/.env
+# Refuse to start with an unconfigured NATS link (ADR 0010 §9). A worker that
+# cannot reach/authenticate the coordinator bus is useless, and an empty seed
+# fails confusingly deep in startup. Fail fast here with a clear journalctl
+# line instead. The EnvironmentFile above has already populated the
+# environment; ${VAR:?msg} makes /bin/sh exit non-zero and print "VAR: msg"
+# (which systemd records as the ExecStartPre failure) when VAR is empty/unset.
+# NOTE: `$$` so systemd passes a literal `$` through to /bin/sh instead of
+# doing its own (no `:?` support) expansion — the shell performs the check.
+# Single double-quoted argument, kept apostrophe-free to avoid cross-layer
+# quoting fragility.
+ExecStartPre=/bin/sh -c ": $${TURING_NATS_URL:?missing in .env -- paste the coordinator NATS URL from setup-coordinator.sh Phase 5}; : $${TURING_NATS_NKEY_SEED:?missing in .env -- paste this node seed from setup-coordinator.sh Phase 5}"
 ExecStart=/home/turing/venv/bin/python -m turing
 Restart=always
 RestartSec=10
-EnvironmentFile=/home/turing/turing/.env
 
 [Install]
 WantedBy=multi-user.target
