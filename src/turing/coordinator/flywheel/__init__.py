@@ -22,6 +22,14 @@ mirroring the rest of the coordinator's state stores (``EpisodeStore``,
 
 from __future__ import annotations
 
+from turing.coordinator.flywheel.morning_curation import (
+    CurationDecision,
+    CurationRecord,
+    InboxDraft,
+    MorningCuration,
+    SFTCandidate,
+    parse_inbox_draft,
+)
 from turing.coordinator.flywheel.nightly_dispatcher import (
     NightlyDispatcher,
     NightlyRunReport,
@@ -38,6 +46,10 @@ from turing.coordinator.flywheel.question_queue import QuestionQueue, ResearchQu
 
 __all__ = [
     "PROPOSED_FRAGMENT_KEY",
+    "CurationDecision",
+    "CurationRecord",
+    "InboxDraft",
+    "MorningCuration",
     "NightlyDispatcher",
     "NightlyRunReport",
     "ProposalStatus",
@@ -45,6 +57,8 @@ __all__ = [
     "ProposedQueue",
     "QuestionQueue",
     "ResearchQuestion",
+    "SFTCandidate",
+    "parse_inbox_draft",
     "proposals_from_result",
     "proposals_to_fragment",
 ]

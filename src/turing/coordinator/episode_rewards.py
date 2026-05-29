@@ -42,6 +42,7 @@ class RewardSource(str, Enum):  # noqa: UP042
     SUBTASK_THUMB = "subtask_thumb"
     SYNTHESIS_THUMB_FRACTIONAL = "synthesis_thumb_fractional"
     CRITIC_FALLBACK = "critic_fallback"
+    MORNING_CURATION = "morning_curation"
 
 
 @dataclass(frozen=True)
@@ -206,6 +207,30 @@ def write_critic_fallback(
             episode_id=episode_id,
             source=RewardSource.CRITIC_FALLBACK,
             value=critic_fallback_value(critic_score),
+            recorded_at_ms=recorded_at_ms,
+        )
+    )
+
+
+def write_morning_curation(
+    store: EpisodeRewardsStore,
+    *,
+    episode_id: str,
+    value: float,
+    recorded_at_ms: int,
+) -> None:
+    """Append a MORNING_CURATION reward event for ``episode_id``.
+
+    In Phase 0 the operator's morning accept / reject / edit decision *is* the
+    reward signal (ADR 0009 supersedes the ADR 0004 real-time critic and the
+    ADR 0006 Discord reward UI for Phase 0). The caller maps the decision to a
+    ``value`` (e.g. accept → +1.0, reject → −1.0, edit → a partial credit).
+    """
+    store.append(
+        RewardEvent(
+            episode_id=episode_id,
+            source=RewardSource.MORNING_CURATION,
+            value=value,
             recorded_at_ms=recorded_at_ms,
         )
     )
