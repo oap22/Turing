@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from turing.coordinator.dispatch.client import SubtaskDispatchClient
+    from turing.coordinator.flywheel.proposed_queue import ProposedQueue
     from turing.coordinator.flywheel.question_queue import QuestionQueue, ResearchQuestion
     from turing.coordinator.lifecycle.episode_store import EpisodeStore
     from turing.coordinator.registry import CapabilityRegistry
@@ -67,6 +68,7 @@ class NightlyDispatcher:
         now_ms: Callable[[], int],
         deadline_ms: int = _DEFAULT_DEADLINE_MS,
         grace_s: float = 30.0,
+        proposed_queue: ProposedQueue | None = None,
     ) -> None:
         self._queue = queue
         self._dispatch = dispatch_client
@@ -75,6 +77,7 @@ class NightlyDispatcher:
         self._now_ms = now_ms
         self._deadline_ms = deadline_ms
         self._grace_s = grace_s
+        self._proposed = proposed_queue
 
     async def run_nightly(self, *, batch_id: str | None = None) -> NightlyRunReport:
         """Dispatch every approved question, evenly across live workers.
@@ -168,6 +171,17 @@ class NightlyDispatcher:
             latency_ms=result.latency_ms or (self._now_ms() - started),
             outcome=outcome,
         )
+        # Land any follow-up questions the worker *proposed* (it does not — and
+        # cannot — dispatch them itself) into the holding queue for the morning
+        # frontier review. Never auto-pursued in Phase 0.
+        if self._proposed is not None:
+            self._proposed.ingest_from_result(
+                result,
+                origin_task_id=batch_id,
+                origin_question_id=question.question_id,
+                now_ms=self._now_ms(),
+                default_specialty=question.specialty,
+            )
         self._queue.mark_dispatched(question.question_id, at_ms=started)
         return question.question_id, outcome is SubtaskState.COMPLETED
 

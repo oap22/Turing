@@ -26,11 +26,25 @@ from turing.coordinator.flywheel.nightly_dispatcher import (
     NightlyDispatcher,
     NightlyRunReport,
 )
+from turing.coordinator.flywheel.proposed_queue import (
+    PROPOSED_FRAGMENT_KEY,
+    ProposalStatus,
+    ProposedQuestion,
+    ProposedQueue,
+    proposals_from_result,
+    proposals_to_fragment,
+)
 from turing.coordinator.flywheel.question_queue import QuestionQueue, ResearchQuestion
 
 __all__ = [
+    "PROPOSED_FRAGMENT_KEY",
     "NightlyDispatcher",
     "NightlyRunReport",
+    "ProposalStatus",
+    "ProposedQuestion",
+    "ProposedQueue",
     "QuestionQueue",
     "ResearchQuestion",
+    "proposals_from_result",
+    "proposals_to_fragment",
 ]
