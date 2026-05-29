@@ -18,6 +18,11 @@ from turing.learning.trainer.dpo_dataset_builder import (
     DPODatasetBuilder,
     DPODatasetInfo,
 )
+from turing.learning.trainer.flywheel_cycle import (
+    CycleRejectedError,
+    CycleReport,
+    FlywheelTrainingCycle,
+)
 from turing.learning.trainer.job import TrainingJob, TrainingJobValidationError
 from turing.learning.trainer.job_builder import DatasetInfo, TrainingJobBuilder
 from turing.learning.trainer.lora_recipe import (
@@ -66,10 +71,13 @@ __all__ = [
     "BudgetedTeacherAB",
     "BudgetedTeacherABReport",
     "CudaLoraTrainer",
+    "CycleRejectedError",
+    "CycleReport",
     "DPODatasetBuilder",
     "DPODatasetInfo",
     "DatasetInfo",
     "DatasetReplaceError",
+    "FlywheelTrainingCycle",
     "InMemoryObjectStore",
     "InboundConnectionRefusedError",
     "InvalidRecipeError",
