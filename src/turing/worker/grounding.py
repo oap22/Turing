@@ -131,9 +131,7 @@ class GroundedResearcher:
         answer = ""
 
         for _ in range(self._max_iterations):
-            resp = await self._llm.complete(
-                messages, system=_SYSTEM_PROMPT, tools=[WEB_FETCH_TOOL]
-            )
+            resp = await self._llm.complete(messages, system=_SYSTEM_PROMPT, tools=[WEB_FETCH_TOOL])
             model = resp.model or model
             tokens += int(resp.usage.get("total_tokens", 0))
             if resp.content:
@@ -148,9 +146,7 @@ class GroundedResearcher:
             )
             for call in resp.tool_calls:
                 tool_output = await self._run_tool_call(call, sources)
-                messages.append(
-                    Message(role=Role.TOOL, content=tool_output, tool_call_id=call.id)
-                )
+                messages.append(Message(role=Role.TOOL, content=tool_output, tool_call_id=call.id))
         else:
             # Loop exhausted without a final text turn — use the last reasoning.
             answer = reasoning[-1] if reasoning else ""

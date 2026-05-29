@@ -131,9 +131,7 @@ async def test_dedup_rejects_near_duplicate_admits_novel() -> None:
 async def test_dedup_rejects_internal_duplicates_among_survivors() -> None:
     """Two near-identical survivors of the same batch: the second is deduped."""
     dup = "How does NF4 quantisation reduce QLoRA memory during fine-tuning?"
-    frontier = QuestionFrontier(
-        evolver=StubEvolver(in_depth=[dup], in_breadth=[dup])
-    )
+    frontier = QuestionFrontier(evolver=StubEvolver(in_depth=[dup], in_breadth=[dup]))
 
     result = await frontier.process(seeds=["QLoRA memory?"])
 

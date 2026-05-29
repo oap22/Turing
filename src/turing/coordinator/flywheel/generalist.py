@@ -116,9 +116,10 @@ def replicate_to_fleet(
     first (advancing STAGED → FLEET_ROLLOUT), then the rest, leaving the
     coordinator ``COMPLETED`` — i.e. the adapter replicated to all workers.
     """
-    ordered: Sequence[str] = (coordinator.canary_worker, *(
-        w for w in fleet.workers if w != coordinator.canary_worker
-    ))
+    ordered: Sequence[str] = (
+        coordinator.canary_worker,
+        *(w for w in fleet.workers if w != coordinator.canary_worker),
+    )
     for worker_id in ordered:
         coordinator.report_live_eval(
             LiveEvalReport(worker_id=worker_id, score=score, version=version)

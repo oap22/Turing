@@ -139,9 +139,7 @@ class ProposedQueue:
         return self._proposals[proposal_id]
 
     def all(self) -> list[ProposedQuestion]:
-        return sorted(
-            self._proposals.values(), key=lambda p: (p.created_at_ms, p.proposal_id)
-        )
+        return sorted(self._proposals.values(), key=lambda p: (p.created_at_ms, p.proposal_id))
 
     def pending(self) -> list[ProposedQuestion]:
         """Proposals awaiting the morning frontier review, oldest-first."""

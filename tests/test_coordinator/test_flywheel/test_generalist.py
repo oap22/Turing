@@ -117,9 +117,7 @@ def test_regression_on_any_worker_halts_replication() -> None:
     from turing.coordinator.promotion.rollout import LiveEvalReport, RegressionHaltedError
 
     with pytest.raises(RegressionHaltedError):
-        coordinator.report_live_eval(
-            LiveEvalReport(worker_id="jetson-1", score=0.40, version="v1")
-        )
+        coordinator.report_live_eval(LiveEvalReport(worker_id="jetson-1", score=0.40, version="v1"))
     assert coordinator.state is RolloutState.HALTED
     assert recorder.events and recorder.events[0][0] == "regression_halted"
 

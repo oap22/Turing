@@ -63,7 +63,9 @@ def _fetch_then_answer() -> list[LLMResponse]:
         LLMResponse(
             content="I should ground this in a real paper.",
             tool_calls=[
-                ToolCall(id="t1", name="web_fetch", arguments={"url": "https://arxiv.org/abs/2305.14314"})
+                ToolCall(
+                    id="t1", name="web_fetch", arguments={"url": "https://arxiv.org/abs/2305.14314"}
+                )
             ],
             model="qwen2.5:7b",
             usage={"total_tokens": 50},
@@ -151,7 +153,9 @@ async def test_disallowed_fetch_surfaces_error_without_crashing(tmp_path: Path) 
     responses = [
         LLMResponse(
             content="Trying a source.",
-            tool_calls=[ToolCall(id="t1", name="web_fetch", arguments={"url": "https://evil.com/x"})],
+            tool_calls=[
+                ToolCall(id="t1", name="web_fetch", arguments={"url": "https://evil.com/x"})
+            ],
             model="m",
             usage={"total_tokens": 10},
         ),
