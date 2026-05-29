@@ -1,10 +1,11 @@
-"""Test γ: end-to-end Discord fallback when the SPA is unreachable.
+"""Test γ: end-to-end ntfy fallback when the SPA is unreachable.
 
 Wires a real ``TelemetrySink`` through ``create_app`` together with an
 ``AlertDispatcher`` whose reachability clock reads that sink. No WebSocket
 client ever connects, so ``last_send_ms`` stays ``None`` for the whole test
 — the bootstrap-as-unreachable case — and three hot heartbeats must escalate
-to exactly one operator DM.
+to exactly one operator ntfy push (ADR-0010 §2; replaces the retired
+Discord-DM fallback).
 """
 
 from __future__ import annotations
@@ -21,24 +22,24 @@ from turing.gateway.ring_buffer import RingBuffer, RingBufferConfig
 from turing.gateway.telemetry_sink import TelemetrySink
 
 
-class _FakeDiscord:
+class _FakeNtfy:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def dm_operator(self, content: str) -> None:
+    async def ntfy_push(self, content: str) -> None:
         self.calls.append(content)
 
 
 @pytest.mark.asyncio
-async def test_hot_heartbeats_escalate_to_discord_when_spa_unreachable(tmp_path) -> None:  # type: ignore[no-untyped-def]
+async def test_hot_heartbeats_escalate_to_ntfy_when_spa_unreachable(tmp_path) -> None:  # type: ignore[no-untyped-def]
     cfg = RingBufferConfig(path=tmp_path / "t.db", retention_seconds=10**9, max_bytes=10**9)
     buffer = RingBuffer(cfg)
     await buffer.open()
     sink = TelemetrySink(buffer=buffer)
-    discord = _FakeDiscord()
+    ntfy = _FakeNtfy()
     dispatcher = AlertDispatcher(
         AlertEngine(now_ms=lambda: 1_700_000_000_000),
-        discord_client=discord,
+        ntfy_client=ntfy,
         reachability_clock=lambda: sink.last_send_ms,
     )
 
@@ -65,5 +66,5 @@ async def test_hot_heartbeats_escalate_to_discord_when_spa_unreachable(tmp_path)
 
     # No WS client ever connected, so the SPA never received a frame.
     assert sink.last_send_ms is None
-    # Exactly one DM, on the alerting edge, with the one-line summary.
-    assert discord.calls == ["⚠ pi-beta TEMP danger: 86.0°C (>82.0°C)"]
+    # Exactly one push, on the alerting edge, with the one-line summary.
+    assert ntfy.calls == ["⚠ pi-beta TEMP danger: 86.0°C (>82.0°C)"]

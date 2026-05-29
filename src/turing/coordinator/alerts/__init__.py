@@ -5,7 +5,9 @@ detect sustained warn/danger conditions through a small state machine, and
 push ``alert`` frames out over the existing gateway WebSocket so the SPA
 can render a persistent banner.
 
-Discord fallback and snooze land in later slices.
+The closed-laptop fallback (when the SPA is unreachable) is an ntfy push,
+self-hosted on the Surface coordinator — see ``ntfy_client.py`` (ADR-0010 §2,
+replacing the retired Discord-DM fallback).
 """
 
 from turing.coordinator.alerts.dispatcher import DEFAULT_SNOOZE_MS, AlertDispatcher
