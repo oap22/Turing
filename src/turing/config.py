@@ -38,6 +38,8 @@ class TuringConfig(BaseSettings):
         default="!turing",
         description="Prefix for bot commands",
     )
+    # TODO(slice D): remove with Discord teardown — dead after ADR-0010 §2
+    # swapped the closed-laptop fallback to ntfy (see operator_ntfy_topic).
     discord_operator_user_id: int | None = Field(
         default=None,
         validation_alias="TURING_OPERATOR_DISCORD_ID",
@@ -56,6 +58,13 @@ class TuringConfig(BaseSettings):
         description="ntfy topic that receives hardware-safety alert pushes "
         "when the SPA is unreachable; coordinator-only, unset disables the "
         "ntfy fallback",
+    )
+    coordinator_ntfy_base_url: str | None = Field(
+        default=None,
+        validation_alias="TURING_COORDINATOR_NTFY_BASE_URL",
+        description="ntfy server base URL on the Surface coordinator "
+        "(e.g. http://surface.<tailnet>.ts.net:8090); coordinator-only, "
+        "unset disables the ntfy fallback",
     )
 
     # ── Anthropic (cloud LLM) ────────────────────────────────────────────
