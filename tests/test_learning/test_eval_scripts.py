@@ -77,12 +77,14 @@ def test_arxiv_miner_script_emits_jsonl(tmp_path: Path, capsys: pytest.CaptureFi
 def test_eval_script_exits_nonzero_when_cases_missing(
     tmp_path: Path,
 ) -> None:
-    # Async main; pytest-asyncio not strictly needed since we just run it.
+    # Async main; use asyncio.run() rather than get_event_loop(), which raises
+    # "no current event loop" on a sync test after an async one (pytest-asyncio
+    # unsets the loop on teardown) on Python 3.12+.
     import asyncio
 
     import eval_research_summarize
 
-    exit_code = asyncio.get_event_loop().run_until_complete(
+    exit_code = asyncio.run(
         eval_research_summarize.main(["--cases", str(tmp_path / "missing.jsonl"), "--fake-worker"])
     )
     assert exit_code != 0

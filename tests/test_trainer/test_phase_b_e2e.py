@@ -9,8 +9,8 @@ from turing.coordinator.lifecycle.episode_store import Episode, EpisodeStore
 from turing.coordinator.lifecycle.lifecycle import SubtaskState
 from turing.coordinator.promotion import PromotionGate
 from turing.learning.trainer import (
+    CudaLoraTrainer,
     InMemoryObjectStore,
-    MLXLoraTrainer,
     TrainerPublisher,
     TrainingJob,
     TrainingJobBuilder,
@@ -58,7 +58,7 @@ def test_phase_b_chain_passes_eval_delta_and_lands_as_staged(
 ) -> None:
     """The full chain the issue's E2E acceptance criterion describes:
     1. Pull top-K positive episodes for the specialty
-    2. Train an MLX LoRA adapter on the dataset
+    2. Train a CUDA LoRA adapter on the dataset (H100/DGX, ADR 0009)
     3. Sign and publish the manifest
     4. AdapterRegistry verifies (slice 20)
     5. Eval delta clears the 2% floor (slice 22 gate)
@@ -91,14 +91,14 @@ def test_phase_b_chain_passes_eval_delta_and_lands_as_staged(
         method="sft",
         hyperparameters={"lr": 1e-4},
     )
-    trainer = MLXLoraTrainer(backend=_stub_backend, dataset_path=dataset_path)
+    trainer = CudaLoraTrainer(backend=_stub_backend, dataset_path=dataset_path)
     artifact_dir = tmp_path / "artifacts"
     result = trainer.train(job, artifact_dir=artifact_dir)
 
     # --- 4. Publish + verify --------------------------------------------------
     signer = MessageSigner.generate()
     publisher = TrainerPublisher(
-        signer=signer, object_store=InMemoryObjectStore(), facility_name="mbp"
+        signer=signer, object_store=InMemoryObjectStore(), facility_name="dgx-1"
     )
     manifest = publisher.publish(job, result, version="rs@v2")
     registry = AdapterRegistry(

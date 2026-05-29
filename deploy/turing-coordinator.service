@@ -1,0 +1,35 @@
+[Unit]
+Description=Turing coordinator (orchestration, scheduler, Discord bot, gateway, vault index)
+Documentation=https://github.com/oap22/Turing
+# Runs inside WSL2 Ubuntu on the Surface Pro; needs [boot] systemd=true in
+# /etc/wsl.conf. See deploy/surface-coordinator.md (ADR 0009, issue #258).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=turing
+Group=turing
+WorkingDirectory=/var/lib/turing
+EnvironmentFile=/etc/turing/coordinator.env
+ExecStart=/usr/local/bin/turing
+
+# The coordinator runs no local LLM inference; it does hold the shell safety
+# gate, so keep the standard hardening.
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/turing
+
+# A coordinator that dies takes the fleet's brain offline — restart promptly.
+Restart=on-failure
+RestartSec=10s
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Install]
+WantedBy=multi-user.target

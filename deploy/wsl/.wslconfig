@@ -1,0 +1,10 @@
+# .wslconfig — place on the WINDOWS side at C:\Users\<you>\.wslconfig (Windows 11).
+# Mirrored networking lets the Jetsons reach the coordinator's NATS (4222) and
+# gateway (8765) at the Surface's LAN IP, sidestepping WSL2's default NAT.
+# After editing: `wsl --shutdown`, then restart the distro.
+# (ADR 0009 §1, issue #258.)
+[wsl2]
+networkingMode=mirrored
+
+[experimental]
+hostAddressLoopback=true
