@@ -178,36 +178,5 @@ class TestAutonomyPolicy:
         assert decision is PolicyDecision.REQUIRE_APPROVAL
 
 
-# ── Discord view ──────────────────────────────────────────────────────
-
-
-class TestTrainingJobApprovalView:
-    """The Discord approval UI mirrors ConfirmActionView's 60s pattern."""
-
-    def test_default_timeout_is_60_seconds(self) -> None:
-        from turing.discord_bot.views import TrainingJobApprovalView
-
-        proposal = TrainingJobProposal(
-            specialty="x",
-            base_model="qwen2.5-7b",
-            method="sft",
-            estimated_cost_usd=1.0,
-            dataset_summary="",
-        )
-        view = TrainingJobApprovalView(proposal=proposal, authorized_user_id=42)
-        assert view.timeout == 60.0
-
-    def test_constructs_with_proposal(self) -> None:
-        from turing.discord_bot.views import TrainingJobApprovalView
-
-        proposal = TrainingJobProposal(
-            specialty="research-summarize",
-            base_model="qwen2.5-7b",
-            method="sft",
-            estimated_cost_usd=4.5,
-            dataset_summary="example",
-        )
-        view = TrainingJobApprovalView(proposal=proposal, authorized_user_id=7)
-        assert view.proposal is proposal
-        assert view.authorized_user_id == 7
-        assert view.result is None
+# The Discord training-approval view (TrainingJobApprovalView) was deleted with
+# ADR 0010; its approval affordance moves to the webui in a follow-on slice.

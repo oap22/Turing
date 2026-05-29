@@ -1,9 +1,9 @@
 """Pydantic schema for one eval row.
 
-The voice-match axis stays a stub field (``voice_ref_id``) — it's filled by
-pairwise preference collection through the Discord thumbs flow once
-preferences accumulate. We never let an LLM synthesise an ``expected_*``
-field; all expecteds are mined from real sources or hand-authored.
+The voice-match axis stays a stub field (``voice_ref_id``) — a future
+pairwise-preference collection axis (TBD) will fill it once preferences
+accumulate. We never let an LLM synthesise an ``expected_*`` field; all
+expecteds are mined from real sources or hand-authored.
 """
 
 from __future__ import annotations

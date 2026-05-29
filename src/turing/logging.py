@@ -77,7 +77,7 @@ def setup_logging(config: TuringConfig) -> None:
     root_logger.setLevel(log_level)
 
     # Silence noisy third-party loggers.
-    for noisy in ("discord", "httpx", "httpcore", "urllib3", "asyncio"):
+    for noisy in ("httpx", "httpcore", "urllib3", "asyncio"):
         logging.getLogger(noisy).setLevel(max(log_level, logging.WARNING))
 
     # Bind the node name globally so every subsequent log line includes it.

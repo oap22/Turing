@@ -1,9 +1,10 @@
-"""Live-DAG Discord renderer (slice 15/26, #17).
+"""Live-DAG text renderer (slice 15/26, #17).
 
-Pure rendering: produces the message body for the single live-editing
-Discord message that mirrors a DAG's progress. Discord posting and message
-editing happen in the cog layer; this module is unit-testable without any
-network or discord.py dependency.
+Pure rendering: produces the message body that mirrors a DAG's progress as
+the underlying state changes. ADR 0010 retired the Discord surface that
+originally consumed this; the renderer itself has no surface coupling and is
+preserved for the webui DAG view. It is unit-testable without any network
+dependency.
 
 The renderer is intentionally deep but pure — given a :class:`LiveDAGView`
 snapshot it returns a string. Callers diff/replace the message body each
@@ -67,7 +68,7 @@ def _format_subtask(sv: SubtaskView) -> str:
 
 
 def render_live_dag(view: LiveDAGView) -> str:
-    """Render a :class:`LiveDAGView` to a Discord message body."""
+    """Render a :class:`LiveDAGView` to a message body."""
     prompt = view.user_prompt.strip()
     if len(prompt) > _PROMPT_PREVIEW_CHARS:
         prompt = prompt[: _PROMPT_PREVIEW_CHARS - 1] + "…"

@@ -28,23 +28,14 @@ class TuringConfig(BaseSettings):
     node_name: str = Field(default="pi-alpha", description="Human-readable node name")
     node_id: str = Field(default="", description="Unique node UUID (auto-generated if empty)")
 
-    # ── Discord ──────────────────────────────────────────────────────────
-    discord_token: str = Field(default="", description="Discord bot token")
-    discord_admin_ids: list[int] = Field(
+    # ── Operator / admin ─────────────────────────────────────────────────
+    # Surface-agnostic admin allow-list (ADR 0010 retired the Discord task bot
+    # and its Discord-specific admin IDs). The safety gate auto-approves
+    # HIGH-risk tool calls for these users. Entries are opaque identifiers;
+    # whichever operator surface is in front sets ``user_id`` to match.
+    admin_user_ids: list[str] = Field(
         default_factory=list,
-        description="List of Discord user IDs with admin privileges",
-    )
-    discord_command_prefix: str = Field(
-        default="!turing",
-        description="Prefix for bot commands",
-    )
-    # TODO(slice D): remove with Discord teardown — dead after ADR-0010 §2
-    # swapped the closed-laptop fallback to ntfy (see operator_ntfy_topic).
-    discord_operator_user_id: int | None = Field(
-        default=None,
-        validation_alias="TURING_OPERATOR_DISCORD_ID",
-        description="Discord user ID that receives hardware-safety alert DMs "
-        "when the SPA is unreachable; unset disables the Discord fallback",
+        description="List of operator user IDs with admin privileges",
     )
 
     # ── Alerts (closed-laptop fallback) ──────────────────────────────────
@@ -95,6 +86,18 @@ class TuringConfig(BaseSettings):
     embedding_model_path: Path = Field(
         default=Path("./models/all-MiniLM-L6-v2"),
         description="Path to the ONNX embedding model directory",
+    )
+    vault_root: Path = Field(
+        default=Path("/home/turing/vault"),
+        description=(
+            "Working-tree root of the vault git repository. The vault watcher "
+            "diffs each new commit against its parent and reindexes only the "
+            "changed markdown files (ADR 0010 §4)."
+        ),
+    )
+    vault_poll_interval_seconds: float = Field(
+        default=5.0,
+        description="Seconds the vault watcher sleeps between git HEAD polls",
     )
 
     # ── Mesh networking ──────────────────────────────────────────────────

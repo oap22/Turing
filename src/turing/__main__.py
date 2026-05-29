@@ -150,14 +150,7 @@ async def _run(config: TuringConfig) -> None:
     )
     agent.executor = executor
 
-    # 8. Discord Bot
-    from turing.discord_bot.bot import TuringBot
-
-    bot = TuringBot(config, agent=agent, mesh_node=mesh_node, memory_store=memory_store)
-    # Give executor reference to bot for confirmation views
-    executor.bot = bot
-
-    # 8b. Hardware-safety alerts (PRD #228) — build the alert dispatcher and
+    # 8. Hardware-safety alerts (PRD #228) — build the alert dispatcher and
     # wire it into mesh presence + the gateway. Per ADR-0010 §2 the closed-laptop
     # fallback transport is ntfy (self-hosted on the Surface coordinator),
     # replacing the retired Discord-DM fallback.
@@ -203,7 +196,7 @@ async def _run(config: TuringConfig) -> None:
         )
         presence.set_alert_dispatcher(alert_dispatcher)
 
-    # 8c. Operator UI gateway (pi-alpha only)
+    # 8b. Operator UI gateway (pi-alpha only)
     gateway = None
     if config.gateway_enabled:
         import time as _time
@@ -262,17 +255,11 @@ async def _run(config: TuringConfig) -> None:
         loop.add_signal_handler(sig, _signal_handler)
 
     try:
-        bot_task = asyncio.create_task(bot.start_bot())
-        shutdown_task = asyncio.create_task(shutdown_event.wait())
-
-        _done, pending = await asyncio.wait(
-            [bot_task, shutdown_task],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        # Cancel remaining tasks
-        for task in pending:
-            task.cancel()
+        # The coordinator/gateway/mesh run as long-lived background services
+        # (ADR 0010 §6). With the Discord task bot retired there is no
+        # foreground client to await — the process stays up until a signal
+        # sets the shutdown event.
+        await shutdown_event.wait()
     finally:
         # Cleanup
         logger.info("turing.shutting_down")
@@ -289,8 +276,6 @@ async def _run(config: TuringConfig) -> None:
         if mesh_node:
             await mesh_node.stop()
         await memory_store.close()
-        if not bot.is_closed():
-            await bot.close()
         logger.info("turing.stopped")
 
 

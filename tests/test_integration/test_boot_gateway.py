@@ -3,8 +3,12 @@
 Two missed wires from issue #70 (``GatewayService`` not instantiated in
 ``__main__.py`` and ``spa_assets_dir`` never threaded into ``create_app``)
 shipped because every component had unit tests but the booted-process path
-had none. This test exercises the actual ``_run`` entry point with the
-Discord boundary stubbed so a regression on either wire fails loudly.
+had none. This test exercises the actual ``_run`` entry point so a regression
+on either wire fails loudly.
+
+Post-ADR 0010, ``_run`` boots the coordinator/gateway/mesh with no Discord
+bot — there is no token to validate and no LoginFailure to guard against, so
+the boundary that previously had to be stubbed is simply gone.
 """
 
 from __future__ import annotations
@@ -65,7 +69,6 @@ async def test_boot_path_serves_spa_and_authenticates(tmp_path: Path) -> None:
         _env_file=None,  # type: ignore[call-arg]
         node_name="test-pi",
         env="development",
-        discord_token="stub-token",
         anthropic_api_key="stub-key",
         db_path=tmp_path / "turing.db",
         embedding_model_path=tmp_path / "no-embeddings",
@@ -76,35 +79,13 @@ async def test_boot_path_serves_spa_and_authenticates(tmp_path: Path) -> None:
         gateway_port=port,
     )
 
-    # Stub the Discord boundary so _run() doesn't dial Discord. The bot is
-    # constructed normally; only its run loop and shutdown are no-ops.
-    async def _no_op_start(self):  # type: ignore[no-untyped-def]
-        await asyncio.Event().wait()  # park forever; cancelled at teardown
-
-    async def _no_op_close(self):  # type: ignore[no-untyped-def]
-        return None
-
     base = f"http://127.0.0.1:{port}"
 
     # add_signal_handler doesn't work on every event loop policy; bypass it.
     def _no_signal(*a, **kw):  # type: ignore[no-untyped-def]
         return None
 
-    with (
-        patch(
-            "turing.discord_bot.bot.TuringBot.start_bot",
-            new=_no_op_start,
-        ),
-        patch(
-            "turing.discord_bot.bot.TuringBot.close",
-            new=_no_op_close,
-        ),
-        patch(
-            "turing.discord_bot.bot.TuringBot.is_closed",
-            new=lambda self: True,
-        ),
-        patch.object(asyncio.get_event_loop(), "add_signal_handler", _no_signal),
-    ):
+    with patch.object(asyncio.get_event_loop(), "add_signal_handler", _no_signal):
         from turing.__main__ import _run
 
         run_task = asyncio.create_task(_run(config))
