@@ -7,9 +7,41 @@
 # unattended/already-provisioned re-run, and must require a hostname only when
 # there is genuinely nothing to fall back to.
 #
+# Rather than mirror the logic, we extract the REAL resolve block from the
+# shipped script and run it under the same `set -euo pipefail`, with
+# `hostnamectl`, `die`, and `read`'s stdin stubbed. So:
+#   (a) any edit to the prompt block in setup-jetson.sh is exercised here, and
+#   (b) the set -e/EOF interaction is real — dropping the `|| true` after
+#       `read` would let a closed-stdin re-run abort under set -e, which this
+#       test would catch as a FAIL (see the closed-stdin case).
+#
 # Run: bash tests/scripts/test_setup_jetson_hostname.sh
 
 set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT="$HERE/../../scripts/setup-jetson.sh"
+
+[[ -r "$SCRIPT" ]] || { echo "FAIL - cannot read $SCRIPT"; exit 1; }
+
+# Pull the real resolve block out of the shipped script, between two stable,
+# unique anchor lines (inclusive of the leading hostname read, up to but not
+# including NODE_NAME=). If the block can't be found the anchors drifted —
+# fail loudly so the test is updated alongside the script.
+RESOLVE_BLOCK="$(
+    awk '
+        /^HOSTNAME_CURRENT="\$\(hostnamectl --static\)"$/ { f = 1 }
+        f && /^NODE_NAME="\$HOSTNAME_NEW"$/ { exit }
+        f { print }
+    ' "$SCRIPT"
+)"
+if [[ -z "$RESOLVE_BLOCK" ]] \
+    || ! grep -q 'read -r -p' <<<"$RESOLVE_BLOCK" \
+    || ! grep -q 'die ' <<<"$RESOLVE_BLOCK"; then
+    echo "FAIL - could not extract the resolve block from setup-jetson.sh"
+    echo "       (anchor lines likely changed — update this test to match)"
+    exit 1
+fi
 
 fail=0
 check() {
@@ -22,50 +54,47 @@ check() {
     fi
 }
 
-# Mirror of the resolve logic in setup-jetson.sh. `hostnamectl` is stubbed so
-# the test is host-independent. `read || true` + default expansion is exactly
-# what the script does.
+# Run the extracted block exactly as the real script does: under
+# `set -euo pipefail`, with `hostnamectl --static` and `die` stubbed so the
+# test is host-independent. stdin is supplied by the caller (a heredoc string
+# for typed input, or /dev/null for the unattended/EOF re-run). The block ends
+# by leaving the resolved name in HOSTNAME_NEW; we echo it. `die` prints the
+# sentinel `__DIE__` so the required-hostname path is observable, and we mark a
+# `set -e` abort (e.g. if `|| true` were dropped) with `__ABORT__`.
 resolve_hostname() {
-    local current_static="$1"        # what `hostnamectl --static` would print
-    local typed="$2"                 # what the operator types ("" == Enter)
-    local closed_stdin="${3:-no}"    # "yes" == EOF (unattended / piped re-run)
-
-    local HOSTNAME_CURRENT HOSTNAME_NEW
-    HOSTNAME_CURRENT="$current_static"
-    if [[ "$closed_stdin" == "yes" ]]; then
-        read -r HOSTNAME_NEW </dev/null || true
-    else
-        HOSTNAME_NEW="$typed"
-    fi
-    HOSTNAME_NEW="${HOSTNAME_NEW:-$HOSTNAME_CURRENT}"
-    if [[ -z "$HOSTNAME_NEW" ]]; then
-        echo "__DIE__"
-        return 0
-    fi
-    echo "$HOSTNAME_NEW"
+    local current_static="$1"        # what `hostnamectl --static` prints
+    bash -c '
+        set -euo pipefail
+        hostnamectl() { printf "%s\n" "'"$current_static"'"; }
+        die() { echo "__DIE__"; exit 0; }
+        '"$RESOLVE_BLOCK"'
+        printf "%s\n" "$HOSTNAME_NEW"
+    ' || echo "__ABORT__"
 }
 
 # First run: operator types a hostname → that value wins.
 check "first run: typed value is used" \
-    "jetson-1" "$(resolve_hostname "ubuntu" "jetson-1")"
+    "jetson-1" "$(resolve_hostname "ubuntu" <<<"jetson-1")"
 
 # Re-run, operator presses Enter → keeps the already-set hostname (no-op).
 check "re-run: empty input keeps current hostname" \
-    "jetson-1" "$(resolve_hostname "jetson-1" "")"
+    "jetson-1" "$(resolve_hostname "jetson-1" <<<"")"
 
 # Re-run, fully unattended (stdin closed / EOF) → keeps current, does NOT hang
-# or abort under set -e. This is the Slice J "clean no-op" requirement.
+# or abort under set -e. This is the Slice J "clean no-op" requirement, and the
+# case that the `|| true` after `read` protects: drop it and this run aborts
+# (yielding __ABORT__ instead of the kept hostname), failing the test.
 check "re-run: closed stdin keeps current hostname (no hang/abort)" \
-    "jetson-1" "$(resolve_hostname "jetson-1" "" "yes")"
+    "jetson-1" "$(resolve_hostname "jetson-1" </dev/null)"
 
 # First run on an unconfigured box where the operator just hits Enter and there
 # is no usable current hostname → must still demand a value (die path).
 check "first run: empty input + no current hostname dies" \
-    "__DIE__" "$(resolve_hostname "" "")"
+    "__DIE__" "$(resolve_hostname "" <<<"")"
 
 # Operator explicitly renames an already-provisioned host → typed value wins.
 check "re-run: explicit rename overrides current" \
-    "jetson-2" "$(resolve_hostname "jetson-1" "jetson-2")"
+    "jetson-2" "$(resolve_hostname "jetson-1" <<<"jetson-2")"
 
 if [[ "$fail" -ne 0 ]]; then
     echo "RESULT: FAIL"
