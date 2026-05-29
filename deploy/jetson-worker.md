@@ -44,7 +44,11 @@ sudo jetson_clocks
 ollama pull qwen2.5:7b-instruct-q4_K_M
 
 # 3. Point the worker at it
-cp deploy/jetson-worker.env /etc/turing/worker.env   # or merge into your env
+sudo cp deploy/jetson-worker.env /etc/turing/worker.env   # set TURING_NATS_URL to the coordinator
+
+# 4. Install + start the worker unit
+sudo cp deploy/turing-worker.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now turing-worker
 ```
 
 ## On-device verification + benchmark (operator)

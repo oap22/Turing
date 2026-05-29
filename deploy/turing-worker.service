@@ -1,0 +1,33 @@
+[Unit]
+Description=Turing research worker (executor + local quantized inference)
+Documentation=https://github.com/oap22/Turing
+# Runs on each Jetson Orin Nano Super. Requires Ollama serving the pinned model
+# (see deploy/jetson-worker.md, ADR 0009 issue #259).
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=turing
+Group=turing
+WorkingDirectory=/var/lib/turing
+EnvironmentFile=/etc/turing/worker.env
+ExecStart=/usr/local/bin/turing
+
+# Workers run low-risk local tools only; they never hold the shell safety gate.
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/turing
+
+Restart=on-failure
+RestartSec=10s
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Install]
+WantedBy=multi-user.target

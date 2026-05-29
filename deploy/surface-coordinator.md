@@ -60,6 +60,16 @@ systemctl is-system-running   # "running" or "degraded" (not "offline")
 ps -p 1 -o comm=              # systemd
 ```
 
+Install the coordinator unit ([`turing-coordinator.service`](turing-coordinator.service)):
+
+```bash
+sudo cp deploy/turing-coordinator.service /etc/systemd/system/
+# Create /etc/turing/coordinator.env with the coordinator's settings
+# (Discord/Anthropic keys, TURING_GATEWAY_ENABLED=true, NATS bind, $TURING_DB_PATH).
+# The coordinator runs NO local inference — do not set a worker model here.
+sudo systemctl daemon-reload && sudo systemctl enable --now turing-coordinator
+```
+
 ## 3. WSL2 — networking (the NAT gotcha)
 
 **WSL2 is NAT'd by default** — the Jetsons on the LAN cannot reach services bound
