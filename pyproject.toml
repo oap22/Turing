@@ -48,6 +48,7 @@ dev = [
 [project.scripts]
 turing = "turing.__main__:main"
 turing-ui = "turing.launcher:main"
+turing-vault-watcher = "turing.vault.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/turing"]
