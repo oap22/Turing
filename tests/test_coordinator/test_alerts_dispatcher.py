@@ -246,98 +246,98 @@ async def test_snooze_map_is_in_memory_only() -> None:
     assert d2.snoozed_until("pi-beta", "temp_celsius") is None
 
 
-class _FakeDiscord:
-    """Records DM attempts; optionally raises to exercise failure isolation."""
+class _FakeNtfy:
+    """Records push attempts; optionally raises to exercise failure isolation."""
 
     def __init__(self, *, raises: bool = False) -> None:
         self.calls: list[str] = []
         self._raises = raises
 
-    async def dm_operator(self, content: str) -> None:
+    async def ntfy_push(self, content: str) -> None:
         self.calls.append(content)
         if self._raises:
-            raise RuntimeError("429 rate limited")
+            raise RuntimeError("503 ntfy unreachable")
 
 
 @pytest.mark.asyncio
-async def test_discord_fallback_engaged_when_spa_stale() -> None:
+async def test_ntfy_fallback_engaged_when_spa_stale() -> None:
     """Test α (fallback engaged when stale)."""
-    discord = _FakeDiscord()
+    ntfy = _FakeNtfy()
     dispatcher = AlertDispatcher(
         AlertEngine(now_ms=lambda: _NOW),
-        discord_client=discord,
+        ntfy_client=ntfy,
         reachability_clock=lambda: _NOW - 120_000,
     )
     for _ in range(3):
         await dispatcher.observe(_peer(85.0), _NOW)
-    assert discord.calls == ["⚠ pi-beta TEMP danger: 85.0°C (>82.0°C)"]
+    assert ntfy.calls == ["⚠ pi-beta TEMP danger: 85.0°C (>82.0°C)"]
 
 
 @pytest.mark.asyncio
-async def test_discord_fallback_engaged_when_reachability_none() -> None:
+async def test_ntfy_fallback_engaged_when_reachability_none() -> None:
     """Test α (fallback engaged when None — bootstrap-as-unreachable)."""
-    discord = _FakeDiscord()
+    ntfy = _FakeNtfy()
     dispatcher = AlertDispatcher(
         AlertEngine(now_ms=lambda: _NOW),
-        discord_client=discord,
+        ntfy_client=ntfy,
         reachability_clock=lambda: None,
     )
     for _ in range(3):
         await dispatcher.observe(_peer(85.0), _NOW)
-    assert len(discord.calls) == 1
+    assert len(ntfy.calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_discord_fallback_skipped_when_spa_fresh() -> None:
-    """Test α (fallback skipped when fresh): a recent SPA push suppresses DM."""
-    discord = _FakeDiscord()
+async def test_ntfy_fallback_skipped_when_spa_fresh() -> None:
+    """Test α (fallback skipped when fresh): a recent SPA push suppresses ntfy."""
+    ntfy = _FakeNtfy()
     dispatcher = AlertDispatcher(
         AlertEngine(now_ms=lambda: _NOW),
-        discord_client=discord,
+        ntfy_client=ntfy,
         reachability_clock=lambda: _NOW - 30_000,
     )
     for _ in range(3):
         await dispatcher.observe(_peer(85.0), _NOW)
-    assert discord.calls == []
+    assert ntfy.calls == []
 
 
 @pytest.mark.asyncio
-async def test_discord_cleared_never_dms() -> None:
-    """Test α (cleared never DMs): DM fires on the alerting edge only."""
-    discord = _FakeDiscord()
+async def test_ntfy_cleared_never_posts() -> None:
+    """Test α (cleared never posts): the push fires on the alerting edge only."""
+    ntfy = _FakeNtfy()
     dispatcher = AlertDispatcher(
         AlertEngine(now_ms=lambda: _NOW),
-        discord_client=discord,
+        ntfy_client=ntfy,
         reachability_clock=lambda: _NOW - 120_000,
     )
     for _ in range(3):
         await dispatcher.observe(_peer(85.0), _NOW)  # alerting edge
-    assert len(discord.calls) == 1
+    assert len(ntfy.calls) == 1
     for _ in range(3):
         await dispatcher.observe(_peer(20.0), _NOW)  # cleared edge
-    assert len(discord.calls) == 1  # cleared did not DM
+    assert len(ntfy.calls) == 1  # cleared did not push
 
 
 @pytest.mark.asyncio
-async def test_discord_snooze_suppresses_dm() -> None:
-    """Test α (snooze suppresses Discord too)."""
-    discord = _FakeDiscord()
+async def test_ntfy_snooze_suppresses_post() -> None:
+    """Test α (snooze suppresses ntfy too)."""
+    ntfy = _FakeNtfy()
     dispatcher = AlertDispatcher(
         AlertEngine(now_ms=lambda: _NOW),
-        discord_client=discord,
+        ntfy_client=ntfy,
         reachability_clock=lambda: None,
     )
     await dispatcher.snooze("pi-beta", "temp_celsius", _NOW)
     for _ in range(5):
         await dispatcher.observe(_peer(85.0), _NOW)
-    assert discord.calls == []
+    assert ntfy.calls == []
 
 
 @pytest.mark.asyncio
-async def test_discord_failure_isolated_from_engine() -> None:
-    """Test α (Discord failure isolation): a raising dm_operator never
+async def test_ntfy_failure_isolated_from_engine() -> None:
+    """Test α (ntfy failure isolation): a raising ntfy_push never
     propagates out of observe; SPA frames still emit in order."""
-    discord = _FakeDiscord(raises=True)
+    ntfy = _FakeNtfy(raises=True)
     frames: list[dict] = []
 
     async def sink(frame: dict) -> None:
@@ -346,7 +346,7 @@ async def test_discord_failure_isolated_from_engine() -> None:
     dispatcher = AlertDispatcher(
         AlertEngine(now_ms=lambda: _NOW),
         send_frame=sink,
-        discord_client=discord,
+        ntfy_client=ntfy,
         reachability_clock=lambda: None,
     )
     for _ in range(3):
@@ -356,17 +356,102 @@ async def test_discord_failure_isolated_from_engine() -> None:
     for _ in range(3):
         await dispatcher.observe(_peer(85.0), _NOW)  # re-alert
 
-    # The engine's SPA frames are unaffected by the Discord failures.
+    # The engine's SPA frames are unaffected by the ntfy failures.
     assert [f["state"] for f in frames] == ["alerting", "cleared", "alerting"]
-    # dm_operator was attempted on each alerting edge and raised each time;
+    # ntfy_push was attempted on each alerting edge and raised each time;
     # surviving the loop is the isolation guarantee.
-    assert len(discord.calls) == 2
+    assert len(ntfy.calls) == 2
 
 
 @pytest.mark.asyncio
-async def test_no_discord_client_is_a_silent_noop() -> None:
-    """Test β (config gate, dispatcher side): with no discord_client the
-    alerting edge drives no Discord interaction and never raises."""
+async def test_snooze_survives_ntfy_failure() -> None:
+    """A failed ntfy push must not clear or bypass the snooze.
+
+    The snooze is evaluated upstream in ``observe`` (before any transport
+    call), so a raising ``ntfy_push`` can never clear the snooze map or let
+    the suppressed ``alerting`` edge slip through. Here the key is snoozed,
+    the SPA is unreachable (so the fallback path is live), and the only way
+    ntfy is reached at all is the *update* frame's path — which it is not on
+    a fresh snooze. We assert: no alerting frame escapes, ntfy is never
+    pushed (snooze suppressed the edge before the transport), and the snooze
+    map still holds afterwards."""
+    ntfy = _FakeNtfy(raises=True)
+    frames: list[dict] = []
+
+    async def sink(frame: dict) -> None:
+        frames.append(frame)
+
+    dispatcher = AlertDispatcher(
+        AlertEngine(now_ms=lambda: _NOW),
+        send_frame=sink,
+        ntfy_client=ntfy,
+        reachability_clock=lambda: None,  # unreachable → fallback path is live
+    )
+
+    # Snooze TEMP on pi-beta before it ever alerts.
+    expiry = await dispatcher.snooze("pi-beta", "temp_celsius", _NOW)
+
+    # Drive into alerting. The snooze suppresses the alerting edge upstream,
+    # so neither a frame nor an ntfy push goes out — and the raising client
+    # is never even reached on this path.
+    for _ in range(5):
+        await dispatcher.observe(_peer(85.0), _NOW)
+
+    # No alerting frame escaped (snooze suppressed it).
+    assert [f for f in frames if f["field"] == "temp_celsius"] == []
+    # ntfy was not pushed — the snooze short-circuited before the transport.
+    assert ntfy.calls == []
+    # The snooze map survived the whole run, unchanged.
+    assert dispatcher.snoozed_until("pi-beta", "temp_celsius") == expiry
+
+
+@pytest.mark.asyncio
+async def test_snooze_survives_ntfy_failure_on_active_alert() -> None:
+    """A raising ntfy push on the alerting edge must not clear the snooze.
+
+    This drives the failure through the *transport* itself: the key alerts
+    first (one push attempt, which raises), then the operator snoozes the
+    active alert. The raised error is swallowed by the dispatcher and the
+    snooze map is wholly unaffected — a later heartbeat still sees the snooze."""
+    ntfy = _FakeNtfy(raises=True)
+    frames: list[dict] = []
+
+    async def sink(frame: dict) -> None:
+        frames.append(frame)
+
+    dispatcher = AlertDispatcher(
+        AlertEngine(now_ms=lambda: _NOW),
+        send_frame=sink,
+        ntfy_client=ntfy,
+        reachability_clock=lambda: None,  # unreachable → fallback engaged
+    )
+
+    # Alert first: the alerting edge fires one ntfy push, which raises and is
+    # swallowed (failure isolation). The engine state is now ``alerting``.
+    for _ in range(3):
+        await dispatcher.observe(_peer(85.0), _NOW)
+    assert len(ntfy.calls) == 1
+    assert [f["state"] for f in frames] == ["alerting"]
+
+    # Now snooze the active alert. The snooze is recorded regardless of the
+    # earlier transport failure.
+    expiry = await dispatcher.snooze("pi-beta", "temp_celsius", _NOW)
+
+    # The snooze map holds, and a fresh heartbeat keeps respecting it: no new
+    # alerting frame, no new push (the alerting edge stays suppressed).
+    for _ in range(5):
+        await dispatcher.observe(_peer(85.0), _NOW)
+    assert dispatcher.snoozed_until("pi-beta", "temp_celsius") == expiry
+    assert len(ntfy.calls) == 1  # no further push after the snooze
+    # Only the original alerting + the snooze update frame exist.
+    assert [f["state"] for f in frames] == ["alerting", "alerting"]
+    assert frames[1]["snoozed_until_ms"] == expiry
+
+
+@pytest.mark.asyncio
+async def test_no_ntfy_client_is_a_silent_noop() -> None:
+    """Test β (config gate, dispatcher side): with no ntfy_client the
+    alerting edge drives no ntfy interaction and never raises."""
     frames: list[dict] = []
 
     async def sink(frame: dict) -> None:

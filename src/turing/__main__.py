@@ -158,20 +158,22 @@ async def _run(config: TuringConfig) -> None:
     executor.bot = bot
 
     # 8b. Hardware-safety alerts (PRD #228) — build the alert dispatcher and
-    # wire it into mesh presence + the gateway. Built here, after the bot
-    # exists, so the Discord DM fallback can reach a live bot.
+    # wire it into mesh presence + the gateway. Per ADR-0010 §2 the closed-laptop
+    # fallback transport is ntfy (self-hosted on the Surface coordinator),
+    # replacing the retired Discord-DM fallback.
     alert_dispatcher: AlertDispatcher | None = None
     telemetry_sink: TelemetrySink | None = None
     alerts_ring_buffer: RingBuffer | None = None
     if config.mesh_enabled and presence is not None:
-        from turing.coordinator.alerts.discord_client import DiscordAlertClient
         from turing.coordinator.alerts.dispatcher import AlertDispatcher, ReachabilityClock
+        from turing.coordinator.alerts.ntfy_client import NtfyAlertClient
 
-        discord_client = DiscordAlertClient(bot, config.discord_operator_user_id)
-        if config.discord_operator_user_id is None:
+        ntfy_client = NtfyAlertClient(config.coordinator_ntfy_base_url, config.operator_ntfy_topic)
+        if config.operator_ntfy_topic is None or config.coordinator_ntfy_base_url is None:
             logger.warning(
-                "alerts.discord_fallback_disabled",
-                msg="TURING_OPERATOR_DISCORD_ID unset; hardware-safety alert DMs disabled",
+                "alerts.ntfy_fallback_disabled",
+                msg="TURING_OPERATOR_NTFY_TOPIC / TURING_COORDINATOR_NTFY_BASE_URL unset; "
+                "hardware-safety alert pushes disabled",
             )
         reachability_clock: ReachabilityClock | None = None
         if config.gateway_enabled:
@@ -196,7 +198,7 @@ async def _run(config: TuringConfig) -> None:
 
             reachability_clock = _spa_last_send
         alert_dispatcher = AlertDispatcher(
-            discord_client=discord_client,
+            ntfy_client=ntfy_client,
             reachability_clock=reachability_clock,
         )
         presence.set_alert_dispatcher(alert_dispatcher)

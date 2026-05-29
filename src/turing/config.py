@@ -57,6 +57,13 @@ class TuringConfig(BaseSettings):
         "when the SPA is unreachable; coordinator-only, unset disables the "
         "ntfy fallback",
     )
+    coordinator_ntfy_base_url: str | None = Field(
+        default=None,
+        validation_alias="TURING_COORDINATOR_NTFY_BASE_URL",
+        description="ntfy server base URL on the Surface coordinator "
+        "(e.g. http://surface.<tailnet>.ts.net:8090); coordinator-only, "
+        "unset disables the ntfy fallback",
+    )
 
     # ── Anthropic (cloud LLM) ────────────────────────────────────────────
     anthropic_api_key: str = Field(default="", description="Anthropic API key")
