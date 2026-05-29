@@ -1,0 +1,32 @@
+# ntfy server — closed-laptop hardware-safety alert push for Turing.
+#
+# Per ADR-0010 §2/§6, ntfy is self-hosted inside WSL2 on the Surface
+# coordinator and replaces the retired Discord-DM alert fallback. It runs as
+# its own systemd unit (Restart=always) so it rides through Surface reboots
+# alongside the three turing-* units; the alerts dispatcher posts to the
+# operator's per-operator topic (TURING_OPERATOR_NTFY_TOPIC) when the SPA
+# telemetry sink has gone stale.
+#
+# Install is codified into scripts/setup-coordinator.sh in slice G; until that
+# lands, install this unit by hand following docs/coordinator-ntfy.md (the
+# install is idempotent — drop the file, daemon-reload, enable --now).
+
+[Unit]
+Description=ntfy server (Turing closed-laptop alert push)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ntfy
+Group=ntfy
+# ntfy reads /etc/ntfy/server.yml for base-url, listen-http, and cache/auth
+# settings (see docs/coordinator-ntfy.md). The default listen-http is :80;
+# the server.yml on the Surface scopes it to a Tailnet-reachable port that
+# the Windows Firewall rule (Tailnet subnet only) admits.
+ExecStart=/usr/bin/ntfy serve --config /etc/ntfy/server.yml
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

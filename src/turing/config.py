@@ -45,6 +45,19 @@ class TuringConfig(BaseSettings):
         "when the SPA is unreachable; unset disables the Discord fallback",
     )
 
+    # ── Alerts (closed-laptop fallback) ──────────────────────────────────
+    # Per ADR-0010 §2, ntfy (self-hosted on the Surface coordinator) replaces
+    # the Discord-DM closed-laptop fallback. Topic is per operator. Lives on
+    # the coordinator only; the alerts dispatcher posts here when the SPA
+    # telemetry sink has gone stale (slice B wires the transport).
+    operator_ntfy_topic: str | None = Field(
+        default=None,
+        validation_alias="TURING_OPERATOR_NTFY_TOPIC",
+        description="ntfy topic that receives hardware-safety alert pushes "
+        "when the SPA is unreachable; coordinator-only, unset disables the "
+        "ntfy fallback",
+    )
+
     # ── Anthropic (cloud LLM) ────────────────────────────────────────────
     anthropic_api_key: str = Field(default="", description="Anthropic API key")
     anthropic_model: str = Field(
