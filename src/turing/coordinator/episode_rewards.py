@@ -5,11 +5,17 @@ Rewards are *events*, not a single per-episode column. The schema:
     episode_id, source, value, recorded_at_ms,
     discord_user_id, discord_message_id
 
+The ``discord_*`` columns are retained as historical reward-source
+provenance — they record where a reaction originated for events written by
+the (now-retired, ADR 0010) Discord surface. New emitters (the webui
+queue/chat reward path) leave them ``None``; the reward math never reads
+them except to match cancellation rows.
+
 Multiple rows per episode are expected — direct subtask thumb plus
 synthesis-attributed fractional credit plus critic-fallback all stack on
 the same episode. Effective reward = ``SUM(value)``.
 
-A cancellation row (operator un-reacting during a bot-offline window)
+A cancellation row (operator un-reacting during a surface-offline window)
 is just an additional event whose ``value`` is the negation of the
 prior reaction's value, with the same ``discord_user_id`` and
 ``discord_message_id``. Audit history preserved; sum stays

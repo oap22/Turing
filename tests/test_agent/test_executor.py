@@ -74,15 +74,20 @@ async def test_safety_denied_tool():
     registry.execute.assert_not_awaited()
 
 
-async def test_needs_confirmation_no_bot():
-    """Tool needing confirmation with no bot available should be denied."""
+async def test_needs_confirmation_denied_no_surface():
+    """A NEEDS_CONFIRMATION tool is denied by default after ADR 0010.
+
+    The interactive Discord confirmation surface was retired; until the webui
+    chat pane reintroduces an approval affordance, the executor fails safe by
+    denying any action that requires confirmation.
+    """
     registry = _make_mock_tool_registry()
     gate = _make_mock_safety_gate(
         decision=SafetyDecision.NEEDS_CONFIRMATION,
         reason="High-risk operation requires confirmation",
         risk_level="high",
     )
-    executor = Executor(registry, gate, bot=None)
+    executor = Executor(registry, gate)
 
     tool_call = ToolCall(
         id="tc-confirm", name="process", arguments={"action": "kill_process", "pid": 1234}
@@ -90,75 +95,7 @@ async def test_needs_confirmation_no_bot():
     result = await executor.execute_tool_call(tool_call, user_id="user-1", channel_id="ch-1")
 
     assert result.success is False
-    assert "not confirmed" in result.error.lower()
-    registry.execute.assert_not_awaited()
-
-
-async def test_needs_confirmation_approved(monkeypatch):
-    """Tool needing confirmation that gets approved should execute."""
-    registry = _make_mock_tool_registry()
-    gate = _make_mock_safety_gate(
-        decision=SafetyDecision.NEEDS_CONFIRMATION,
-        reason="High-risk operation",
-        risk_level="high",
-    )
-
-    # Create a mock bot with channel
-    mock_bot = MagicMock()
-    mock_channel = AsyncMock()
-    mock_bot.get_channel.return_value = mock_channel
-
-    executor = Executor(registry, gate, bot=mock_bot)
-
-    # Mock the ConfirmActionView to auto-approve
-    mock_view = MagicMock()
-    mock_view.wait_for_result = AsyncMock(return_value=True)
-
-    monkeypatch.setattr(
-        "turing.discord_bot.views.ConfirmActionView",
-        lambda **kwargs: mock_view,
-    )
-
-    tool_call = ToolCall(id="tc-confirmed", name="process", arguments={"action": "kill_process"})
-    result = await executor.execute_tool_call(tool_call, user_id="123", channel_id="456")
-
-    assert result.success is True
-    assert result.output == "command output"
-    registry.execute.assert_awaited_once()
-
-
-async def test_needs_confirmation_denied(monkeypatch):
-    """Tool needing confirmation that gets denied should not execute."""
-    registry = _make_mock_tool_registry()
-    gate = _make_mock_safety_gate(
-        decision=SafetyDecision.NEEDS_CONFIRMATION,
-        reason="High-risk operation",
-        risk_level="high",
-    )
-
-    mock_bot = MagicMock()
-    mock_channel = AsyncMock()
-    mock_bot.get_channel.return_value = mock_channel
-
-    executor = Executor(registry, gate, bot=mock_bot)
-
-    mock_view = MagicMock()
-    mock_view.wait_for_result = AsyncMock(return_value=False)
-
-    monkeypatch.setattr(
-        "turing.discord_bot.views.ConfirmActionView",
-        lambda **kwargs: mock_view,
-    )
-
-    tool_call = ToolCall(
-        id="tc-denied-confirm",
-        name="process",
-        arguments={"action": "kill_process"},
-    )
-    result = await executor.execute_tool_call(tool_call, user_id="123", channel_id="456")
-
-    assert result.success is False
-    assert "not confirmed" in result.error.lower()
+    assert "no operator surface" in result.error.lower()
     registry.execute.assert_not_awaited()
 
 

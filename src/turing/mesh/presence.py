@@ -71,8 +71,8 @@ class PresenceService:
     def set_alert_dispatcher(self, dispatcher: AlertDispatcher | None) -> None:
         """Late-bind the hardware-safety alert dispatcher.
 
-        The boot sequence builds the dispatcher after the Discord bot exists
-        (slice 4) — later than ``PresenceService`` is constructed — so it is
+        The boot sequence builds the dispatcher later than ``PresenceService``
+        is constructed (it depends on the gateway telemetry sink), so it is
         attached here rather than passed to ``__init__``.
         """
         self._alert_dispatcher = dispatcher

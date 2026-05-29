@@ -20,7 +20,7 @@ async def test_log_action_persists_audit_row(temp_db) -> None:
     store = MemoryStore(str(temp_db))
     await store.initialize()
     try:
-        gate = SafetyGate(config=MagicMock(discord_admin_ids=[]), audit_store=store)
+        gate = SafetyGate(config=MagicMock(admin_user_ids=[]), audit_store=store)
         await gate.log_action(
             user_id="u-1",
             tool_name="shell",
@@ -48,7 +48,7 @@ async def test_log_action_does_not_emit_audit_store_error(
     store = MemoryStore(str(temp_db))
     await store.initialize()
     try:
-        gate = SafetyGate(config=MagicMock(discord_admin_ids=[]), audit_store=store)
+        gate = SafetyGate(config=MagicMock(admin_user_ids=[]), audit_store=store)
         with caplog.at_level("ERROR"):
             await gate.log_action(
                 user_id="u-2",

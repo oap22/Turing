@@ -1,4 +1,8 @@
-"""Canary REJECTED handler — hard-examples + Discord notify (#118 follow-up)."""
+"""Canary REJECTED handler — hard-examples + rejection notice (#118 follow-up).
+
+ADR 0010 retired the Discord live-DAG channel; the handler now logs the
+rejection notice for morning review instead of posting it to Discord.
+"""
 
 from __future__ import annotations
 
@@ -93,8 +97,21 @@ def test_format_rejection_notice_handles_no_prior_live():
 # ── on_rejected handler ─────────────────────────────────────────────
 
 
+def _capture_notice(monkeypatch) -> list[dict]:
+    """Capture the structured rejection-notice log emitted by the handler."""
+    from turing.coordinator.promotion import canary_rejection as cr
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        cr.logger,
+        "info",
+        lambda event, **kw: captured.append({"event": event, **kw}),
+    )
+    return captured
+
+
 @pytest.mark.asyncio
-async def test_handler_writes_hard_examples_and_posts_notice():
+async def test_handler_writes_hard_examples_and_logs_notice(monkeypatch):
     episode_store = EpisodeStore()
     log = RejectionLog()
     notifier_calls: list[tuple[str, dict]] = []
@@ -103,16 +120,12 @@ async def test_handler_writes_hard_examples_and_posts_notice():
         def notify(self, kind, payload):
             notifier_calls.append((kind, payload))
 
-    posted: list[str] = []
-
-    async def discord_post(body):
-        posted.append(body)
+    logged = _capture_notice(monkeypatch)
 
     handler = make_canary_rejected_handler(
         episode_store=episode_store,
         rejection_log=log,
         notifier=_Notifier(),
-        discord_post=discord_post,
         now_ms=lambda: 5_000,
     )
 
@@ -145,10 +158,11 @@ async def test_handler_writes_hard_examples_and_posts_notice():
     assert {e.subtask_id for e in archived} == {"c1", "c2"}
     assert all(e.specialty == "research-deep" for e in archived)
 
-    # Notifier and Discord both called.
+    # Notifier fired and the rejection notice was logged with full context.
     assert notifier_calls and notifier_calls[0][0] == "training_failed"
-    assert posted and "research:v3" in posted[0]
-    assert "Regressions this month for `research-deep`: 1" in posted[0]
+    assert logged and logged[0]["event"] == "canary.rejected_notice"
+    assert "research:v3" in logged[0]["body"]
+    assert "Regressions this month for `research-deep`: 1" in logged[0]["body"]
     # RejectionLog updated.
     assert (
         log.count_within(specialty="research-deep", now_ms=5_000, horizon_ms=REGRESSION_HORIZON_MS)
@@ -157,7 +171,7 @@ async def test_handler_writes_hard_examples_and_posts_notice():
 
 
 @pytest.mark.asyncio
-async def test_handler_no_hard_examples_skips_archive_but_still_posts():
+async def test_handler_no_hard_examples_skips_archive_but_still_logs(monkeypatch):
     episode_store = EpisodeStore()
     log = RejectionLog()
 
@@ -165,16 +179,12 @@ async def test_handler_no_hard_examples_skips_archive_but_still_posts():
         def notify(self, kind, payload):
             raise AssertionError("no hard examples → notifier should not fire")
 
-    posted: list[str] = []
-
-    async def discord_post(body):
-        posted.append(body)
+    logged = _capture_notice(monkeypatch)
 
     handler = make_canary_rejected_handler(
         episode_store=episode_store,
         rejection_log=log,
         notifier=_Notifier(),
-        discord_post=discord_post,
         now_ms=lambda: 1_000,
     )
     await handler(_outcome(hard_examples=()), "r", "v1", "x")
@@ -185,13 +195,14 @@ async def test_handler_no_hard_examples_skips_archive_but_still_posts():
         else list(episode_store._rows.values())
     )
     assert archived == []
-    assert posted, "Discord notice still goes out even with no hard examples"
+    assert logged, "rejection notice still goes out even with no hard examples"
 
 
 @pytest.mark.asyncio
-async def test_handler_works_without_discord_post():
+async def test_handler_does_not_raise(monkeypatch):
     episode_store = EpisodeStore()
     log = RejectionLog()
+    _capture_notice(monkeypatch)
 
     class _Notifier:
         def notify(self, *args, **kwargs):
@@ -201,7 +212,6 @@ async def test_handler_works_without_discord_post():
         episode_store=episode_store,
         rejection_log=log,
         notifier=_Notifier(),
-        discord_post=None,
         now_ms=lambda: 1,
     )
     await handler(_outcome(), "r", "v1", "x")  # must not raise

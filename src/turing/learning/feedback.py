@@ -1,4 +1,4 @@
-"""Feedback collection from Discord reactions and explicit corrections."""
+"""Feedback collection from operator thumbs and explicit corrections."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ logger = structlog.get_logger("turing.learning.feedback")
 
 
 class FeedbackCollector:
-    """Tracks success/failure via Discord reactions and explicit feedback.
+    """Tracks success/failure via operator thumbs and explicit feedback.
 
     Records positive and negative signals for responses, as well as
     explicit corrections from users.  This data is stored in the audit
