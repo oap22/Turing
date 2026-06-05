@@ -30,6 +30,10 @@ from turing.coordinator.flywheel.frontier import (
     default_eliminator,
     rouge_l,
 )
+from turing.coordinator.flywheel.frontier_review import (
+    FrontierReview,
+    promoted_question_id,
+)
 from turing.coordinator.flywheel.generalist import (
     AI_ML_GENERALIST,
     GENERALIST_FLEET_SIZE,
@@ -69,6 +73,7 @@ __all__ = [
     "EvolutionAxis",
     "EvolvedQuestion",
     "FrontierResult",
+    "FrontierReview",
     "GeneralistAdapterRollout",
     "GeneralistFleet",
     "InboxDraft",
@@ -84,6 +89,7 @@ __all__ = [
     "SFTCandidate",
     "default_eliminator",
     "parse_inbox_draft",
+    "promoted_question_id",
     "proposals_from_result",
     "proposals_to_fragment",
     "replicate_to_fleet",
