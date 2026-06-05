@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import socket
 from typing import Any
 
@@ -15,6 +16,13 @@ logger = structlog.get_logger("turing.tools.network")
 
 # Default timeout for network operations (seconds).
 DEFAULT_TIMEOUT = 10
+
+# A hostname or IP literal: alphanumerics plus ``. - _ :`` (the colon covers
+# IPv6 literals). The first character must be alphanumeric so a value can never
+# be interpreted as a ``ping`` flag, and the set excludes whitespace and every
+# shell metacharacter. Paired with create_subprocess_exec (no shell) this makes
+# command injection impossible.
+_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:_-]*$")
 
 
 class NetworkTool(Tool):
@@ -108,13 +116,21 @@ class NetworkTool(Tool):
 
         count = min(kwargs.get("count", 4), 10)
 
-        # Sanitize host to prevent command injection.
-        safe_host = host.replace(";", "").replace("&", "").replace("|", "").replace("`", "").strip()
+        # Reject anything that is not a plausible host/IP. With the no-shell
+        # exec below, a value like ``8.8.8.8; rm -rf /`` can never reach a shell
+        # — and it is rejected here anyway.
+        safe_host = host.strip()
+        if not _HOST_RE.match(safe_host):
+            return ToolResult(success=False, output="", error=f"Invalid host '{host}'")
 
-        cmd = f"ping -c {count} -W {DEFAULT_TIMEOUT} {safe_host}"
         try:
-            process = await asyncio.create_subprocess_shell(
-                cmd,
+            process = await asyncio.create_subprocess_exec(
+                "ping",
+                "-c",
+                str(count),
+                "-W",
+                str(DEFAULT_TIMEOUT),
+                safe_host,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
