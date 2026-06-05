@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import signal
 from typing import Any
 
@@ -12,6 +13,12 @@ import structlog
 from turing.tools.base import RiskLevel, Tool, ToolResult
 
 logger = structlog.get_logger("turing.tools.process")
+
+# systemd unit names use a restricted character set (alphanumerics plus
+# ``. _ - @ :`` and the ``.slice``/``@instance`` syntax). Anything outside this
+# is rejected before exec, and the call goes through ``create_subprocess_exec``
+# (no shell) so the unit name can never be interpreted as a command.
+_SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@:-]*$")
 
 
 class ProcessTool(Tool):
@@ -204,12 +211,22 @@ class ProcessTool(Tool):
                 error=f"Invalid service action '{service_action}'. Valid: start, stop, restart, status",
             )
 
-        # Sanitize service name to prevent injection.
-        safe_name = service_name.replace(";", "").replace("&", "").replace("|", "").strip()
+        # Reject anything that is not a plausible systemd unit name. Combined
+        # with the no-shell exec below this closes the injection hole entirely
+        # (a value like ``nginx $(rm -rf /)`` never reaches a shell and is
+        # rejected here anyway).
+        safe_name = service_name.strip()
+        if not _SERVICE_NAME_RE.match(safe_name):
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Invalid service name '{service_name}'",
+            )
 
-        cmd = f"systemctl {service_action} {safe_name}"
-        process = await asyncio.create_subprocess_shell(
-            cmd,
+        process = await asyncio.create_subprocess_exec(
+            "systemctl",
+            service_action,
+            safe_name,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
