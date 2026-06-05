@@ -254,6 +254,51 @@ def test_watcher_reindexes_curated_note_from_promotion_commit(tmp_path: Path) ->
     assert not any(path.startswith("vault/inbox/") for path in snapshot)
 
 
+def test_promotion_does_not_sweep_in_untracked_sibling_drafts(tmp_path: Path) -> None:
+    # A single task_id dir can hold several drafts. Promoting one must not drag
+    # its untracked siblings (still awaiting review) into the curated commit/index.
+    _init_vault_repo(tmp_path)
+    _write_draft(tmp_path, task_id="night-1", slug="answer")
+    sibling = _write_draft(
+        tmp_path,
+        task_id="night-1",  # SAME task_id dir
+        slug="sibling",
+        answer="A second draft still awaiting review.",
+    )
+    assert sibling.parent == (tmp_path / "vault" / "inbox" / "night-1")
+    committer = VaultCommitter(vault_root=tmp_path, identity=_IDENTITY)
+    curator = MorningCuration(
+        vault_root=tmp_path, episode_rewards=EpisodeRewardsStore(), committer=committer
+    )
+    index = VaultIndex(embedder=DeterministicHashEmbedder())
+    watcher = VaultWatcher(
+        vault_root=tmp_path, index=index, last_indexed_sha=_git(tmp_path, "rev-parse", "HEAD")
+    )
+
+    # Promote ONLY the first draft.
+    drafts = curator.list_inbox()
+    first = next(d for d in drafts if d.path.stem == "answer")
+    curated, _ = curator.accept(
+        first, episode_id="ep-1", question="Explain QLoRA.", recorded_at_ms=1000
+    )
+
+    # The sibling never entered the tree — only the curated note did.
+    sibling_rel = sibling.relative_to(tmp_path).as_posix()
+    curated_rel = curated.relative_to(tmp_path).as_posix()
+    tracked = _git(tmp_path, "ls-tree", "--name-only", "-r", "HEAD").splitlines()
+    assert curated_rel in tracked
+    assert sibling_rel not in tracked
+    assert not any(t.startswith("vault/inbox/") for t in tracked)
+    assert sibling.exists()  # still on disk, awaiting review
+
+    # Read-side: the watcher must not leak the sibling into the curated index.
+    watcher.poll_once()
+    snapshot = index.snapshot()
+    assert curated_rel in snapshot
+    assert sibling_rel not in snapshot
+    assert not any(path.startswith("vault/inbox/") for path in snapshot)
+
+
 def test_edit_with_committer_commits_corrected_target(tmp_path: Path) -> None:
     _init_vault_repo(tmp_path)
     _write_draft(tmp_path)
