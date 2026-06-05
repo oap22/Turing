@@ -24,7 +24,11 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from turing.coordinator.dispatch import SubtaskDispatch
+from turing.coordinator.dispatch import (
+    SubtaskDispatch,
+    SubtaskKind,
+    reasoning_from_result,
+)
 from turing.coordinator.dispatch.client import SubtaskTimeoutError
 from turing.coordinator.lifecycle.episode_store import Episode
 from turing.coordinator.lifecycle.lifecycle import SubtaskState
@@ -137,6 +141,7 @@ class NightlyDispatcher:
             prompt=question.prompt,
             source_inputs=[],
             deadline_ms=deadline,
+            kind=SubtaskKind.RESEARCH.value,
         )
         try:
             result = await self._dispatch.dispatch(
@@ -170,6 +175,9 @@ class NightlyDispatcher:
             tokens=result.tokens_used,
             latency_ms=result.latency_ms or (self._now_ms() - started),
             outcome=outcome,
+            # The worker's grounded reasoning rides the result fragment; record
+            # it so the episode is reasoning-bearing, not answer-only (#261).
+            reasoning=reasoning_from_result(result),
         )
         # Land any follow-up questions the worker *proposed* (it does not — and
         # cannot — dispatch them itself) into the holding queue for the morning
@@ -196,6 +204,7 @@ class NightlyDispatcher:
         tokens: int,
         latency_ms: int,
         outcome: SubtaskState,
+        reasoning: tuple[str, ...] = (),
     ) -> None:
         self._episodes.record(
             Episode(
@@ -206,7 +215,7 @@ class NightlyDispatcher:
                 model_version=model,
                 adapter_version="",
                 input_text=question.prompt,
-                trajectory=(),
+                trajectory=reasoning,
                 output_text=output,
                 success=outcome is SubtaskState.COMPLETED,
                 latency_ms=latency_ms,
