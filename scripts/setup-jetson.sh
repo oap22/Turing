@@ -22,13 +22,24 @@
 # for this device and paste them at the Phase 4 prompts here — this is a manual
 # hand-off; the seeds are never transmitted automatically. For non-interactive
 # / re-imaging runs, export them first instead of typing:
-#   TURING_NATS_URL=nats://surface.<tailnet>.ts.net:4222 \
+#   TURING_NATS_URL=tls://surface.<tailnet>.ts.net:4222 \
 #   TURING_NATS_NKEY_SEED=SUA... \
 #       bash scripts/setup-jetson.sh </dev/null
 # Re-runs preserve whatever is already in .env (same policy as every other
 # field); delete the .env to regenerate from scratch.
 #
 # Everything else is automated.
+#
+# Fleet-orchestrated runs (scripts/setup-fleet.sh) drive this script fully
+# hands-off from the coordinator and honour three extra env vars so neither
+# interactive hand-off above is needed per node:
+#   • TURING_HOSTNAME       — sets this node's hostname without the prompt.
+#   • TURING_DEPLOY_SRC=DIR — deploy code by rsync from DIR instead of cloning
+#                             from GitHub (so a PRIVATE repo needs no per-node
+#                             gh auth). The coordinator stages its tree there.
+#   • TURING_SKIP_GH_AUTH=1 — skip the gh auth login step (pair with the above).
+# Tailscale must already be up on the node for the orchestrator to reach it,
+# which is exactly the state that lets us skip hand-off #1 too.
 
 set -euo pipefail
 
@@ -83,10 +94,13 @@ echo "This will provision the current Jetson as a Turing worker node."
 echo "Coordinator-only services (Discord, Anthropic, gateway) are NOT installed."
 
 # Re-runs must not re-prompt for a value that's already been set. Seed the
-# default from the current static hostname so the operator can press Enter
-# (or run unattended / piped from /dev/null) and keep what's already there.
-# `|| true` keeps `set -e` happy when stdin is closed (EOF on re-run).
-HOSTNAME_CURRENT="$(hostnamectl --static)"
+# default from $TURING_HOSTNAME if the caller exported one (the fleet
+# orchestrator, scripts/setup-fleet.sh, does this so it can name each node
+# without a human at the keyboard), else from the current static hostname so
+# the operator can press Enter (or run unattended / piped from /dev/null) and
+# keep what's already there. `|| true` keeps `set -e` happy when stdin is
+# closed (EOF on re-run).
+HOSTNAME_CURRENT="${TURING_HOSTNAME:-$(hostnamectl --static)}"
 read -r -p "Hostname for this Jetson (e.g. jetson-1) [${HOSTNAME_CURRENT}]: " HOSTNAME_NEW || true
 HOSTNAME_NEW="${HOSTNAME_NEW:-$HOSTNAME_CURRENT}"
 [[ -n "$HOSTNAME_NEW" ]] || die "Hostname is required (no current hostname to fall back to)."
@@ -110,7 +124,7 @@ if [[ -f "$ENV_PATH" ]]; then
     echo "  .env present — keeping existing TURING_NATS_URL / TURING_NATS_NKEY_SEED"
 else
     NATS_URL_DEFAULT="${TURING_NATS_URL:-}"
-    read -r -p "Coordinator NATS URL (e.g. nats://surface.<tailnet>.ts.net:4222) [${NATS_URL_DEFAULT}]: " NATS_URL_NEW || true
+    read -r -p "Coordinator NATS URL (e.g. tls://surface.<tailnet>.ts.net:4222) [${NATS_URL_DEFAULT}]: " NATS_URL_NEW || true
     NATS_URL_NEW="${NATS_URL_NEW:-$NATS_URL_DEFAULT}"
     [[ -n "$NATS_URL_NEW" ]] || die "TURING_NATS_URL is required on a fresh install (see the coordinator's Phase 5 output)."
 
@@ -189,7 +203,13 @@ fi
 
 # ── Phase 3: code deploy as turing ───────────────────────────────────
 log "Phase 3.1 — GitHub authentication for the turing user"
-if ! sudo -u turing -H gh auth status >/dev/null 2>&1; then
+if [[ -n "${TURING_SKIP_GH_AUTH:-}" ]]; then
+    # The fleet orchestrator (scripts/setup-fleet.sh --push-repo) deploys the
+    # code out-of-band by rsyncing the coordinator's tree (TURING_DEPLOY_SRC),
+    # so a private repo provisions with no per-node GitHub device flow. Skip
+    # the interactive gh auth entirely. (gh stays installed for later manual use.)
+    echo "  TURING_SKIP_GH_AUTH set — skipping gh auth (code deployed out-of-band)"
+elif ! sudo -u turing -H gh auth status >/dev/null 2>&1; then
     echo "  launching 'gh auth login' as turing."
     echo "  Choose: GitHub.com → SSH → generate a new key (title: ${HOSTNAME_NEW}-turing) → Login with web browser."
     echo "  Headless Jetson note: gh will try to open a browser and fail — that's fine."
@@ -211,8 +231,28 @@ else
     echo "  already authenticated, skipping"
 fi
 
-log "Phase 3.2 — Clone the repo to /home/turing/turing"
-if [[ ! -d /home/turing/turing/.git ]]; then
+log "Phase 3.2 — Deploy the repo to /home/turing/turing"
+if [[ -n "${TURING_DEPLOY_SRC:-}" ]]; then
+    # Out-of-band code deploy (fleet orchestrator, --push-repo): the coordinator
+    # rsync'd its working tree to $TURING_DEPLOY_SRC (a staging dir in the ssh
+    # user's home). Mirror it into the turing-owned checkout — no GitHub round
+    # trip, so a PRIVATE repo provisions without per-node gh auth.
+    #
+    # --delete keeps the checkout in lockstep with the coordinator, but the
+    # excludes below are load-bearing: they protect this worker's runtime state
+    # (.env with its NATS seed, the SQLite data/ dir, the downloaded embedding
+    # models/ dir, the venv) from being wiped on a code refresh. rsync's --delete
+    # never removes excluded paths.
+    [[ -d "$TURING_DEPLOY_SRC" ]] || die "TURING_DEPLOY_SRC=$TURING_DEPLOY_SRC not found (orchestrator rsync did not land)."
+    echo "  deploying from $TURING_DEPLOY_SRC (rsync, no clone)"
+    sudo mkdir -p /home/turing/turing
+    sudo rsync -a --delete \
+        --exclude='.env' --exclude='.env.*' \
+        --exclude='data/' --exclude='models/' --exclude='.venv/' \
+        --exclude='__pycache__/' --exclude='.git/' --exclude='.claude/' \
+        "${TURING_DEPLOY_SRC%/}/" /home/turing/turing/
+    sudo chown -R turing:turing /home/turing/turing
+elif [[ ! -d /home/turing/turing/.git ]]; then
     # Prefer SSH (gh auth login set up the key); fall back to HTTPS via gh's git credential helper.
     as_turing "git clone $REPO_URL_SSH ~/turing" \
       || as_turing "git clone $REPO_URL_HTTPS ~/turing"
