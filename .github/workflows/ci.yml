@@ -102,3 +102,27 @@ jobs:
 
       - name: Audit dependencies
         run: pip-audit --strict --skip-editable .
+
+  tui:
+    # The Rust operator surface (tui/). Same gates as the crate's own README:
+    # formatting, clippy-as-errors, and the unit + render-smoke test suite.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tui
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Toolchain
+        run: |
+          rustup component add rustfmt clippy
+          cargo --version
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
