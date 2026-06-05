@@ -89,7 +89,7 @@ usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; s/^
 # ── arg parse ────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --hosts)     shift; read -r -a _h <<<"${1:-}"; HOSTS+=("${_h[@]}");;
+        --hosts)     shift; read -r -a _h <<<"${1:-}"; [[ ${#_h[@]} -gt 0 ]] && HOSTS+=("${_h[@]}");;
         --user)      shift; SSH_USER="${1:?--user needs a value}";;
         --nats-url)  shift; NATS_URL_OVERRIDE="${1:?--nats-url needs a value}";;
         --seed-dir)  shift; SEED_DIR="${1:?--seed-dir needs a value}";;
@@ -167,10 +167,13 @@ provision_node() {
         return 1
     }
 
-    # Reachability preflight — fail fast with a clear message.
+    # Reachability preflight — fail fast with a clear message. Force
+    # BatchMode=yes here so a node missing key auth fails immediately instead of
+    # hanging on a password/passphrase prompt (the real run keeps BatchMode=no
+    # for clone-mode's interactive gh device flow).
     if [[ $DRY_RUN -eq 0 ]]; then
-        ssh "${SSH_OPTS[@]}" "$target" true 2>/dev/null \
-            || { warn "[$host] cannot SSH as $SSH_USER (is it on the Tailnet? is the user right?)"; return 1; }
+        ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$target" true 2>/dev/null \
+            || { warn "[$host] cannot SSH as $SSH_USER (on the Tailnet? right user? key installed?)"; return 1; }
     fi
 
     # Remote env handed to setup-jetson.sh. The seed is secret; it rides the
@@ -223,7 +226,12 @@ REMOTE
         log "[DRY-RUN] node $idx → $host"
         [[ "$DEPLOY_MODE" == "push" ]] && info "rsync ${REPO_ROOT}/ → ${target}:~/${DEPLOY_STAGE}/"
         info "ssh $target  (worker-${idx} seed: ${seed:0:6}…, nats: $nats_url)"
-        printf '%s\n' "$remote_script" | sed 's/^/    | /'
+        # Print the remote plan, but REDACT the secret seed — dry-run output
+        # lands in scrollback / screen-shares / CI logs, so the full
+        # TURING_NATS_NKEY_SEED must never be echoed (the :0:6 above is enough).
+        printf '%s\n' "$remote_script" \
+            | sed -E "s/(TURING_NATS_NKEY_SEED=')[^']*/\1<redacted>/" \
+            | sed 's/^/    | /'
         return 0
     fi
 
