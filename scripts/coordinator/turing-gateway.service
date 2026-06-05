@@ -1,18 +1,28 @@
 # turing-gateway.service — webui static + WebSocket + chat/queue API (ADR-0010 §6).
 #
-# Part of the three-unit coordinator process layout. The gateway currently runs
-# IN-PROCESS inside turing-coordinator.service (TURING_GATEWAY_ENABLED=true in
-# .env.coordinator), so a dedicated standalone gateway entrypoint is not on PATH
-# yet — the gateway/coordinator process split is follow-on work (the webui
-# chat-pane slice E + a `python -m turing.gateway` entrypoint).
+# Part of the three-unit coordinator process layout. The dedicated standalone
+# gateway entrypoint now EXISTS (`python -m turing.gateway`), but by default the
+# gateway still runs IN-PROCESS inside turing-coordinator.service
+# (TURING_GATEWAY_ENABLED=true in .env.coordinator), bound to gateway_port.
+#
+# Moving the gateway to its own unit is therefore OPT-IN, to avoid a port
+# double-bind that would break the coordinator. Flip BOTH of these in
+# .env.coordinator to move it:
+#
+#   TURING_GATEWAY_STANDALONE=1      # this unit execs `python -m turing.gateway`
+#   TURING_GATEWAY_ENABLED=false     # coordinator releases gateway_port
 #
 # To honour ADR-0010 §6 — three units, each Restart=always, installed and
 # enabled now — this unit is installed/enabled/started by Phase 7 as a guarded
-# wrapper: it execs the dedicated gateway entrypoint the moment it exists, and
-# until then holds as a clean long-running no-op (logging once why) so the unit
-# is genuinely active without crash-looping a missing module or starting a
-# second full agent. It does NOT fire the cold-start ntfy push (only the
-# coordinator unit does).
+# wrapper. It execs the dedicated entrypoint only when the opt-in flag is set
+# truthy, the module is importable, AND TURING_GATEWAY_ENABLED is *explicitly*
+# false (so the coordinator has released gateway_port). If STANDALONE is set but
+# ENABLED is still truthy / unset, it refuses and holds — otherwise it would
+# start a second gateway that loses the bind and crash-loops every RestartSec.
+# Otherwise it holds as a clean long-running no-op (logging once why) so the
+# unit is genuinely active without crash-looping or double-binding the
+# coordinator's in-process gateway. Truthy/falsey matching is case-insensitive.
+# It does NOT fire the cold-start ntfy push (only the coordinator unit does).
 
 [Unit]
 Description=Turing gateway (webui static + WebSocket + chat/queue API)
@@ -23,11 +33,16 @@ Wants=network-online.target
 Type=simple
 User=turing
 WorkingDirectory=/home/turing/turing
-# Run the dedicated gateway entrypoint if/when it lands; otherwise hold as a
-# clean no-op so Restart=always doesn't crash-loop and the coordinator's
-# in-process gateway keeps serving the webui in the meantime. The probe is a
-# plain file-existence test on the module's __main__.py (no heavyweight import).
-ExecStart=/bin/sh -c 'if /home/turing/venv/bin/python -c "import turing.gateway,os,sys; sys.exit(0 if os.path.exists(os.path.join(os.path.dirname(turing.gateway.__file__),\"__main__.py\")) else 1)" 2>/dev/null; then exec /home/turing/venv/bin/python -m turing.gateway; else echo "turing-gateway: dedicated entrypoint not present yet (gateway runs in-process under turing-coordinator); holding. Activates when the gateway split lands."; exec sleep infinity; fi'
+# Run the dedicated gateway entrypoint ONLY when the operator has opted in via
+# TURING_GATEWAY_STANDALONE (truthy) AND TURING_GATEWAY_ENABLED is explicitly
+# false (coordinator released the port) AND the module is present; otherwise
+# hold as a clean no-op so Restart=always doesn't crash-loop and — critically —
+# we never double-bind gateway_port while the coordinator's in-process gateway
+# still owns it. Env values are lowercased so True/YES/On all match; ENABLED
+# must be an explicit false/0/no/off to proceed (unset → assume the coordinator
+# owns the port → hold, fail-safe). Both branches exec, so this stays PID 1 of
+# the unit under Type=simple.
+ExecStart=/bin/sh -c 'std=$(printf %s "${TURING_GATEWAY_STANDALONE:-}" | tr "[:upper:]" "[:lower:]"); ena=$(printf %s "${TURING_GATEWAY_ENABLED:-}" | tr "[:upper:]" "[:lower:]"); case "$std" in 1|true|yes|on) case "$ena" in 0|false|no|off) : ;; *) echo "turing-gateway: TURING_GATEWAY_STANDALONE is set but TURING_GATEWAY_ENABLED is not explicitly false — the coordinator still owns gateway_port; refusing to start a second gateway (it would crash-loop on the bind). Set TURING_GATEWAY_ENABLED=false to move the gateway here. Holding."; exec sleep infinity ;; esac; if /home/turing/venv/bin/python -c "import turing.gateway,os,sys; sys.exit(0 if os.path.exists(os.path.join(os.path.dirname(turing.gateway.__file__),\"__main__.py\")) else 1)" 2>/dev/null; then echo "turing-gateway: standalone opt-in confirmed (coordinator released gateway_port); starting python -m turing.gateway."; exec /home/turing/venv/bin/python -m turing.gateway; else echo "turing-gateway: TURING_GATEWAY_STANDALONE set but the entrypoint module is missing; holding."; exec sleep infinity; fi ;; *) echo "turing-gateway: standalone opt-out (TURING_GATEWAY_STANDALONE unset/false); gateway runs in-process under turing-coordinator. Set TURING_GATEWAY_STANDALONE=1 and TURING_GATEWAY_ENABLED=false to move it here. Holding."; exec sleep infinity ;; esac'
 Restart=always
 RestartSec=10
 EnvironmentFile=/home/turing/turing/.env.coordinator
