@@ -42,7 +42,7 @@ dev = [
     "alembic>=1.18.4",
     "types-psutil",
     "types-PyYAML",
-    "testcontainers>=4.0",
+    "testcontainers>=4.14.2",
 ]
 
 [project.scripts]
