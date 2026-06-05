@@ -14,10 +14,12 @@ __all__ = [
     "Embedder",
     "InvalidFrontmatterError",
     "InvalidProposalPathError",
+    "VaultCommitter",
     "VaultHit",
     "VaultIndex",
     "VaultProposer",
     "VaultWatcher",
+    "promotion_commit_message",
 ]
 
 
@@ -34,6 +36,10 @@ def __getattr__(name: str) -> Any:
         from turing.vault import watcher
 
         return getattr(watcher, name)
+    if name in ("VaultCommitter", "promotion_commit_message"):
+        from turing.vault import committer
+
+        return getattr(committer, name)
     if name in (
         "InvalidFrontmatterError",
         "InvalidProposalPathError",
