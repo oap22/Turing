@@ -13,13 +13,23 @@ from .envelopes import (
     SubtaskKind,
     TaskResult,
 )
+from .grounding_fragment import (
+    GROUNDING_FRAGMENT_KEY,
+    grounding_to_fragment,
+    merge_fragments,
+    reasoning_from_result,
+)
 
 __all__ = [
     "ENVELOPE_VERSION",
+    "GROUNDING_FRAGMENT_KEY",
     "SourceInput",
     "SubtaskDispatch",
     "SubtaskDispatchClient",
     "SubtaskKind",
     "SubtaskTimeoutError",
     "TaskResult",
+    "grounding_to_fragment",
+    "merge_fragments",
+    "reasoning_from_result",
 ]
