@@ -14,7 +14,7 @@
     4. Writes /etc/wsl.conf inside the distro with [boot] systemd=true.
     5. Sets the Windows power plan to never sleep / do-nothing-on-lid on AC.
     6. Opens Windows Firewall inbound for NATS (4222), gateway (8765), and
-       ntfy (80/443) scoped to the local Tailnet subnet (100.64.0.0/10).
+       ntfy (8090) scoped to the local Tailnet subnet (100.64.0.0/10).
     7. Registers a Task Scheduler entry that runs `wsl -d Ubuntu` at boot and
        restarts it if it exits (always-on posture, ADR 0010 §7).
 
@@ -30,7 +30,7 @@
   Ports (all served inside WSL2, Tailnet-facing):
     NATS    4222/tcp
     gateway 8765/tcp
-    ntfy    80/tcp, 443/tcp
+    ntfy    8090/tcp
   Tailnet subnet: 100.64.0.0/10 (Tailscale CGNAT range; ADR 0010 §8).
   Power GUIDs:
     SUB_BUTTONS 4f971e89-eebd-4455-a8de-9e59040e7347
@@ -115,11 +115,12 @@ function Get-CanonicalAddress {
     return $a
 }
 
-# Port map: name -> @(protocol, ports[]). ntfy serves both 80 and 443.
+# Port map: name -> @(protocol, ports[]). ntfy listens on :8090 (the
+# self-hosted server's listen-http, scripts/coordinator/server.yml) — NOT 80/443.
 $PortMap = [ordered]@{
     "NATS"    = @{ Protocol = "TCP"; Ports = @(4222) }
     "gateway" = @{ Protocol = "TCP"; Ports = @(8765) }
-    "ntfy"    = @{ Protocol = "TCP"; Ports = @(80, 443) }
+    "ntfy"    = @{ Protocol = "TCP"; Ports = @(8090) }
 }
 
 # ── preflight ────────────────────────────────────────────────────────
@@ -210,7 +211,7 @@ $wslConfigPath = Join-Path $env:USERPROFILE ".wslconfig"
 $wslConfigBody = @"
 # .wslconfig — managed by scripts/bootstrap-surface.ps1 (ADR 0010 §5).
 # Mirrored networking lets the Jetsons reach the coordinator's NATS (4222),
-# gateway (8765), and ntfy (80/443) at the Surface's LAN/Tailnet IP, sidestepping
+# gateway (8765), and ntfy (8090) at the Surface's LAN/Tailnet IP, sidestepping
 # WSL2's default NAT. After editing: `wsl --shutdown`, then restart the distro.
 [wsl2]
 networkingMode=mirrored

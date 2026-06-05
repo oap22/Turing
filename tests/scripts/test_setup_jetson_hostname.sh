@@ -30,7 +30,7 @@ SCRIPT="$HERE/../../scripts/setup-jetson.sh"
 # fail loudly so the test is updated alongside the script.
 RESOLVE_BLOCK="$(
     awk '
-        /^HOSTNAME_CURRENT="\$\(hostnamectl --static\)"$/ { f = 1 }
+        /^HOSTNAME_CURRENT="\$\{TURING_HOSTNAME:-\$\(hostnamectl --static\)\}"$/ { f = 1 }
         f && /^NODE_NAME="\$HOSTNAME_NEW"$/ { exit }
         f { print }
     ' "$SCRIPT"
@@ -63,7 +63,8 @@ check() {
 # `set -e` abort (e.g. if `|| true` were dropped) with `__ABORT__`.
 resolve_hostname() {
     local current_static="$1"        # what `hostnamectl --static` prints
-    bash -c '
+    local override="${2-}"           # optional exported TURING_HOSTNAME ("" = unset)
+    TURING_HOSTNAME="$override" bash -c '
         set -euo pipefail
         hostnamectl() { printf "%s\n" "'"$current_static"'"; }
         die() { echo "__DIE__"; exit 0; }
@@ -95,6 +96,16 @@ check "first run: empty input + no current hostname dies" \
 # Operator explicitly renames an already-provisioned host → typed value wins.
 check "re-run: explicit rename overrides current" \
     "jetson-2" "$(resolve_hostname "jetson-1" <<<"jetson-2")"
+
+# TURING_HOSTNAME (exported by scripts/setup-fleet.sh) seeds the default so an
+# unattended/EOF run names a fresh node with no prompt — even when the box still
+# reports a generic current hostname.
+check "fleet: TURING_HOSTNAME seeds the default on unattended run" \
+    "jetson-9" "$(resolve_hostname "ubuntu" "jetson-9" </dev/null)"
+
+# …but a hostname the operator actually types still overrides the env default.
+check "fleet: typed input overrides TURING_HOSTNAME" \
+    "jetson-3" "$(resolve_hostname "ubuntu" "jetson-9" <<<"jetson-3")"
 
 if [[ "$fail" -ne 0 ]]; then
     echo "RESULT: FAIL"
