@@ -280,7 +280,13 @@ pub fn parse_frame(raw: &str) -> Option<Frame> {
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string(),
-            uptime_s: v.get("uptime_s").and_then(|x| x.as_u64()).unwrap_or(0),
+            // uptime_s is a float on the wire (monotonic-clock delta), so read
+            // it as f64 and truncate — as_u64() returns None for a non-integer.
+            uptime_s: v
+                .get("uptime_s")
+                .and_then(|x| x.as_f64())
+                .map(|f| f as u64)
+                .unwrap_or(0),
         },
         "queue.snapshot" => {
             let items = v.get("items").cloned().unwrap_or_default();
@@ -355,6 +361,16 @@ mod tests {
                 assert_eq!(node_name, "pi-alpha");
                 assert_eq!(uptime_s, 42);
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parses_hello_float_uptime() {
+        // The gateway emits uptime_s as a float (monotonic delta).
+        let f = parse_frame(r#"{"type":"hello","node_name":"n","uptime_s":42.9}"#).unwrap();
+        match f {
+            Frame::Hello { uptime_s, .. } => assert_eq!(uptime_s, 42),
             _ => panic!("wrong variant"),
         }
     }

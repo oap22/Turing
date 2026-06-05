@@ -205,7 +205,9 @@ mod tests {
     /// A populated app exercising every pane's data path.
     fn populated() -> App {
         let mut app = App::new();
-        app.apply_frame(parse_frame(r#"{"type":"hello","node_name":"pi-alpha","uptime_s":99}"#).unwrap());
+        app.apply_frame(
+            parse_frame(r#"{"type":"hello","node_name":"pi-alpha","uptime_s":99}"#).unwrap(),
+        );
         app.apply_frame(
             parse_frame(
                 r#"{"type":"queue.snapshot","timestamp_ms":1,"items":[
@@ -239,13 +241,25 @@ mod tests {
     }
 
     fn buffer_text(t: &Terminal<TestBackend>) -> String {
-        t.backend().buffer().content().iter().map(|c| c.symbol()).collect()
+        t.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
     }
 
     #[test]
     fn every_pane_renders_without_panic() {
         let mut app = populated();
-        for pane in [Pane::Queue, Pane::Chat, Pane::Specs, Pane::Trace, Pane::Alerts, Pane::Help] {
+        for pane in [
+            Pane::Queue,
+            Pane::Chat,
+            Pane::Specs,
+            Pane::Trace,
+            Pane::Alerts,
+            Pane::Help,
+        ] {
             app.active = pane;
             let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
             term.draw(|f| draw(f, &app)).unwrap();

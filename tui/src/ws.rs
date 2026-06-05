@@ -29,7 +29,10 @@ pub async fn run(ws_url: String, token: String, tx: Sender<EngineEvent>) {
         let _ = tx.send(EngineEvent::WsStatus(WsStatus::Connecting)).await;
         match connect_and_pump(&ws_url, &token, &tx).await {
             Ok(()) => {
-                // Clean server close — treat as a normal disconnect and retry.
+                // We were connected, then the server closed — a normal drop
+                // (e.g. a coordinator restart). Reset the backoff so the
+                // reconnect after stable uptime is quick, not pinned at the cap.
+                backoff = BACKOFF_START;
                 if tx
                     .send(EngineEvent::WsStatus(WsStatus::Disconnected(
                         "closed".into(),
@@ -48,10 +51,11 @@ pub async fn run(ws_url: String, token: String, tx: Sender<EngineEvent>) {
                 {
                     return;
                 }
+                // Connect/transport failure — grow the backoff toward the cap.
+                backoff = (backoff * 2).min(BACKOFF_MAX);
             }
         }
         tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(BACKOFF_MAX);
     }
 }
 
@@ -100,9 +104,18 @@ async fn connect_and_pump(
 
 /// Shorten the noisiest tungstenite errors for the one-line status bar.
 fn friendly(raw: &str) -> String {
-    if raw.contains("401") || raw.to_lowercase().contains("unauthorized") {
-        "401 — check the bearer token".into()
-    } else if raw.contains("Connection refused") || raw.contains("refused") {
+    let lower = raw.to_lowercase();
+    // The gateway rejects a bad/absent bearer by closing the upgrade before
+    // accept (Starlette → HTTP 403) or with policy-violation 1008, so match all
+    // the auth-rejection shapes, not just a literal 401.
+    if raw.contains("401")
+        || raw.contains("403")
+        || raw.contains("1008")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+    {
+        "auth rejected — check the bearer token".into()
+    } else if lower.contains("refused") {
         "connection refused — is the gateway up?".into()
     } else {
         raw.chars().take(60).collect()
