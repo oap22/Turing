@@ -335,9 +335,7 @@ class TestManageService:
             "a|b",
         ],
     )
-    async def test_rejects_injection_payloads(
-        self, process_tool: ProcessTool, service_name: str
-    ):
+    async def test_rejects_injection_payloads(self, process_tool: ProcessTool, service_name: str):
         """Service names with shell metacharacters / whitespace are rejected.
 
         Regression guard for the command-injection fix (#312): the value never
