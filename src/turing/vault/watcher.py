@@ -16,13 +16,15 @@ Single-writer invariant: the coordinator's git is the *only* writer to the
 WSL2 working tree. External Obsidian Sync of the same vault is incompatible —
 see ``docs/operator/vault-git-workflow.md``.
 
-Scope note — ADR 0010 §4 AC#3 (coordinator *auto-commits* on curated
-promotion) is intentionally **not** implemented here. This watcher is the
-read-side: it consumes whatever the git log already contains. The write-side
-(turning a curation "accept" into a vault commit) lives in the curation
-surface — Slice C (queue manager) / Slice E (chat pane) — and is deferred to
-that work. The single-writer invariant above is exactly what makes that split
-safe: only one component ever writes the working tree.
+Scope note — this watcher is the **read-side**: it consumes whatever the git
+log already contains. The **write-side** of ADR 0010 §4 AC#3 (turning a
+curation "accept"/"edit" into a vault commit) lives in
+:class:`turing.vault.committer.VaultCommitter`, which the Phase 0 curation
+surface (:class:`turing.coordinator.flywheel.morning_curation.MorningCuration`)
+injects so each promotion is exactly one commit; the webui queue/chat surfaces
+(Slice C/E) reuse the same committer. The single-writer invariant above is
+exactly what makes that split safe: only one component ever writes the working
+tree.
 """
 
 from __future__ import annotations
