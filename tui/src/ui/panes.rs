@@ -98,10 +98,10 @@ pub fn queue(f: &mut Frame, area: Rect, app: &App) {
 
 fn mark(decision: &str) -> &'static str {
     match decision {
-        "accept" => "✓",
-        "reject" => "✗",
-        "edit" => "✎",
-        _ => "•",
+        "accept" => "accept",
+        "reject" => "reject",
+        "edit" => "edit",
+        _ => "curated",
     }
 }
 
@@ -356,7 +356,7 @@ pub fn alerts(f: &mut Frame, area: Rect, app: &App) {
         .title(format!(" alerts ({}) — 's' snooze ", list_data.len()))
         .border_style(border(active));
     if list_data.is_empty() {
-        let p = Paragraph::new("No active hardware alerts. 🟢")
+        let p = Paragraph::new("No active hardware alerts.")
             .style(Style::default().fg(theme::DIM))
             .block(block);
         f.render_widget(p, area);

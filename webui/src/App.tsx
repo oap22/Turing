@@ -169,6 +169,13 @@ export default function App() {
   // Backtick toggles the debug pane (hidden by default).
   useEffect(() => {
     function onKey(ev: KeyboardEvent) {
+      const target = ev.target as HTMLElement | null;
+      if (
+        target?.closest("input, textarea, select, button") ||
+        target?.isContentEditable
+      ) {
+        return;
+      }
       if (ev.key === "~" || ev.key === "`") {
         setShowDebug((s) => !s);
       }
@@ -187,6 +194,12 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col">
+      <a
+        href="#operator-surface"
+        className="sr-only focus:not-sr-only focus:absolute focus:left-3 focus:top-3 focus:z-[60] focus:rounded focus:bg-sky-950 focus:px-3 focus:py-2 focus:text-sm focus:text-sky-100"
+      >
+        skip to operator surface
+      </a>
       <AlertBanner alerts={alerts} />
       <header className="border-b border-neutral-800 px-4 py-2 text-sm font-semibold">
         turing — fleet observability
@@ -194,11 +207,17 @@ export default function App() {
           press ` to toggle debug stream
         </span>
       </header>
-      <section className="h-[42%] min-h-[260px] border-b border-neutral-800">
+      <section
+        aria-label="Question queue"
+        className="h-[42%] min-h-[260px] border-b border-neutral-800"
+      >
         <QueuePane items={queueItems} />
       </section>
-      <main className="flex flex-1 overflow-hidden">
-        <section className="flex flex-1 flex-col border-r border-neutral-800">
+      <main id="operator-surface" className="flex flex-1 overflow-hidden">
+        <section
+          aria-label="Fleet graph and specs"
+          className="flex flex-1 flex-col border-r border-neutral-800"
+        >
           <div className="flex-1 overflow-hidden">
             <CallGraphCanvas
               state={visibleState}
@@ -207,14 +226,23 @@ export default function App() {
           </div>
           <SpecsGrid rows={specsRows} />
         </section>
-        <aside className="w-[420px] border-r border-neutral-800">
+        <aside
+          aria-label="Message trace"
+          className="w-[420px] border-r border-neutral-800"
+        >
           <TracePane liveEvents={liveTrace} onSelect={onTraceSelect} />
         </aside>
-        <aside className="w-[360px] border-r border-neutral-800">
+        <aside
+          aria-label="Chat tasks"
+          className="w-[360px] border-r border-neutral-800"
+        >
           <ChatPane sessions={chatSessions} />
         </aside>
         {showDebug && (
-          <aside className="w-[480px] overflow-auto bg-neutral-950 p-2 font-mono text-xs">
+          <aside
+            aria-label="Incoming frames debug stream"
+            className="w-[480px] overflow-auto bg-neutral-950 p-2 font-mono text-xs"
+          >
             <h2 className="mb-2 text-neutral-400">incoming frames (debug)</h2>
             <ol className="space-y-1">
               {debugFrames.map((f, i) => (

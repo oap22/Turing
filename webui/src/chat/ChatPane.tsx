@@ -11,7 +11,7 @@
 // `chat.delta`, so a failed POST self-heals on the next frame — same contract
 // as the queue pane.
 
-import { useState } from "react";
+import { memo, useState } from "react";
 import type { ChatSession, ChatSubtask } from "../ws";
 import {
   acceptSubtask,
@@ -46,7 +46,11 @@ export default function ChatPane({ sessions }: Props) {
           ad-hoc task submission
         </span>
       </div>
-      <div className="flex-1 space-y-3 overflow-y-auto p-2" data-testid="chat-thread">
+      <div
+        aria-label="Chat threads"
+        className="flex-1 space-y-3 overflow-y-auto p-2"
+        data-testid="chat-thread"
+      >
         {sessions.length === 0 && (
           <p className="px-1 text-neutral-600">
             no chats yet — submit a prompt below
@@ -81,13 +85,18 @@ function PromptBox() {
   return (
     <form
       data-testid="chat-prompt-form"
+      aria-label="Submit chat prompt"
       className="flex items-end gap-1 border-t border-neutral-800 p-2"
       onSubmit={(e) => {
         e.preventDefault();
         void send();
       }}
     >
+      <label className="sr-only" htmlFor="chat-prompt-input">
+        Ad-hoc task prompt
+      </label>
       <textarea
+        id="chat-prompt-input"
         data-testid="chat-prompt-input"
         value={prompt}
         onChange={(e) => setPrompt(e.target.value)}
@@ -106,6 +115,7 @@ function PromptBox() {
         type="submit"
         data-testid="chat-submit"
         disabled={busy || prompt.trim() === ""}
+        aria-label="Submit chat prompt"
         className="rounded border border-sky-700 px-2 py-1 text-[11px] text-sky-200 hover:bg-sky-500/10 disabled:opacity-40"
       >
         send
@@ -114,15 +124,19 @@ function PromptBox() {
   );
 }
 
-function ChatThread({ session }: { session: ChatSession }) {
+const ChatThread = memo(function ChatThread({ session }: { session: ChatSession }) {
+  const headingId = `chat-session-heading-${session.id}`;
   return (
     <section
       data-testid={`chat-session-${session.id}`}
       data-subtask-count={session.subtasks.length}
+      aria-labelledby={headingId}
       className="rounded border border-neutral-800 bg-neutral-900/60"
     >
       <header className="border-b border-neutral-800 px-2 py-1 text-neutral-200">
-        <span className="break-words">{session.prompt}</span>
+        <span id={headingId} className="break-words">
+          {session.prompt}
+        </span>
         <span className="ml-2 font-mono text-[10px] text-neutral-500">
           {session.specialty}
         </span>
@@ -139,9 +153,9 @@ function ChatThread({ session }: { session: ChatSession }) {
       </ol>
     </section>
   );
-}
+});
 
-function SubtaskRow({ subtask }: { subtask: ChatSubtask }) {
+const SubtaskRow = memo(function SubtaskRow({ subtask }: { subtask: ChatSubtask }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
@@ -168,6 +182,7 @@ function SubtaskRow({ subtask }: { subtask: ChatSubtask }) {
       data-testid={`chat-subtask-${subtask.id}`}
       data-status={subtask.status}
       data-decision={subtask.decision ?? ""}
+      aria-busy={busy ? "true" : "false"}
       className={`rounded border p-2 ${cardClass}`}
     >
       <div className="mb-0.5 flex flex-wrap items-center gap-x-2 font-mono text-[10px] text-neutral-500">
@@ -200,6 +215,7 @@ function SubtaskRow({ subtask }: { subtask: ChatSubtask }) {
             type="button"
             data-testid={`chat-accept-${subtask.id}`}
             disabled={busy}
+            aria-label={`Accept completed subtask ${subtask.index + 1}`}
             onClick={() =>
               void run(() => acceptSubtask(subtask.session_id, subtask.id))
             }
@@ -211,6 +227,7 @@ function SubtaskRow({ subtask }: { subtask: ChatSubtask }) {
             type="button"
             data-testid={`chat-reject-${subtask.id}`}
             disabled={busy}
+            aria-label={`Reject completed subtask ${subtask.index + 1}`}
             onClick={() =>
               void run(() => rejectSubtask(subtask.session_id, subtask.id))
             }
@@ -222,6 +239,7 @@ function SubtaskRow({ subtask }: { subtask: ChatSubtask }) {
             type="button"
             data-testid={`chat-edit-${subtask.id}`}
             disabled={busy}
+            aria-label={`Edit completed subtask ${subtask.index + 1}`}
             onClick={() => {
               setDraft(subtask.corrected_answer ?? subtask.content);
               setEditing(true);
@@ -235,7 +253,11 @@ function SubtaskRow({ subtask }: { subtask: ChatSubtask }) {
 
       {subtask.status === "completed" && editing && (
         <div className="mt-2 space-y-1">
+          <label className="sr-only" htmlFor={`chat-edit-input-${subtask.id}`}>
+            Corrected subtask answer
+          </label>
           <textarea
+            id={`chat-edit-input-${subtask.id}`}
             data-testid={`chat-edit-input-${subtask.id}`}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
@@ -248,6 +270,7 @@ function SubtaskRow({ subtask }: { subtask: ChatSubtask }) {
               type="button"
               data-testid={`chat-edit-submit-${subtask.id}`}
               disabled={busy || draft.trim() === ""}
+              aria-label={`Save correction for subtask ${subtask.index + 1}`}
               onClick={() =>
                 void run(() =>
                   editSubtask(subtask.session_id, subtask.id, draft),
@@ -261,6 +284,7 @@ function SubtaskRow({ subtask }: { subtask: ChatSubtask }) {
               type="button"
               data-testid={`chat-edit-cancel-${subtask.id}`}
               disabled={busy}
+              aria-label={`Cancel correction for subtask ${subtask.index + 1}`}
               onClick={() => setEditing(false)}
               className="rounded border border-neutral-700 px-2 py-0.5 text-[11px] text-neutral-400 hover:bg-white/5 disabled:opacity-40"
             >
@@ -285,4 +309,4 @@ function SubtaskRow({ subtask }: { subtask: ChatSubtask }) {
       )}
     </li>
   );
-}
+});
