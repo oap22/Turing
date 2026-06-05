@@ -59,18 +59,23 @@ class VaultCommitter:
     def commit_paths(self, *, paths: Sequence[Path], message: str) -> str | None:
         """Stage adds + deletions under ``paths`` and commit them as one commit.
 
-        Each entry in ``paths`` is staged with ``git add -A -- <path>`` so a
-        promotion (a *new* curated file plus the *removed* inbox draft) collapses
-        into a single commit. Passing a directory (e.g. the inbox draft's parent)
-        captures the deletion of a now-removed draft without having to name a
-        path that no longer exists on disk.
+        Each entry in ``paths`` is staged individually with ``git add -A --
+        <path>`` so a promotion (a *new* curated file plus the *removed* inbox
+        draft) collapses into a single commit. A pathspec that matches nothing —
+        an untracked draft that has already been moved out of the inbox, the
+        normal flywheel case — is tolerated as a no-op (see :meth:`_stage`); any
+        other git failure re-raises. Staging the exact draft path (rather than
+        its parent dir) is deliberate: a ``task_id`` dir can hold sibling drafts
+        still awaiting review, and naming the directory would sweep those
+        untracked siblings into the commit.
 
         Returns the new ``HEAD`` sha, or ``None`` when nothing was staged — that
         makes a re-promotion of an already-committed file an idempotent no-op
         rather than an empty-commit error.
         """
         rels = [self._rel(p) for p in paths]
-        self._git("add", "-A", "--", *rels)
+        for rel in rels:
+            self._stage(rel)
         if self._nothing_staged():
             return None
         self._commit(message)
@@ -87,6 +92,27 @@ class VaultCommitter:
         if p.is_absolute():
             p = p.resolve().relative_to(self._root)
         return p.as_posix()
+
+    def _stage(self, rel: str) -> None:
+        """Stage adds/deletions for one pathspec.
+
+        An untracked draft that has already been moved out of the inbox matches
+        neither the index nor the working tree, so ``git add`` would abort with
+        ``pathspec ... did not match any files``. That case has nothing to stage
+        (the file was never tracked), so it is tolerated; any other git failure
+        re-raises. ``git add -A -- <tracked-but-deleted-path>`` still correctly
+        stages a deletion, so the tracked-draft case is unaffected.
+        """
+        result = subprocess.run(
+            ["git", "add", "-A", "--", rel],
+            cwd=self._root,
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode != 0 and b"did not match any files" not in result.stderr:
+            raise subprocess.CalledProcessError(
+                result.returncode, result.args, result.stdout, result.stderr
+            )
 
     def _git(self, *args: str) -> None:
         subprocess.run(["git", *args], cwd=self._root, check=True, capture_output=True)
