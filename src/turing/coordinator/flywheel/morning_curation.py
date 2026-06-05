@@ -259,8 +259,11 @@ class MorningCuration:
 
         No-op (returns ``None``) when no committer is wired — the draft has
         already been moved on disk; the commit is the audit-trail half. Staging
-        the curated file plus the inbox draft's parent dir captures both the new
-        note and the removed draft in a single commit.
+        the curated file plus the *exact* inbox draft path captures both the new
+        note and the removed draft in a single commit. Naming the precise draft
+        path (not its parent dir) is what keeps untracked sibling drafts still
+        awaiting review out of the commit — a ``task_id`` dir can hold several
+        drafts, and staging the parent would sweep those siblings in.
         """
         if self._committer is None:
             return None
@@ -275,7 +278,7 @@ class MorningCuration:
             curated_rel=curated_rel,
         )
         return self._committer.commit_paths(
-            paths=[curated, draft.path.parent],
+            paths=[curated, draft.path],
             message=message,
         )
 
