@@ -133,8 +133,9 @@ class TuringConfig(BaseSettings):
     allowed_plugins: list[str] | None = Field(
         default=None,
         description="Allow-list of plugin names permitted to load from plugins/. "
-        "Loading a plugin runs arbitrary code; unset loads every plugin found "
-        "(plugins/ is a fully trusted code location). Env: TURING_ALLOWED_PLUGINS.",
+        "Loading a plugin runs arbitrary code, so this is fail-closed: unset "
+        '(the default) loads NO plugins. Use ["*"] to load every plugin found, '
+        "or a JSON list of names. Env: TURING_ALLOWED_PLUGINS.",
     )
 
     # ── Telemetry ────────────────────────────────────────────────────────
