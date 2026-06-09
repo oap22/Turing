@@ -15,6 +15,44 @@ logger = structlog.get_logger("turing.tools.filesystem")
 # Maximum file size for read operations (100 KB).
 MAX_READ_SIZE = 100 * 1024
 
+# Read actions (read_file/list_directory/search_files) are auto-approved by the
+# safety gate, so they must refuse to surface credential material directly. The
+# patterns below are matched against the *resolved* path (symlinks followed) so
+# a symlink under an allowed dir cannot point at a secret and exfiltrate it.
+_SENSITIVE_NAMES = frozenset(
+    {
+        ".netrc",
+        ".pgpass",
+        ".htpasswd",
+        "shadow",
+        "credentials",
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+    }
+)
+_SENSITIVE_DIR_COMPONENTS = frozenset({".ssh", ".aws", ".gnupg"})
+_SENSITIVE_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
+
+
+def _is_sensitive_path(path: Path) -> bool:
+    """True if ``path`` (resolved) names a secret file or lives in a secret dir."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    name = resolved.name
+    lower = name.lower()
+    if name in _SENSITIVE_NAMES:
+        return True
+    # dotenv files in any form: ".env", ".env.local", "production.env".
+    if lower.startswith(".env") or lower.endswith(".env"):
+        return True
+    if lower.endswith(_SENSITIVE_SUFFIXES):
+        return True
+    return bool({part.lower() for part in resolved.parts} & _SENSITIVE_DIR_COMPONENTS)
+
 
 class FileSystemTool(Tool):
     """Perform filesystem operations: read, write, list, and search."""
@@ -105,9 +143,22 @@ class FileSystemTool(Tool):
             logger.error("filesystem_error", action=action, path=path_str, error=str(exc))
             return ToolResult(success=False, output="", error=str(exc))
 
+    @staticmethod
+    def _deny_if_sensitive(path: Path) -> ToolResult | None:
+        """Return a denial result if ``path`` resolves to credential material."""
+        if _is_sensitive_path(path):
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Access denied: {path} matches a protected secret path",
+            )
+        return None
+
     async def _read_file(self, path_str: str, **_kwargs: Any) -> ToolResult:
         """Read a file's contents (up to MAX_READ_SIZE bytes)."""
         filepath = Path(path_str)
+        if (denied := self._deny_if_sensitive(filepath)) is not None:
+            return denied
         if not filepath.exists():
             return ToolResult(success=False, output="", error=f"File not found: {path_str}")
         if not filepath.is_file():
@@ -152,6 +203,8 @@ class FileSystemTool(Tool):
     async def _list_directory(self, path_str: str, **_kwargs: Any) -> ToolResult:
         """List the contents of a directory."""
         dirpath = Path(path_str)
+        if (denied := self._deny_if_sensitive(dirpath)) is not None:
+            return denied
         if not dirpath.exists():
             return ToolResult(success=False, output="", error=f"Directory not found: {path_str}")
         if not dirpath.is_dir():
@@ -177,13 +230,18 @@ class FileSystemTool(Tool):
         """Search for files matching a glob pattern under a directory."""
         pattern: str = kwargs.get("pattern", "*")
         dirpath = Path(path_str)
+        if (denied := self._deny_if_sensitive(dirpath)) is not None:
+            return denied
         if not dirpath.exists():
             return ToolResult(success=False, output="", error=f"Directory not found: {path_str}")
         if not dirpath.is_dir():
             return ToolResult(success=False, output="", error=f"Not a directory: {path_str}")
 
         full_pattern = str(dirpath / "**" / pattern)
-        matches = sorted(globmod.glob(full_pattern, recursive=True))
+        # Filter out any secret paths so search can't enumerate credentials.
+        matches = sorted(
+            m for m in globmod.glob(full_pattern, recursive=True) if not _is_sensitive_path(Path(m))
+        )
 
         if not matches:
             return ToolResult(success=True, output=f"No files matching '{pattern}' in {path_str}")

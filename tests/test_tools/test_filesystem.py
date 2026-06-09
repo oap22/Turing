@@ -72,6 +72,57 @@ class TestReadFile:
         assert "too large" in result.error.lower()
 
 
+class TestSensitivePathGuard:
+    """Read actions must refuse to surface credential material."""
+
+    @pytest.mark.parametrize("name", [".env", "id_rsa", "server.pem", "deploy.key", ".netrc"])
+    async def test_read_secret_file_denied(
+        self, fs_tool: FileSystemTool, tmp_path: Path, name: str
+    ):
+        secret = tmp_path / name
+        secret.write_text("SUPER_SECRET=1")
+        result = await fs_tool.execute(action="read_file", path=str(secret))
+        assert result.success is False
+        assert "protected secret path" in result.error
+        assert "SUPER_SECRET" not in result.output
+
+    async def test_read_inside_ssh_dir_denied(self, fs_tool: FileSystemTool, tmp_path: Path):
+        ssh = tmp_path / ".ssh"
+        ssh.mkdir()
+        key = ssh / "authorized_keys"
+        key.write_text("ssh-rsa AAAA...")
+        result = await fs_tool.execute(action="read_file", path=str(key))
+        assert result.success is False
+        assert "protected secret path" in result.error
+
+    async def test_symlink_to_secret_denied(self, fs_tool: FileSystemTool, tmp_path: Path):
+        target = tmp_path / "real.env"
+        target.write_text("TOKEN=abc")
+        link = tmp_path / "innocent.txt"
+        link.symlink_to(target)
+        result = await fs_tool.execute(action="read_file", path=str(link))
+        assert result.success is False
+        assert "protected secret path" in result.error
+
+    async def test_list_ssh_dir_denied(self, fs_tool: FileSystemTool, tmp_path: Path):
+        ssh = tmp_path / ".ssh"
+        ssh.mkdir()
+        (ssh / "id_rsa").write_text("key")
+        result = await fs_tool.execute(action="list_directory", path=str(ssh))
+        assert result.success is False
+        assert "protected secret path" in result.error
+
+    async def test_search_excludes_secrets(self, fs_tool: FileSystemTool, tmp_path: Path):
+        (tmp_path / "app.py").write_text("code")
+        (tmp_path / ".env").write_text("TOKEN=abc")
+        (tmp_path / "key.pem").write_text("-----BEGIN-----")
+        result = await fs_tool.execute(action="search_files", path=str(tmp_path), pattern="*")
+        assert result.success is True
+        assert "app.py" in result.output
+        assert ".env" not in result.output
+        assert "key.pem" not in result.output
+
+
 class TestWriteFile:
     """Test the write_file action."""
 

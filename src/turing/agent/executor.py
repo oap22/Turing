@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from turing.agent.safety import SafetyDecision
+from turing.agent.safety import SafetyDecision, _redact_arguments
 from turing.tools.base import ToolResult
 
 if TYPE_CHECKING:
@@ -52,7 +52,7 @@ class Executor:
             "executor.tool_call_start",
             tool=tool_name,
             user_id=user_id,
-            arguments=arguments,
+            arguments=_redact_arguments(arguments),
         )
 
         # Step 1: Safety gate check
