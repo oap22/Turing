@@ -1,11 +1,12 @@
 """Plugin loader for discovering and instantiating plugins from the filesystem.
 
-Trust boundary (issue #239): :meth:`PluginLoader.load_plugin` calls
+Trust boundary (issues #239, #346): :meth:`PluginLoader.load_plugin` calls
 ``importlib`` ``exec_module``, which runs arbitrary Python from ``plugins/``
-with full process privileges during startup. ``plugins/`` is therefore a
-**fully trusted code location** — treat it exactly like ``src/``. The optional
-``TURING_ALLOWED_PLUGINS`` allow-list (config ``allowed_plugins``) narrows
-which plugin directories may load; see :meth:`PluginLoader._enforce_allowlist`.
+with full process privileges during startup. The ``TURING_ALLOWED_PLUGINS``
+allow-list (config ``allowed_plugins``) is therefore **fail-closed**: when it
+is unset (the default) no plugin loads at all. Operators must opt in with an
+explicit list of plugin names, or ``["*"]`` to load everything discovered;
+see :meth:`PluginLoader._enforce_allowlist`.
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ class PluginLoader:
 
     def __init__(self, config: Any | None = None) -> None:
         self._config = config
+        self._warned_allowlist_unset = False
 
     def scan_directory(self, path: str | Path) -> list[PluginManifest]:
         """Scan a directory for plugin manifests.
@@ -106,8 +108,9 @@ class PluginLoader:
             An instantiated Plugin object.
 
         Raises:
-            PermissionError: If a ``TURING_ALLOWED_PLUGINS`` allow-list is
-                configured and this plugin is not on it.
+            PermissionError: If the plugin is not permitted by the
+                ``TURING_ALLOWED_PLUGINS`` allow-list (which is fail-closed:
+                unset means no plugin may load).
             ImportError: If the module cannot be loaded.
             AttributeError: If the class is not found in the module.
             TypeError: If the class is not a Plugin subclass.
@@ -161,14 +164,33 @@ class PluginLoader:
     def _enforce_allowlist(self, manifest: PluginManifest) -> None:
         """Refuse to load a plugin outside the configured allow-list.
 
-        ``load_plugin`` runs arbitrary code via ``exec_module``. When
-        ``TURING_ALLOWED_PLUGINS`` (config ``allowed_plugins``) is set, only
-        the named plugins may load. When it is unset the allow-list is
-        inactive — every plugin in ``plugins/`` loads, since that directory
-        is a fully trusted code location.
+        ``load_plugin`` runs arbitrary code via ``exec_module``, so the
+        allow-list is fail-closed (issue #346):
+
+        - ``allowed_plugins`` unset (the default) → no plugin may load.
+        - ``allowed_plugins == ["*"]`` → every discovered plugin may load
+          (explicit opt-in).
+        - Otherwise → only the named plugins may load.
         """
         allowed = getattr(self._config, "allowed_plugins", None) if self._config else None
         if allowed is None:
+            if not self._warned_allowlist_unset:
+                self._warned_allowlist_unset = True
+                logger.warning(
+                    "plugin_allowlist_unset",
+                    plugin=manifest.name,
+                    message=(
+                        "Plugins were discovered but skipped: TURING_ALLOWED_PLUGINS "
+                        "is unset and the allow-list is fail-closed. Set it to a JSON "
+                        'list of plugin names, or ["*"] to load every plugin.'
+                    ),
+                )
+            raise PermissionError(
+                f"Plugin '{manifest.name}' refused: TURING_ALLOWED_PLUGINS is unset "
+                f"and the allow-list is fail-closed; set it to a list of plugin "
+                f'names or ["*"] to opt in'
+            )
+        if allowed == ["*"]:
             return
         if manifest.name not in allowed:
             raise PermissionError(
