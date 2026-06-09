@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
+import structlog.testing
+
 from turing.agent.executor import Executor
 from turing.agent.safety import SafetyCheckResult, SafetyDecision
 from turing.llm.base import ToolCall
@@ -145,3 +147,32 @@ async def test_audit_logging():
     assert call_kwargs["tool_name"] == "system_info"
     assert call_kwargs["user_id"] == "user-1"
     assert call_kwargs["approved"] is True
+
+
+async def test_start_log_redacts_secrets_in_arguments():
+    """Regression for #331: the pre-audit ``tool_call_start`` log must not
+    emit raw secrets — argument values pass through the redactor before they
+    reach structlog, mirroring the audit-path redaction in SafetyGate."""
+    registry = _make_mock_tool_registry()
+    gate = _make_mock_safety_gate()
+    executor = Executor(registry, gate)
+
+    secret = "Bearer sk-ant-api03-abcdefghijklmnopqrstuvwx"
+    tool_call = ToolCall(
+        id="tc-secret",
+        name="network",
+        arguments={"action": "http_request", "body": f"Authorization: {secret}"},
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        await executor.execute_tool_call(tool_call, user_id="user-1")
+
+    start_events = [e for e in logs if e["event"] == "executor.tool_call_start"]
+    assert start_events, "tool_call_start event was not logged"
+    logged_args = str(start_events[0]["arguments"])
+    assert "sk-ant-api03" not in logged_args
+    assert "[REDACTED" in logged_args
+    # The raw arguments object handed to the tool itself is untouched.
+    registry.execute.assert_awaited_once_with(
+        "network", action="http_request", body=f"Authorization: {secret}"
+    )

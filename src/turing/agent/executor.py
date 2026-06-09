@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from turing.agent.safety import SafetyDecision
+from turing.agent.safety import SafetyDecision, _redact_arguments
 from turing.tools.base import ToolResult
 
 if TYPE_CHECKING:
@@ -48,11 +48,14 @@ class Executor:
         tool_name = tool_call.name
         arguments = tool_call.arguments
 
+        # Redact before this pre-audit log line: raw arguments can carry
+        # tokens or passwords, and SafetyGate's own redaction only covers the
+        # audit path, not this structlog event (#331).
         logger.info(
             "executor.tool_call_start",
             tool=tool_name,
             user_id=user_id,
-            arguments=arguments,
+            arguments=_redact_arguments(arguments),
         )
 
         # Step 1: Safety gate check

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import re
 import socket
 from typing import Any
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import structlog
@@ -17,12 +19,74 @@ logger = structlog.get_logger("turing.tools.network")
 # Default timeout for network operations (seconds).
 DEFAULT_TIMEOUT = 10
 
+# Redirect hops http_request will follow before refusing. Redirects are
+# followed manually so every hop is re-validated against the SSRF guard.
+MAX_REDIRECTS = 5
+
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
 # A hostname or IP literal: alphanumerics plus ``. - _ :`` (the colon covers
 # IPv6 literals). The first character must be alphanumeric so a value can never
 # be interpreted as a ``ping`` flag, and the set excludes whitespace and every
 # shell metacharacter. Paired with create_subprocess_exec (no shell) this makes
 # command injection impossible.
 _HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:_-]*$")
+
+
+def _ip_is_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True only for globally routable unicast addresses.
+
+    Blocks loopback, RFC1918 / ULA private ranges, link-local (which covers
+    the 169.254.169.254 cloud metadata endpoint), multicast, reserved, and
+    unspecified addresses — the SSRF targets called out in issue #333.
+    IPv4-mapped IPv6 (``::ffff:10.0.0.1``) falls inside ``is_private``.
+    """
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+async def _check_url_target(url: str) -> str | None:
+    """SSRF guard: return a refusal reason, or ``None`` if the URL is safe.
+
+    Resolves the host *at check time* and refuses if any resolved address is
+    non-public, so a hostname DNS-pointed at localhost or the LAN is caught,
+    not just literal private IPs. Called again for every redirect hop.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return f"Unsupported URL scheme '{parsed.scheme}' (only http/https allowed)"
+    host = parsed.hostname
+    if not host:
+        return "URL has no host"
+
+    try:
+        addresses = [host]
+        ipaddress.ip_address(host)
+    except ValueError:
+        loop = asyncio.get_running_loop()
+        try:
+            infos = await loop.run_in_executor(
+                None,
+                lambda: socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM),
+            )
+        except socket.gaierror as exc:
+            return f"DNS resolution failed for '{host}': {exc}"
+        addresses = [str(info[4][0]) for info in infos]
+        if not addresses:
+            return f"DNS resolution returned no addresses for '{host}'"
+
+    for addr in addresses:
+        # Strip any IPv6 zone id ("fe80::1%eth0") before parsing.
+        ip = ipaddress.ip_address(addr.split("%")[0])
+        if not _ip_is_public(ip):
+            return f"Blocked non-public address {ip} for host '{host}' (SSRF guard)"
+    return None
 
 
 class NetworkTool(Tool):
@@ -114,7 +178,13 @@ class NetworkTool(Tool):
         if not host:
             return ToolResult(success=False, output="", error="No host specified")
 
-        count = min(kwargs.get("count", 4), 10)
+        try:
+            count = int(kwargs.get("count", 4))
+        except (TypeError, ValueError):
+            return ToolResult(
+                success=False, output="", error=f"Invalid count '{kwargs.get('count')}'"
+            )
+        count = max(1, min(count, 10))
 
         # Reject anything that is not a plausible host/IP. With the no-shell
         # exec below, a value like ``8.8.8.8; rm -rf /`` can never reach a shell
@@ -169,11 +239,36 @@ class NetworkTool(Tool):
         body = kwargs.get("body")
 
         try:
-            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT, follow_redirects=True) as client:
-                if method == "GET":
-                    response = await client.get(url)
+            # Redirects are followed manually: every hop (including the first
+            # URL) goes through the SSRF guard, so a public URL that 302s to
+            # localhost / LAN / metadata addresses is refused (#333).
+            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT, follow_redirects=False) as client:
+                current_url = url
+                current_method = method
+                for _hop in range(MAX_REDIRECTS + 1):
+                    refusal = await _check_url_target(current_url)
+                    if refusal:
+                        return ToolResult(success=False, output="", error=refusal)
+
+                    if current_method == "GET":
+                        response = await client.get(current_url)
+                    else:
+                        response = await client.post(current_url, content=body)
+
+                    location = response.headers.get("location")
+                    if response.status_code not in _REDIRECT_STATUSES or not location:
+                        break
+                    current_url = urljoin(current_url, location)
+                    # 303 (and historical 301/302 behaviour) downgrades to GET;
+                    # 307/308 preserve the method and body.
+                    if response.status_code in (301, 302, 303):
+                        current_method = "GET"
                 else:
-                    response = await client.post(url, content=body)
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error=f"Too many redirects (more than {MAX_REDIRECTS})",
+                    )
 
             # Truncate response body if very large.
             response_text = response.text
