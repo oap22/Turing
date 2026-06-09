@@ -91,6 +91,55 @@ Canonical label vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `re
 
 Single-context layout: `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
+## Multi-contributor & multi-agent workflow
+
+Multiple humans each run multiple agent sessions against this repo in parallel.
+The rules below keep them from colliding. (Decision record: issue #356.)
+
+### Claiming work
+
+- The unit of work is a GitHub issue; `ready-for-agent` issues are the free queue.
+- **The claim is the issue assignee.** Before starting, assign your human:
+  `gh issue edit <n> --add-assignee @me`. One agent per issue. Never start on an
+  issue assigned to someone else. Unassign to release a claim you abandon.
+- Non-trivial drive-by work gets an issue first.
+
+### Branches & worktrees
+
+- Branch naming: `<github-user>/<issue>-<slug>` (e.g. `loducaj/284-coordinator-pt2`).
+- One worktree per concurrently-running agent; **one branch = one agent** — two
+  sessions never share a branch.
+- Close the agent session before removing its worktree; remove worktrees after merge.
+
+### PRs & review tiers
+
+- Everything reaches `main` via PR with green CI. Reference the issue (`Closes #<n>`).
+- **Human review is mandatory** when the PR does any of: touches a CODEOWNERS
+  hotspot · adds or changes an alembic migration / DB schema · adds or changes a
+  dependency · changes a wire contract or gateway API · changes an ADR or
+  `CONTEXT.md` · exceeds ~400 changed lines excluding tests and lockfiles.
+- Otherwise a **fresh agent session** reviews the PR (`/code-review`, findings
+  posted as PR comments) and the owning human reads the verdict before merging.
+- Every PR description must self-classify its review tier and state whether
+  GitNexus impact analysis ran.
+
+### Sequence rules (hazards git merges cleanly but breaks)
+
+- **Alembic:** migrations form one linear chain. If `main` gained a migration
+  while your PR was open, re-point your `down_revision` to the new tip before
+  merge. CI enforces single-head (`tests/test_alembic_chain.py`).
+- **ADRs:** take the next free number; never reuse one. CI enforces uniqueness
+  (`tests/test_adr_numbering.py`; the historical 0001/0010 duplicates are
+  frozen grandfathers).
+
+### GitNexus scope
+
+The MUST rules in the GitNexus block below apply **when modifying existing
+symbols under `src/turing/` and the local index is available** (one-time
+per-clone setup: `cp .mcp.json.example .mcp.json && npx gitnexus analyze`).
+Additive changes (new files, docs, tests, scripts) don't require impact
+analysis. Either way, state in the PR whether it ran.
+
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 

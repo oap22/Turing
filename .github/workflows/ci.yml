@@ -15,7 +15,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        # PRs run 3.11 only (Actions-minutes budget under parallel agent PRs,
+        # issue #356); pushes to main run the full matrix as the post-merge
+        # canary. Required status checks should pin to `test (3.11)`.
+        python-version: ${{ fromJSON(github.event_name == 'pull_request' && '["3.11"]' || '["3.11", "3.12", "3.13"]') }}
     steps:
       - uses: actions/checkout@v6
 
@@ -115,23 +118,49 @@ jobs:
   tui:
     # The Rust operator surface (tui/). Same gates as the crate's own README:
     # formatting, clippy-as-errors, and the unit + render-smoke test suite.
+    # On PRs the heavy steps run only when tui/** changed (issue #356); the
+    # job itself still reports success, so it stays safe as a required check.
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: tui
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect tui changes
+        id: diff
+        working-directory: .
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "tui=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "${{ github.event.pull_request.base.sha }}...HEAD" | grep -q '^tui/'; then
+            echo "tui=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tui=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Toolchain
+        if: steps.diff.outputs.tui == 'true'
         run: |
           rustup component add rustfmt clippy
           cargo --version
 
+      - name: Cargo cache
+        if: steps.diff.outputs.tui == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tui
+
       - name: Format check
+        if: steps.diff.outputs.tui == 'true'
         run: cargo fmt --check
 
       - name: Clippy (deny warnings)
+        if: steps.diff.outputs.tui == 'true'
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
+        if: steps.diff.outputs.tui == 'true'
         run: cargo test
