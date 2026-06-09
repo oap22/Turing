@@ -256,13 +256,13 @@ def signed_transports():
     coord = SignedTransport(
         bus=bus,
         signer=coord_sig,
-        trusted_keys=[worker_sig.public_key],
+        trusted_keys={"worker-1": worker_sig.public_key},
         now_ms=lambda: 1_700_000_000_000,
     )
     worker = SignedTransport(
         bus=bus,
         signer=worker_sig,
-        trusted_keys=[coord_sig.public_key],
+        trusted_keys={"coordinator": coord_sig.public_key},
         now_ms=lambda: 1_700_000_000_000,
     )
     return bus, coord, worker, coord_sig, worker_sig

@@ -42,13 +42,13 @@ def bus_and_keys():
     coord = SignedTransport(
         bus=bus,
         signer=coord_signer,
-        trusted_keys=[worker_signer.public_key],
+        trusted_keys={"w1": worker_signer.public_key},
         now_ms=now,
     )
     worker = SignedTransport(
         bus=bus,
         signer=worker_signer,
-        trusted_keys=[coord_signer.public_key],
+        trusted_keys={"coord": coord_signer.public_key},
         now_ms=now,
     )
     return bus, coord, worker

@@ -144,14 +144,17 @@ def _build_coordinator_worker(
     async def _connect_and_build() -> WorkerFn:
         bus = await NatsBus.connect(url=nats_url, tls_enabled=True, nkey_seed=None, lan_only=True)
         signer = MessageSigner.generate()
-        # Trust set wired up out-of-band in production (manifests advertise
-        # public keys); for the eval harness we accept any signed reply by
-        # adding the signer's own key as trusted (loopback) — replace with
-        # a real trust list when this is deployed against the live pool.
+        # Trust map wired up out-of-band in production (manifests advertise
+        # public keys); for the eval harness we bind the harness's own key to
+        # its own id plus the target worker_id (loopback) — replace with the
+        # real node_id -> key map when this runs against the live pool.
+        trusted = {"eval-harness": signer.public_key}
+        if worker_id is not None:
+            trusted[worker_id] = signer.public_key
         transport = SignedTransport(
             bus=bus,
             signer=signer,
-            trusted_keys=[signer.public_key],
+            trusted_keys=trusted,
             now_ms=lambda: int(time.time() * 1000),
         )
         client = SubtaskDispatchClient(

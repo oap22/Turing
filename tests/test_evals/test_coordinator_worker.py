@@ -50,10 +50,10 @@ def transports():
     worker_signer = MessageSigner.generate()
     now = _now_factory()
     coord = SignedTransport(
-        bus=bus, signer=coord_signer, trusted_keys=[worker_signer.public_key], now_ms=now
+        bus=bus, signer=coord_signer, trusted_keys={"stub": worker_signer.public_key}, now_ms=now
     )
     worker = SignedTransport(
-        bus=bus, signer=worker_signer, trusted_keys=[coord_signer.public_key], now_ms=now
+        bus=bus, signer=worker_signer, trusted_keys={"harness": coord_signer.public_key}, now_ms=now
     )
     return coord, worker
 

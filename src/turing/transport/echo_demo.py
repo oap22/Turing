@@ -41,7 +41,10 @@ async def run_echo_round_trip(
 
     coordinator_signer = MessageSigner.generate()
     worker_signer = MessageSigner.generate()
-    trusted = [coordinator_signer.public_key, worker_signer.public_key]
+    trusted = {
+        "coordinator": coordinator_signer.public_key,
+        "worker": worker_signer.public_key,
+    }
 
     coordinator = SignedTransport(
         bus=bus, signer=coordinator_signer, trusted_keys=trusted, now_ms=lambda: 0

@@ -47,13 +47,18 @@ def transports():
     coord = SignedTransport(
         bus=bus,
         signer=coordinator_signer,
-        trusted_keys=[worker_signer.public_key],
+        # The single worker key is bound to every stub sender_id used below.
+        trusted_keys={
+            "stub-worker": worker_signer.public_key,
+            "slow": worker_signer.public_key,
+            "w": worker_signer.public_key,
+        },
         now_ms=now,
     )
     worker = SignedTransport(
         bus=bus,
         signer=worker_signer,
-        trusted_keys=[coordinator_signer.public_key],
+        trusted_keys={"coordinator": coordinator_signer.public_key},
         now_ms=now,
     )
     return bus, coord, worker, coordinator_signer, worker_signer
