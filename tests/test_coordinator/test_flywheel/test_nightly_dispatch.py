@@ -52,10 +52,17 @@ def transports():
     worker_signer = MessageSigner.generate()
     now = _now_ms_factory()
     coord = SignedTransport(
-        bus=bus, signer=coord_signer, trusted_keys=[worker_signer.public_key], now_ms=now
+        bus=bus,
+        signer=coord_signer,
+        # One worker key bound to every direct-worker id the tests use.
+        trusted_keys={wid: worker_signer.public_key for wid in ("w1", "w2", "w3", "w4")},
+        now_ms=now,
     )
     worker = SignedTransport(
-        bus=bus, signer=worker_signer, trusted_keys=[coord_signer.public_key], now_ms=now
+        bus=bus,
+        signer=worker_signer,
+        trusted_keys={"coordinator": coord_signer.public_key},
+        now_ms=now,
     )
     return bus, coord, worker
 

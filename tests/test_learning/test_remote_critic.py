@@ -59,13 +59,13 @@ def _transports():
     coord = SignedTransport(
         bus=bus,
         signer=coord_signer,
-        trusted_keys=[judge_signer.public_key],
+        trusted_keys={"judge-1": judge_signer.public_key},
         now_ms=lambda: 1_000,
     )
     judge = SignedTransport(
         bus=bus,
         signer=judge_signer,
-        trusted_keys=[coord_signer.public_key],
+        trusted_keys={"coordinator": coord_signer.public_key},
         now_ms=lambda: 1_000,
     )
     return bus, coord, judge

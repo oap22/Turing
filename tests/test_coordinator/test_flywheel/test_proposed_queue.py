@@ -142,10 +142,13 @@ async def test_proposed_questions_are_never_auto_dispatched() -> None:
     worker_signer = MessageSigner.generate()
     now = _now_ms_factory()
     coord = SignedTransport(
-        bus=bus, signer=coord_signer, trusted_keys=[worker_signer.public_key], now_ms=now
+        bus=bus, signer=coord_signer, trusted_keys={"w1": worker_signer.public_key}, now_ms=now
     )
     worker = SignedTransport(
-        bus=bus, signer=worker_signer, trusted_keys=[coord_signer.public_key], now_ms=now
+        bus=bus,
+        signer=worker_signer,
+        trusted_keys={"coordinator": coord_signer.public_key},
+        now_ms=now,
     )
 
     dispatched_subjects: list[str] = []

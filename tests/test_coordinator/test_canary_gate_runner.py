@@ -57,20 +57,22 @@ def _registered_adapter(
 
 
 def _transports(worker_count: int = 2):
+    # Worker i's key is bound to id "w-a", "w-b", ... — _attach_worker calls
+    # must use the matching worker_id for the binding check to pass.
     bus = InMemoryBus()
     coord_signer = MessageSigner.generate()
     workers = []
-    trusted_for_coord = []
-    for _ in range(worker_count):
+    trusted_for_coord: dict[str, bytes] = {}
+    for n in range(worker_count):
         ws = MessageSigner.generate()
         wt = SignedTransport(
             bus=bus,
             signer=ws,
-            trusted_keys=[coord_signer.public_key],
+            trusted_keys={"coord": coord_signer.public_key},
             now_ms=lambda: 1_000,
         )
         workers.append(wt)
-        trusted_for_coord.append(ws.public_key)
+        trusted_for_coord[f"w-{'abcdefgh'[n]}"] = ws.public_key
     coord = SignedTransport(
         bus=bus,
         signer=coord_signer,
