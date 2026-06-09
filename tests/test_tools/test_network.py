@@ -271,12 +271,13 @@ class TestSsrfGuard:
             "::1",  # IPv6 loopback
         ],
     )
-    async def test_http_request_blocks_internal_addresses(
-        self, network_tool: NetworkTool, ip: str
-    ):
+    async def test_http_request_blocks_internal_addresses(self, network_tool: NetworkTool, ip: str):
         factory, client = _fake_httpx_client(_fake_response())
         with (
-            patch("turing.tools.network.socket.getaddrinfo", side_effect=lambda *a, **k: _addrinfo_for(ip)),
+            patch(
+                "turing.tools.network.socket.getaddrinfo",
+                side_effect=lambda *a, **k: _addrinfo_for(ip),
+            ),
             patch("turing.tools.network.httpx.AsyncClient", factory),
         ):
             result = await network_tool.execute(
@@ -287,9 +288,7 @@ class TestSsrfGuard:
         client.get.assert_not_awaited()
 
     async def test_http_request_rejects_non_http_scheme(self, network_tool: NetworkTool):
-        result = await network_tool.execute(
-            action="http_request", url="file:///etc/passwd"
-        )
+        result = await network_tool.execute(action="http_request", url="file:///etc/passwd")
         assert result.success is False
         assert "scheme" in result.error.lower()
 
@@ -301,15 +300,15 @@ class TestSsrfGuard:
         factory, _client = _fake_httpx_client(redirect)
 
         def _resolver(host, *_a, **_k):
-            return _addrinfo_for("169.254.169.254" if host == "169.254.169.254" else "93.184.216.34")
+            return _addrinfo_for(
+                "169.254.169.254" if host == "169.254.169.254" else "93.184.216.34"
+            )
 
         with (
             patch("turing.tools.network.socket.getaddrinfo", side_effect=_resolver),
             patch("turing.tools.network.httpx.AsyncClient", factory),
         ):
-            result = await network_tool.execute(
-                action="http_request", url="http://public.example/"
-            )
+            result = await network_tool.execute(action="http_request", url="http://public.example/")
         assert result.success is False
         assert "SSRF" in result.error
 
