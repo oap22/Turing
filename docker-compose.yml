@@ -1,5 +1,14 @@
 x-nats-url: &nats-url "nats://nats:4222"
 
+# ── DEV-ONLY mesh presence keys (issue #348) ──────────────────────────
+# Presence heartbeat/leave messages are Ed25519-signed; each node gets a
+# fixed keypair so the 4-node simulation interoperates out of the box.
+# These keypairs are PUBLIC, checked into the repo, and exist ONLY for the
+# local docker-compose simulation. NEVER use them in production — generate
+# fresh per-node seeds there (see .env.example for the one-liner).
+# The map binds node_id -> Ed25519 public key hex for all 4 sim nodes.
+x-mesh-trusted-keys: &mesh-trusted-keys '{"pi-alpha":"03c2ea7fa3167cbd598a6098bbd5010cfb50d8c7dabc2ee57f0d7288f4bf84a6","pi-beta":"b2923d27ca09e07e7039bd09ef6c8739ebf8f6c0cedf443d5a829a2b15caf782","pi-gamma":"a0e2a930f9b1ea5175d9f80b32a8e8a7318765a3f8e4f6f00abeeb7fb2564a9d","pi-delta":"7535f68c3d755b157b95f1c6c5ffa3be72292e8e5016829d10e52cb74417185f"}'
+
 x-turing-common: &turing-common
   build:
     context: .
@@ -62,10 +71,17 @@ services:
     container_name: turing-node-1
     environment:
       TURING_NODE_NAME: pi-alpha
+      # Fixed node_id so the signed-presence trusted-keys map can bind this
+      # node's key to a stable identity (issue #348).
+      TURING_NODE_ID: pi-alpha
       TURING_DISCORD_TOKEN: ${TURING_DISCORD_TOKEN}
       TURING_ANTHROPIC_API_KEY: ${TURING_ANTHROPIC_API_KEY}
       TURING_OLLAMA_HOST: http://ollama:11434
       TURING_MESH_ENABLED: "true"
+      # DEV-ONLY signing seed for the local simulation — see the
+      # x-mesh-trusted-keys comment. Never use in production.
+      TURING_MESH_SIGNING_SEED: "362bc6754d050c744e39ebaf59fa1332d94dd27cbc9b9ceeea04b593c6d537be"
+      TURING_MESH_TRUSTED_KEYS: *mesh-trusted-keys
       TURING_DB_PATH: /app/data/turing.db
       TURING_NATS_URL: *nats-url
       # Plugin allow-list is fail-closed (issue #346); opt the bundled
@@ -86,9 +102,16 @@ services:
     container_name: turing-node-2
     environment:
       TURING_NODE_NAME: pi-beta
+      # Fixed node_id so the signed-presence trusted-keys map can bind this
+      # node's key to a stable identity (issue #348).
+      TURING_NODE_ID: pi-beta
       TURING_OLLAMA_HOST: http://ollama:11434
       TURING_LLM_ROUTING_MODE: local
       TURING_MESH_ENABLED: "true"
+      # DEV-ONLY signing seed for the local simulation — see the
+      # x-mesh-trusted-keys comment. Never use in production.
+      TURING_MESH_SIGNING_SEED: "c68a2e4873ba979a89ca4ad552d9055710a052c253cb7547b3b976d7f96fa674"
+      TURING_MESH_TRUSTED_KEYS: *mesh-trusted-keys
       TURING_DB_PATH: /app/data/turing.db
       TURING_NATS_URL: *nats-url
       # Plugin allow-list is fail-closed (issue #346); opt the bundled
@@ -103,9 +126,16 @@ services:
     container_name: turing-node-3
     environment:
       TURING_NODE_NAME: pi-gamma
+      # Fixed node_id so the signed-presence trusted-keys map can bind this
+      # node's key to a stable identity (issue #348).
+      TURING_NODE_ID: pi-gamma
       TURING_OLLAMA_HOST: http://ollama:11434
       TURING_LLM_ROUTING_MODE: local
       TURING_MESH_ENABLED: "true"
+      # DEV-ONLY signing seed for the local simulation — see the
+      # x-mesh-trusted-keys comment. Never use in production.
+      TURING_MESH_SIGNING_SEED: "95fa884823d5c2241395e4185738f52e0bbd2fc5dda4567f01145bd990ab2ed7"
+      TURING_MESH_TRUSTED_KEYS: *mesh-trusted-keys
       TURING_DB_PATH: /app/data/turing.db
       TURING_NATS_URL: *nats-url
       # Plugin allow-list is fail-closed (issue #346); opt the bundled
@@ -120,9 +150,16 @@ services:
     container_name: turing-node-4
     environment:
       TURING_NODE_NAME: pi-delta
+      # Fixed node_id so the signed-presence trusted-keys map can bind this
+      # node's key to a stable identity (issue #348).
+      TURING_NODE_ID: pi-delta
       TURING_OLLAMA_HOST: http://ollama:11434
       TURING_LLM_ROUTING_MODE: local
       TURING_MESH_ENABLED: "true"
+      # DEV-ONLY signing seed for the local simulation — see the
+      # x-mesh-trusted-keys comment. Never use in production.
+      TURING_MESH_SIGNING_SEED: "4e4d9bb9c56860c8d2bdeae71db4dc0c32e8a6eafe3490ed65f69aaa9940d55a"
+      TURING_MESH_TRUSTED_KEYS: *mesh-trusted-keys
       TURING_DB_PATH: /app/data/turing.db
       TURING_NATS_URL: *nats-url
       # Plugin allow-list is fail-closed (issue #346); opt the bundled

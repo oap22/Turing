@@ -51,6 +51,21 @@ class MessageSigner:
     def generate(cls) -> MessageSigner:
         return cls(Ed25519PrivateKey.generate())
 
+    @classmethod
+    def from_seed_hex(cls, seed_hex: str) -> MessageSigner:
+        """Build a signer from a hex-encoded 32-byte Ed25519 private-key seed.
+
+        This is the serialization the ``TURING_MESH_SIGNING_SEED`` config
+        field uses (issue #348). Raises ``ValueError`` on malformed input.
+        """
+        try:
+            seed = bytes.fromhex(seed_hex.strip())
+        except ValueError as exc:
+            raise ValueError("signing seed is not valid hex") from exc
+        if len(seed) != 32:
+            raise ValueError(f"signing seed must be 32 bytes, got {len(seed)}")
+        return cls(Ed25519PrivateKey.from_private_bytes(seed))
+
     @property
     def public_key(self) -> bytes:
         return self._public_key_bytes

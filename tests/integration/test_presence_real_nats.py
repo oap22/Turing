@@ -2,13 +2,14 @@
 
 Same assertion as the in-memory presence test (mutual discovery between two
 nodes), but the bytes traverse an actual ``nats:2.10`` broker via the
-``nats_url`` fixture. Proves the contract end-to-end on the same transport
-production runs on.
+``nats_url`` fixture. Proves the signed-presence contract (issue #348)
+end-to-end on the same transport production runs on.
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,8 @@ import pytest
 from turing.mesh.node import MeshNode
 from turing.mesh.presence import PresenceService
 from turing.transport.nats_bus import NatsBus
+from turing.transport.signed_transport import SignedTransport
+from turing.transport.signer import MessageSigner
 
 pytestmark = pytest.mark.integration
 
@@ -32,8 +35,23 @@ async def test_two_nodes_discover_each_other_via_real_nats(nats_url: str) -> Non
     bus_b = await NatsBus.connect(url=nats_url, tls_enabled=False, nkey_seed=None, lan_only=False)
     node_a = _make_node("a", "pi-alpha", ["shell"])
     node_b = _make_node("b", "pi-beta", ["search"])
-    pres_a = PresenceService(node_a, bus_a, heartbeat_interval=0.05, stale_after=60.0)
-    pres_b = PresenceService(node_b, bus_b, heartbeat_interval=0.05, stale_after=60.0)
+
+    signer_a = MessageSigner.generate()
+    signer_b = MessageSigner.generate()
+    trusted = {"a": signer_a.public_key, "b": signer_b.public_key}
+
+    def _now_ms() -> int:
+        return int(time.time() * 1000)
+
+    transport_a = SignedTransport(bus=bus_a, signer=signer_a, trusted_keys=trusted, now_ms=_now_ms)
+    transport_b = SignedTransport(bus=bus_b, signer=signer_b, trusted_keys=trusted, now_ms=_now_ms)
+
+    pres_a = PresenceService(
+        node_a, transport_a, heartbeat_interval=0.05, stale_after=60.0, heartbeat_min_interval=0.0
+    )
+    pres_b = PresenceService(
+        node_b, transport_b, heartbeat_interval=0.05, stale_after=60.0, heartbeat_min_interval=0.0
+    )
 
     await pres_a.start()
     await pres_b.start()

@@ -34,3 +34,23 @@ def test_verify_rejects_unknown_signer() -> None:
 
     with pytest.raises(SignatureError):
         alice.verify(signed, trusted_public_keys=[alice.public_key])
+
+
+def test_from_seed_hex_roundtrip() -> None:
+    # Issue #348: TURING_MESH_SIGNING_SEED is a hex 32-byte Ed25519 seed.
+    seed_hex = "11" * 32
+    signer_a = MessageSigner.from_seed_hex(seed_hex)
+    signer_b = MessageSigner.from_seed_hex(seed_hex)
+
+    # Deterministic: same seed -> same identity.
+    assert signer_a.public_key == signer_b.public_key
+
+    signed = signer_a.sign(b"hello")
+    assert signer_b.verify(signed, trusted_public_keys=[signer_b.public_key]) == b"hello"
+
+
+def test_from_seed_hex_rejects_bad_input() -> None:
+    with pytest.raises(ValueError, match="not valid hex"):
+        MessageSigner.from_seed_hex("zz" * 32)
+    with pytest.raises(ValueError, match="32 bytes"):
+        MessageSigner.from_seed_hex("ab" * 16)
