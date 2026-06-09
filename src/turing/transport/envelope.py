@@ -74,6 +74,16 @@ class ReplayWindow:
                 f"message timestamp {timestamp_ms} is older than ttl {self._ttl_ms}ms"
             )
 
+        # Reject future-dated timestamps beyond an allowed clock-skew window.
+        # Without an upper bound, a captured frame whose timestamp is set far in
+        # the future never reads as "stale", defeating the freshness guarantee
+        # (and keeping its request_id un-evictable). The window is symmetric
+        # with the past bound so legitimate clock skew is tolerated.
+        if timestamp_ms - now > self._ttl_ms:
+            raise ReplayError(
+                f"message timestamp {timestamp_ms} is more than {self._ttl_ms}ms in the future"
+            )
+
         if request_id in self._seen:
             raise ReplayError(f"replay of request_id={request_id!r}")
 

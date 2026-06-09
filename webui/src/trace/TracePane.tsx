@@ -57,7 +57,10 @@ export default function TracePane({ liveEvents, onSelect }: Props) {
   }, [history, liveEvents, filter]);
 
   return (
-    <div className="flex h-full flex-col bg-term-bg font-mono text-xs">
+    <div
+      aria-label="Message trace"
+      className="flex h-full flex-col bg-term-bg font-mono text-xs"
+    >
       <div className="border-b border-term-edge bg-term-panel px-3 py-1.5">
         <span className="text-[11px] font-bold uppercase tracking-widest text-term-fg">
           trace
@@ -67,20 +70,34 @@ export default function TracePane({ liveEvents, onSelect }: Props) {
         </span>
       </div>
       <FilterBar filter={filter} onChange={setFilter} />
-      <ol className="flex-1 overflow-auto">
+      <ol aria-label="Trace events" className="flex-1 overflow-auto">
         {merged.map((e) => {
           const key = `${e.node_name}/${e.event_type}/${e.timestamp_ms}/${e.seq ?? 0}`;
+          const expanded = expandedKey === key;
           return (
             <li
               key={key}
-              className="cursor-pointer border-b border-term-edge/60 px-2 py-1 hover:bg-term-raised"
-              onClick={() => {
-                onSelect?.(e);
-                setExpandedKey((prev) => (prev === key ? null : key));
-              }}
+              className="border-b border-term-edge/60 hover:bg-term-raised"
             >
-              <Row event={e} />
-              {expandedKey === key && <Expansion event={e} />}
+              <button
+                type="button"
+                aria-expanded={expanded}
+                aria-label={`${expanded ? "Collapse" : "Expand"} trace event ${
+                  e.event_type
+                } from ${e.node_name}`}
+                className="w-full px-2 py-1 text-left"
+                onClick={() => {
+                  onSelect?.(e);
+                  setExpandedKey((prev) => (prev === key ? null : key));
+                }}
+              >
+                <Row event={e} />
+              </button>
+              {expanded && (
+                <div className="px-2 pb-1">
+                  <Expansion event={e} />
+                </div>
+              )}
             </li>
           );
         })}
@@ -169,8 +186,16 @@ function FilterBar({
   onChange: (next: TraceFilter) => void;
 }) {
   return (
-    <div className="flex flex-wrap items-center gap-2 border-b border-term-edge bg-term-panel px-2 py-1 text-[11px] text-term-dim">
+    <div
+      role="search"
+      aria-label="Trace filters"
+      className="flex flex-wrap items-center gap-2 border-b border-term-edge bg-term-panel px-2 py-1 text-[11px] text-term-dim"
+    >
+      <label className="sr-only" htmlFor="trace-filter-nodes">
+        Filter trace by nodes
+      </label>
       <input
+        id="trace-filter-nodes"
         type="text"
         placeholder="nodes (csv)"
         value={filter.nodes.join(",")}
@@ -182,7 +207,11 @@ function FilterBar({
         }
         className={FILTER_INPUT}
       />
+      <label className="sr-only" htmlFor="trace-filter-events">
+        Filter trace by event types
+      </label>
       <input
+        id="trace-filter-events"
         type="text"
         placeholder="event types (csv)"
         value={filter.eventTypes.join(",")}
@@ -194,7 +223,11 @@ function FilterBar({
         }
         className={FILTER_INPUT}
       />
+      <label className="sr-only" htmlFor="trace-filter-duration">
+        Minimum duration in milliseconds
+      </label>
       <input
+        id="trace-filter-duration"
         type="number"
         placeholder="min ms"
         value={filter.minDurationMs ?? ""}

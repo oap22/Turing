@@ -142,10 +142,10 @@ pub fn queue(f: &mut Frame, area: Rect, app: &App) {
 
 fn mark(decision: &str) -> &'static str {
     match decision {
-        "accept" => "✓",
-        "reject" => "✗",
-        "edit" => "✎",
-        _ => "•",
+        "accept" => "accept",
+        "reject" => "reject",
+        "edit" => "edit",
+        _ => "curated",
     }
 }
 

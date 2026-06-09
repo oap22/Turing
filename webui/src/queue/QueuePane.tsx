@@ -10,7 +10,7 @@
 // signal. The pane is optimistic only insofar as the authoritative item state
 // re-arrives as a `queue.delta`, so a failed POST self-heals on the next frame.
 
-import { useMemo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import type { QueueItem, QueueStatus } from "../ws";
 import {
   acceptQuestion,
@@ -96,17 +96,24 @@ function Column({
   label: string;
   items: QueueItem[];
 }) {
+  const headingId = `queue-column-heading-${status}`;
   return (
     <section
       data-testid={`queue-column-${status}`}
       data-count={items.length}
+      aria-labelledby={headingId}
       className="flex min-w-0 flex-col bg-term-bg"
     >
       <header className="flex items-center justify-between border-b border-term-edge px-2 py-1 text-[10px] uppercase tracking-widest text-term-dim">
-        <span>{label}</span>
-        <span className="tabular-nums text-term-dim">{items.length}</span>
+        <span id={headingId}>{label}</span>
+        <span
+          aria-label={`${items.length} ${label} questions`}
+          className="tabular-nums text-term-dim"
+        >
+          {items.length}
+        </span>
       </header>
-      <ol className="flex-1 space-y-1 overflow-y-auto p-1">
+      <ol aria-labelledby={headingId} className="flex-1 space-y-1 overflow-y-auto p-1">
         {items.map((item) => (
           <QueueCard key={item.id} item={item} />
         ))}
@@ -115,7 +122,7 @@ function Column({
   );
 }
 
-function QueueCard({ item }: { item: QueueItem }) {
+const QueueCard = memo(function QueueCard({ item }: { item: QueueItem }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
@@ -142,6 +149,7 @@ function QueueCard({ item }: { item: QueueItem }) {
       data-testid={`queue-card-${item.id}`}
       data-status={item.status}
       data-decision={item.decision ?? ""}
+      aria-busy={busy ? "true" : "false"}
       className={`border p-2 ${cardClass}`}
     >
       <div className="flex items-start justify-between gap-2">
@@ -169,6 +177,7 @@ function QueueCard({ item }: { item: QueueItem }) {
             type="button"
             data-testid={`queue-approve-${item.id}`}
             disabled={busy}
+            aria-label={`Approve question: ${item.prompt}`}
             onClick={() => void run(() => approveQuestion(item.id))}
             className={`${BTN} border-sky-700 text-sky-200 hover:bg-sky-500/10`}
           >
@@ -183,6 +192,7 @@ function QueueCard({ item }: { item: QueueItem }) {
             type="button"
             data-testid={`queue-accept-${item.id}`}
             disabled={busy}
+            aria-label={`Accept drafted answer for: ${item.prompt}`}
             onClick={() => void run(() => acceptQuestion(item.id))}
             className={`${BTN} border-emerald-700 text-emerald-200 hover:bg-emerald-500/10`}
           >
@@ -192,6 +202,7 @@ function QueueCard({ item }: { item: QueueItem }) {
             type="button"
             data-testid={`queue-reject-${item.id}`}
             disabled={busy}
+            aria-label={`Reject drafted answer for: ${item.prompt}`}
             onClick={() => void run(() => rejectQuestion(item.id))}
             className={`${BTN} border-rose-700 text-rose-200 hover:bg-rose-500/10`}
           >
@@ -201,6 +212,7 @@ function QueueCard({ item }: { item: QueueItem }) {
             type="button"
             data-testid={`queue-edit-${item.id}`}
             disabled={busy}
+            aria-label={`Edit drafted answer for: ${item.prompt}`}
             onClick={() => {
               setDraft(item.corrected_answer ?? "");
               setEditing(true);
@@ -214,7 +226,11 @@ function QueueCard({ item }: { item: QueueItem }) {
 
       {item.status === "drafted" && editing && (
         <div className="mt-2 space-y-1">
+          <label className="sr-only" htmlFor={`queue-edit-input-${item.id}`}>
+            Corrected answer
+          </label>
           <textarea
+            id={`queue-edit-input-${item.id}`}
             data-testid={`queue-edit-input-${item.id}`}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
@@ -227,6 +243,7 @@ function QueueCard({ item }: { item: QueueItem }) {
               type="button"
               data-testid={`queue-edit-submit-${item.id}`}
               disabled={busy || draft.trim() === ""}
+              aria-label={`Save correction for: ${item.prompt}`}
               onClick={() => void run(() => editQuestion(item.id, draft))}
               className={`${BTN} border-amber-700 text-amber-200 hover:bg-amber-500/10`}
             >
@@ -236,6 +253,7 @@ function QueueCard({ item }: { item: QueueItem }) {
               type="button"
               data-testid={`queue-edit-cancel-${item.id}`}
               disabled={busy}
+              aria-label={`Cancel correction for: ${item.prompt}`}
               onClick={() => setEditing(false)}
               className={`${BTN} border-term-edge text-term-dim hover:bg-white/5`}
             >
@@ -260,4 +278,4 @@ function QueueCard({ item }: { item: QueueItem }) {
       )}
     </li>
   );
-}
+});

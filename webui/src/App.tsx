@@ -204,6 +204,13 @@ export default function App() {
   // Backtick toggles the debug pane (hidden by default).
   useEffect(() => {
     function onKey(ev: KeyboardEvent) {
+      const target = ev.target as HTMLElement | null;
+      if (
+        target?.closest("input, textarea, select, button") ||
+        target?.isContentEditable
+      ) {
+        return;
+      }
       if (ev.key === "~" || ev.key === "`") {
         setShowDebug((s) => {
           const next = !s;
@@ -228,6 +235,12 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col bg-term-bg text-term-fg">
+      <a
+        href="#operator-surface"
+        className="sr-only focus:not-sr-only focus:absolute focus:left-3 focus:top-3 focus:z-[60] focus:rounded focus:bg-term-panel focus:px-3 focus:py-2 focus:text-sm focus:text-term-fg"
+      >
+        skip to operator surface
+      </a>
       <MemoAlertBanner alerts={alerts} />
       <header className="flex items-center gap-3 border-b border-term-edge bg-term-panel px-3 py-1.5 text-sm">
         <span className="bg-term-accent px-2 py-0.5 text-xs font-bold tracking-widest text-black">
@@ -246,11 +259,17 @@ export default function App() {
           </span>
         </span>
       </header>
-      <section className="h-[42%] min-h-[260px] border-b border-term-edge">
+      <section
+        aria-label="Question queue"
+        className="h-[42%] min-h-[260px] border-b border-term-edge"
+      >
         <MemoQueuePane items={queueItems} />
       </section>
-      <main className="flex flex-1 overflow-hidden">
-        <section className="flex min-w-0 flex-1 flex-col border-r border-term-edge">
+      <main id="operator-surface" className="flex flex-1 overflow-hidden">
+        <section
+          aria-label="Fleet graph and specs"
+          className="flex min-w-0 flex-1 flex-col border-r border-term-edge"
+        >
           <div className="flex-1 overflow-hidden">
             <MemoCallGraphCanvas
               state={visibleState}
@@ -259,14 +278,20 @@ export default function App() {
           </div>
           <MemoSpecsGrid rows={specsRows} />
         </section>
-        <aside className="w-[420px] shrink-0 border-r border-term-edge">
+        <aside
+          aria-label="Message trace"
+          className="w-[420px] shrink-0 border-r border-term-edge"
+        >
           <MemoTracePane liveEvents={liveTrace} onSelect={onTraceSelect} />
         </aside>
-        <aside className="w-[360px] shrink-0">
+        <aside aria-label="Chat tasks" className="w-[360px] shrink-0">
           <MemoChatPane sessions={chatSessions} />
         </aside>
         {showDebug && (
-          <aside className="w-[480px] shrink-0 overflow-auto border-l border-term-edge bg-term-panel p-2 font-mono text-xs">
+          <aside
+            aria-label="Incoming frames debug stream"
+            className="w-[480px] shrink-0 overflow-auto border-l border-term-edge bg-term-panel p-2 font-mono text-xs"
+          >
             <h2 className="mb-2 text-[11px] uppercase tracking-widest text-term-dim">
               incoming frames<span className="term-cursor" />
             </h2>
