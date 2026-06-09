@@ -21,6 +21,7 @@ class SubtaskKind(StrEnum):
     """
 
     DEFAULT = "default"
+    RESEARCH = "research"  # grounded research (ADR 0009 §2 "Night", #261)
     CRITIC_SCORE = "critic_score"
     CANARY_EVAL = "canary_eval"
     EXTRACT_LESSONS = "extract_lessons"

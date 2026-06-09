@@ -27,9 +27,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from turing.coordinator.episode_rewards import write_morning_curation
+from turing.vault.committer import promotion_commit_message
 
 if TYPE_CHECKING:
     from turing.coordinator.episode_rewards import EpisodeRewardsStore
+    from turing.vault.committer import VaultCommitter
 
 # Default decision → reward mapping. Accept is a clean positive; reject a clean
 # negative; edit is net-positive-but-imperfect (the draft was salvageable, but
@@ -84,6 +86,7 @@ class CurationRecord:
     recorded_at_ms: int
     curated_path: Path | None = None
     corrected_answer: str | None = None
+    commit_sha: str | None = None
 
 
 class MorningCuration:
@@ -98,6 +101,7 @@ class MorningCuration:
         accept_reward: float = ACCEPT_REWARD,
         reject_reward: float = REJECT_REWARD,
         edit_reward: float = EDIT_REWARD,
+        committer: VaultCommitter | None = None,
     ) -> None:
         self._root = Path(vault_root).resolve()
         self._rewards = episode_rewards
@@ -105,6 +109,11 @@ class MorningCuration:
         self._accept_reward = accept_reward
         self._reject_reward = reject_reward
         self._edit_reward = edit_reward
+        # Write-side of ADR 0010 §4 AC#3. When present, each accept/edit
+        # promotion is recorded as one structured vault commit (the watcher's
+        # read-side then reindexes that commit). Default ``None`` keeps the
+        # plain path-move behaviour for callers without a git-backed vault.
+        self._committer = committer
         self._decisions: list[CurationRecord] = []
         self._candidates: list[SFTCandidate] = []
 
@@ -141,12 +150,20 @@ class MorningCuration:
         )
         self._candidates.append(candidate)
         self._reward(episode_id, self._accept_reward, recorded_at_ms)
+        sha = self._commit_promotion(
+            CurationDecision.ACCEPT,
+            draft,
+            episode_id=episode_id,
+            reward=self._accept_reward,
+            curated=curated,
+        )
         self._log(
             CurationDecision.ACCEPT,
             draft,
             episode_id=episode_id,
             recorded_at_ms=recorded_at_ms,
             curated_path=curated,
+            commit_sha=sha,
         )
         return curated, candidate
 
@@ -170,6 +187,13 @@ class MorningCuration:
         )
         self._candidates.append(candidate)
         self._reward(episode_id, self._edit_reward, recorded_at_ms)
+        sha = self._commit_promotion(
+            CurationDecision.EDIT,
+            draft,
+            episode_id=episode_id,
+            reward=self._edit_reward,
+            curated=curated,
+        )
         self._log(
             CurationDecision.EDIT,
             draft,
@@ -177,6 +201,7 @@ class MorningCuration:
             recorded_at_ms=recorded_at_ms,
             curated_path=curated,
             corrected_answer=corrected_answer,
+            commit_sha=sha,
         )
         return curated, candidate
 
@@ -221,6 +246,42 @@ class MorningCuration:
             draft.path.unlink(missing_ok=True)
         return curated_path
 
+    def _commit_promotion(
+        self,
+        decision: CurationDecision,
+        draft: InboxDraft,
+        *,
+        episode_id: str,
+        reward: float,
+        curated: Path,
+    ) -> str | None:
+        """Record the promotion as one structured vault commit (AC#3).
+
+        No-op (returns ``None``) when no committer is wired — the draft has
+        already been moved on disk; the commit is the audit-trail half. Staging
+        the curated file plus the *exact* inbox draft path captures both the new
+        note and the removed draft in a single commit. Naming the precise draft
+        path (not its parent dir) is what keeps untracked sibling drafts still
+        awaiting review out of the commit — a ``task_id`` dir can hold several
+        drafts, and staging the parent would sweep those siblings in.
+        """
+        if self._committer is None:
+            return None
+        curated_rel = curated.resolve().relative_to(self._root).as_posix()
+        message = promotion_commit_message(
+            decision=str(decision),
+            task_id=draft.task_id,
+            slug=draft.path.stem,
+            specialty=draft.specialty,
+            episode_id=episode_id,
+            reward=reward,
+            curated_rel=curated_rel,
+        )
+        return self._committer.commit_paths(
+            paths=[curated, draft.path],
+            message=message,
+        )
+
     def _reward(self, episode_id: str, value: float, recorded_at_ms: int) -> None:
         write_morning_curation(
             self._rewards,
@@ -238,6 +299,7 @@ class MorningCuration:
         recorded_at_ms: int,
         curated_path: Path | None = None,
         corrected_answer: str | None = None,
+        commit_sha: str | None = None,
     ) -> None:
         self._decisions.append(
             CurationRecord(
@@ -247,6 +309,7 @@ class MorningCuration:
                 recorded_at_ms=recorded_at_ms,
                 curated_path=curated_path,
                 corrected_answer=corrected_answer,
+                commit_sha=commit_sha,
             )
         )
 

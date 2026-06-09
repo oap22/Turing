@@ -78,3 +78,30 @@ class TestCombined:
         out = redact(text, max_bytes=300)
         assert "bob@example.org" not in out
         assert "[REDACTED:email]" in out
+
+
+class TestAssignedSecretRedaction:
+    def test_strips_gateway_token_assignment(self) -> None:
+        out = redact("gateway_token=s3cr3tOpaqueValue123")
+        assert "s3cr3tOpaqueValue123" not in out
+        assert "[REDACTED:secret]" in out
+        # The key name is preserved for diagnostics.
+        assert "gateway_token=" in out
+
+    def test_strips_password_colon(self) -> None:
+        out = redact("password: hunter2hunter2")
+        assert "hunter2hunter2" not in out
+        assert "[REDACTED:secret]" in out
+
+    def test_strips_quoted_secret(self) -> None:
+        out = redact('api_key="abcdEFGH1234 wxyz"')
+        assert "abcdEFGH1234" not in out
+        assert "[REDACTED:secret]" in out
+
+
+class TestNkeySeedRedaction:
+    def test_strips_nats_nkey_seed(self) -> None:
+        seed = "SUAGMVQHBNJY6KJHFL5LRJN6CQ3LPYDM5L3LZK3X4JZ6QJ5VYZ2C7NQABC"
+        out = redact(f"connecting with {seed} now")
+        assert seed not in out
+        assert "[REDACTED:nkey-seed]" in out
