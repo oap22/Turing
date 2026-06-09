@@ -48,6 +48,9 @@ class Executor:
         tool_name = tool_call.name
         arguments = tool_call.arguments
 
+        # Redact before this pre-audit log line: raw arguments can carry
+        # tokens or passwords, and SafetyGate's own redaction only covers the
+        # audit path, not this structlog event (#331).
         logger.info(
             "executor.tool_call_start",
             tool=tool_name,

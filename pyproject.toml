@@ -103,6 +103,9 @@ indent-style = "space"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Force imports from this worktree's src/ so pytest never resolves `turing`
+# from another editable checkout (#335).
+pythonpath = ["src"]
 asyncio_mode = "auto"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",

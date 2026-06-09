@@ -169,7 +169,13 @@ class NetworkTool(Tool):
         if not host:
             return ToolResult(success=False, output="", error="No host specified")
 
-        count = min(kwargs.get("count", 4), 10)
+        try:
+            count = int(kwargs.get("count", 4))
+        except (TypeError, ValueError):
+            return ToolResult(
+                success=False, output="", error=f"Invalid count '{kwargs.get('count')}'"
+            )
+        count = max(1, min(count, 10))
 
         # Reject anything that is not a plausible host/IP. With the no-shell
         # exec below, a value like ``8.8.8.8; rm -rf /`` can never reach a shell
@@ -261,6 +267,13 @@ class NetworkTool(Tool):
                         redirects += 1
                         continue
                     break
+
+            if response.is_redirect:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Too many redirects (more than {_MAX_REDIRECTS})",
+                )
 
             # Truncate response body if very large.
             response_text = response.text

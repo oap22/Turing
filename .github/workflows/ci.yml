@@ -36,6 +36,7 @@ jobs:
         working-directory: webui
         run: |
           npm ci --legacy-peer-deps
+          npm run test
           npm run build
 
       - name: Install dependencies

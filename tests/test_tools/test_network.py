@@ -93,6 +93,19 @@ class TestPing:
         argv = p.await_args.args
         assert argv[1:3] == ("-c", "10")
 
+    async def test_count_is_clamped_to_at_least_one(self, network_tool: NetworkTool):
+        with _patch_ping_subprocess(0, stdout=b"ok") as p:
+            await network_tool.execute(action="ping", host="1.1.1.1", count=-5)
+        argv = p.await_args.args
+        assert argv[1:3] == ("-c", "1")
+
+    async def test_non_integer_count_is_rejected(self, network_tool: NetworkTool):
+        with _patch_ping_subprocess(0) as p:
+            result = await network_tool.execute(action="ping", host="1.1.1.1", count="; id")
+        assert result.success is False
+        assert "Invalid count" in result.error
+        p.assert_not_awaited()
+
     async def test_failed_ping_returns_stderr(self, network_tool: NetworkTool):
         with _patch_ping_subprocess(1, stderr=b"unknown host"):
             result = await network_tool.execute(action="ping", host="nope.invalid")
@@ -172,6 +185,12 @@ def _fake_response(*, status_code: int = 200, text: str = "hello", reason: str =
     return resp
 
 
+def _patch_public_dns(addr: str = "93.184.216.34"):
+    """Make every hostname resolve to a public address (SSRF guard passes)."""
+    addrinfo = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (addr, 0))]
+    return patch("turing.tools.network.socket.getaddrinfo", return_value=addrinfo)
+
+
 def _public_addrinfo(*_args, **_kwargs):
     """Stand-in for ``socket.getaddrinfo`` that resolves to a public address.
 
@@ -182,7 +201,7 @@ def _public_addrinfo(*_args, **_kwargs):
 
 
 @pytest.fixture(autouse=True)
-def _patch_public_dns():
+def _public_dns_default():
     with patch("turing.tools.network.socket.getaddrinfo", side_effect=_public_addrinfo):
         yield
 
@@ -200,7 +219,7 @@ class TestHttpRequest:
 
     async def test_successful_get(self, network_tool: NetworkTool):
         factory, client = _fake_httpx_client(_fake_response(text="payload"))
-        with patch("turing.tools.network.httpx.AsyncClient", factory):
+        with patch("turing.tools.network.httpx.AsyncClient", factory), _patch_public_dns():
             result = await network_tool.execute(action="http_request", url="http://example.com")
         assert result.success is True
         assert "Status: 200 OK" in result.output
@@ -209,7 +228,7 @@ class TestHttpRequest:
 
     async def test_post_passes_body(self, network_tool: NetworkTool):
         factory, client = _fake_httpx_client(_fake_response(text="created", status_code=201))
-        with patch("turing.tools.network.httpx.AsyncClient", factory):
+        with patch("turing.tools.network.httpx.AsyncClient", factory), _patch_public_dns():
             result = await network_tool.execute(
                 action="http_request", url="http://x", method="POST", body="data"
             )
@@ -220,7 +239,7 @@ class TestHttpRequest:
         factory, _ = _fake_httpx_client(
             _fake_response(status_code=404, reason="Not Found", text="missing")
         )
-        with patch("turing.tools.network.httpx.AsyncClient", factory):
+        with patch("turing.tools.network.httpx.AsyncClient", factory), _patch_public_dns():
             result = await network_tool.execute(action="http_request", url="http://x")
         assert result.success is False
         assert "HTTP 404" in result.error
@@ -228,24 +247,129 @@ class TestHttpRequest:
     async def test_large_body_is_truncated(self, network_tool: NetworkTool):
         big = "x" * 5000
         factory, _ = _fake_httpx_client(_fake_response(text=big))
-        with patch("turing.tools.network.httpx.AsyncClient", factory):
+        with patch("turing.tools.network.httpx.AsyncClient", factory), _patch_public_dns():
             result = await network_tool.execute(action="http_request", url="http://x")
         assert result.truncated is True
         assert "(response truncated)" in result.output
 
     async def test_timeout(self, network_tool: NetworkTool):
         factory = MagicMock(side_effect=httpx.TimeoutException("slow"))
-        with patch("turing.tools.network.httpx.AsyncClient", factory):
+        with patch("turing.tools.network.httpx.AsyncClient", factory), _patch_public_dns():
             result = await network_tool.execute(action="http_request", url="http://x")
         assert result.success is False
         assert "timed out" in result.error
 
     async def test_request_error(self, network_tool: NetworkTool):
         factory = MagicMock(side_effect=httpx.ConnectError("refused"))
-        with patch("turing.tools.network.httpx.AsyncClient", factory):
+        with patch("turing.tools.network.httpx.AsyncClient", factory), _patch_public_dns():
             result = await network_tool.execute(action="http_request", url="http://x")
         assert result.success is False
         assert "HTTP request failed" in result.error
+
+    async def test_follows_public_redirect(self, network_tool: NetworkTool):
+        first = _fake_response(status_code=302, reason="Found", text="")
+        first.is_redirect = True
+        first.headers = {"location": "http://other.example/final"}
+        final = _fake_response(text="landed")
+        factory, client = _fake_httpx_client(first)
+        client.get = AsyncMock(side_effect=[first, final])
+        with patch("turing.tools.network.httpx.AsyncClient", factory), _patch_public_dns():
+            result = await network_tool.execute(action="http_request", url="http://example.com")
+        assert result.success is True
+        assert "landed" in result.output
+        assert client.get.await_count == 2
+
+    async def test_too_many_redirects(self, network_tool: NetworkTool):
+        bouncer = _fake_response(status_code=302, reason="Found", text="")
+        bouncer.is_redirect = True
+        bouncer.headers = {"location": "http://example.com/again"}
+        factory, _client = _fake_httpx_client(bouncer)
+        with patch("turing.tools.network.httpx.AsyncClient", factory), _patch_public_dns():
+            result = await network_tool.execute(action="http_request", url="http://example.com")
+        assert result.success is False
+        assert "Too many redirects" in result.error
+
+
+class TestHttpSsrfGuard:
+    """Regression tests for #333 — http_request must not reach private targets."""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://localhost/admin",
+            "http://127.0.0.1:8080/",
+            "http://[::1]/",
+            "http://10.0.0.5/",
+            "http://172.16.0.1/",
+            "http://192.168.1.1/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::ffff:127.0.0.1]/",
+        ],
+    )
+    async def test_blocks_private_and_metadata_targets(self, network_tool: NetworkTool, url: str):
+        loopback = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))]
+        factory, client = _fake_httpx_client(_fake_response())
+        with (
+            patch("turing.tools.network.httpx.AsyncClient", factory),
+            patch("turing.tools.network.socket.getaddrinfo", return_value=loopback),
+        ):
+            result = await network_tool.execute(action="http_request", url=url)
+        assert result.success is False
+        assert "SSRF protection" in result.error
+        client.get.assert_not_awaited()
+        client.post.assert_not_awaited()
+
+    async def test_blocks_hostname_resolving_to_private(self, network_tool: NetworkTool):
+        rfc1918 = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.0.10", 0))]
+        factory, client = _fake_httpx_client(_fake_response())
+        with (
+            patch("turing.tools.network.httpx.AsyncClient", factory),
+            patch("turing.tools.network.socket.getaddrinfo", return_value=rfc1918),
+        ):
+            result = await network_tool.execute(action="http_request", url="http://evil.example/")
+        assert result.success is False
+        assert "SSRF protection" in result.error
+        client.get.assert_not_awaited()
+
+    async def test_blocks_redirect_to_private(self, network_tool: NetworkTool):
+        redirect = _fake_response(status_code=302, reason="Found", text="")
+        redirect.is_redirect = True
+        redirect.headers = {"location": "http://169.254.169.254/latest/meta-data/"}
+        factory, client = _fake_httpx_client(redirect)
+
+        def _resolver(host, *_a, **_k):
+            ip = "169.254.169.254" if host == "169.254.169.254" else "93.184.216.34"
+            family = socket.AF_INET
+            return [(family, socket.SOCK_STREAM, 6, "", (ip, 0))]
+
+        with (
+            patch("turing.tools.network.httpx.AsyncClient", factory),
+            patch("turing.tools.network.socket.getaddrinfo", side_effect=_resolver),
+        ):
+            result = await network_tool.execute(action="http_request", url="http://example.com")
+        assert result.success is False
+        assert "SSRF protection" in result.error
+        # Only the first (public) hop was fetched; the private hop never was.
+        client.get.assert_awaited_once_with("http://example.com")
+
+    async def test_blocks_non_http_scheme(self, network_tool: NetworkTool):
+        result = await network_tool.execute(action="http_request", url="ftp://example.com/file")
+        assert result.success is False
+        assert "Unsupported URL scheme" in result.error
+
+    async def test_dns_failure_is_refused(self, network_tool: NetworkTool):
+        factory, client = _fake_httpx_client(_fake_response())
+        with (
+            patch("turing.tools.network.httpx.AsyncClient", factory),
+            patch(
+                "turing.tools.network.socket.getaddrinfo",
+                side_effect=socket.gaierror("no such host"),
+            ),
+        ):
+            result = await network_tool.execute(action="http_request", url="http://nope.invalid/")
+        assert result.success is False
+        assert "could not resolve host" in result.error
+        client.get.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
