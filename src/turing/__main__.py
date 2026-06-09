@@ -104,10 +104,17 @@ async def _run(config: TuringConfig) -> None:
 
     safety_gate = SafetyGate(config, audit_store=memory_store)
 
-    # 6. Mesh (optional) — NATS-backed peer presence (ADR-0008)
+    # 6. Mesh (optional) — NATS-backed peer presence (ADR-0008), signed
+    # end-to-end via SignedTransport (issue #348). Fail-closed: without a
+    # signing seed AND a trusted-keys map, presence never starts and unsigned
+    # presence traffic is never consumed.
+    import time as _mesh_time
+
     from turing.mesh.node import MeshNode
     from turing.mesh.presence import PresenceService
     from turing.transport.nats_bus import NatsBus
+    from turing.transport.signed_transport import SignedTransport
+    from turing.transport.signer import MessageSigner
 
     mesh_node = None
     presence: PresenceService | None = None
@@ -116,22 +123,42 @@ async def _run(config: TuringConfig) -> None:
         mesh_node = MeshNode(config)
         mesh_node.capabilities = [t.name for t in tool_registry.get_all()]
         await mesh_node.start()
-        try:
-            mesh_bus = await NatsBus.connect(
-                url=config.nats_url,
-                tls_enabled=config.nats_tls_enabled,
-                nkey_seed=config.nats_nkey_seed,
-                lan_only=config.nats_lan_only,
-            )
-            presence = PresenceService(mesh_node, mesh_bus)
-            await presence.start()
-            logger.info("mesh.started", node=config.node_name)
-        except Exception as exc:
+        if not config.mesh_signing_seed or not config.mesh_trusted_keys:
             logger.warning(
-                "mesh.presence_unavailable",
-                error=str(exc),
-                msg="NATS bus unavailable; node will operate as a singleton",
+                "mesh.presence_signing_unconfigured",
+                msg="TURING_MESH_SIGNING_SEED and/or TURING_MESH_TRUSTED_KEYS "
+                "unset; presence requires signed transport (issue #348) and "
+                "will not start — node will operate as a singleton",
             )
+        else:
+            try:
+                signer = MessageSigner.from_seed_hex(config.mesh_signing_seed)
+                trusted_keys = {
+                    node_id: bytes.fromhex(key_hex)
+                    for node_id, key_hex in config.mesh_trusted_keys.items()
+                }
+                mesh_bus = await NatsBus.connect(
+                    url=config.nats_url,
+                    tls_enabled=config.nats_tls_enabled,
+                    nkey_seed=config.nats_nkey_seed,
+                    lan_only=config.nats_lan_only,
+                )
+                presence_transport = SignedTransport(
+                    bus=mesh_bus,
+                    signer=signer,
+                    trusted_keys=trusted_keys,
+                    now_ms=lambda: int(_mesh_time.time() * 1000),
+                )
+                presence = PresenceService(mesh_node, presence_transport)
+                await presence.start()
+                logger.info("mesh.started", node=config.node_name)
+            except Exception as exc:
+                logger.warning(
+                    "mesh.presence_unavailable",
+                    error=str(exc),
+                    msg="NATS bus unavailable or presence signing "
+                    "misconfigured; node will operate as a singleton",
+                )
 
     # 7. Agent
     from turing.agent.core import Agent

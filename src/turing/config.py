@@ -104,6 +104,26 @@ class TuringConfig(BaseSettings):
     # Per ADR-0008, peer presence rides on the shared NATS bus
     # (subjects ``mesh.presence.*``); there is no separate mesh port.
     mesh_enabled: bool = Field(default=False, description="Enable mesh peer presence")
+    # Presence is signed (issue #348): every heartbeat/leave rides the same
+    # SignedTransport envelope the dispatch pipeline uses. Both fields below
+    # are REQUIRED for presence to start when mesh_enabled — fail-closed:
+    # unset means presence stays off and the node runs as a singleton.
+    mesh_signing_seed: str | None = Field(
+        default=None,
+        description="Hex-encoded 32-byte Ed25519 private-key seed this node "
+        "signs mesh presence messages with. Required (together with "
+        "mesh_trusted_keys) for presence to start; unset disables presence "
+        "(fail-closed). Env: TURING_MESH_SIGNING_SEED.",
+    )
+    mesh_trusted_keys: dict[str, str] | None = Field(
+        default=None,
+        description="JSON object mapping node_id -> hex-encoded Ed25519 "
+        "public key for every trusted mesh node (including this one). A "
+        "presence message is only accepted when its signature verifies "
+        "against the key bound to the claimed sender_id. Required for "
+        "presence to start; unset disables presence (fail-closed). "
+        "Env: TURING_MESH_TRUSTED_KEYS.",
+    )
 
     # ── Runtime bus (NATS) ───────────────────────────────────────────────
     nats_url: str = Field(

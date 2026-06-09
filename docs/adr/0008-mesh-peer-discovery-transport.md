@@ -229,6 +229,14 @@ Pyre nodes to roll forward from.
 - Authenticated presence (signed heartbeats). Capability-token v1
   (ADR 0003) covers the dispatch side; presence is read-only-public
   for v1 here.
+  - **Update (2026-06, issue #348):** this exclusion is superseded.
+    Presence now rides `SignedTransport` — heartbeat/leave are
+    Ed25519-signed `MeshMessage` envelopes verified against a per-node
+    trusted-keys map (`TURING_MESH_TRUSTED_KEYS`), with replay
+    protection and sender-id binding. Peer identity comes from the
+    verified `sender_id`; unsigned frames are dropped. Fail-closed:
+    without `TURING_MESH_SIGNING_SEED` + trusted keys, presence does
+    not start.
 - Operator-UI graph implementation against the new presence stream.
 - Hardening for >50-node clusters. Current and planned scale is
   single-digit nodes; revisit if/when scale changes.

@@ -18,6 +18,13 @@ logger = structlog.get_logger("turing.mesh.node")
 # without dragging in the presence service.
 STALE_AFTER_SECONDS = 60.0
 
+# Hard cap on the peer table (issue #348). The fleet is single-digit nodes
+# (ADR-0008 sizes the presence design for <=8); 64 leaves generous headroom
+# while bounding memory if a trusted-but-misbehaving publisher floods the
+# heartbeat subject with fabricated node_ids. Updates to already-known peers
+# are always allowed — only NEW node_ids beyond the cap are dropped.
+MAX_PEERS = 64
+
 
 def is_specs_stale(
     peer: PeerInfo,
@@ -135,7 +142,20 @@ class MeshNode:
         logger.info("mesh_node_stopped", node_id=self._node_id)
 
     def add_peer(self, peer: PeerInfo) -> None:
-        """Add or update a peer in the known peers dictionary."""
+        """Add or update a peer in the known peers dictionary.
+
+        New node_ids beyond ``MAX_PEERS`` are dropped with a warning so a
+        flood of fabricated identities cannot grow the table unboundedly
+        (issue #348). Updates to existing peers always go through.
+        """
+        if peer.node_id not in self._peers and len(self._peers) >= MAX_PEERS:
+            logger.warning(
+                "peer_table_full",
+                peer_id=peer.node_id,
+                peer_name=peer.name,
+                max_peers=MAX_PEERS,
+            )
+            return
         peer.touch()
         self._peers[peer.node_id] = peer
         logger.info(

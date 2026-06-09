@@ -117,9 +117,16 @@ def _encode(signed: SignedMessage) -> bytes:
 
 
 def _decode(raw: bytes) -> SignedMessage:
-    frame = json.loads(raw.decode("utf-8"))
-    return SignedMessage(
-        sender_public_key=bytes.fromhex(frame["k"]),
-        signature=bytes.fromhex(frame["s"]),
-        payload=bytes.fromhex(frame["p"]),
-    )
+    # Malformed frames (unsigned legacy JSON, truncated bytes, wrong shapes)
+    # must surface as ValueError so the subscribe path routes them to
+    # `on_error` instead of crashing the subscription (issue #348: unsigned
+    # presence frames from pre-signing nodes are dropped, not fatal).
+    try:
+        frame = json.loads(raw.decode("utf-8"))
+        return SignedMessage(
+            sender_public_key=bytes.fromhex(frame["k"]),
+            signature=bytes.fromhex(frame["s"]),
+            payload=bytes.fromhex(frame["p"]),
+        )
+    except (KeyError, TypeError) as exc:
+        raise ValueError("malformed signed-transport frame") from exc

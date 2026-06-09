@@ -165,3 +165,31 @@ async def test_subscribe_drops_replayed_messages(bus: InMemoryBus) -> None:
 
     assert len(received) == 1
     assert any(isinstance(e, ReplayError) for e in errors)
+
+
+async def test_malformed_frames_route_to_on_error_not_crash(bus: InMemoryBus) -> None:
+    # Issue #348: unsigned legacy JSON and garbage bytes on a subscribed
+    # subject must surface via on_error (ValueError), never kill delivery.
+    signer = MessageSigner.generate()
+    transport = SignedTransport(
+        bus=bus,
+        signer=signer,
+        trusted_keys={"coordinator": signer.public_key},
+        now_ms=lambda: 1_000,
+    )
+
+    received: list[MeshMessage] = []
+    errors: list[Exception] = []
+    await transport.subscribe("echo.request", received.append, on_error=errors.append)
+
+    await bus.publish("echo.request", b'{"node_id": "evil", "ts_ms": 0}')  # unsigned legacy JSON
+    await bus.publish("echo.request", b"\x00\xffnot-json")  # garbage bytes
+    await bus.publish("echo.request", b"[1, 2, 3]")  # wrong JSON shape
+
+    assert received == []
+    assert len(errors) == 3
+    assert all(isinstance(e, ValueError) for e in errors)
+
+    # The subscription is still alive after the bad frames.
+    await transport.publish(_msg())
+    assert received == [_msg()]

@@ -141,6 +141,31 @@ class TestEnvOverrides:
         assert cfg.allowed_write_paths == ["/var/data", "/opt/out"]
 
 
+class TestMeshSigningConfig:
+    """Signed-presence key material (issue #348) — fail-closed defaults."""
+
+    def test_defaults_are_unset(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.mesh_signing_seed is None
+        assert cfg.mesh_trusted_keys is None
+
+    def test_signing_seed_override(self) -> None:
+        seed = "ab" * 32
+        with patch.dict("os.environ", {"TURING_MESH_SIGNING_SEED": seed}, clear=True):
+            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.mesh_signing_seed == seed
+
+    def test_trusted_keys_parse_from_json(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"TURING_MESH_TRUSTED_KEYS": '{"pi-alpha": "aa11", "pi-beta": "bb22"}'},
+            clear=True,
+        ):
+            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.mesh_trusted_keys == {"pi-alpha": "aa11", "pi-beta": "bb22"}
+
+
 class TestOperatorNtfyTopic:
     """The ntfy closed-laptop alert fallback topic (ADR-0010 §2)."""
 
