@@ -81,6 +81,11 @@ export default function AlertBanner({ alerts }: Props) {
   return (
     <div
       data-testid="alert-banner"
+      role="status"
+      aria-live="polite"
+      aria-label={`${alerts.length} active hardware alert${
+        alerts.length === 1 ? "" : "s"
+      }`}
       className="sticky top-0 z-50 flex flex-col gap-1 border-b border-neutral-800 bg-neutral-950 p-2"
     >
       {alerts.map((alert) => {
@@ -98,6 +103,11 @@ export default function AlertBanner({ alerts }: Props) {
             data-testid="alert-row"
             data-severity={alert.severity}
             data-snoozed={snoozed ? "true" : "false"}
+            aria-label={`${alert.severity} alert on ${alert.node_name}: ${
+              alert.field
+            } ${formatValueAndThreshold(alert)}${
+              snoozed ? `, snoozed ${formatRemaining(expiry - now)}` : ""
+            }`}
             className={`flex items-center gap-3 rounded border px-3 py-1.5 text-sm ${severityClass(
               alert.severity,
             )}${snoozed ? " opacity-50" : ""}`}
@@ -120,6 +130,10 @@ export default function AlertBanner({ alerts }: Props) {
               <button
                 type="button"
                 data-testid="snooze-button"
+                aria-label={`Snooze ${alert.node_name} ${alert.field.replace(
+                  "_",
+                  " ",
+                )} alert for 4 hours`}
                 onClick={() => void handleSnooze(alert)}
                 className="rounded border border-current px-2 py-0.5 text-xs hover:bg-white/10"
               >

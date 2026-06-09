@@ -62,19 +62,25 @@ export default function SpecsGrid({ rows }: SpecsGridProps) {
     <div
       data-testid="specs-grid"
       data-scrolls={scrolls ? "true" : "false"}
+      role="table"
+      aria-label="Fleet hardware specifications"
       className="border-t border-neutral-800 px-3 py-2 font-mono text-xs"
     >
-      <div className="mb-1 grid grid-cols-[1.6fr_2.2fr_auto_auto_auto_auto_auto_auto] gap-x-3 text-neutral-500">
-        <span>node</span>
-        <span>hardware</span>
-        <span className="text-right">CPU%</span>
-        <span className="text-right">MEM</span>
-        <span className="text-right">DISK</span>
-        <span className="text-right">TEMP</span>
-        <span className="text-right">UP</span>
-        <span className="text-right">LOAD</span>
+      <div
+        role="row"
+        className="mb-1 grid grid-cols-[1.6fr_2.2fr_auto_auto_auto_auto_auto_auto] gap-x-3 text-neutral-500"
+      >
+        <span role="columnheader">node</span>
+        <span role="columnheader">hardware</span>
+        <span role="columnheader" className="text-right">CPU%</span>
+        <span role="columnheader" className="text-right">MEM</span>
+        <span role="columnheader" className="text-right">DISK</span>
+        <span role="columnheader" className="text-right">TEMP</span>
+        <span role="columnheader" className="text-right">UP</span>
+        <span role="columnheader" className="text-right">LOAD</span>
       </div>
       <ol
+        role="rowgroup"
         className={
           "space-y-0.5" + (scrolls ? " max-h-48 overflow-y-auto" : "")
         }
@@ -89,36 +95,45 @@ export default function SpecsGrid({ rows }: SpecsGridProps) {
             .filter(Boolean)
             .join(" ");
           return (
-          <li
-            key={row.node_id}
-            data-testid={`specs-row-${row.node_id}`}
-            data-self={row.self ? "true" : "false"}
-            data-severity={severity}
-            data-stale={row.stale ? "true" : "false"}
-            className={classes}
-            style={{ minHeight: "32px", alignItems: "center" }}
-          >
-            <span className="truncate">{row.node_name}</span>
-            <span className="truncate text-neutral-400" data-testid={`hw-${row.node_id}`}>
-              {formatHardwareLabel(row.specs)}
-            </span>
-            <span className="text-right tabular-nums">
-              {fmtCpu(row.specs?.cpu_percent)}
-            </span>
-            <span className="text-right tabular-nums">
-              {fmtUsage(row.specs?.mem_used_bytes, row.specs?.ram_total_bytes)}
-            </span>
-            <span className="text-right tabular-nums">
-              {fmtUsage(row.specs?.disk_used_bytes, row.specs?.disk_total_bytes)}
-            </span>
-            <span className="text-right tabular-nums">
-              {fmtTemp(row.specs?.temp_celsius)}
-            </span>
-            <span className="text-right tabular-nums">
-              {formatUptime(row.specs?.uptime_seconds)}
-            </span>
-            <span className="text-right tabular-nums">{fmtLoadavg(row.specs)}</span>
-          </li>
+            <li
+              key={row.node_id}
+              data-testid={`specs-row-${row.node_id}`}
+              data-self={row.self ? "true" : "false"}
+              data-severity={severity}
+              data-stale={row.stale ? "true" : "false"}
+              role="row"
+              className={classes}
+              style={{ minHeight: "32px", alignItems: "center" }}
+            >
+              <span role="cell" className="truncate">
+                {row.node_name}
+              </span>
+              <span
+                role="cell"
+                className="truncate text-neutral-400"
+                data-testid={`hw-${row.node_id}`}
+              >
+                {formatHardwareLabel(row.specs)}
+              </span>
+              <span role="cell" className="text-right tabular-nums">
+                {fmtCpu(row.specs?.cpu_percent)}
+              </span>
+              <span role="cell" className="text-right tabular-nums">
+                {fmtUsage(row.specs?.mem_used_bytes, row.specs?.ram_total_bytes)}
+              </span>
+              <span role="cell" className="text-right tabular-nums">
+                {fmtUsage(row.specs?.disk_used_bytes, row.specs?.disk_total_bytes)}
+              </span>
+              <span role="cell" className="text-right tabular-nums">
+                {fmtTemp(row.specs?.temp_celsius)}
+              </span>
+              <span role="cell" className="text-right tabular-nums">
+                {formatUptime(row.specs?.uptime_seconds)}
+              </span>
+              <span role="cell" className="text-right tabular-nums">
+                {fmtLoadavg(row.specs)}
+              </span>
+            </li>
           );
         })}
       </ol>
