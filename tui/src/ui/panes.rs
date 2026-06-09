@@ -5,7 +5,10 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, List, ListItem, ListState, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{
+    Block, Cell, List, ListItem, ListState, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Table, Wrap,
+};
 use ratatui::Frame;
 
 use crate::app::{App, Pane};
@@ -41,6 +44,17 @@ fn fmt_uptime(secs: u64) -> String {
     }
 }
 
+/// Wall-clock `HH:MM:SS` (UTC) from an epoch-milliseconds stamp.
+fn fmt_clock(ts_ms: i64) -> String {
+    let secs = (ts_ms / 1000).rem_euclid(86_400);
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3_600,
+        (secs % 3_600) / 60,
+        secs % 60
+    )
+}
+
 fn truncate(s: &str, max: usize) -> String {
     let one_line = s.replace(['\n', '\r'], " ");
     if one_line.chars().count() <= max {
@@ -50,6 +64,28 @@ fn truncate(s: &str, max: usize) -> String {
         t.push('…');
         t
     }
+}
+
+/// Right-hand scrollbar for a list with `len` rows and selection `sel`.
+fn scrollbar(f: &mut Frame, area: Rect, len: usize, sel: usize) {
+    if len == 0 || area.height as usize >= len {
+        return;
+    }
+    let mut state = ScrollbarState::new(len).position(sel);
+    f.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .thumb_symbol("┃")
+            .track_style(Style::default().fg(theme::DIM))
+            .thumb_style(Style::default().fg(theme::ACCENT)),
+        area.inner(ratatui::layout::Margin {
+            horizontal: 0,
+            vertical: 1,
+        }),
+        &mut state,
+    );
 }
 
 // ── queue ─────────────────────────────────────────────────────────────────────
@@ -62,27 +98,34 @@ pub fn queue(f: &mut Frame, area: Rect, app: &App) {
         let rows: Vec<ListItem> = items
             .iter()
             .map(|it| {
-                let mut spans = Vec::new();
+                let mut head = Vec::new();
                 if let Some(d) = &it.decision {
-                    spans.push(Span::styled(
+                    head.push(Span::styled(
                         format!("{} ", mark(d)),
                         Style::default().fg(theme::decision_color(d)),
                     ));
                 }
-                spans.push(Span::raw(truncate(&it.prompt, width.saturating_sub(2))));
-                ListItem::new(Line::from(spans))
+                head.push(Span::raw(truncate(&it.prompt, width.saturating_sub(2))));
+                let meta = Line::from(vec![
+                    Span::styled(
+                        format!("  {}", truncate(&it.specialty, 14)),
+                        Style::default().fg(theme::ACCENT),
+                    ),
+                    Span::styled(
+                        format!(" · {}", truncate(&it.proposed_by, 12)),
+                        Style::default().fg(theme::DIM),
+                    ),
+                ]);
+                ListItem::new(vec![Line::from(head), meta])
             })
             .collect();
-        let border = if active {
-            Style::default().fg(theme::ACCENT)
-        } else {
-            Style::default().fg(theme::DIM)
-        };
-        let title = Span::styled(
-            format!(" {name} ({}) ", items.len()),
-            Style::default().fg(theme::status_color(name)),
-        );
-        let block = Block::bordered().title(title).border_style(border);
+        let title = Line::from(vec![
+            theme::title(name, active),
+            Span::styled(format!("{} ", items.len()), Style::default().fg(theme::DIM)),
+        ]);
+        let block = Block::bordered()
+            .title(title)
+            .border_style(theme::border(active));
         let list = List::new(rows)
             .block(block)
             .highlight_style(theme::selected());
@@ -90,6 +133,7 @@ pub fn queue(f: &mut Frame, area: Rect, app: &App) {
             let mut st = ListState::default();
             st.select(Some(app.queue_row));
             f.render_stateful_widget(list, cols[i], &mut st);
+            scrollbar(f, cols[i], items.len() * 2, app.queue_row * 2);
         } else {
             f.render_widget(list, cols[i]);
         }
@@ -116,9 +160,16 @@ pub fn chat(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|s| ListItem::new(truncate(&s.prompt, 30)))
         .collect();
+    let stitle = Line::from(vec![
+        theme::title("threads", active),
+        Span::styled(
+            format!("{} ", app.sessions.len()),
+            Style::default().fg(theme::DIM),
+        ),
+    ]);
     let sblock = Block::bordered()
-        .title(" threads ")
-        .border_style(border(active));
+        .title(stitle)
+        .border_style(theme::border(active));
     let slist = List::new(sess_items)
         .block(sblock)
         .highlight_style(theme::selected());
@@ -127,10 +178,11 @@ pub fn chat(f: &mut Frame, area: Rect, app: &App) {
         sstate.select(Some(app.chat_sel));
     }
     f.render_stateful_widget(slist, parts[0], &mut sstate);
+    scrollbar(f, parts[0], app.sessions.len(), app.chat_sel);
 
     // thread detail
     let tblock = Block::bordered()
-        .title(" thread ")
+        .title(theme::title("thread", false))
         .border_style(Style::default().fg(theme::DIM));
     match app.selected_session() {
         None => {
@@ -145,22 +197,33 @@ pub fn chat(f: &mut Frame, area: Rect, app: &App) {
                 .subtasks
                 .iter()
                 .map(|st| {
-                    let head = Line::from(vec![
+                    let status_tag = if st.status == "streaming" {
+                        format!("[{}…] ", st.status)
+                    } else {
+                        format!("[{}] ", st.status)
+                    };
+                    let mut head = vec![
                         Span::styled(format!("#{} ", st.index), Style::default().fg(theme::DIM)),
                         Span::styled(
-                            format!("[{}] ", st.status),
+                            status_tag,
                             Style::default().fg(theme::status_color(&st.status)),
                         ),
                         Span::styled(
                             format!("{} ", st.specialty),
                             Style::default().fg(theme::ACCENT),
                         ),
-                    ]);
+                    ];
+                    if let Some(d) = &st.decision {
+                        head.push(Span::styled(
+                            format!("{} {}", mark(d), d),
+                            Style::default().fg(theme::decision_color(d)),
+                        ));
+                    }
                     let body = Line::from(Span::raw(truncate(
                         &st.content,
                         parts[1].width.saturating_sub(4) as usize,
                     )));
-                    ListItem::new(vec![head, body])
+                    ListItem::new(vec![Line::from(head), body])
                 })
                 .collect();
             let inner = tblock.inner(parts[1]);
@@ -168,7 +231,7 @@ pub fn chat(f: &mut Frame, area: Rect, app: &App) {
             // header line with the prompt
             let chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(inner);
             let hdr = Paragraph::new(Line::from(vec![
-                Span::styled("Q: ", Style::default().fg(theme::ACCENT)),
+                Span::styled("Q: ", Style::default().fg(theme::ACCENT).bold()),
                 Span::raw(session.prompt.clone()),
             ]))
             .wrap(Wrap { trim: true });
@@ -184,18 +247,31 @@ pub fn chat(f: &mut Frame, area: Rect, app: &App) {
 }
 
 // ── specs ─────────────────────────────────────────────────────────────────────
+const GAUGE_W: usize = 5;
+
+/// `▮▮▯▯▯ 42%` cell with severity colouring.
+fn gauge_cell(pct: Option<f64>, sev_color: ratatui::style::Color) -> Cell<'static> {
+    match pct {
+        Some(p) => Cell::from(Line::from(vec![
+            Span::styled(theme::gauge(p, GAUGE_W), Style::default().fg(sev_color)),
+            Span::styled(format!(" {p:>3.0}%"), Style::default().fg(sev_color)),
+        ])),
+        None => Cell::from("—").style(Style::default().fg(theme::DIM)),
+    }
+}
+
 pub fn specs(f: &mut Frame, area: Rect, app: &App) {
-    let header = Row::new(["node", "hw", "cpu%", "mem", "disk", "temp", "up", "load"])
+    let header = Row::new(["node", "hw", "cpu", "mem", "disk", "temp", "up", "load"])
         .style(Style::default().fg(theme::ACCENT).bold());
     let rows: Vec<Row> = app
         .peers
         .iter()
         .map(|p| {
             let s = p.specs.as_ref();
-            let cpu = s
-                .map(|x| format!("{:.0}", x.cpu_percent))
-                .unwrap_or_else(|| "—".into());
-            let mem = s
+            let cpu_pct = s.map(|x| x.cpu_percent);
+            let mem_pct =
+                s.and_then(|x| disk_percent(Some(x.mem_used_bytes), Some(x.ram_total_bytes)));
+            let mem_abs = s
                 .map(|x| {
                     format!(
                         "{}/{}",
@@ -206,9 +282,6 @@ pub fn specs(f: &mut Frame, area: Rect, app: &App) {
                 .unwrap_or_else(|| "—".into());
             let dpct =
                 s.and_then(|x| disk_percent(Some(x.disk_used_bytes), Some(x.disk_total_bytes)));
-            let disk = dpct
-                .map(|d| format!("{d:.0}%"))
-                .unwrap_or_else(|| "—".into());
             let temp = s.and_then(|x| x.temp_celsius);
             let temp_s = temp
                 .map(|t| format!("{t:.0}°"))
@@ -223,23 +296,35 @@ pub fn specs(f: &mut Frame, area: Rect, app: &App) {
                 .map(|x| truncate(&x.model_name, 18))
                 .unwrap_or_else(|| "—".into());
 
+            let cpu_color = match cpu_pct {
+                Some(c) if c >= 90.0 => theme::DANGER,
+                Some(c) if c >= 75.0 => theme::WARN,
+                _ => theme::FG,
+            };
+            let mem_color = theme::FG;
             let temp_style = Style::default().fg(theme::severity_color(severity_for_temp(temp)));
-            let disk_style = Style::default().fg(theme::severity_color(severity_for_disk(dpct)));
+            let disk_color = theme::severity_color(severity_for_disk(dpct));
             let mut name_style = Style::default().bold();
             if p.stale {
                 name_style = Style::default().fg(theme::DIM);
             }
             let name = if p.is_self {
-                format!("{} (self)", p.node_name)
+                format!("{} ◆", p.node_name)
             } else {
                 p.node_name.clone()
             };
             Row::new(vec![
                 Cell::from(name).style(name_style),
                 Cell::from(hw).style(Style::default().fg(theme::DIM)),
-                Cell::from(cpu),
-                Cell::from(mem),
-                Cell::from(disk).style(disk_style),
+                gauge_cell(cpu_pct, cpu_color),
+                Cell::from(Line::from(vec![
+                    Span::styled(
+                        theme::gauge(mem_pct.unwrap_or(0.0), GAUGE_W),
+                        Style::default().fg(mem_color),
+                    ),
+                    Span::styled(format!(" {mem_abs}"), Style::default().fg(theme::FG)),
+                ])),
+                gauge_cell(dpct, disk_color),
                 Cell::from(temp_s).style(temp_style),
                 Cell::from(up),
                 Cell::from(load),
@@ -249,17 +334,24 @@ pub fn specs(f: &mut Frame, area: Rect, app: &App) {
     let widths = [
         Constraint::Length(18),
         Constraint::Length(20),
-        Constraint::Length(5),
-        Constraint::Length(13),
-        Constraint::Length(6),
+        Constraint::Length(10),
+        Constraint::Length(19),
+        Constraint::Length(10),
         Constraint::Length(6),
         Constraint::Length(6),
         Constraint::Length(6),
     ];
     let active = app.active == Pane::Specs;
+    let title = Line::from(vec![
+        theme::title("fleet", active),
+        Span::styled(
+            format!("{} node(s) · ◆ self ", app.peers.len()),
+            Style::default().fg(theme::DIM),
+        ),
+    ]);
     let block = Block::bordered()
-        .title(format!(" fleet ({}) ", app.peers.len()))
-        .border_style(border(active));
+        .title(title)
+        .border_style(theme::border(active));
     let table = Table::new(rows, widths)
         .header(header)
         .block(block)
@@ -285,25 +377,44 @@ pub fn trace(f: &mut Frame, area: Rect, app: &App) {
                 .unwrap_or_default();
             let mut spans = vec![
                 Span::styled(
+                    format!("{} ", fmt_clock(e.timestamp_ms)),
+                    Style::default().fg(theme::DIM),
+                ),
+                Span::styled(
                     format!("{:<10} ", truncate(&e.node_name, 10)),
                     Style::default().fg(theme::ACCENT),
                 ),
-                Span::raw(format!("{:<22} ", truncate(&e.event_type, 22))),
+                Span::styled(
+                    format!("{:<22} ", truncate(&e.event_type, 22)),
+                    Style::default().fg(theme::event_color(&e.event_type)),
+                ),
                 Span::styled(format!("{dur:>7} "), Style::default().fg(theme::DIM)),
             ];
             if let Some(err) = &e.error {
                 spans.push(Span::styled(
-                    truncate(err, width.saturating_sub(42)),
+                    truncate(err, width.saturating_sub(51)),
                     Style::default().fg(theme::DANGER),
                 ));
             }
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let follow = if app.trace_follow { " ▶follow" } else { "" };
+    let follow = if app.trace_follow {
+        Span::styled("▶ follow ", Style::default().fg(theme::OK))
+    } else {
+        Span::styled("⏸ paused ", Style::default().fg(theme::WARN))
+    };
+    let title = Line::from(vec![
+        theme::title("trace", active),
+        Span::styled(
+            format!("{} ", app.trace.len()),
+            Style::default().fg(theme::DIM),
+        ),
+        follow,
+    ]);
     let block = Block::bordered()
-        .title(format!(" trace ({}){follow} ", app.trace.len()))
-        .border_style(border(active));
+        .title(title)
+        .border_style(theme::border(active));
     let list = List::new(items)
         .block(block)
         .highlight_style(theme::selected());
@@ -312,6 +423,7 @@ pub fn trace(f: &mut Frame, area: Rect, app: &App) {
         state.select(Some(app.trace_sel));
     }
     f.render_stateful_widget(list, area, &mut state);
+    scrollbar(f, area, app.trace.len(), app.trace_sel);
 }
 
 // ── alerts ────────────────────────────────────────────────────────────────────
@@ -333,6 +445,7 @@ pub fn alerts(f: &mut Frame, area: Rect, app: &App) {
             };
             let snoozed = a.snoozed_until_ms.map(|_| "  (snoozed)").unwrap_or("");
             ListItem::new(Line::from(vec![
+                Span::styled("▌ ", Style::default().fg(sev)),
                 Span::styled(
                     format!(
                         "{:<7} ",
@@ -352,9 +465,16 @@ pub fn alerts(f: &mut Frame, area: Rect, app: &App) {
             ]))
         })
         .collect();
+    let title = Line::from(vec![
+        theme::title("alerts", active),
+        Span::styled(
+            format!("{} · s snooze 4h ", list_data.len()),
+            Style::default().fg(theme::DIM),
+        ),
+    ]);
     let block = Block::bordered()
-        .title(format!(" alerts ({}) — 's' snooze ", list_data.len()))
-        .border_style(border(active));
+        .title(title)
+        .border_style(theme::border(active));
     if list_data.is_empty() {
         let p = Paragraph::new("No active hardware alerts.")
             .style(Style::default().fg(theme::DIM))
@@ -371,47 +491,71 @@ pub fn alerts(f: &mut Frame, area: Rect, app: &App) {
 }
 
 // ── help ──────────────────────────────────────────────────────────────────────
-pub fn help(f: &mut Frame, area: Rect) {
-    let lines = vec![
-        Line::from(Span::styled(
-            "Turing TUI — operator surface",
-            Style::default().fg(theme::ACCENT).bold(),
-        )),
-        Line::from(""),
-        Line::from("Global:  1-5 panes · Tab/Shift-Tab cycle · ? help · q / Ctrl-C quit"),
-        Line::from(""),
-        Line::from(Span::styled("Queue (1)", Style::default().bold())),
-        Line::from("  h/l move column · j/k move row"),
-        Line::from("  a approve (proposed) · y accept · n reject · e edit (drafted)"),
-        Line::from(""),
-        Line::from(Span::styled("Chat (2)", Style::default().bold())),
-        Line::from("  j/k thread · h/l subtask · i new prompt"),
-        Line::from("  y accept · n reject · e edit (completed subtask)"),
-        Line::from(""),
-        Line::from(Span::styled("Specs (3)", Style::default().bold())),
-        Line::from("  j/k rows — temp/disk colour-shift toward danger; stale peers dim"),
-        Line::from(""),
-        Line::from(Span::styled("Trace (4)", Style::default().bold())),
-        Line::from("  j/k scroll · f toggle follow (auto-scroll to newest)"),
-        Line::from(""),
-        Line::from(Span::styled("Alerts (5)", Style::default().bold())),
-        Line::from("  j/k rows · s snooze the selected (peer, field) for 4h"),
-        Line::from(""),
-        Line::from("In an input box:  type · Enter submit · Esc cancel"),
-    ];
-    let block = Block::bordered()
-        .title(" help ")
-        .border_style(Style::default().fg(theme::ACCENT));
-    f.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
-        area,
-    );
+/// One `key  description` help row with the key in accent.
+fn help_row(key: &str, desc: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {key:<14}"), Style::default().fg(theme::ACCENT)),
+        Span::styled(desc.to_string(), Style::default().fg(theme::FG)),
+    ])
 }
 
-fn border(active: bool) -> Style {
-    if active {
-        Style::default().fg(theme::ACCENT)
-    } else {
-        Style::default().fg(theme::DIM)
-    }
+fn help_section(name: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("░ {name}"),
+        Style::default().fg(theme::FG).bold(),
+    ))
+}
+
+pub fn help(f: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("TURING", Style::default().fg(theme::ACCENT).bold()),
+            Span::styled(
+                " // terminal operator surface",
+                Style::default().fg(theme::DIM),
+            ),
+        ]),
+        Line::from(""),
+        help_section("global"),
+        help_row("1-5", "switch pane"),
+        help_row("tab / S-tab", "cycle panes"),
+        help_row("?", "this help"),
+        help_row("q · ctrl-c", "quit"),
+        Line::from(""),
+        help_section("queue [1]"),
+        help_row("h/l · j/k", "move column · row"),
+        help_row("a", "approve (proposed)"),
+        help_row("y / n / e", "accept / reject / edit (drafted)"),
+        Line::from(""),
+        help_section("chat [2]"),
+        help_row("j/k · h/l", "thread · subtask"),
+        help_row("i", "new research prompt"),
+        help_row("y / n / e", "thumb a completed subtask"),
+        Line::from(""),
+        help_section("specs [3]"),
+        help_row(
+            "j/k",
+            "rows — temp/disk shift toward danger; stale peers dim",
+        ),
+        Line::from(""),
+        help_section("trace [4]"),
+        help_row("j/k", "scroll"),
+        help_row("f", "toggle follow (auto-scroll to newest)"),
+        Line::from(""),
+        help_section("alerts [5]"),
+        help_row("j/k", "rows"),
+        help_row("s", "snooze the selected (peer, field) for 4h"),
+        Line::from(""),
+        help_section("input box"),
+        help_row("enter / esc", "submit / cancel"),
+    ];
+    let block = Block::bordered()
+        .title(theme::title("help", true))
+        .border_style(Style::default().fg(theme::ACCENT));
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }

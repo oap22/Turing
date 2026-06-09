@@ -31,18 +31,23 @@ function decisionClass(decision: ChatSubtask["decision"]): string {
   if (decision === "accept") return "border-emerald-700 bg-emerald-950/40";
   if (decision === "reject") return "border-rose-700 bg-rose-950/40";
   if (decision === "edit") return "border-amber-700 bg-amber-950/40";
-  return "border-neutral-800 bg-neutral-900";
+  return "border-term-edge bg-term-raised";
 }
+
+const BTN =
+  "border px-2 py-0.5 text-[10px] uppercase tracking-wider disabled:opacity-40";
 
 export default function ChatPane({ sessions }: Props) {
   return (
     <div
       data-testid="chat-pane"
-      className="flex h-full flex-col bg-neutral-950 text-xs"
+      className="flex h-full flex-col bg-term-bg text-xs"
     >
-      <div className="border-b border-neutral-800 px-3 py-2 text-sm font-semibold text-neutral-200">
-        chat
-        <span className="ml-2 text-xs font-normal text-neutral-500">
+      <div className="border-b border-term-edge bg-term-panel px-3 py-1.5">
+        <span className="text-[11px] font-bold uppercase tracking-widest text-term-fg">
+          chat
+        </span>
+        <span className="ml-2 text-[10px] uppercase tracking-wider text-term-dim">
           ad-hoc task submission
         </span>
       </div>
@@ -52,7 +57,7 @@ export default function ChatPane({ sessions }: Props) {
         data-testid="chat-thread"
       >
         {sessions.length === 0 && (
-          <p className="px-1 text-neutral-600">
+          <p className="px-1 text-term-dim">
             no chats yet — submit a prompt below
           </p>
         )}
@@ -86,7 +91,7 @@ function PromptBox() {
     <form
       data-testid="chat-prompt-form"
       aria-label="Submit chat prompt"
-      className="flex items-end gap-1 border-t border-neutral-800 p-2"
+      className="flex items-end gap-1 border-t border-term-edge bg-term-panel p-2"
       onSubmit={(e) => {
         e.preventDefault();
         void send();
@@ -108,15 +113,15 @@ function PromptBox() {
           }
         }}
         rows={2}
-        placeholder="ask for an ad-hoc task…"
-        className="min-w-0 flex-1 resize-none rounded border border-neutral-700 bg-neutral-950 p-1 text-[11px] text-neutral-200"
+        placeholder="> ask for an ad-hoc task…"
+        className="min-w-0 flex-1 resize-none border border-term-edge bg-term-bg p-1 text-[11px] text-term-fg placeholder:text-term-dim focus:border-term-accent focus:outline-none"
       />
       <button
         type="submit"
         data-testid="chat-submit"
         disabled={busy || prompt.trim() === ""}
         aria-label="Submit chat prompt"
-        className="rounded border border-sky-700 px-2 py-1 text-[11px] text-sky-200 hover:bg-sky-500/10 disabled:opacity-40"
+        className={`${BTN} border-term-accent py-1 text-term-accent hover:bg-cyan-500/10`}
       >
         send
       </button>
@@ -131,20 +136,20 @@ const ChatThread = memo(function ChatThread({ session }: { session: ChatSession 
       data-testid={`chat-session-${session.id}`}
       data-subtask-count={session.subtasks.length}
       aria-labelledby={headingId}
-      className="rounded border border-neutral-800 bg-neutral-900/60"
+      className="border border-term-edge bg-term-panel"
     >
-      <header className="border-b border-neutral-800 px-2 py-1 text-neutral-200">
+      <header className="border-b border-term-edge px-2 py-1 text-term-fg">
         <span id={headingId} className="break-words">
           {session.prompt}
         </span>
-        <span className="ml-2 font-mono text-[10px] text-neutral-500">
+        <span className="ml-2 font-mono text-[10px] text-term-accent">
           {session.specialty}
         </span>
       </header>
       <ol className="space-y-1 p-1">
         {session.subtasks.length === 0 && (
-          <li className="px-1 text-[10px] italic text-neutral-600">
-            planning…
+          <li className="term-cursor px-1 text-[10px] text-term-dim">
+            planning
           </li>
         )}
         {session.subtasks.map((subtask) => (
@@ -175,7 +180,7 @@ const SubtaskRow = memo(function SubtaskRow({ subtask }: { subtask: ChatSubtask 
   const isCurated = subtask.status === "curated";
   const cardClass = isCurated
     ? decisionClass(subtask.decision)
-    : "border-neutral-800 bg-neutral-950";
+    : "border-term-edge bg-term-bg";
 
   return (
     <li
@@ -183,13 +188,16 @@ const SubtaskRow = memo(function SubtaskRow({ subtask }: { subtask: ChatSubtask 
       data-status={subtask.status}
       data-decision={subtask.decision ?? ""}
       aria-busy={busy ? "true" : "false"}
-      className={`rounded border p-2 ${cardClass}`}
+      className={`border p-2 ${cardClass}`}
     >
-      <div className="mb-0.5 flex flex-wrap items-center gap-x-2 font-mono text-[10px] text-neutral-500">
-        <span className="rounded bg-neutral-800 px-1 text-neutral-300">
+      <div className="mb-0.5 flex flex-wrap items-center gap-x-2 font-mono text-[10px] text-term-dim">
+        <span className="border border-term-edge bg-term-panel px-1 text-term-accent">
           {subtask.specialty}
         </span>
-        <span data-testid={`chat-subtask-state-${subtask.id}`}>
+        <span
+          data-testid={`chat-subtask-state-${subtask.id}`}
+          className={subtask.status === "streaming" ? "term-cursor" : undefined}
+        >
           {subtask.status}
         </span>
         {subtask.consumed_upstreams.length > 0 && (
@@ -204,7 +212,7 @@ const SubtaskRow = memo(function SubtaskRow({ subtask }: { subtask: ChatSubtask 
       </div>
 
       {subtask.content && (
-        <div className="whitespace-pre-wrap break-words text-neutral-200">
+        <div className="whitespace-pre-wrap break-words text-term-fg">
           {subtask.content}
         </div>
       )}
@@ -219,9 +227,9 @@ const SubtaskRow = memo(function SubtaskRow({ subtask }: { subtask: ChatSubtask 
             onClick={() =>
               void run(() => acceptSubtask(subtask.session_id, subtask.id))
             }
-            className="rounded border border-emerald-700 px-2 py-0.5 text-[11px] text-emerald-200 hover:bg-emerald-500/10 disabled:opacity-40"
+            className={`${BTN} border-emerald-700 text-emerald-200 hover:bg-emerald-500/10`}
           >
-            👍
+            ✓ accept
           </button>
           <button
             type="button"
@@ -231,9 +239,9 @@ const SubtaskRow = memo(function SubtaskRow({ subtask }: { subtask: ChatSubtask 
             onClick={() =>
               void run(() => rejectSubtask(subtask.session_id, subtask.id))
             }
-            className="rounded border border-rose-700 px-2 py-0.5 text-[11px] text-rose-200 hover:bg-rose-500/10 disabled:opacity-40"
+            className={`${BTN} border-rose-700 text-rose-200 hover:bg-rose-500/10`}
           >
-            👎
+            ✗ reject
           </button>
           <button
             type="button"
@@ -244,9 +252,9 @@ const SubtaskRow = memo(function SubtaskRow({ subtask }: { subtask: ChatSubtask 
               setDraft(subtask.corrected_answer ?? subtask.content);
               setEditing(true);
             }}
-            className="rounded border border-amber-700 px-2 py-0.5 text-[11px] text-amber-200 hover:bg-amber-500/10 disabled:opacity-40"
+            className={`${BTN} border-amber-700 text-amber-200 hover:bg-amber-500/10`}
           >
-            edit
+            ✎ edit
           </button>
         </div>
       )}
@@ -263,7 +271,7 @@ const SubtaskRow = memo(function SubtaskRow({ subtask }: { subtask: ChatSubtask 
             onChange={(e) => setDraft(e.target.value)}
             rows={3}
             placeholder="corrected answer"
-            className="w-full rounded border border-neutral-700 bg-neutral-950 p-1 text-[11px] text-neutral-200"
+            className="w-full border border-term-edge bg-term-bg p-1 text-[11px] text-term-fg placeholder:text-term-dim focus:border-term-accent focus:outline-none"
           />
           <div className="flex gap-1">
             <button
@@ -276,7 +284,7 @@ const SubtaskRow = memo(function SubtaskRow({ subtask }: { subtask: ChatSubtask 
                   editSubtask(subtask.session_id, subtask.id, draft),
                 )
               }
-              className="rounded border border-amber-700 px-2 py-0.5 text-[11px] text-amber-200 hover:bg-amber-500/10 disabled:opacity-40"
+              className={`${BTN} border-amber-700 text-amber-200 hover:bg-amber-500/10`}
             >
               save correction
             </button>
@@ -286,7 +294,7 @@ const SubtaskRow = memo(function SubtaskRow({ subtask }: { subtask: ChatSubtask 
               disabled={busy}
               aria-label={`Cancel correction for subtask ${subtask.index + 1}`}
               onClick={() => setEditing(false)}
-              className="rounded border border-neutral-700 px-2 py-0.5 text-[11px] text-neutral-400 hover:bg-white/5 disabled:opacity-40"
+              className={`${BTN} border-term-edge text-term-dim hover:bg-white/5`}
             >
               cancel
             </button>
@@ -301,7 +309,7 @@ const SubtaskRow = memo(function SubtaskRow({ subtask }: { subtask: ChatSubtask 
         >
           {subtask.decision}
           {subtask.decision === "edit" && subtask.corrected_answer && (
-            <div className="mt-0.5 whitespace-pre-wrap break-words font-sans normal-case text-neutral-300">
+            <div className="mt-0.5 whitespace-pre-wrap break-words normal-case text-neutral-300">
               {subtask.corrected_answer}
             </div>
           )}

@@ -39,8 +39,13 @@ function decisionClass(decision: QueueItem["decision"]): string {
   if (decision === "accept") return "border-emerald-700 bg-emerald-950/40";
   if (decision === "reject") return "border-rose-700 bg-rose-950/40";
   if (decision === "edit") return "border-amber-700 bg-amber-950/40";
-  return "border-neutral-800 bg-neutral-900";
+  return "border-term-edge bg-term-raised";
 }
+
+// Shared button look: sharp, quiet, uppercase — the accent colour carries
+// the semantics.
+const BTN =
+  "border px-2 py-0.5 text-[10px] uppercase tracking-wider disabled:opacity-40";
 
 export default function QueuePane({ items }: Props) {
   const byStatus = useMemo(() => {
@@ -58,15 +63,17 @@ export default function QueuePane({ items }: Props) {
   return (
     <div
       data-testid="queue-pane"
-      className="flex h-full flex-col bg-neutral-950 text-xs"
+      className="flex h-full flex-col bg-term-bg text-xs"
     >
-      <div className="border-b border-neutral-800 px-3 py-2 text-sm font-semibold text-neutral-200">
-        question queue
-        <span className="ml-2 text-xs font-normal text-neutral-500">
+      <div className="border-b border-term-edge bg-term-panel px-3 py-1.5">
+        <span className="text-[11px] font-bold uppercase tracking-widest text-term-fg">
+          queue
+        </span>
+        <span className="ml-2 text-[10px] uppercase tracking-wider text-term-dim">
           human-gated research frontier
         </span>
       </div>
-      <div className="grid flex-1 grid-cols-5 gap-px overflow-hidden bg-neutral-800">
+      <div className="grid flex-1 grid-cols-5 gap-px overflow-hidden bg-term-edge">
         {COLUMNS.map((col) => (
           <Column
             key={col.status}
@@ -95,13 +102,13 @@ function Column({
       data-testid={`queue-column-${status}`}
       data-count={items.length}
       aria-labelledby={headingId}
-      className="flex min-w-0 flex-col bg-neutral-950"
+      className="flex min-w-0 flex-col bg-term-bg"
     >
-      <header className="flex items-center justify-between border-b border-neutral-800 px-2 py-1 text-[11px] uppercase tracking-wide text-neutral-500">
+      <header className="flex items-center justify-between border-b border-term-edge px-2 py-1 text-[10px] uppercase tracking-widest text-term-dim">
         <span id={headingId}>{label}</span>
         <span
           aria-label={`${items.length} ${label} questions`}
-          className="tabular-nums text-neutral-600"
+          className="tabular-nums text-term-dim"
         >
           {items.length}
         </span>
@@ -135,7 +142,7 @@ const QueueCard = memo(function QueueCard({ item }: { item: QueueItem }) {
   const isCurated = item.status === "curated";
   const cardClass = isCurated
     ? decisionClass(item.decision)
-    : "border-neutral-800 bg-neutral-900";
+    : "border-term-edge bg-term-raised";
 
   return (
     <li
@@ -143,13 +150,13 @@ const QueueCard = memo(function QueueCard({ item }: { item: QueueItem }) {
       data-status={item.status}
       data-decision={item.decision ?? ""}
       aria-busy={busy ? "true" : "false"}
-      className={`rounded border p-2 ${cardClass}`}
+      className={`border p-2 ${cardClass}`}
     >
       <div className="flex items-start justify-between gap-2">
-        <span className="break-words text-neutral-200">{item.prompt}</span>
+        <span className="break-words text-term-fg">{item.prompt}</span>
       </div>
-      <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-[10px] text-neutral-500">
-        <span className="rounded bg-neutral-800 px-1 text-neutral-300">
+      <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-[10px] text-term-dim">
+        <span className="border border-term-edge bg-term-panel px-1 text-term-accent">
           {item.specialty}
         </span>
         <span>by {item.proposed_by}</span>
@@ -172,7 +179,7 @@ const QueueCard = memo(function QueueCard({ item }: { item: QueueItem }) {
             disabled={busy}
             aria-label={`Approve question: ${item.prompt}`}
             onClick={() => void run(() => approveQuestion(item.id))}
-            className="rounded border border-sky-700 px-2 py-0.5 text-[11px] text-sky-200 hover:bg-sky-500/10 disabled:opacity-40"
+            className={`${BTN} border-sky-700 text-sky-200 hover:bg-sky-500/10`}
           >
             approve
           </button>
@@ -187,7 +194,7 @@ const QueueCard = memo(function QueueCard({ item }: { item: QueueItem }) {
             disabled={busy}
             aria-label={`Accept drafted answer for: ${item.prompt}`}
             onClick={() => void run(() => acceptQuestion(item.id))}
-            className="rounded border border-emerald-700 px-2 py-0.5 text-[11px] text-emerald-200 hover:bg-emerald-500/10 disabled:opacity-40"
+            className={`${BTN} border-emerald-700 text-emerald-200 hover:bg-emerald-500/10`}
           >
             accept
           </button>
@@ -197,7 +204,7 @@ const QueueCard = memo(function QueueCard({ item }: { item: QueueItem }) {
             disabled={busy}
             aria-label={`Reject drafted answer for: ${item.prompt}`}
             onClick={() => void run(() => rejectQuestion(item.id))}
-            className="rounded border border-rose-700 px-2 py-0.5 text-[11px] text-rose-200 hover:bg-rose-500/10 disabled:opacity-40"
+            className={`${BTN} border-rose-700 text-rose-200 hover:bg-rose-500/10`}
           >
             reject
           </button>
@@ -210,7 +217,7 @@ const QueueCard = memo(function QueueCard({ item }: { item: QueueItem }) {
               setDraft(item.corrected_answer ?? "");
               setEditing(true);
             }}
-            className="rounded border border-amber-700 px-2 py-0.5 text-[11px] text-amber-200 hover:bg-amber-500/10 disabled:opacity-40"
+            className={`${BTN} border-amber-700 text-amber-200 hover:bg-amber-500/10`}
           >
             edit
           </button>
@@ -229,7 +236,7 @@ const QueueCard = memo(function QueueCard({ item }: { item: QueueItem }) {
             onChange={(e) => setDraft(e.target.value)}
             rows={3}
             placeholder="corrected answer"
-            className="w-full rounded border border-neutral-700 bg-neutral-950 p-1 text-[11px] text-neutral-200"
+            className="w-full border border-term-edge bg-term-bg p-1 text-[11px] text-term-fg placeholder:text-term-dim focus:border-term-accent focus:outline-none"
           />
           <div className="flex gap-1">
             <button
@@ -238,7 +245,7 @@ const QueueCard = memo(function QueueCard({ item }: { item: QueueItem }) {
               disabled={busy || draft.trim() === ""}
               aria-label={`Save correction for: ${item.prompt}`}
               onClick={() => void run(() => editQuestion(item.id, draft))}
-              className="rounded border border-amber-700 px-2 py-0.5 text-[11px] text-amber-200 hover:bg-amber-500/10 disabled:opacity-40"
+              className={`${BTN} border-amber-700 text-amber-200 hover:bg-amber-500/10`}
             >
               save correction
             </button>
@@ -248,7 +255,7 @@ const QueueCard = memo(function QueueCard({ item }: { item: QueueItem }) {
               disabled={busy}
               aria-label={`Cancel correction for: ${item.prompt}`}
               onClick={() => setEditing(false)}
-              className="rounded border border-neutral-700 px-2 py-0.5 text-[11px] text-neutral-400 hover:bg-white/5 disabled:opacity-40"
+              className={`${BTN} border-term-edge text-term-dim hover:bg-white/5`}
             >
               cancel
             </button>
@@ -263,7 +270,7 @@ const QueueCard = memo(function QueueCard({ item }: { item: QueueItem }) {
         >
           {item.decision}
           {item.decision === "edit" && item.corrected_answer && (
-            <div className="mt-0.5 whitespace-pre-wrap break-words font-sans normal-case text-neutral-300">
+            <div className="mt-0.5 whitespace-pre-wrap break-words normal-case text-neutral-300">
               {item.corrected_answer}
             </div>
           )}

@@ -10,7 +10,7 @@ import {
 // Tailwind tokens for the three severity tiers. Kept in one place so the
 // test assertions can reference them directly.
 export const SEVERITY_CLASSES: Record<Severity, string> = {
-  ok: "text-neutral-200",
+  ok: "text-term-fg",
   warn: "text-amber-300 bg-amber-900/20",
   danger: "text-rose-300 bg-rose-900/30",
 };
@@ -64,11 +64,11 @@ export default function SpecsGrid({ rows }: SpecsGridProps) {
       data-scrolls={scrolls ? "true" : "false"}
       role="table"
       aria-label="Fleet hardware specifications"
-      className="border-t border-neutral-800 px-3 py-2 font-mono text-xs"
+      className="border-t border-term-edge bg-term-panel px-3 py-2 font-mono text-xs"
     >
       <div
         role="row"
-        className="mb-1 grid grid-cols-[1.6fr_2.2fr_auto_auto_auto_auto_auto_auto] gap-x-3 text-neutral-500"
+        className="mb-1 grid grid-cols-[1.6fr_2.2fr_auto_auto_auto_auto_auto_auto] gap-x-3 text-[10px] uppercase tracking-widest text-term-dim"
       >
         <span role="columnheader">node</span>
         <span role="columnheader">hardware</span>
@@ -107,10 +107,11 @@ export default function SpecsGrid({ rows }: SpecsGridProps) {
             >
               <span role="cell" className="truncate">
                 {row.node_name}
+                {row.self ? <span className="text-term-accent"> ◆</span> : null}
               </span>
               <span
                 role="cell"
-                className="truncate text-neutral-400"
+                className="truncate text-term-dim"
                 data-testid={`hw-${row.node_id}`}
               >
                 {formatHardwareLabel(row.specs)}

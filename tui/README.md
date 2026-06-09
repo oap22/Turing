@@ -10,6 +10,17 @@ event-driven redraws (idle CPU ≈ 0 — it only repaints when state actually
 changes), and all socket I/O off the render path. Honours ADR 0009 §5's
 "narrow Rust use for the CLI/TUI; orchestration stays in Python".
 
+## Theme
+
+Both operator surfaces share one "minimalist computer" vocabulary
+(see `src/ui/theme.rs` here and `webui/src/index.css`):
+
+- near-black canvas, dim grey chrome, a single **cyan** accent;
+- green / yellow / red reserved for ok / warn / danger semantics
+  (magenta marks work awaiting a human decision);
+- block-element gauges (`▮▮▮▯▯`) instead of decorative widgets;
+- sharp 1-px borders, lowercase pane tags, keycap-style footer hints.
+
 ## Build
 
 ```bash

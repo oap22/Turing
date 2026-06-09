@@ -1,11 +1,11 @@
-//! Top-level frame composition: alert banner, tab strip + connection status,
-//! the active pane body, a context footer, and the input-modal overlay.
+//! Top-level frame composition: alert banner, brand + tab strip + connection
+//! status, the active pane body, a context footer, and the input-modal overlay.
 
 mod panes;
 mod theme;
 
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
-use ratatui::style::{Style, Stylize};
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Tabs};
 use ratatui::Frame;
@@ -83,23 +83,42 @@ fn draw_banner(f: &mut Frame, area: Rect, app: &App) {
     let summary = format!(" ⚠ {} alert(s): {}  ", danger + warn, bits.join(", "));
     let p = Paragraph::new(Line::from(Span::styled(
         summary,
-        Style::default().fg(theme::DANGER).bold(),
+        Style::default().fg(Color::Black).bold(),
     )))
-    .style(Style::default().bg(color).fg(ratatui::style::Color::Black));
+    .style(Style::default().bg(color).fg(Color::Black));
     f.render_widget(p, area);
 }
 
 fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
-    let split = Layout::horizontal([Constraint::Min(0), Constraint::Length(30)]).split(area);
+    let split = Layout::horizontal([
+        Constraint::Length(9),
+        Constraint::Min(0),
+        Constraint::Length(30),
+    ])
+    .split(area);
+
+    // brand block, the one loud element on screen.
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " TURING ",
+            Style::default().fg(Color::Black).bg(theme::ACCENT).bold(),
+        ))),
+        split[0],
+    );
+
     let titles: Vec<Line> = Pane::TABS
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let mut label = format!(" {} {} ", i + 1, p.title());
-            if *p == Pane::Alerts && !app.alerts.is_empty() {
-                label = format!(" {} {} ({}) ", i + 1, p.title(), app.alerts.len());
-            }
-            Line::from(label)
+            let count = if *p == Pane::Alerts && !app.alerts.is_empty() {
+                format!("({}) ", app.alerts.len())
+            } else {
+                String::new()
+            };
+            Line::from(vec![
+                Span::styled(format!(" {} ", i + 1), Style::default().fg(theme::DIM)),
+                Span::raw(format!("{} {count}", p.title())),
+            ])
         })
         .collect();
     let selected = Pane::TABS
@@ -109,8 +128,8 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
     let tabs = Tabs::new(titles)
         .select(selected)
         .highlight_style(Style::default().fg(theme::ACCENT).bold().reversed())
-        .divider("");
-    f.render_widget(tabs, split[0]);
+        .divider(Span::styled("·", Style::default().fg(theme::DIM)));
+    f.render_widget(tabs, split[1]);
 
     // connection / node status, right-aligned.
     let (label, color) = match &app.ws_status {
@@ -129,7 +148,7 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" "),
     ])
     .right_aligned();
-    f.render_widget(Paragraph::new(status), split[1]);
+    f.render_widget(Paragraph::new(status), split[2]);
 }
 
 fn draw_body(f: &mut Frame, area: Rect, app: &App) {
@@ -143,6 +162,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+/// Footer hints as `key desc` pairs — keys in accent, descriptions dim.
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     if let Some(notice) = &app.notice {
         let p = Paragraph::new(Line::from(Span::styled(
@@ -152,31 +172,72 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(p, area);
         return;
     }
-    let hint = match app.active {
-        Pane::Queue => "h/l col · j/k row · a approve · y/n/e curate · ? help",
-        Pane::Chat => "j/k thread · h/l subtask · i prompt · y/n/e thumb · ? help",
-        Pane::Specs => "j/k rows · ? help · q quit",
-        Pane::Trace => "j/k scroll · f follow · ? help · q quit",
-        Pane::Alerts => "j/k rows · s snooze 4h · ? help · q quit",
-        Pane::Help => "press a number 1-5 to return to a pane · q quit",
+    let hints: &[(&str, &str)] = match app.active {
+        Pane::Queue => &[
+            ("h/l", "col"),
+            ("j/k", "row"),
+            ("a", "approve"),
+            ("y/n/e", "curate"),
+            ("?", "help"),
+        ],
+        Pane::Chat => &[
+            ("j/k", "thread"),
+            ("h/l", "subtask"),
+            ("i", "prompt"),
+            ("y/n/e", "thumb"),
+            ("?", "help"),
+        ],
+        Pane::Specs => &[("j/k", "rows"), ("?", "help"), ("q", "quit")],
+        Pane::Trace => &[
+            ("j/k", "scroll"),
+            ("f", "follow"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        Pane::Alerts => &[
+            ("j/k", "rows"),
+            ("s", "snooze 4h"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        Pane::Help => &[("1-5", "return to a pane"), ("q", "quit")],
     };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!(" {hint}"),
+    let mut spans: Vec<Span> = Vec::with_capacity(hints.len() * 3 + 1);
+    spans.push(Span::raw(" "));
+    for (i, (key, desc)) in hints.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme::DIM)));
+        }
+        spans.push(Span::styled(
+            *key,
+            Style::default().fg(theme::ACCENT).bold(),
+        ));
+        spans.push(Span::styled(
+            format!(" {desc}"),
             Style::default().fg(theme::DIM),
-        ))),
-        area,
-    );
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_input(f: &mut Frame, area: Rect, app: &App) {
     let Some(input) = &app.input else { return };
-    let popup = centered(area, 70, 3);
+    let popup = centered(area, 70, 4);
     f.render_widget(Clear, popup);
     let block = Block::bordered()
-        .title(format!(" {} ", input.label))
+        .title(theme::title(&input.label, true))
+        .title_bottom(
+            Line::from(vec![
+                Span::styled(" enter", Style::default().fg(theme::ACCENT)),
+                Span::styled(" submit · ", Style::default().fg(theme::DIM)),
+                Span::styled("esc", Style::default().fg(theme::ACCENT)),
+                Span::styled(" cancel ", Style::default().fg(theme::DIM)),
+            ])
+            .right_aligned(),
+        )
         .border_style(Style::default().fg(theme::ACCENT));
     let text = Line::from(vec![
+        Span::styled("> ", Style::default().fg(theme::ACCENT)),
         Span::raw(input.buffer.clone()),
         Span::styled("▌", Style::default().fg(theme::ACCENT)), // cursor
     ]);
@@ -267,6 +328,7 @@ mod tests {
             // The alert banner is always present here, and the tab strip too.
             assert!(text.contains("alert"), "{pane:?} missing alert banner");
             assert!(text.contains("Queue"), "{pane:?} missing tab strip");
+            assert!(text.contains("TURING"), "{pane:?} missing brand block");
         }
     }
 
@@ -280,6 +342,16 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
         term.draw(|f| draw(f, &app)).unwrap();
         assert!(buffer_text(&term).contains("research prompt"));
+    }
+
+    #[test]
+    fn footer_shows_keycap_hints() {
+        let mut app = populated();
+        app.active = Pane::Trace;
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("follow"), "trace footer missing follow hint");
     }
 
     #[test]
