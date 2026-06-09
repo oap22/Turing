@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import re
 import socket
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import structlog
@@ -16,6 +18,59 @@ logger = structlog.get_logger("turing.tools.network")
 
 # Default timeout for network operations (seconds).
 DEFAULT_TIMEOUT = 10
+
+# Schemes permitted for http_request. Anything else (file://, gopher://, etc.)
+# is an SSRF vector and is rejected outright.
+_ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+# Cap on redirects we will follow while re-validating each hop's destination.
+_MAX_REDIRECTS = 5
+
+
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True if ``ip`` points at an internal/reserved range we must not reach.
+
+    Blocks loopback, RFC-1918 private, link-local (incl. the cloud metadata
+    endpoint 169.254.169.254), unique-local, multicast, and reserved space.
+    IPv4-mapped IPv6 addresses are unwrapped so ``::ffff:127.0.0.1`` cannot
+    smuggle a loopback target past the check.
+    """
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def _resolve_and_check_host(host: str) -> str | None:
+    """Resolve ``host`` and return an error string if any address is internal.
+
+    Returns ``None`` when every resolved address is a public, routable target.
+    Resolving *all* records (not just the first) prevents a DNS entry that
+    returns one public and one internal address from sneaking through.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        return f"could not resolve host '{host}': {exc}"
+
+    for _family, _type, _proto, _canon, sockaddr in infos:
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            return f"unparseable address for host '{host}'"
+        if _is_blocked_ip(ip):
+            return (
+                f"refusing to connect to internal/reserved address {ip} "
+                f"for host '{host}' (SSRF protection)"
+            )
+    return None
+
 
 # A hostname or IP literal: alphanumerics plus ``. - _ :`` (the colon covers
 # IPv6 literals). The first character must be alphanumeric so a value can never
@@ -152,6 +207,17 @@ class NetworkTool(Tool):
         except TimeoutError:
             return ToolResult(success=False, output="", error=f"Ping to {safe_host} timed out")
 
+    @staticmethod
+    def _validate_url(url: str) -> str | None:
+        """Return an error string if ``url`` is malformed or targets an internal host."""
+        parts = urlsplit(url)
+        if parts.scheme.lower() not in _ALLOWED_SCHEMES:
+            return f"Unsupported URL scheme '{parts.scheme}'. Only http and https are allowed."
+        host = parts.hostname
+        if not host:
+            return f"URL '{url}' has no host"
+        return _resolve_and_check_host(host)
+
     async def _http_request(self, **kwargs: Any) -> ToolResult:
         """Make an HTTP GET or POST request."""
         url = kwargs.get("url", "")
@@ -166,14 +232,35 @@ class NetworkTool(Tool):
                 error=f"Unsupported HTTP method '{method}'. Only GET and POST are allowed.",
             )
 
+        guard_error = self._validate_url(url)
+        if guard_error is not None:
+            return ToolResult(success=False, output="", error=guard_error)
+
         body = kwargs.get("body")
 
         try:
-            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT, follow_redirects=True) as client:
-                if method == "GET":
-                    response = await client.get(url)
-                else:
-                    response = await client.post(url, content=body)
+            # Redirects are followed manually so each hop's destination is
+            # re-validated; httpx's automatic following would let a public URL
+            # 302 to an internal address (e.g. cloud metadata) unchecked.
+            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT, follow_redirects=False) as client:
+                current_url = url
+                redirects = 0
+                while True:
+                    if method == "GET":
+                        response = await client.get(current_url)
+                    else:
+                        response = await client.post(current_url, content=body)
+
+                    if response.is_redirect and redirects < _MAX_REDIRECTS:
+                        location = response.headers.get("location", "")
+                        next_url = str(httpx.URL(current_url).join(location))
+                        guard_error = self._validate_url(next_url)
+                        if guard_error is not None:
+                            return ToolResult(success=False, output="", error=guard_error)
+                        current_url = next_url
+                        redirects += 1
+                        continue
+                    break
 
             # Truncate response body if very large.
             response_text = response.text
@@ -249,6 +336,10 @@ class NetworkTool(Tool):
             return ToolResult(success=False, output="", error="No host specified")
         if port is None:
             return ToolResult(success=False, output="", error="No port specified")
+
+        guard_error = _resolve_and_check_host(host)
+        if guard_error is not None:
+            return ToolResult(success=False, output="", error=guard_error)
 
         port = int(port)
         try:
