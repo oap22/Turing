@@ -1,10 +1,95 @@
 @import "tailwindcss";
 
-html, body, #root {
+/*
+ * "Minimalist computer" theme — shared vocabulary with the Rust TUI:
+ * near-black canvas, one cyan accent, emerald/amber/rose reserved for
+ * semantics, dim grey chrome, monospace everywhere, sharp 1px borders.
+ */
+@theme {
+  --font-mono:
+    "JetBrains Mono", ui-monospace, "SFMono-Regular", "Cascadia Mono", Menlo,
+    Consolas, "Liberation Mono", monospace;
+  /* The whole console is set in mono — it is a computer, after all. */
+  --font-sans: var(--font-mono);
+
+  --color-term-bg: #060809;
+  --color-term-panel: #0b0e10;
+  --color-term-raised: #11151a;
+  --color-term-edge: #1d2329;
+  --color-term-fg: #c9d1d9;
+  --color-term-dim: #6b7280;
+  --color-term-accent: #22d3ee;
+}
+
+html,
+body,
+#root {
   height: 100%;
 }
+
 body {
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-  background-color: #0b0b0b;
-  color: #e7e7e7;
+  font-family: var(--font-mono);
+  background-color: var(--color-term-bg);
+  color: var(--color-term-fg);
+  font-variant-ligatures: none;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--color-term-accent) 30%, transparent);
+}
+
+/* Thin, quiet scrollbars that brighten on hover. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-term-edge) transparent;
+}
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-term-edge);
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-term-accent);
+}
+
+/* Block cursor for streaming/live indicators. */
+@keyframes term-blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+.term-cursor::after {
+  content: "▌";
+  margin-left: 2px;
+  color: var(--color-term-accent);
+  animation: term-blink 1s step-end infinite;
+}
+
+/* React Flow chrome, re-skinned to match the panel palette. */
+.react-flow__controls {
+  box-shadow: none !important;
+  border: 1px solid var(--color-term-edge);
+}
+.react-flow__controls-button {
+  background: var(--color-term-panel) !important;
+  border-bottom: 1px solid var(--color-term-edge) !important;
+}
+.react-flow__controls-button svg {
+  fill: var(--color-term-dim) !important;
+}
+.react-flow__controls-button:hover svg {
+  fill: var(--color-term-accent) !important;
+}
+.react-flow__attribution {
+  display: none;
 }

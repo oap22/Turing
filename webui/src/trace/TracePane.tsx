@@ -11,6 +11,20 @@ interface Props {
 
 const HISTORY_PAGE = 200;
 
+// Family colour for an event type — mirrors the TUI's trace palette so the
+// stream stays scannable without becoming a rainbow.
+function eventClass(eventType: string): string {
+  if (eventType.endsWith(".error")) return "text-rose-400";
+  const family = eventType.split(".")[0];
+  if (family === "llm") return "text-fuchsia-300";
+  if (family === "tool") return "text-cyan-300";
+  if (family === "mesh" || family === "presence") return "text-emerald-300";
+  return "text-term-fg";
+}
+
+const FILTER_INPUT =
+  "border border-term-edge bg-term-bg px-2 py-1 text-term-fg placeholder:text-term-dim focus:border-term-accent focus:outline-none";
+
 export default function TracePane({ liveEvents, onSelect }: Props) {
   const [history, setHistory] = useState<TraceEvent[]>([]);
   const [filter, setFilter] = useState<TraceFilter>(EMPTY_FILTER);
@@ -43,7 +57,15 @@ export default function TracePane({ liveEvents, onSelect }: Props) {
   }, [history, liveEvents, filter]);
 
   return (
-    <div className="flex h-full flex-col bg-neutral-950 font-mono text-xs">
+    <div className="flex h-full flex-col bg-term-bg font-mono text-xs">
+      <div className="border-b border-term-edge bg-term-panel px-3 py-1.5">
+        <span className="text-[11px] font-bold uppercase tracking-widest text-term-fg">
+          trace
+        </span>
+        <span className="ml-2 text-[10px] uppercase tracking-wider text-term-dim">
+          {merged.length} event{merged.length === 1 ? "" : "s"}
+        </span>
+      </div>
       <FilterBar filter={filter} onChange={setFilter} />
       <ol className="flex-1 overflow-auto">
         {merged.map((e) => {
@@ -51,7 +73,7 @@ export default function TracePane({ liveEvents, onSelect }: Props) {
           return (
             <li
               key={key}
-              className="cursor-pointer border-b border-neutral-800 px-2 py-1 hover:bg-neutral-900"
+              className="cursor-pointer border-b border-term-edge/60 px-2 py-1 hover:bg-term-raised"
               onClick={() => {
                 onSelect?.(e);
                 setExpandedKey((prev) => (prev === key ? null : key));
@@ -72,10 +94,10 @@ function Row({ event }: { event: TraceEvent }) {
   const dur = event.duration_ms !== null ? `${Math.round(event.duration_ms)}ms` : "";
   return (
     <div className="grid grid-cols-[80px_120px_1fr_70px] gap-2 text-neutral-300">
-      <span className="text-neutral-500">{ts}</span>
-      <span className="text-emerald-400">{event.node_name}</span>
-      <span>{event.event_type}</span>
-      <span className="text-right text-neutral-400">{dur}</span>
+      <span className="text-term-dim">{ts}</span>
+      <span className="text-term-accent">{event.node_name}</span>
+      <span className={eventClass(event.event_type)}>{event.event_type}</span>
+      <span className="text-right tabular-nums text-term-dim">{dur}</span>
     </div>
   );
 }
@@ -88,7 +110,7 @@ function Expansion({ event }: { event: TraceEvent }) {
     return <ToolExpansion event={event} />;
   }
   return (
-    <pre className="mt-1 max-h-64 overflow-auto rounded bg-neutral-900 p-2 text-[11px] text-neutral-400">
+    <pre className="mt-1 max-h-64 overflow-auto border border-term-edge bg-term-panel p-2 text-[11px] text-neutral-400">
       {JSON.stringify(event.payload, null, 2)}
     </pre>
   );
@@ -97,10 +119,10 @@ function Expansion({ event }: { event: TraceEvent }) {
 function LlmExpansion({ event }: { event: TraceEvent }) {
   const p = event.payload as Record<string, unknown>;
   return (
-    <div className="mt-1 space-y-1 rounded bg-neutral-900 p-2 text-neutral-300">
+    <div className="mt-1 space-y-1 border border-term-edge bg-term-panel p-2 text-neutral-300">
       <div>
-        <span className="text-neutral-500">provider:</span> {String(p.provider ?? "?")} ·{" "}
-        <span className="text-neutral-500">model:</span> {String(p.model ?? "?")}
+        <span className="text-term-dim">provider:</span> {String(p.provider ?? "?")} ·{" "}
+        <span className="text-term-dim">model:</span> {String(p.model ?? "?")}
       </div>
       {p.prompt_sample !== undefined && (
         <details>
@@ -125,12 +147,12 @@ function LlmExpansion({ event }: { event: TraceEvent }) {
 function ToolExpansion({ event }: { event: TraceEvent }) {
   const p = event.payload as Record<string, unknown>;
   return (
-    <div className="mt-1 rounded bg-neutral-900 p-2 text-neutral-300">
+    <div className="mt-1 border border-term-edge bg-term-panel p-2 text-neutral-300">
       <div>
-        <span className="text-neutral-500">tool:</span> {String(p.tool ?? "?")}
+        <span className="text-term-dim">tool:</span> {String(p.tool ?? "?")}
       </div>
       <div>
-        <span className="text-neutral-500">success:</span> {String(p.success ?? "?")}
+        <span className="text-term-dim">success:</span> {String(p.success ?? "?")}
       </div>
       {event.error && (
         <div className="text-rose-400">error: {String(event.error)}</div>
@@ -147,7 +169,7 @@ function FilterBar({
   onChange: (next: TraceFilter) => void;
 }) {
   return (
-    <div className="flex flex-wrap items-center gap-2 border-b border-neutral-800 bg-neutral-900 px-2 py-1 text-[11px] text-neutral-400">
+    <div className="flex flex-wrap items-center gap-2 border-b border-term-edge bg-term-panel px-2 py-1 text-[11px] text-term-dim">
       <input
         type="text"
         placeholder="nodes (csv)"
@@ -158,7 +180,7 @@ function FilterBar({
             nodes: e.target.value.split(",").map((s) => s.trim()).filter(Boolean),
           })
         }
-        className="rounded border border-neutral-700 bg-neutral-950 px-2 py-1"
+        className={FILTER_INPUT}
       />
       <input
         type="text"
@@ -170,7 +192,7 @@ function FilterBar({
             eventTypes: e.target.value.split(",").map((s) => s.trim()).filter(Boolean),
           })
         }
-        className="rounded border border-neutral-700 bg-neutral-950 px-2 py-1"
+        className={FILTER_INPUT}
       />
       <input
         type="number"
@@ -182,7 +204,7 @@ function FilterBar({
             minDurationMs: e.target.value === "" ? null : Number(e.target.value),
           })
         }
-        className="w-20 rounded border border-neutral-700 bg-neutral-950 px-2 py-1"
+        className={`w-20 ${FILTER_INPUT}`}
       />
     </div>
   );

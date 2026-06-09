@@ -49,17 +49,19 @@ export default function CallGraphCanvas({ state, highlightedEdge }: Props) {
           : e.latencyMs !== undefined
             ? `${Math.round(e.latencyMs)} ms`
             : undefined,
+        labelStyle: { fill: "#6b7280", fontFamily: "inherit", fontSize: 10 },
+        labelBgStyle: { fill: "#0b0e10", fillOpacity: 0.9 },
         style: highlighted
-          ? { stroke: "#fbbf24", strokeWidth: 3 }
+          ? { stroke: "#22d3ee", strokeWidth: 3 }
           : e.active
             ? { stroke: "#22c55e", strokeWidth: 2 }
-            : { stroke: "#525252", strokeWidth: 1 },
+            : { stroke: "#374151", strokeWidth: 1 },
       };
     });
   }, [state.edges, highlightedEdge]);
 
   return (
-    <div className="h-full w-full">
+    <div className="h-full w-full bg-term-bg">
       <ReactFlow
         nodes={nodes}
         edges={edges}
@@ -67,8 +69,8 @@ export default function CallGraphCanvas({ state, highlightedEdge }: Props) {
         fitView
         proOptions={{ hideAttribution: true }}
       >
-        <Background />
-        <Controls />
+        <Background color="#1d2329" gap={24} size={1} />
+        <Controls showInteractive={false} />
       </ReactFlow>
     </div>
   );

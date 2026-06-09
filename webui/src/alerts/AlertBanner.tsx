@@ -81,7 +81,7 @@ export default function AlertBanner({ alerts }: Props) {
   return (
     <div
       data-testid="alert-banner"
-      className="sticky top-0 z-50 flex flex-col gap-1 border-b border-neutral-800 bg-neutral-950 p-2"
+      className="sticky top-0 z-50 flex flex-col gap-1 border-b border-term-edge bg-term-bg p-2"
     >
       {alerts.map((alert) => {
         const key = rowKey(alert);
@@ -98,12 +98,13 @@ export default function AlertBanner({ alerts }: Props) {
             data-testid="alert-row"
             data-severity={alert.severity}
             data-snoozed={snoozed ? "true" : "false"}
-            className={`flex items-center gap-3 rounded border px-3 py-1.5 text-sm ${severityClass(
+            className={`flex items-center gap-3 border px-3 py-1.5 text-sm ${severityClass(
               alert.severity,
             )}${snoozed ? " opacity-50" : ""}`}
           >
+            <span aria-hidden="true">▌</span>
             <span className="font-semibold">{alert.node_name}</span>
-            <span className="uppercase tracking-wide text-xs opacity-80">
+            <span className="text-xs uppercase tracking-widest opacity-80">
               {alert.field.replace("_", " ")}
             </span>
             <span className="ml-auto font-mono">
@@ -121,7 +122,7 @@ export default function AlertBanner({ alerts }: Props) {
                 type="button"
                 data-testid="snooze-button"
                 onClick={() => void handleSnooze(alert)}
-                className="rounded border border-current px-2 py-0.5 text-xs hover:bg-white/10"
+                className="border border-current px-2 py-0.5 text-[10px] uppercase tracking-wider hover:bg-white/10"
               >
                 snooze 4h
               </button>

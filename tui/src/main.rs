@@ -114,6 +114,12 @@ async fn main() -> Result<()> {
             },
             engine = rx.recv() => if let Some(ev) = engine {
                 dirty |= app.on_engine(ev);
+                // Coalesce a burst of engine events (trace storms, snapshot +
+                // deltas on reconnect) into a single redraw instead of one
+                // draw per frame.
+                while let Ok(ev) = rx.try_recv() {
+                    dirty |= app.on_engine(ev);
+                }
             },
         }
 

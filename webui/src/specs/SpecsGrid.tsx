@@ -10,7 +10,7 @@ import {
 // Tailwind tokens for the three severity tiers. Kept in one place so the
 // test assertions can reference them directly.
 export const SEVERITY_CLASSES: Record<Severity, string> = {
-  ok: "text-neutral-200",
+  ok: "text-term-fg",
   warn: "text-amber-300 bg-amber-900/20",
   danger: "text-rose-300 bg-rose-900/30",
 };
@@ -62,9 +62,9 @@ export default function SpecsGrid({ rows }: SpecsGridProps) {
     <div
       data-testid="specs-grid"
       data-scrolls={scrolls ? "true" : "false"}
-      className="border-t border-neutral-800 px-3 py-2 font-mono text-xs"
+      className="border-t border-term-edge bg-term-panel px-3 py-2 font-mono text-xs"
     >
-      <div className="mb-1 grid grid-cols-[1.6fr_2.2fr_auto_auto_auto_auto_auto_auto] gap-x-3 text-neutral-500">
+      <div className="mb-1 grid grid-cols-[1.6fr_2.2fr_auto_auto_auto_auto_auto_auto] gap-x-3 text-[10px] uppercase tracking-widest text-term-dim">
         <span>node</span>
         <span>hardware</span>
         <span className="text-right">CPU%</span>
@@ -98,8 +98,11 @@ export default function SpecsGrid({ rows }: SpecsGridProps) {
             className={classes}
             style={{ minHeight: "32px", alignItems: "center" }}
           >
-            <span className="truncate">{row.node_name}</span>
-            <span className="truncate text-neutral-400" data-testid={`hw-${row.node_id}`}>
+            <span className="truncate">
+              {row.node_name}
+              {row.self ? <span className="text-term-accent"> ◆</span> : null}
+            </span>
+            <span className="truncate text-term-dim" data-testid={`hw-${row.node_id}`}>
               {formatHardwareLabel(row.specs)}
             </span>
             <span className="text-right tabular-nums">
