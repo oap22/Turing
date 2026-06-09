@@ -68,6 +68,9 @@ services:
       TURING_MESH_ENABLED: "true"
       TURING_DB_PATH: /app/data/turing.db
       TURING_NATS_URL: *nats-url
+      # Plugin allow-list is fail-closed (issue #346); opt the bundled
+      # example plugin back in for the multi-node simulation.
+      TURING_ALLOWED_PLUGINS: '["example_plugin"]'
       # Bind the HTTP gateway to all interfaces inside the container so
       # the host port mapping below is actually reachable. The default
       # 127.0.0.1 is container-local.
@@ -88,6 +91,9 @@ services:
       TURING_MESH_ENABLED: "true"
       TURING_DB_PATH: /app/data/turing.db
       TURING_NATS_URL: *nats-url
+      # Plugin allow-list is fail-closed (issue #346); opt the bundled
+      # example plugin back in for the multi-node simulation.
+      TURING_ALLOWED_PLUGINS: '["example_plugin"]'
     volumes:
       - node2-data:/app/data
 
@@ -102,6 +108,9 @@ services:
       TURING_MESH_ENABLED: "true"
       TURING_DB_PATH: /app/data/turing.db
       TURING_NATS_URL: *nats-url
+      # Plugin allow-list is fail-closed (issue #346); opt the bundled
+      # example plugin back in for the multi-node simulation.
+      TURING_ALLOWED_PLUGINS: '["example_plugin"]'
     volumes:
       - node3-data:/app/data
 
@@ -116,6 +125,9 @@ services:
       TURING_MESH_ENABLED: "true"
       TURING_DB_PATH: /app/data/turing.db
       TURING_NATS_URL: *nats-url
+      # Plugin allow-list is fail-closed (issue #346); opt the bundled
+      # example plugin back in for the multi-node simulation.
+      TURING_ALLOWED_PLUGINS: '["example_plugin"]'
     volumes:
       - node4-data:/app/data
 
