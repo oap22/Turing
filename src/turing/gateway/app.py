@@ -14,6 +14,7 @@ import json
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
+from urllib.parse import urlsplit
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request, Response, WebSocket
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -47,6 +48,10 @@ if TYPE_CHECKING:
 
 DEFAULT_PAGE_LIMIT = 200
 
+# Upper bound on a single ``/api/events`` page; without it a caller can request
+# an arbitrarily large ``limit`` and force a full ring-buffer scan + JSON build.
+MAX_PAGE_LIMIT = 1000
+
 PUBLIC_PATHS = frozenset({"/", "/healthz", "/token-handoff", "/peers"})
 
 # Friendly landing payload returned on bare ``GET /`` when the caller is not
@@ -58,6 +63,23 @@ _LANDING_PAYLOAD = {
     "login": "/token-handoff?token=<your-token>",
     "healthz": "/healthz",
 }
+
+
+def _ws_origin_allowed(websocket: WebSocket) -> bool:
+    """Allow the WS handshake only for same-origin or non-browser callers.
+
+    Browsers always send an ``Origin`` header on a WebSocket handshake; if it
+    is present it must match the ``Host`` the request was sent to. Requests
+    with no ``Origin`` (curl, server-side clients) are allowed through to the
+    bearer check. This blocks cross-site WebSocket hijacking via the cookie.
+    """
+    origin = websocket.headers.get("origin")
+    if not origin:
+        return True
+    host = websocket.headers.get("host")
+    if not host:
+        return False
+    return urlsplit(origin).netloc == host
 
 
 class _BearerMiddleware(BaseHTTPMiddleware):
@@ -195,19 +217,23 @@ def create_app(
         """
         if ring_buffer is None:
             return {"events": [], "next_offset": None}
+        # Clamp pagination params so a single request can't force a full-table
+        # scan + JSON materialization of the entire buffer (DoS / memory spike).
+        limit = min(max(0, int(limit)), MAX_PAGE_LIMIT)
+        offset = max(0, int(offset))
         # Fetch one extra row to detect whether more pages remain.
-        fetch_limit = max(0, int(limit)) + 1
+        fetch_limit = limit + 1
         rows = await ring_buffer.query(
             node_names=tuple(node) if node else None,
             event_types=tuple(event_type) if event_type else None,
             since_ms=since_ms,
             min_duration_ms=min_duration_ms,
             limit=fetch_limit,
-            offset=int(offset),
+            offset=offset,
         )
         has_more = len(rows) > limit
         events = rows[:limit]
-        next_offset = (int(offset) + limit) if has_more else None
+        next_offset = (offset + limit) if has_more else None
         return {"events": events, "next_offset": next_offset}
 
     @app.post("/alerts/{node_id}/{field}/snooze")
@@ -365,6 +391,15 @@ def create_app(
 
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:
+        # Reject cross-origin handshakes (CSWSH): the cookie auth below would
+        # otherwise let any web page the operator visits open a socket with the
+        # ambient gateway cookie and read the full telemetry/queue/chat stream.
+        # SameSite=Lax does not reliably cover the WS handshake, so enforce a
+        # same-origin check explicitly. Non-browser clients (no Origin header)
+        # are allowed; they still need the bearer token.
+        if not _ws_origin_allowed(websocket):
+            await websocket.close(code=1008)  # Policy violation
+            return
         if not auth.check(
             authorization_header=websocket.headers.get("Authorization"),
             cookie_token=websocket.cookies.get(COOKIE_NAME),

@@ -168,7 +168,23 @@ def _fake_response(*, status_code: int = 200, text: str = "hello", reason: str =
     resp.text = text
     resp.content = text.encode()
     resp.headers = {"content-type": "text/plain"}
+    resp.is_redirect = False
     return resp
+
+
+def _public_addrinfo(*_args, **_kwargs):
+    """Stand-in for ``socket.getaddrinfo`` that resolves to a public address.
+
+    The SSRF guard resolves every URL/host before connecting; tests mock the
+    HTTP/socket layer, so the resolver is mocked too to return a routable IP.
+    """
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+
+
+@pytest.fixture(autouse=True)
+def _patch_public_dns():
+    with patch("turing.tools.network.socket.getaddrinfo", side_effect=_public_addrinfo):
+        yield
 
 
 class TestHttpRequest:
@@ -230,6 +246,85 @@ class TestHttpRequest:
             result = await network_tool.execute(action="http_request", url="http://x")
         assert result.success is False
         assert "HTTP request failed" in result.error
+
+
+# ---------------------------------------------------------------------------
+# SSRF egress guard (issue: http_request / port_check could reach internal hosts)
+# ---------------------------------------------------------------------------
+
+
+def _addrinfo_for(ip: str):
+    family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+    return [(family, socket.SOCK_STREAM, 6, "", (ip, 0))]
+
+
+class TestSsrfGuard:
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "127.0.0.1",  # loopback
+            "169.254.169.254",  # cloud metadata / link-local
+            "10.0.0.5",  # RFC-1918 private
+            "192.168.1.10",  # RFC-1918 private
+            "172.16.0.1",  # RFC-1918 private
+            "0.0.0.0",  # unspecified
+            "::1",  # IPv6 loopback
+        ],
+    )
+    async def test_http_request_blocks_internal_addresses(self, network_tool: NetworkTool, ip: str):
+        factory, client = _fake_httpx_client(_fake_response())
+        with (
+            patch(
+                "turing.tools.network.socket.getaddrinfo",
+                side_effect=lambda *a, **k: _addrinfo_for(ip),
+            ),
+            patch("turing.tools.network.httpx.AsyncClient", factory),
+        ):
+            result = await network_tool.execute(
+                action="http_request", url="http://internal.example/"
+            )
+        assert result.success is False
+        assert "SSRF" in result.error
+        client.get.assert_not_awaited()
+
+    async def test_http_request_rejects_non_http_scheme(self, network_tool: NetworkTool):
+        result = await network_tool.execute(action="http_request", url="file:///etc/passwd")
+        assert result.success is False
+        assert "scheme" in result.error.lower()
+
+    async def test_http_request_blocks_redirect_to_internal(self, network_tool: NetworkTool):
+        """A public URL that redirects to an internal address is re-validated and blocked."""
+        redirect = _fake_response(status_code=302)
+        redirect.is_redirect = True
+        redirect.headers = {"location": "http://169.254.169.254/latest/meta-data/"}
+        factory, _client = _fake_httpx_client(redirect)
+
+        def _resolver(host, *_a, **_k):
+            return _addrinfo_for(
+                "169.254.169.254" if host == "169.254.169.254" else "93.184.216.34"
+            )
+
+        with (
+            patch("turing.tools.network.socket.getaddrinfo", side_effect=_resolver),
+            patch("turing.tools.network.httpx.AsyncClient", factory),
+        ):
+            result = await network_tool.execute(action="http_request", url="http://public.example/")
+        assert result.success is False
+        assert "SSRF" in result.error
+
+    async def test_port_check_blocks_internal(self, network_tool: NetworkTool):
+        opener = AsyncMock()
+        with (
+            patch(
+                "turing.tools.network.socket.getaddrinfo",
+                side_effect=lambda *a, **k: _addrinfo_for("127.0.0.1"),
+            ),
+            patch("turing.tools.network.asyncio.open_connection", opener),
+        ):
+            result = await network_tool.execute(action="port_check", host="localhost", port=22)
+        assert result.success is False
+        assert "SSRF" in result.error
+        opener.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
