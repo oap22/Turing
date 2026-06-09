@@ -81,7 +81,15 @@ jobs:
         run: docker info
 
       - name: Pre-pull nats:2.10
-        run: docker pull nats:2.10
+        # Docker Hub occasionally times out on hosted runners; retry with
+        # backoff so a registry blip doesn't fail the whole job.
+        run: |
+          for delay in 5 15 30 60; do
+            docker pull nats:2.10 && exit 0
+            echo "docker pull failed; retrying in ${delay}s..."
+            sleep "$delay"
+          done
+          docker pull nats:2.10
 
       - name: Run real-broker integration tests
         env:
