@@ -60,3 +60,23 @@ class TestWebSocketHelloFrame:
         with client.websocket_connect("/ws") as ws:
             frame = json.loads(ws.receive_text())
             assert frame["type"] == "hello"
+
+
+class TestWebSocketOrigin:
+    """Cross-site WebSocket hijacking (CSWSH) protection."""
+
+    def test_cross_origin_handshake_rejected(self, client: TestClient) -> None:
+        client.cookies.set("turing_gateway_token", "secret-token")
+        with (
+            pytest.raises(WebSocketDisconnect),
+            client.websocket_connect("/ws", headers={"Origin": "http://evil.example"}) as ws,
+        ):
+            ws.receive_text()
+
+    def test_same_origin_handshake_allowed(self, client: TestClient) -> None:
+        with client.websocket_connect(
+            "/ws",
+            headers={"Authorization": "Bearer secret-token", "Origin": "http://testserver"},
+        ) as ws:
+            frame = json.loads(ws.receive_text())
+            assert frame["type"] == "hello"

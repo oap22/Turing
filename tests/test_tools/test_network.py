@@ -181,6 +181,7 @@ def _fake_response(*, status_code: int = 200, text: str = "hello", reason: str =
     resp.text = text
     resp.content = text.encode()
     resp.headers = {"content-type": "text/plain"}
+    resp.is_redirect = False
     return resp
 
 
@@ -188,6 +189,21 @@ def _patch_public_dns(addr: str = "93.184.216.34"):
     """Make every hostname resolve to a public address (SSRF guard passes)."""
     addrinfo = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (addr, 0))]
     return patch("turing.tools.network.socket.getaddrinfo", return_value=addrinfo)
+
+
+def _public_addrinfo(*_args, **_kwargs):
+    """Stand-in for ``socket.getaddrinfo`` that resolves to a public address.
+
+    The SSRF guard resolves every URL/host before connecting; tests mock the
+    HTTP/socket layer, so the resolver is mocked too to return a routable IP.
+    """
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+
+
+@pytest.fixture(autouse=True)
+def _public_dns_default():
+    with patch("turing.tools.network.socket.getaddrinfo", side_effect=_public_addrinfo):
+        yield
 
 
 class TestHttpRequest:
@@ -252,6 +268,7 @@ class TestHttpRequest:
 
     async def test_follows_public_redirect(self, network_tool: NetworkTool):
         first = _fake_response(status_code=302, reason="Found", text="")
+        first.is_redirect = True
         first.headers = {"location": "http://other.example/final"}
         final = _fake_response(text="landed")
         factory, client = _fake_httpx_client(first)
@@ -264,6 +281,7 @@ class TestHttpRequest:
 
     async def test_too_many_redirects(self, network_tool: NetworkTool):
         bouncer = _fake_response(status_code=302, reason="Found", text="")
+        bouncer.is_redirect = True
         bouncer.headers = {"location": "http://example.com/again"}
         factory, _client = _fake_httpx_client(bouncer)
         with patch("turing.tools.network.httpx.AsyncClient", factory), _patch_public_dns():
@@ -297,7 +315,7 @@ class TestHttpSsrfGuard:
         ):
             result = await network_tool.execute(action="http_request", url=url)
         assert result.success is False
-        assert "Blocked non-public address" in result.error
+        assert "SSRF protection" in result.error
         client.get.assert_not_awaited()
         client.post.assert_not_awaited()
 
@@ -310,17 +328,27 @@ class TestHttpSsrfGuard:
         ):
             result = await network_tool.execute(action="http_request", url="http://evil.example/")
         assert result.success is False
-        assert "Blocked non-public address" in result.error
+        assert "SSRF protection" in result.error
         client.get.assert_not_awaited()
 
     async def test_blocks_redirect_to_private(self, network_tool: NetworkTool):
         redirect = _fake_response(status_code=302, reason="Found", text="")
+        redirect.is_redirect = True
         redirect.headers = {"location": "http://169.254.169.254/latest/meta-data/"}
         factory, client = _fake_httpx_client(redirect)
-        with patch("turing.tools.network.httpx.AsyncClient", factory), _patch_public_dns():
+
+        def _resolver(host, *_a, **_k):
+            ip = "169.254.169.254" if host == "169.254.169.254" else "93.184.216.34"
+            family = socket.AF_INET
+            return [(family, socket.SOCK_STREAM, 6, "", (ip, 0))]
+
+        with (
+            patch("turing.tools.network.httpx.AsyncClient", factory),
+            patch("turing.tools.network.socket.getaddrinfo", side_effect=_resolver),
+        ):
             result = await network_tool.execute(action="http_request", url="http://example.com")
         assert result.success is False
-        assert "Blocked non-public address" in result.error
+        assert "SSRF protection" in result.error
         # Only the first (public) hop was fetched; the private hop never was.
         client.get.assert_awaited_once_with("http://example.com")
 
@@ -340,8 +368,87 @@ class TestHttpSsrfGuard:
         ):
             result = await network_tool.execute(action="http_request", url="http://nope.invalid/")
         assert result.success is False
-        assert "DNS resolution failed" in result.error
+        assert "could not resolve host" in result.error
         client.get.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# SSRF egress guard (issue: http_request / port_check could reach internal hosts)
+# ---------------------------------------------------------------------------
+
+
+def _addrinfo_for(ip: str):
+    family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+    return [(family, socket.SOCK_STREAM, 6, "", (ip, 0))]
+
+
+class TestSsrfGuard:
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "127.0.0.1",  # loopback
+            "169.254.169.254",  # cloud metadata / link-local
+            "10.0.0.5",  # RFC-1918 private
+            "192.168.1.10",  # RFC-1918 private
+            "172.16.0.1",  # RFC-1918 private
+            "0.0.0.0",  # unspecified
+            "::1",  # IPv6 loopback
+        ],
+    )
+    async def test_http_request_blocks_internal_addresses(self, network_tool: NetworkTool, ip: str):
+        factory, client = _fake_httpx_client(_fake_response())
+        with (
+            patch(
+                "turing.tools.network.socket.getaddrinfo",
+                side_effect=lambda *a, **k: _addrinfo_for(ip),
+            ),
+            patch("turing.tools.network.httpx.AsyncClient", factory),
+        ):
+            result = await network_tool.execute(
+                action="http_request", url="http://internal.example/"
+            )
+        assert result.success is False
+        assert "SSRF" in result.error
+        client.get.assert_not_awaited()
+
+    async def test_http_request_rejects_non_http_scheme(self, network_tool: NetworkTool):
+        result = await network_tool.execute(action="http_request", url="file:///etc/passwd")
+        assert result.success is False
+        assert "scheme" in result.error.lower()
+
+    async def test_http_request_blocks_redirect_to_internal(self, network_tool: NetworkTool):
+        """A public URL that redirects to an internal address is re-validated and blocked."""
+        redirect = _fake_response(status_code=302)
+        redirect.is_redirect = True
+        redirect.headers = {"location": "http://169.254.169.254/latest/meta-data/"}
+        factory, _client = _fake_httpx_client(redirect)
+
+        def _resolver(host, *_a, **_k):
+            return _addrinfo_for(
+                "169.254.169.254" if host == "169.254.169.254" else "93.184.216.34"
+            )
+
+        with (
+            patch("turing.tools.network.socket.getaddrinfo", side_effect=_resolver),
+            patch("turing.tools.network.httpx.AsyncClient", factory),
+        ):
+            result = await network_tool.execute(action="http_request", url="http://public.example/")
+        assert result.success is False
+        assert "SSRF" in result.error
+
+    async def test_port_check_blocks_internal(self, network_tool: NetworkTool):
+        opener = AsyncMock()
+        with (
+            patch(
+                "turing.tools.network.socket.getaddrinfo",
+                side_effect=lambda *a, **k: _addrinfo_for("127.0.0.1"),
+            ),
+            patch("turing.tools.network.asyncio.open_connection", opener),
+        ):
+            result = await network_tool.execute(action="port_check", host="localhost", port=22)
+        assert result.success is False
+        assert "SSRF" in result.error
+        opener.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
