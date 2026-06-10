@@ -164,8 +164,9 @@ class TuringConfig(BaseSettings):
         description="Host allowlist for the worker-local web_fetch grounding tool "
         "(ADR 0009 §2). Each entry admits the host and its subdomains; the default "
         "covers research-paper sources (arXiv, Google Scholar via scholar.google.com, "
-        "Semantic Scholar, OpenReview, …). JSON list in env: "
-        "TURING_WEB_FETCH_ALLOWED_HOSTS.",
+        "Semantic Scholar, OpenReview, …). This is the contract the worker grounding "
+        "assembly consumes when it lands — nothing reads it in Phase 0 yet. JSON "
+        "list in env: TURING_WEB_FETCH_ALLOWED_HOSTS.",
     )
 
     # ── Telemetry ────────────────────────────────────────────────────────

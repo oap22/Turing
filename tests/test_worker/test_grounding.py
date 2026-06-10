@@ -24,8 +24,10 @@ from turing.worker.grounding import (
 )
 from turing.worker.tools.web_fetch import (
     DEFAULT_ALLOWED_HOSTS,
+    MAX_REDIRECT_HOPS,
     WebFetchAllowlist,
     WebFetchNotAllowedError,
+    httpx_fetcher,
     web_fetch,
 )
 
@@ -137,6 +139,78 @@ async def test_web_fetch_refuses_disallowed_host() -> None:
         await web_fetch(
             "https://evil.com/x", allowlist=allow, fetcher=_fake_fetcher, now_ms=1, source_id="s1"
         )
+
+
+# ── httpx fetcher redirect validation ────────────────────────────────────────
+
+
+class _StubResponse:
+    def __init__(self, status_code: int, *, location: str | None = None, text: str = "") -> None:
+        self.status_code = status_code
+        self.headers = {"location": location} if location is not None else {}
+        self.text = text
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class _StubClient:
+    """httpx.AsyncClient-like: serves a scripted URL → response map."""
+
+    def __init__(self, routes: dict[str, _StubResponse]) -> None:
+        self._routes = routes
+        self.requested: list[str] = []
+
+    async def get(self, url: str, *, timeout: float, follow_redirects: bool) -> _StubResponse:
+        assert follow_redirects is False  # hops must be validated, never auto-followed
+        self.requested.append(url)
+        return self._routes[url]
+
+
+@pytest.mark.asyncio
+async def test_httpx_fetcher_refuses_redirect_to_disallowed_host() -> None:
+    """Google Scholar's /scholar_url open redirect must not become an
+    allowlist bypass: the redirect target is re-checked and refused."""
+    start = "https://scholar.google.com/scholar_url?url=http://169.254.169.254/"
+    client = _StubClient(
+        {start: _StubResponse(302, location="http://169.254.169.254/latest/meta-data/")}
+    )
+    fetch = httpx_fetcher(client, allowlist=WebFetchAllowlist(DEFAULT_ALLOWED_HOSTS))
+    with pytest.raises(WebFetchNotAllowedError):
+        await fetch(start)
+    # The internal host was never contacted.
+    assert client.requested == [start]
+
+
+@pytest.mark.asyncio
+async def test_httpx_fetcher_follows_allowed_redirects_including_relative() -> None:
+    client = _StubClient(
+        {
+            "https://arxiv.org/abs/2305.14314": _StubResponse(301, location="/pdf/2305.14314"),
+            "https://arxiv.org/pdf/2305.14314": _StubResponse(
+                302, location="https://export.arxiv.org/pdf/2305.14314"
+            ),
+            "https://export.arxiv.org/pdf/2305.14314": _StubResponse(
+                200, text="<title>QLoRA</title>paper text"
+            ),
+        }
+    )
+    fetch = httpx_fetcher(client, allowlist=WebFetchAllowlist(DEFAULT_ALLOWED_HOSTS))
+    title, text = await fetch("https://arxiv.org/abs/2305.14314")
+    assert title == "QLoRA"
+    assert "paper text" in text
+    assert len(client.requested) == 3
+
+
+@pytest.mark.asyncio
+async def test_httpx_fetcher_caps_redirect_hops() -> None:
+    loop_url = "https://arxiv.org/loop"
+    client = _StubClient({loop_url: _StubResponse(302, location=loop_url)})
+    fetch = httpx_fetcher(client, allowlist=WebFetchAllowlist(DEFAULT_ALLOWED_HOSTS))
+    with pytest.raises(WebFetchNotAllowedError, match="redirects"):
+        await fetch(loop_url)
+    assert len(client.requested) == MAX_REDIRECT_HOPS + 1
 
 
 # ── grounded draft path ──────────────────────────────────────────────────────

@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -35,9 +35,12 @@ MAX_FETCH_CHARS = 8_000
 # ``TuringConfig.web_fetch_allowed_hosts`` (env ``TURING_WEB_FETCH_ALLOWED_HOSTS``).
 # Subdomains of each entry are allowed, so ``scholar.google.com`` admits Google
 # Scholar (paper search, citations, PDF links) without ever allowlisting
-# ``google.com`` itself. Hosts are direct-content sources only: generic
-# redirectors (doi.org and friends) stay off the list because the allowlist
-# checks the *requested* URL, not where a redirect lands.
+# ``google.com`` itself. Redirects are not a way around the list — the
+# production fetcher re-checks every hop (see :func:`httpx_fetcher`), which is
+# what keeps Scholar's own ``/scholar_url?url=…`` open redirect from becoming a
+# bypass. Generic redirectors (doi.org and friends) still stay off the list:
+# they resolve to arbitrary publisher hosts that aren't allowlisted, so
+# admitting them buys nothing.
 DEFAULT_ALLOWED_HOSTS: tuple[str, ...] = (
     "arxiv.org",
     "scholar.google.com",
@@ -121,15 +124,39 @@ async def web_fetch(
     )
 
 
-def httpx_fetcher(client: object, *, timeout_s: float = 20.0) -> Fetcher:  # pragma: no cover
+# Redirect chains beyond this are refused — research sources resolve in a
+# hop or two; anything longer is a loop or a laundering chain.
+MAX_REDIRECT_HOPS = 5
+
+
+def httpx_fetcher(
+    client: object, *, allowlist: WebFetchAllowlist, timeout_s: float = 20.0
+) -> Fetcher:
     """Build a :data:`Fetcher` over an ``httpx.AsyncClient``-like object.
 
-    Kept import-light and untested here (no live network in CI); the grounding
-    loop is exercised against an injected stub fetcher instead.
+    Redirects are followed *manually* and every hop is re-checked against the
+    allowlist: an allowed host that 3xx-redirects elsewhere (Google Scholar's
+    ``/scholar_url?url=…`` open redirect, say) must not become an allowlist
+    bypass to arbitrary or internal hosts. Kept import-light (stdlib +
+    duck-typed client only).
     """
 
     async def _fetch(url: str) -> tuple[str, str]:
-        response = await client.get(url, timeout=timeout_s, follow_redirects=True)  # type: ignore[attr-defined]
+        current = url
+        for _ in range(MAX_REDIRECT_HOPS + 1):
+            allowlist.check(current)
+            response = await client.get(  # type: ignore[attr-defined]
+                current, timeout=timeout_s, follow_redirects=False
+            )
+            location = response.headers.get("location", "")
+            if 300 <= response.status_code < 400 and location:
+                current = urljoin(current, location)
+                continue
+            break
+        else:
+            raise WebFetchNotAllowedError(
+                f"web_fetch refused {url!r}: more than {MAX_REDIRECT_HOPS} redirects"
+            )
         response.raise_for_status()
         text = response.text
         # Best-effort <title> extraction without an HTML parser dependency.
