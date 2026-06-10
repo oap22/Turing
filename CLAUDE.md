@@ -30,6 +30,17 @@ docker compose up -d                      # 4 nodes + Ollama
 docker compose logs -f turing-node-1      # Follow primary node
 ```
 
+## Remote-session gotchas (Claude Code on the web / agent containers)
+
+Known failure modes in managed containers — work around them instead of rediscovering them:
+
+- **Tests that create git commits in tmp repos** (vault committer/proposer/watcher, bench cycle) fail with `git commit … exit status 128` because the container's global git config enables commit signing. Run them with a neutral config:
+  `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null pytest …`
+  These same failures (~40 tests) are pre-existing on any branch in this environment; they are not caused by your change.
+- **GitHub MCP `pull_request_read` with `method: get_status` returns 403** ("Resource not accessible by integration"). Use `method: get_check_runs` instead — it works and covers CI state.
+- **`webui/` tests need `npm ci` first** — `npm run test` fails with `vitest: not found` on a fresh clone.
+- **No pre-built venv** — `pytest`/`mypy` on PATH don't see the project. Create `.venv` per the Setup block above and call `.venv/bin/pytest` etc.
+
 ## Architecture
 
 **Turing** is an autonomous AI assistant running on Raspberry Pis, communicating via Discord, with a hybrid LLM brain (local Ollama + cloud Claude API).
