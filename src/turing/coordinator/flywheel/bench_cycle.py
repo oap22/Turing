@@ -18,6 +18,11 @@ git vault, tmp output dirs). Exactly three edges are faked:
    (corrected answer becomes the SFT target), reject, plus frontier-review
    approve *and* decline.
 
+One piece of bench glue sits outside those edges: the A/B preference probe
+maps the operator's curation verdicts onto ``Episode.critic_score`` (the field
+``DPODatasetBuilder`` pairs on) by hand — production Phase 0 has no
+curation→critic projection yet, only the dormant pre-0009 critic queue.
+
 Two cycles are mandatory: the ADR 0009 guardrails (accumulate-never-replace,
 retrain-from-base, frontier dedup) are cross-cycle properties invisible in a
 single pass. Cycle 2 seeds partly from cycle 1's worker-proposed follow-ups
@@ -204,6 +209,13 @@ def _now_ms_factory(start: int = 1_700_000_000_000) -> Callable[[], int]:
         return counter["t"]
 
     return now
+
+
+def _stub_adapter_blob(*, base_model: str, dataset_sha256: str) -> bytes:
+    """The synthetic trainer's artifact: a pure function of (base model,
+    dataset bytes) — shared with the from-base invariant so the published
+    hash can be recomputed from those inputs and nothing else."""
+    return f"bench-stub-adapter|base={base_model}|dataset={dataset_sha256}".encode()
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -628,6 +640,10 @@ class BenchCycle:
 
         # The operator's probe preference, written back through the episode
         # store's real post-hoc scoring API, is what the DPO builder pairs on.
+        # Bench glue, not a production seam: nothing in Phase 0 maps curation
+        # decisions to critic scores (the only production caller of
+        # update_critic_score is the dormant pre-0009 critic queue) — this
+        # stands in for that future curation→critic projection.
         self._episodes.update_critic_score(subtask_id="q-c2-probe-a", critic_score=0.9)
         self._episodes.update_critic_score(subtask_id="q-c2-probe-b", critic_score=0.2)
         dpo = DPODatasetBuilder(episode_store=self._episodes).build(
@@ -660,11 +676,24 @@ class BenchCycle:
         )
 
         manifest = self._train_and_register(dataset, version="v2")
+        # Recomputing the stub blob from (base model, v2 dataset bytes) alone
+        # and matching the *published* manifest hash proves the artifact is a
+        # pure function of those inputs — nothing cycle-1-derived could have
+        # entered training. (A `train_from_base is True` conjunct would be
+        # tautological: LoraRecipe.__post_init__ rejects anything else.)
+        expected_v2_sha = hashlib.sha256(
+            _stub_adapter_blob(
+                base_model=BASE_MODEL,
+                dataset_sha256=hashlib.sha256(dataset.out_path.read_bytes()).hexdigest(),
+            )
+        ).hexdigest()
         self._check(
             "cycle2: adapter built from base, not from the cycle-1 adapter",
             manifest.base_model == BASE_MODEL
             and all(j["base_model"] == BASE_MODEL for j in self._trainer_jobs)
-            and self._recipe.to_hyperparameters()["train_from_base"] is True,
+            and manifest.sha256 == expected_v2_sha
+            and manifest.sha256 != cycle1["manifest"].sha256,
+            f"published sha256={manifest.sha256[:12]}…",
         )
 
         self._rigged_canary_scores["v2"] = CYCLE2_CANARY_SCORE
@@ -718,9 +747,11 @@ class BenchCycle:
         )
         hard_ids = [h.subtask_id for h in outcome.hard_examples]
         # Guard against make_canary_rejected_handler no longer registering these
-        # episodes: a missing episode would crash with AttributeError rather than
-        # raising a clear BenchInvariantError.
-        missing = [hid for hid in hard_ids if self._episodes.get(hid) is None]
+        # episodes. EpisodeStore.get raises KeyError for an absent id, so check
+        # membership against a snapshot — a missing episode must surface as a
+        # clear BenchInvariantError, not an incidental traceback.
+        registered = {ep.subtask_id for ep in self._episodes.all_episodes()}
+        missing = [hid for hid in hard_ids if hid not in registered]
         self._check(
             "rejection: hard_example episodes were registered in EpisodeStore",
             len(missing) == 0,
@@ -766,9 +797,15 @@ class BenchCycle:
             for line in positives.out_path.read_text(encoding="utf-8").splitlines()
             if line
         ]
+        # The filter must *separate*, not merely exclude: the accepted probe's
+        # positive row has to survive the same build the hard examples are
+        # filtered out of, otherwise an empty build would pass vacuously.
+        probe = self._episodes.get("q-c2-probe-a")
         self._check(
             "feed-forward: hard_examples never promoted into positive training rows",
-            all(r["input"] not in hard_inputs for r in rows),
+            any(r["input"] == probe.input_text and r["output"] == probe.output_text for r in rows)
+            and all(r["input"] not in hard_inputs for r in rows),
+            f"positive_rows={len(rows)}",
         )
 
     # ── seams: dataset / trainer / registry ─────────────────────────────────
@@ -814,7 +851,7 @@ class BenchCycle:
         """Synthetic edge #2 — the blob is derived from the base model and the
         dataset only; a prior adapter cannot leak in (no stacking)."""
         dataset_sha = hashlib.sha256(dataset_path.read_bytes()).hexdigest()
-        blob = f"bench-stub-adapter|base={job.base_model}|dataset={dataset_sha}".encode()
+        blob = _stub_adapter_blob(base_model=job.base_model, dataset_sha256=dataset_sha)
         out_path.write_bytes(blob)
         self._trainer_jobs.append({"job_id": job.job_id, "base_model": job.base_model})
         return blob
@@ -945,10 +982,14 @@ class BenchCycle:
                 len(events) == 1 and events[0].value == value,
                 f"events={[(e.source.value, e.value) for e in events]}",
             )
+            # Each bench episode carries exactly one curation event (asserted
+            # above), so the effective reward must equal that event's value —
+            # an independently-known expectation, not effective_reward's own
+            # SUM(value) definition read back.
             self._check(
-                f"{cycle}: effective reward is SUM(value) ({episode_id})",
-                self._rewards.effective_reward(episode_id)
-                == sum(e.value for e in self._rewards.events_for(episode_id)),
+                f"{cycle}: effective reward equals the curation verb's value ({episode_id})",
+                self._rewards.effective_reward(episode_id) == value,
+                f"effective={self._rewards.effective_reward(episode_id)} expected={value}",
             )
             self._summary.setdefault("reward_rows", {})[episode_id] = [
                 (e.source.value, e.value) for e in self._rewards.events_for(episode_id)
