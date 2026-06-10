@@ -48,7 +48,7 @@ export default function ObservabilityView({
       </section>
       <aside
         aria-label="Message trace"
-        className="w-[420px] shrink-0 border-l border-term-edge"
+        className="w-[420px] shrink-0 border-r border-term-edge"
       >
         <MemoTracePane liveEvents={liveTrace} onSelect={onTraceSelect} />
       </aside>
