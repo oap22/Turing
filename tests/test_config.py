@@ -141,6 +141,35 @@ class TestEnvOverrides:
         assert cfg.allowed_write_paths == ["/var/data", "/opt/out"]
 
 
+class TestWebFetchAllowedHosts:
+    """The web_fetch grounding allowlist (ADR 0009 §2) — research-paper defaults."""
+
+    def test_default_covers_research_paper_sources(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+        assert "arxiv.org" in cfg.web_fetch_allowed_hosts
+        assert "scholar.google.com" in cfg.web_fetch_allowed_hosts
+        assert "semanticscholar.org" in cfg.web_fetch_allowed_hosts
+        # Google Scholar must NOT drag all of google.com onto the allowlist.
+        assert "google.com" not in cfg.web_fetch_allowed_hosts
+
+    def test_default_matches_canonical_constant(self) -> None:
+        from turing.worker.tools.web_fetch import DEFAULT_ALLOWED_HOSTS
+
+        with patch.dict("os.environ", {}, clear=True):
+            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.web_fetch_allowed_hosts == list(DEFAULT_ALLOWED_HOSTS)
+
+    def test_override_via_env_json_list(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"TURING_WEB_FETCH_ALLOWED_HOSTS": '["arxiv.org", "example.org"]'},
+            clear=True,
+        ):
+            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.web_fetch_allowed_hosts == ["arxiv.org", "example.org"]
+
+
 class TestMeshSigningConfig:
     """Signed-presence key material (issue #348) — fail-closed defaults."""
 

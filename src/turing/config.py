@@ -9,6 +9,8 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from turing.worker.tools.web_fetch import DEFAULT_ALLOWED_HOSTS
+
 
 class TuringConfig(BaseSettings):
     """Central configuration for the Turing assistant.
@@ -156,6 +158,15 @@ class TuringConfig(BaseSettings):
         "Loading a plugin runs arbitrary code, so this is fail-closed: unset "
         '(the default) loads NO plugins. Use ["*"] to load every plugin found, '
         "or a JSON list of names. Env: TURING_ALLOWED_PLUGINS.",
+    )
+    web_fetch_allowed_hosts: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_ALLOWED_HOSTS),
+        description="Host allowlist for the worker-local web_fetch grounding tool "
+        "(ADR 0009 §2). Each entry admits the host and its subdomains; the default "
+        "covers research-paper sources (arXiv, Google Scholar via scholar.google.com, "
+        "Semantic Scholar, OpenReview, …). This is the contract the worker grounding "
+        "assembly consumes when it lands — nothing reads it in Phase 0 yet. JSON "
+        "list in env: TURING_WEB_FETCH_ALLOWED_HOSTS.",
     )
 
     # ── Telemetry ────────────────────────────────────────────────────────

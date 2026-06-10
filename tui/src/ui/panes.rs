@@ -261,8 +261,17 @@ fn gauge_cell(pct: Option<f64>, sev_color: ratatui::style::Color) -> Cell<'stati
 }
 
 pub fn specs(f: &mut Frame, area: Rect, app: &App) {
-    let header = Row::new(["node", "hw", "cpu", "mem", "disk", "temp", "up", "load"])
-        .style(Style::default().fg(theme::ACCENT).bold());
+    let header = Row::new([
+        "node",
+        "hw",
+        "cpu",
+        "mem",
+        "disk",
+        "temp",
+        "up",
+        "load 1/5/15",
+    ])
+    .style(Style::default().fg(theme::ACCENT).bold());
     let rows: Vec<Row> = app
         .peers
         .iter()
@@ -290,10 +299,21 @@ pub fn specs(f: &mut Frame, area: Rect, app: &App) {
                 .map(|x| fmt_uptime(x.uptime_seconds))
                 .unwrap_or_else(|| "—".into());
             let load = s
-                .map(|x| format!("{:.2}", x.loadavg_1m))
+                .map(|x| {
+                    format!(
+                        "{:.2} {:.2} {:.2}",
+                        x.loadavg_1m, x.loadavg_5m, x.loadavg_15m
+                    )
+                })
                 .unwrap_or_else(|| "—".into());
             let hw = s
-                .map(|x| truncate(&x.model_name, 18))
+                .map(|x| {
+                    if x.cpu_cores > 0 {
+                        format!("{} {}c", truncate(&x.model_name, 15), x.cpu_cores)
+                    } else {
+                        truncate(&x.model_name, 18)
+                    }
+                })
                 .unwrap_or_else(|| "—".into());
 
             let cpu_color = match cpu_pct {
@@ -339,7 +359,7 @@ pub fn specs(f: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(10),
         Constraint::Length(6),
         Constraint::Length(6),
-        Constraint::Length(6),
+        Constraint::Length(17),
     ];
     let active = app.active == Pane::Specs;
     let title = Line::from(vec![
