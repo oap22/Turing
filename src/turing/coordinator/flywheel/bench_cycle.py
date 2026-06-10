@@ -136,6 +136,14 @@ IDENTITY = ("turing-bench", "bench@turing.local")
 CYCLE1_CANARY_SCORE = 81.0
 CYCLE2_CANARY_SCORE = 79.0
 
+# Scripted operator preference for the cycle-2 A/B probe, written back through
+# the real post-hoc scoring API (`EpisodeStore.update_critic_score`). The gap
+# must clear DPODatasetBuilder's min_score_gap (0.3) for the pair to form. In
+# production this writer is the deferred cloud-judge path (ADR 0009); the
+# bench scripts it as part of synthetic edge #3.
+PROBE_PREFERRED_SCORE = 0.9
+PROBE_REJECTED_SCORE = 0.2
+
 # Real grounding fragments the canned worker drafts cite (ADR 0009: knowledge
 # enters from outside the student model).
 _SOURCES = [
@@ -219,6 +227,11 @@ def _git(repo: Path, *args: str) -> None:
             "GIT_AUTHOR_EMAIL": IDENTITY[1],
             "GIT_COMMITTER_NAME": IDENTITY[0],
             "GIT_COMMITTER_EMAIL": IDENTITY[1],
+            # Insulate the fixture repo from the developer's global config
+            # (commit signing, hooks) so the seed commit can't fail on
+            # machines with e.g. commit.gpgsign=true.
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
         },
     )
 
@@ -316,7 +329,6 @@ class BenchCycle:
         self._scripted_proposals: dict[str, list[tuple[str, str]]] = {}
         self._rigged_canary_scores: dict[str, float] = {}
         self._dispatched_prompts: list[str] = []
-        self._trainer_jobs: list[dict[str, str]] = []
 
     # ── public entry point ───────────────────────────────────────────────────
 
@@ -447,12 +459,18 @@ class BenchCycle:
         )
 
         # Morning frontier review: approve one proposal, decline the other.
+        # Select by prompt, not position — pending() tie-breaks same-batch
+        # proposals by their random uuid ids, so positional indexing would make
+        # the scripted operator's choice (and every downstream artifact)
+        # nondeterministic.
         review = FrontierReview(proposed=self._proposed, queue=self._queue)
         pending = self._proposed.pending()
         self._check("cycle1: worker proposals landed in the holding queue", len(pending) == 2)
-        promoted = review.approve(pending[0].proposal_id, now_ms=self._now())
-        review.decline(pending[1].proposal_id)
-        declined = self._proposed.get(pending[1].proposal_id)
+        to_approve = next(p for p in pending if "LoRA rank" in p.prompt)
+        to_decline = next(p for p in pending if "colour" in p.prompt)
+        promoted = review.approve(to_approve.proposal_id, now_ms=self._now())
+        review.decline(to_decline.proposal_id)
+        declined = self._proposed.get(to_decline.proposal_id)
         self._check(
             "cycle1: approved proposal promoted with origin provenance",
             promoted.approved
@@ -625,8 +643,12 @@ class BenchCycle:
 
         # The operator's probe preference, written back through the episode
         # store's real post-hoc scoring API, is what the DPO builder pairs on.
-        self._episodes.update_critic_score(subtask_id="q-c2-probe-a", critic_score=0.9)
-        self._episodes.update_critic_score(subtask_id="q-c2-probe-b", critic_score=0.2)
+        self._episodes.update_critic_score(
+            subtask_id="q-c2-probe-a", critic_score=PROBE_PREFERRED_SCORE
+        )
+        self._episodes.update_critic_score(
+            subtask_id="q-c2-probe-b", critic_score=PROBE_REJECTED_SCORE
+        )
         dpo = DPODatasetBuilder(episode_store=self._episodes).build(
             specialty=AI_ML_GENERALIST, out_path=self._artifacts / "dataset-dpo-v2.jsonl"
         )
@@ -657,11 +679,18 @@ class BenchCycle:
         )
 
         manifest = self._train_and_register(dataset, version="v2")
+        # No-stacking is asserted on the artifacts: the signed manifest names
+        # the base model (not the v1 adapter), the recipe cannot express a
+        # base_adapter, and the v2 blob is derived from base+dataset only —
+        # it carries no trace of the v1 blob's sha.
+        v1_sha = cycle1["manifest"].sha256
+        v2_blob = (self._artifacts / "bench-v2.adapter.safetensors").read_bytes()
         self._check(
             "cycle2: adapter built from base, not from the cycle-1 adapter",
             manifest.base_model == BASE_MODEL
-            and all(j["base_model"] == BASE_MODEL for j in self._trainer_jobs)
-            and self._recipe.to_hyperparameters()["train_from_base"] is True,
+            and self._recipe.to_hyperparameters()["train_from_base"] is True
+            and f"base={BASE_MODEL}" in v2_blob.decode()
+            and v1_sha not in v2_blob.decode(),
         )
 
         self._rigged_canary_scores["v2"] = CYCLE2_CANARY_SCORE
@@ -706,7 +735,7 @@ class BenchCycle:
         self._check(
             "rejection: cycle-2 adapter is permanently REJECTED",
             self._adapters.state_of(name=name, version="v2").value == "REJECTED"
-            and self._raises_value_error(lambda: self._adapters.promote(name=name, version="v2")),
+            and self._raises(ValueError, lambda: self._adapters.promote(name=name, version="v2")),
         )
         self._check(
             "rejection: canary reverts to the cycle-1 adapter",
@@ -743,6 +772,12 @@ class BenchCycle:
             "feed-forward: hard_examples present in the next dataset build input",
             hard_ids <= next_input_ids,
         )
+        # Backfill a high critic score onto the hard-example FAILED episodes so
+        # the builder's min_critic_score prefilter cannot mask the check below:
+        # only the FAILED-outcome filter (the guardrail hard_examples.py
+        # documents) is left to keep them out of positive rows.
+        for hid in hard_ids:
+            self._episodes.update_critic_score(subtask_id=hid, critic_score=0.95)
         positives = TrainingJobBuilder(episode_store=self._episodes).build(
             specialty=AI_ML_GENERALIST,
             top_k=100,
@@ -789,7 +824,7 @@ class BenchCycle:
         blob = result.adapter_path.read_bytes()
         self._check(
             f"{version}: tampered adapter blob fails AdapterRegistry.verify",
-            self._raises_hash_mismatch(lambda: self._adapters.verify(manifest, blob + b"x")),
+            self._raises(HashMismatchError, lambda: self._adapters.verify(manifest, blob + b"x")),
         )
         self._adapters.register(manifest, blob)  # verify → STAGED
         self._check(
@@ -804,7 +839,6 @@ class BenchCycle:
         dataset_sha = hashlib.sha256(dataset_path.read_bytes()).hexdigest()
         blob = f"bench-stub-adapter|base={job.base_model}|dataset={dataset_sha}".encode()
         out_path.write_bytes(blob)
-        self._trainer_jobs.append({"job_id": job.job_id, "base_model": job.base_model})
         return blob
 
     # ── synthetic edge #1: the worker LLM ────────────────────────────────────
@@ -818,10 +852,15 @@ class BenchCycle:
 
         async def handle(msg: MeshMessage) -> None:
             payload = json.loads(msg.payload.decode("utf-8"))
-            if payload.get("kind") == SubtaskKind.CANARY_EVAL.value:
+            kind = payload.get("kind")
+            if kind == SubtaskKind.CANARY_EVAL.value:
                 result = self._handle_canary_eval(payload, worker_id)
-            else:
+            elif kind == SubtaskKind.RESEARCH.value:
                 result = self._handle_research(payload, worker_id)
+            else:
+                # Fail fast rather than fabricating a plausible draft for a
+                # kind the bench's worker edge doesn't script.
+                raise BenchInvariantError(f"bench worker got unscripted kind {kind!r}")
             reply = MeshMessage(
                 request_id=f"r-{payload['subtask_id']}",
                 sender_id=worker_id,
@@ -865,11 +904,12 @@ class BenchCycle:
             ),
             slug=subtask_id,
         )
+        # An empty proposals fragment would still be a truthy dict, so map
+        # "no scripted proposals" to None rather than proposals_to_fragment([]).
+        scripted = self._scripted_proposals.get(subtask_id)
         fragment = merge_fragments(
             grounding_to_fragment(reasoning=reasoning, confidence=0.8, source_count=len(_SOURCES)),
-            proposals_to_fragment(self._scripted_proposals.get(subtask_id, []))
-            if subtask_id in self._scripted_proposals
-            else None,
+            proposals_to_fragment(scripted) if scripted else None,
         )
         return TaskResult(
             subtask_id=subtask_id,
@@ -943,6 +983,11 @@ class BenchCycle:
         for d in (self._vault_root, self._artifacts, self._eval_dir):
             d.mkdir(parents=True, exist_ok=True)
         _git(self._vault_root, "init", "-q")
+        # Repo-local config so the VaultCommitter's curation commits are also
+        # insulated from the developer's global signing/hook setup.
+        _git(self._vault_root, "config", "commit.gpgsign", "false")
+        _git(self._vault_root, "config", "user.name", IDENTITY[0])
+        _git(self._vault_root, "config", "user.email", IDENTITY[1])
         _git(self._vault_root, "commit", "-q", "--allow-empty", "-m", "vault: bench seed")
 
     def _seed_candidates(self) -> list[SFTCandidate]:
@@ -981,6 +1026,16 @@ class BenchCycle:
     def _make_on_rejected(
         self,
     ) -> Callable[[CanaryGateOutcome, str, str, str], Awaitable[None]]:
+        """The production rejection handler, plus the bench's feed delivery.
+
+        ``make_canary_rejected_handler`` archives hard examples and *logs* the
+        formatted notice — the webui/morning-review surfacing is a follow-on
+        slice (see canary_rejection.py). Until that lands, the bench formats
+        the same notice with the real formatter and delivers it to its
+        recorded feed, so the "notice reaches the feed" invariant pins the
+        intended contract rather than nothing. The bench knows its incumbent
+        is the cycle-1 adapter, so prior_* name the reverted-to version.
+        """
         base_handler = make_canary_rejected_handler(
             episode_store=self._episodes,
             rejection_log=self._rejection_log,
@@ -998,7 +1053,7 @@ class BenchCycle:
                 specialty=specialty,
                 outcome=outcome,
                 prior_name=name,
-                prior_version="v1",
+                prior_version="v1",  # the bench's scripted incumbent (cycle 1)
                 regressions_30d=self._rejection_log.count_within(
                     specialty=specialty,
                     now_ms=self._now(),
@@ -1025,18 +1080,11 @@ class BenchCycle:
         logger.debug("bench_invariant_held", name=name)
 
     @staticmethod
-    def _raises_value_error(fn: Callable[[], object]) -> bool:
+    def _raises(exc_type: type[BaseException], fn: Callable[[], object]) -> bool:
+        """True iff ``fn()`` raises ``exc_type`` — for negative-path invariants."""
         try:
             fn()
-        except ValueError:
-            return True
-        return False
-
-    @staticmethod
-    def _raises_hash_mismatch(fn: Callable[[], object]) -> bool:
-        try:
-            fn()
-        except HashMismatchError:
+        except exc_type:
             return True
         return False
 

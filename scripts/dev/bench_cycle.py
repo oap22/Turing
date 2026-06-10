@@ -21,9 +21,6 @@ import asyncio
 import sys
 from pathlib import Path
 
-# Allow running straight from a checkout without `pip install -e .`.
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-
 from turing.coordinator.flywheel.bench_cycle import (
     BenchCycle,
     BenchInvariantError,
@@ -32,8 +29,10 @@ from turing.coordinator.flywheel.bench_cycle import (
 
 async def run(args: argparse.Namespace) -> int:
     output_dir = Path(args.output).resolve()
-    if output_dir.exists() and any(output_dir.iterdir()):
-        print(f"refusing to run: {output_dir} exists and is not empty", file=sys.stderr)
+    if output_dir.exists() and (not output_dir.is_dir() or any(output_dir.iterdir())):
+        print(
+            f"refusing to run: {output_dir} exists and is not an empty directory", file=sys.stderr
+        )
         print("pick a fresh --output dir (the bench owns everything under it)", file=sys.stderr)
         return 2
 
@@ -62,7 +61,9 @@ async def run(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(
+        description="Run the bench cycle: two software-only turns of the research flywheel (#360)."
+    )
     parser.add_argument(
         "--output",
         default="data/bench-cycle",
