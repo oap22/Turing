@@ -84,9 +84,9 @@ const TABS: ReadonlyArray<{ id: TabId; label: string; hotkey: string }> = [
   { id: "obs", label: "observability", hotkey: "3" },
 ];
 
-function tabFromHash(hash: string): TabId {
+function tabFromHash(hash: string): TabId | null {
   const id = hash.replace(/^#/, "");
-  return TABS.find((t) => t.id === id)?.id ?? "queue";
+  return TABS.find((t) => t.id === id)?.id ?? null;
 }
 
 const WS_STATUS_LABEL: Record<WsStatus, { dot: string; text: string; cls: string }> = {
@@ -113,7 +113,9 @@ export default function App() {
   const [now, setNow] = useState(() => Date.now());
   const [specsRows, setSpecsRows] = useState<PeerSpecsRow[]>([]);
   const [wsStatus, setWsStatus] = useState<WsStatus>("reconnecting");
-  const [tab, setTab] = useState<TabId>(() => tabFromHash(window.location.hash));
+  const [tab, setTab] = useState<TabId>(
+    () => tabFromHash(window.location.hash) ?? "queue",
+  );
 
   const navigate = useCallback((next: TabId) => {
     setTab(next);
@@ -124,9 +126,18 @@ export default function App() {
     }
   }, []);
 
-  // External hash edits (or back/forward) still steer the view.
+  // External hash edits (or back/forward) still steer the view. Non-tab
+  // hashes (the #operator-surface skip link, in-page anchors) are ignored
+  // rather than coerced, so following them never switches the view.
   useEffect(() => {
-    const onHash = () => setTab(tabFromHash(window.location.hash));
+    const initial = window.location.hash;
+    if (initial !== "" && tabFromHash(initial) === null) {
+      window.history.replaceState(null, "", "#queue");
+    }
+    const onHash = () => {
+      const next = tabFromHash(window.location.hash);
+      if (next !== null) setTab(next);
+    };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);

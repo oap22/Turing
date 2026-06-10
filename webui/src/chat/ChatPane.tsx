@@ -7,7 +7,8 @@
 // Laid out master-detail (issue #358): a thread list on the left, the selected
 // thread's subtasks on the right with the prompt box pinned underneath. A null
 // selection follows the newest thread, so a fresh submit comes into view on
-// its own; clicking a thread pins it.
+// its own; clicking a thread — or touching the detail pane at all — pins it,
+// so another client's submit can't swap the thread mid-interaction.
 //
 // State is driven by the `chat.snapshot` / `chat.delta` WS frames (see
 // `reducer.ts`); the prompt box POSTs to `/api/chat/submit` and the per-subtask
@@ -16,7 +17,15 @@
 // `chat.delta`, so a failed POST self-heals on the next frame — same contract
 // as the queue pane.
 
-import { memo, useMemo, useRef, useState, type RefObject } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from "react";
 import type { ChatSession, ChatSubtask } from "../ws";
 import {
   acceptSubtask,
@@ -51,6 +60,20 @@ export default function ChatPane({ sessions }: Props) {
   const selected = pinned ?? newest;
   const reversedSessions = useMemo(() => [...sessions].reverse(), [sessions]);
   const promptRef = useRef<HTMLTextAreaElement>(null);
+
+  // A pin to a session that vanished from a snapshot (WS reconnect after a
+  // gateway restart) is cleared rather than kept dormant — otherwise the view
+  // would snap back unprompted if the id ever reappeared.
+  useEffect(() => {
+    if (pinnedId !== null && pinned === undefined) setPinnedId(null);
+  }, [pinnedId, pinned]);
+
+  // Following the newest thread is for idle viewing only: the moment the
+  // operator touches the detail pane (editing a correction, reading a stream),
+  // pin it so another client's submit can't yank the thread mid-interaction.
+  const pinSelected = useCallback(() => {
+    setPinnedId((cur) => cur ?? (selected ? selected.id : null));
+  }, [selected]);
 
   return (
     <div
@@ -107,6 +130,8 @@ export default function ChatPane({ sessions }: Props) {
           aria-label="Chat threads"
           className="flex-1 overflow-y-auto p-2"
           data-testid="chat-thread"
+          onPointerDownCapture={pinSelected}
+          onFocusCapture={pinSelected}
         >
           {!selected && (
             <p className="px-1 text-term-dim">

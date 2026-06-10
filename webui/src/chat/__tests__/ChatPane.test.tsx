@@ -259,6 +259,42 @@ describe("ChatPane master-detail", () => {
     expect(screen.getByText("older answer")).toBeInTheDocument();
   });
 
+  it("interacting with the detail pane pins the followed thread", () => {
+    const { rerender } = render(<ChatPane sessions={twoSessions()} />);
+    expect(screen.getByTestId("chat-session-new")).toBeInTheDocument();
+    // Touching the detail pane (e.g. starting an edit) pins the thread…
+    fireEvent.pointerDown(screen.getByTestId("chat-session-new"));
+    // …so another client's submit can't yank it out from under the operator.
+    rerender(
+      <ChatPane
+        sessions={[
+          ...twoSessions(),
+          session({ id: "intruder", created_at_ms: 3 }),
+        ]}
+      />,
+    );
+    expect(screen.getByTestId("chat-session-new")).toBeInTheDocument();
+    expect(
+      screen.queryByTestId("chat-session-intruder"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("clears a stale pin when the pinned thread disappears", () => {
+    const { rerender } = render(<ChatPane sessions={twoSessions()} />);
+    fireEvent.click(screen.getByTestId("chat-thread-item-old"));
+    expect(screen.getByTestId("chat-session-old")).toBeInTheDocument();
+    // A reconnect snapshot no longer carries the pinned session: fall back to
+    // following the newest…
+    const [old, newest] = twoSessions();
+    rerender(<ChatPane sessions={[newest]} />);
+    expect(screen.getByTestId("chat-session-new")).toBeInTheDocument();
+    // …and the pin is cleared, so the id reappearing doesn't snap the view
+    // back to it.
+    rerender(<ChatPane sessions={[old, newest]} />);
+    expect(screen.getByTestId("chat-session-new")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-session-old")).not.toBeInTheDocument();
+  });
+
   it("flags completed-unrewarded subtasks on the thread list item", () => {
     render(<ChatPane sessions={twoSessions()} />);
     expect(

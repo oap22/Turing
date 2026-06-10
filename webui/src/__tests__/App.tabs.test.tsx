@@ -105,6 +105,24 @@ describe("App — tabbed views", () => {
     expect(window.location.hash).toBe("#queue");
   });
 
+  it("non-tab hashes (the skip link) do not change the active view", () => {
+    window.location.hash = "#chat";
+    render(<App />);
+    expect(screen.getByTestId("chat-pane")).toBeInTheDocument();
+    // Activating the "skip to operator surface" link sets a non-tab hash.
+    window.location.hash = "#operator-surface";
+    fireEvent(window, new HashChangeEvent("hashchange"));
+    expect(screen.getByTestId("chat-pane")).toBeInTheDocument();
+    expect(screen.queryByTestId("queue-pane")).not.toBeInTheDocument();
+  });
+
+  it("an unknown initial hash falls back to queue and normalizes the URL", () => {
+    window.location.hash = "#bogus";
+    render(<App />);
+    expect(screen.getByTestId("queue-pane")).toBeInTheDocument();
+    expect(window.location.hash).toBe("#queue");
+  });
+
   it("hotkeys are suppressed while typing in a form control", () => {
     window.location.hash = "#chat";
     render(<App />);
