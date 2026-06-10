@@ -58,6 +58,8 @@ const peersBody = {
 };
 
 beforeEach(() => {
+  // The specs grid lives in the Observability tab (issue #358); land there.
+  window.location.hash = "#obs";
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const url = typeof input === "string" ? input : input.toString();
     if (url.endsWith("/peers")) {
@@ -74,6 +76,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   cleanup();
+  window.location.hash = "";
 });
 
 describe("App — specs panel integration", () => {

@@ -15,7 +15,6 @@ import {
   type AlertsState,
 } from "./alerts/reducer";
 import type { AlertFrame } from "./alerts/types";
-import CallGraphCanvas from "./CallGraphCanvas";
 import ChatPane from "./chat/ChatPane";
 import {
   applyChatFrame,
@@ -24,6 +23,7 @@ import {
   type ChatState,
 } from "./chat/reducer";
 import { emptyState, markStale, reduce, type Frame } from "./graph/reducer";
+import ObservabilityView from "./ObservabilityView";
 import QueuePane from "./queue/QueuePane";
 import {
   applyQueueFrame,
@@ -31,9 +31,7 @@ import {
   listQueue,
   type QueueState,
 } from "./queue/reducer";
-import SpecsGrid from "./specs/SpecsGrid";
 import type { PeerSpecsRow } from "./specs/types";
-import TracePane from "./trace/TracePane";
 import type { TraceEvent } from "./trace/types";
 import { connectGatewayWS, type ChatFrame, type QueueFrame } from "./ws";
 
@@ -70,9 +68,26 @@ type WsStatus = "open" | "closed" | "reconnecting";
 const MemoAlertBanner = memo(AlertBanner);
 const MemoQueuePane = memo(QueuePane);
 const MemoChatPane = memo(ChatPane);
-const MemoTracePane = memo(TracePane);
-const MemoSpecsGrid = memo(SpecsGrid);
-const MemoCallGraphCanvas = memo(CallGraphCanvas);
+
+// ── Tabbed views (issue #358) ────────────────────────────────────────────────
+//
+// One view at a time, grouped by operator activity: Queue (the hero surface,
+// default), Chat, and Observability (graph + specs + trace). All reducers stay
+// mounted in App, so hidden views keep ingesting WS frames and the badges stay
+// live. The active view syncs to the URL hash so a reload lands where you were.
+
+type TabId = "queue" | "chat" | "obs";
+
+const TABS: ReadonlyArray<{ id: TabId; label: string; hotkey: string }> = [
+  { id: "queue", label: "queue", hotkey: "1" },
+  { id: "chat", label: "chat", hotkey: "2" },
+  { id: "obs", label: "observability", hotkey: "3" },
+];
+
+function tabFromHash(hash: string): TabId | null {
+  const id = hash.replace(/^#/, "");
+  return TABS.find((t) => t.id === id)?.id ?? null;
+}
 
 const WS_STATUS_LABEL: Record<WsStatus, { dot: string; text: string; cls: string }> = {
   open: { dot: "●", text: "live", cls: "text-emerald-400" },
@@ -98,6 +113,34 @@ export default function App() {
   const [now, setNow] = useState(() => Date.now());
   const [specsRows, setSpecsRows] = useState<PeerSpecsRow[]>([]);
   const [wsStatus, setWsStatus] = useState<WsStatus>("reconnecting");
+  const [tab, setTab] = useState<TabId>(
+    () => tabFromHash(window.location.hash) ?? "queue",
+  );
+
+  const navigate = useCallback((next: TabId) => {
+    setTab(next);
+    // replaceState keeps the hash bookmarkable without spamming history or
+    // re-firing hashchange.
+    if (window.location.hash !== `#${next}`) {
+      window.history.replaceState(null, "", `#${next}`);
+    }
+  }, []);
+
+  // External hash edits (or back/forward) still steer the view. Non-tab
+  // hashes (the #operator-surface skip link, in-page anchors) are ignored
+  // rather than coerced, so following them never switches the view.
+  useEffect(() => {
+    const initial = window.location.hash;
+    if (initial !== "" && tabFromHash(initial) === null) {
+      window.history.replaceState(null, "", "#queue");
+    }
+    const onHash = () => {
+      const next = tabFromHash(window.location.hash);
+      if (next !== null) setTab(next);
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
 
   // The debug ring lives in a ref so recording a frame is free; it is only
   // mirrored into state (→ re-render) while the debug pane is actually open.
@@ -201,14 +244,23 @@ export default function App() {
   }, []);
   const visibleState = useMemo(() => markStale(state, now), [state, now]);
 
-  // Backtick toggles the debug pane (hidden by default).
+  // Backtick toggles the debug pane (hidden by default); 1/2/3 switch views.
+  // Both are suppressed while typing in a form control.
   useEffect(() => {
     function onKey(ev: KeyboardEvent) {
-      const target = ev.target as HTMLElement | null;
+      const target = ev.target instanceof HTMLElement ? ev.target : null;
       if (
-        target?.closest("input, textarea, select, button") ||
-        target?.isContentEditable
+        target?.closest("input, textarea, select") ||
+        target?.isContentEditable ||
+        ev.metaKey ||
+        ev.ctrlKey ||
+        ev.altKey
       ) {
+        return;
+      }
+      const hot = TABS.find((t) => t.hotkey === ev.key);
+      if (hot) {
+        navigate(hot.id);
         return;
       }
       if (ev.key === "~" || ev.key === "`") {
@@ -221,7 +273,31 @@ export default function App() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [navigate]);
+
+  // Tab badges mean "you owe a decision", not "something happened": proposed
+  // items await approval, drafted items await curation, completed subtasks
+  // await a thumb. Observability carries no badge — alerts own the banner.
+  const queueBadge = useMemo(
+    () =>
+      queueItems.filter(
+        (i) => i.status === "proposed" || i.status === "drafted",
+      ).length,
+    [queueItems],
+  );
+  const chatBadge = useMemo(
+    () =>
+      chatSessions.reduce(
+        (n, s) =>
+          n + s.subtasks.filter((st) => st.status === "completed").length,
+        0,
+      ),
+    [chatSessions],
+  );
+  const badges = useMemo<Record<TabId, number>>(
+    () => ({ queue: queueBadge, chat: chatBadge, obs: 0 }),
+    [queueBadge, chatBadge],
+  );
 
   // Selecting a trace event briefly highlights the matching call-graph edge.
   const onTraceSelect = useCallback((e: TraceEvent) => {
@@ -246,7 +322,40 @@ export default function App() {
         <span className="bg-term-accent px-2 py-0.5 text-xs font-bold tracking-widest text-black">
           TURING
         </span>
-        <span className="text-xs text-term-dim">// fleet console</span>
+        <nav aria-label="Views" className="flex items-center gap-1 text-xs">
+          {TABS.map((t) => {
+            const active = tab === t.id;
+            const badge = badges[t.id];
+            return (
+              <button
+                key={t.id}
+                type="button"
+                data-testid={`tab-${t.id}`}
+                aria-current={active ? "page" : undefined}
+                onClick={() => navigate(t.id)}
+                className={`flex items-center gap-1.5 border px-2 py-0.5 uppercase tracking-wider ${
+                  active
+                    ? "border-term-accent text-term-accent"
+                    : "border-transparent text-term-dim hover:text-term-fg"
+                }`}
+              >
+                <kbd className="border border-term-edge bg-term-raised px-1 normal-case text-term-dim">
+                  {t.hotkey}
+                </kbd>
+                {t.label}
+                {badge > 0 && (
+                  <span
+                    data-testid={`tab-badge-${t.id}`}
+                    aria-label={`${badge} items awaiting a decision`}
+                    className="bg-term-raised px-1 tabular-nums text-amber-300"
+                  >
+                    {badge}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </nav>
         <span className="ml-auto flex items-center gap-4 text-xs">
           <span className="text-term-dim">
             <kbd className="border border-term-edge bg-term-raised px-1 text-term-fg">
@@ -259,34 +368,28 @@ export default function App() {
           </span>
         </span>
       </header>
-      <section
-        aria-label="Question queue"
-        className="h-[42%] min-h-[260px] border-b border-term-edge"
-      >
-        <MemoQueuePane items={queueItems} />
-      </section>
-      <main id="operator-surface" className="flex flex-1 overflow-hidden">
-        <section
-          aria-label="Fleet graph and specs"
-          className="flex min-w-0 flex-1 flex-col border-r border-term-edge"
-        >
-          <div className="flex-1 overflow-hidden">
-            <MemoCallGraphCanvas
-              state={visibleState}
+      <main id="operator-surface" className="flex min-h-0 flex-1 overflow-hidden">
+        <div className="min-w-0 flex-1 overflow-hidden">
+          {tab === "queue" && (
+            <section aria-label="Question queue" className="h-full">
+              <MemoQueuePane items={queueItems} />
+            </section>
+          )}
+          {tab === "chat" && (
+            <section aria-label="Chat tasks" className="h-full">
+              <MemoChatPane sessions={chatSessions} />
+            </section>
+          )}
+          {tab === "obs" && (
+            <ObservabilityView
+              graphState={visibleState}
               highlightedEdge={highlightedEdge}
+              specsRows={specsRows}
+              liveTrace={liveTrace}
+              onTraceSelect={onTraceSelect}
             />
-          </div>
-          <MemoSpecsGrid rows={specsRows} />
-        </section>
-        <aside
-          aria-label="Message trace"
-          className="w-[420px] shrink-0 border-r border-term-edge"
-        >
-          <MemoTracePane liveEvents={liveTrace} onSelect={onTraceSelect} />
-        </aside>
-        <aside aria-label="Chat tasks" className="w-[360px] shrink-0">
-          <MemoChatPane sessions={chatSessions} />
-        </aside>
+          )}
+        </div>
         {showDebug && (
           <aside
             aria-label="Incoming frames debug stream"

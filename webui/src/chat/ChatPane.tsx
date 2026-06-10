@@ -4,6 +4,12 @@
 // into the SAME thread; a per-subtask thumb feeds the load-bearing
 // `episode_rewards` signal through the gateway's REUSED Slice C emitter.
 //
+// Laid out master-detail (issue #358): a thread list on the left, the selected
+// thread's subtasks on the right with the prompt box pinned underneath. A null
+// selection follows the newest thread, so a fresh submit comes into view on
+// its own; clicking a thread — or touching the detail pane at all — pins it,
+// so another client's submit can't swap the thread mid-interaction.
+//
 // State is driven by the `chat.snapshot` / `chat.delta` WS frames (see
 // `reducer.ts`); the prompt box POSTs to `/api/chat/submit` and the per-subtask
 // thumbs POST to the accept/reject/edit endpoints (see `api.ts`). The pane is
@@ -11,7 +17,15 @@
 // `chat.delta`, so a failed POST self-heals on the next frame — same contract
 // as the queue pane.
 
-import { memo, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from "react";
 import type { ChatSession, ChatSubtask } from "../ws";
 import {
   acceptSubtask,
@@ -38,39 +52,155 @@ const BTN =
   "border px-2 py-0.5 text-[10px] uppercase tracking-wider disabled:opacity-40";
 
 export default function ChatPane({ sessions }: Props) {
+  // null = follow the newest thread; a session id pins the selection.
+  const [pinnedId, setPinnedId] = useState<string | null>(null);
+  // `sessions` arrives oldest-first (listChat), so the newest is last.
+  const newest = sessions.length > 0 ? sessions[sessions.length - 1] : null;
+  const pinned = pinnedId !== null ? sessions.find((s) => s.id === pinnedId) : undefined;
+  const selected = pinned ?? newest;
+  const reversedSessions = useMemo(() => [...sessions].reverse(), [sessions]);
+  const promptRef = useRef<HTMLTextAreaElement>(null);
+
+  // A pin to a session that vanished from a snapshot (WS reconnect after a
+  // gateway restart) is cleared rather than kept dormant — otherwise the view
+  // would snap back unprompted if the id ever reappeared.
+  useEffect(() => {
+    if (pinnedId !== null && pinned === undefined) setPinnedId(null);
+  }, [pinnedId, pinned]);
+
+  // Following the newest thread is for idle viewing only: the moment the
+  // operator touches the detail pane (editing a correction, reading a stream),
+  // pin it so another client's submit can't yank the thread mid-interaction.
+  const pinSelected = useCallback(() => {
+    setPinnedId((cur) => cur ?? (selected ? selected.id : null));
+  }, [selected]);
+
   return (
     <div
       data-testid="chat-pane"
-      className="flex h-full flex-col bg-term-bg text-xs"
+      className="flex h-full bg-term-bg text-xs"
     >
-      <div className="border-b border-term-edge bg-term-panel px-3 py-1.5">
-        <span className="text-[11px] font-bold uppercase tracking-widest text-term-fg">
-          chat
-        </span>
-        <span className="ml-2 text-[10px] uppercase tracking-wider text-term-dim">
-          ad-hoc task submission
-        </span>
-      </div>
-      <div
-        aria-label="Chat threads"
-        className="flex-1 space-y-3 overflow-y-auto p-2"
-        data-testid="chat-thread"
+      <aside
+        aria-label="Chat thread list"
+        className="flex w-64 shrink-0 flex-col border-r border-term-edge"
       >
-        {sessions.length === 0 && (
-          <p className="px-1 text-term-dim">
-            no chats yet — submit a prompt below
-          </p>
-        )}
-        {sessions.map((session) => (
-          <ChatThread key={session.id} session={session} />
-        ))}
-      </div>
-      <PromptBox />
+        <div className="border-b border-term-edge bg-term-panel px-3 py-1.5">
+          <span className="text-[11px] font-bold uppercase tracking-widest text-term-fg">
+            threads
+          </span>
+          <span className="ml-2 tabular-nums text-[10px] text-term-dim">
+            {sessions.length}
+          </span>
+        </div>
+        <ol data-testid="chat-thread-list" className="flex-1 overflow-y-auto">
+          {sessions.length === 0 && (
+            <li className="p-2 text-term-dim">no threads yet</li>
+          )}
+          {reversedSessions.map((session) => (
+            <ThreadListItem
+              key={session.id}
+              session={session}
+              active={session.id === selected?.id}
+              onSelect={() => setPinnedId(session.id)}
+            />
+          ))}
+        </ol>
+        <button
+          type="button"
+          data-testid="chat-new-thread"
+          onClick={() => {
+            setPinnedId(null);
+            promptRef.current?.focus();
+          }}
+          className={`${BTN} m-2 border-term-edge text-term-dim hover:border-term-accent hover:text-term-accent`}
+        >
+          + new
+        </button>
+      </aside>
+      <section className="flex min-w-0 flex-1 flex-col">
+        <div className="border-b border-term-edge bg-term-panel px-3 py-1.5">
+          <span className="text-[11px] font-bold uppercase tracking-widest text-term-fg">
+            chat
+          </span>
+          <span className="ml-2 text-[10px] uppercase tracking-wider text-term-dim">
+            ad-hoc task submission
+          </span>
+        </div>
+        <div
+          aria-label="Chat threads"
+          className="flex-1 overflow-y-auto p-2"
+          data-testid="chat-thread"
+          onPointerDownCapture={pinSelected}
+          onFocusCapture={pinSelected}
+        >
+          {!selected && (
+            <p className="px-1 text-term-dim">
+              no chats yet — submit a prompt below
+            </p>
+          )}
+          {selected && <ChatThread session={selected} />}
+        </div>
+        <PromptBox onSubmitted={() => setPinnedId(null)} promptRef={promptRef} />
+      </section>
     </div>
   );
 }
 
-function PromptBox() {
+const ThreadListItem = memo(function ThreadListItem({
+  session,
+  active,
+  onSelect,
+}: {
+  session: ChatSession;
+  active: boolean;
+  onSelect: () => void;
+}) {
+  const streaming = session.subtasks.some((s) => s.status === "streaming");
+  // Completed-but-unrewarded subtasks await the operator's thumb — the same
+  // "you owe a decision" semantics as the App tab badge.
+  const awaiting = session.subtasks.filter(
+    (s) => s.status === "completed",
+  ).length;
+  return (
+    <li>
+      <button
+        type="button"
+        data-testid={`chat-thread-item-${session.id}`}
+        data-active={active ? "true" : "false"}
+        aria-pressed={active}
+        onClick={onSelect}
+        className={`block w-full border-b border-term-edge px-2 py-1.5 text-left ${
+          active
+            ? "bg-term-raised text-term-fg"
+            : "text-term-dim hover:bg-term-panel hover:text-term-fg"
+        }`}
+      >
+        <span className="line-clamp-2 break-words">{session.prompt}</span>
+        <span className="mt-0.5 flex items-center gap-2 font-mono text-[10px]">
+          <span className="text-term-accent">{session.specialty}</span>
+          {streaming && <span className="term-cursor" aria-label="streaming" />}
+          {awaiting > 0 && (
+            <span
+              data-testid={`chat-thread-awaiting-${session.id}`}
+              aria-label={`${awaiting} subtasks awaiting a decision`}
+              className="bg-term-panel px-1 tabular-nums text-amber-300"
+            >
+              {awaiting}
+            </span>
+          )}
+        </span>
+      </button>
+    </li>
+  );
+});
+
+function PromptBox({
+  onSubmitted,
+  promptRef,
+}: {
+  onSubmitted: () => void;
+  promptRef: RefObject<HTMLTextAreaElement | null>;
+}) {
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -80,8 +210,10 @@ function PromptBox() {
     setBusy(true);
     try {
       await submitChat(text);
-      // The submitted thread re-arrives as a `chat.delta`; clear the box.
+      // The submitted thread re-arrives as a `chat.delta`; clear the box and
+      // unpin so the new thread comes into view.
       setPrompt("");
+      onSubmitted();
     } finally {
       setBusy(false);
     }
@@ -101,6 +233,7 @@ function PromptBox() {
         Ad-hoc task prompt
       </label>
       <textarea
+        ref={promptRef}
         id="chat-prompt-input"
         data-testid="chat-prompt-input"
         value={prompt}
@@ -113,7 +246,7 @@ function PromptBox() {
           }
         }}
         rows={2}
-        placeholder="> ask for an ad-hoc task…"
+        placeholder="> ask for an ad-hoc task… (starts a new thread)"
         className="min-w-0 flex-1 resize-none border border-term-edge bg-term-bg p-1 text-[11px] text-term-fg placeholder:text-term-dim focus:border-term-accent focus:outline-none"
       />
       <button
@@ -138,7 +271,7 @@ const ChatThread = memo(function ChatThread({ session }: { session: ChatSession 
       aria-labelledby={headingId}
       className="border border-term-edge bg-term-panel"
     >
-      <header className="border-b border-term-edge px-2 py-1 text-term-fg">
+      <header className="border-b border-term-edge px-2 py-1.5 text-sm leading-snug text-term-fg">
         <span id={headingId} className="break-words">
           {session.prompt}
         </span>
@@ -212,7 +345,7 @@ const SubtaskRow = memo(function SubtaskRow({ subtask }: { subtask: ChatSubtask 
       </div>
 
       {subtask.content && (
-        <div className="whitespace-pre-wrap break-words text-term-fg">
+        <div className="whitespace-pre-wrap break-words text-sm leading-snug text-term-fg">
           {subtask.content}
         </div>
       )}
@@ -271,7 +404,7 @@ const SubtaskRow = memo(function SubtaskRow({ subtask }: { subtask: ChatSubtask 
             onChange={(e) => setDraft(e.target.value)}
             rows={3}
             placeholder="corrected answer"
-            className="w-full border border-term-edge bg-term-bg p-1 text-[11px] text-term-fg placeholder:text-term-dim focus:border-term-accent focus:outline-none"
+            className="w-full border border-term-edge bg-term-bg p-1 text-sm leading-snug text-term-fg placeholder:text-term-dim focus:border-term-accent focus:outline-none"
           />
           <div className="flex gap-1">
             <button
@@ -309,7 +442,7 @@ const SubtaskRow = memo(function SubtaskRow({ subtask }: { subtask: ChatSubtask 
         >
           {subtask.decision}
           {subtask.decision === "edit" && subtask.corrected_answer && (
-            <div className="mt-0.5 whitespace-pre-wrap break-words normal-case text-neutral-300">
+            <div className="mt-0.5 whitespace-pre-wrap break-words text-sm normal-case leading-snug text-neutral-300">
               {subtask.corrected_answer}
             </div>
           )}
