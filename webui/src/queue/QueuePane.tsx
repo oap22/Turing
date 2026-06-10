@@ -153,7 +153,9 @@ const QueueCard = memo(function QueueCard({ item }: { item: QueueItem }) {
       className={`border p-2 ${cardClass}`}
     >
       <div className="flex items-start justify-between gap-2">
-        <span className="break-words text-term-fg">{item.prompt}</span>
+        <span className="break-words text-sm leading-snug text-term-fg">
+          {item.prompt}
+        </span>
       </div>
       <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-[10px] text-term-dim">
         <span className="border border-term-edge bg-term-panel px-1 text-term-accent">
@@ -236,7 +238,7 @@ const QueueCard = memo(function QueueCard({ item }: { item: QueueItem }) {
             onChange={(e) => setDraft(e.target.value)}
             rows={3}
             placeholder="corrected answer"
-            className="w-full border border-term-edge bg-term-bg p-1 text-[11px] text-term-fg placeholder:text-term-dim focus:border-term-accent focus:outline-none"
+            className="w-full border border-term-edge bg-term-bg p-1 text-sm leading-snug text-term-fg placeholder:text-term-dim focus:border-term-accent focus:outline-none"
           />
           <div className="flex gap-1">
             <button
@@ -270,7 +272,7 @@ const QueueCard = memo(function QueueCard({ item }: { item: QueueItem }) {
         >
           {item.decision}
           {item.decision === "edit" && item.corrected_answer && (
-            <div className="mt-0.5 whitespace-pre-wrap break-words normal-case text-neutral-300">
+            <div className="mt-0.5 whitespace-pre-wrap break-words text-sm normal-case leading-snug text-neutral-300">
               {item.corrected_answer}
             </div>
           )}
