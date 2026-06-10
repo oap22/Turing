@@ -12,6 +12,23 @@ live in `src/index.css` as a Tailwind v4 `@theme` block (`term-bg`,
 emerald/amber/rose reserved for semantics, sharp 1-px borders, uppercase
 micro-labels, and a `term-cursor` blink for live/streaming indicators.
 
+## Views
+
+The console is segmented into three tabbed views (issue #358), one visible at
+a time, switched by clicking the header tabs or pressing `1`/`2`/`3` (hash-
+synced: `#queue`, `#chat`, `#obs`):
+
+- **queue** (default) — the full-screen five-column human-gated frontier.
+- **chat** — master-detail: thread list left, the selected thread's subtasks
+  right, prompt box pinned underneath (a submit always starts a new thread).
+- **observability** — call graph + fleet specs strip, with the message-trace
+  column alongside (selecting a trace event highlights the matching edge).
+
+The alert banner and the backtick debug overlay stay global. Tab badges count
+items awaiting an operator decision (proposed/drafted questions, completed-
+unrewarded subtasks). All reducers stay mounted in `App.tsx`, so hidden views
+keep ingesting WS frames and badges stay live.
+
 ## Build
 
 ```bash

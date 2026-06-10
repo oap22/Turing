@@ -181,7 +181,8 @@ describe("ChatPane thread", () => {
         ]}
       />,
     );
-    expect(screen.getByText("why is the sky blue?")).toBeInTheDocument();
+    // The prompt renders in both the thread list and the detail header.
+    expect(screen.getAllByText("why is the sky blue?").length).toBeGreaterThan(0);
     expect(screen.getByText("Rayleigh scattering.")).toBeInTheDocument();
     expect(
       screen.getByTestId("chat-session-s1").getAttribute("data-subtask-count"),
@@ -209,6 +210,64 @@ describe("ChatPane thread", () => {
     const badge = screen.getByTestId("chat-upstreams-st1");
     expect(badge.textContent).toMatch(/2 upstreams/);
     expect(badge.getAttribute("title")).toBe("up-a, up-b");
+  });
+});
+
+describe("ChatPane master-detail", () => {
+  function twoSessions() {
+    return [
+      session({
+        id: "old",
+        prompt: "the older thread",
+        created_at_ms: 1,
+        subtasks: [
+          subtask({
+            id: "o1",
+            session_id: "old",
+            status: "completed",
+            content: "older answer",
+          }),
+        ],
+      }),
+      session({
+        id: "new",
+        prompt: "the newer thread",
+        created_at_ms: 2,
+        subtasks: [
+          subtask({ id: "n1", session_id: "new", content: "newer answer" }),
+        ],
+      }),
+    ];
+  }
+
+  it("auto-selects the newest thread", () => {
+    render(<ChatPane sessions={twoSessions()} />);
+    expect(screen.getByTestId("chat-session-new")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-session-old")).not.toBeInTheDocument();
+    expect(
+      screen
+        .getByTestId("chat-thread-item-new")
+        .getAttribute("data-active"),
+    ).toBe("true");
+  });
+
+  it("clicking a thread list item pins that thread into the detail pane", () => {
+    render(<ChatPane sessions={twoSessions()} />);
+    fireEvent.click(screen.getByTestId("chat-thread-item-old"));
+    expect(screen.getByTestId("chat-session-old")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-session-new")).not.toBeInTheDocument();
+    expect(screen.getByText("older answer")).toBeInTheDocument();
+  });
+
+  it("flags completed-unrewarded subtasks on the thread list item", () => {
+    render(<ChatPane sessions={twoSessions()} />);
+    expect(
+      screen.getByTestId("chat-thread-awaiting-old").textContent,
+    ).toBe("1");
+    // The newer thread's subtask is pending — no decision owed yet.
+    expect(
+      screen.queryByTestId("chat-thread-awaiting-new"),
+    ).not.toBeInTheDocument();
   });
 });
 
