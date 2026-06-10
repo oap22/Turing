@@ -22,7 +22,12 @@ from turing.worker.grounding import (
     GroundedResearcher,
     build_grounded_episode,
 )
-from turing.worker.tools.web_fetch import WebFetchAllowlist, WebFetchNotAllowedError, web_fetch
+from turing.worker.tools.web_fetch import (
+    DEFAULT_ALLOWED_HOSTS,
+    WebFetchAllowlist,
+    WebFetchNotAllowedError,
+    web_fetch,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -87,6 +92,42 @@ def test_allowlist_matches_host_and_subdomain() -> None:
     assert allow.is_allowed("https://export.arxiv.org/abs/1234")  # subdomain
     assert not allow.is_allowed("https://evil.com/x")
     assert not allow.is_allowed("ftp://arxiv.org/x")  # unsafe scheme
+
+
+def test_default_hosts_admit_research_paper_sources() -> None:
+    """The canonical defaults must give workers the open web for papers —
+    Google Scholar in particular (goal of the grounding loop, ADR 0009 §2)."""
+    allow = WebFetchAllowlist(DEFAULT_ALLOWED_HOSTS)
+    assert allow.is_allowed("https://scholar.google.com/scholar?q=lora+fine-tuning")
+    assert allow.is_allowed("https://arxiv.org/abs/2305.14314")
+    assert allow.is_allowed("https://export.arxiv.org/abs/2305.14314")
+    assert allow.is_allowed("https://www.semanticscholar.org/paper/abc")
+    assert allow.is_allowed("https://api.semanticscholar.org/graph/v1/paper/search?query=qlora")
+    assert allow.is_allowed("https://openreview.net/forum?id=xyz")
+    assert allow.is_allowed("https://aclanthology.org/2023.acl-long.1/")
+    assert allow.is_allowed("https://en.wikipedia.org/wiki/Low-rank_adaptation")
+
+
+def test_default_hosts_do_not_leak_beyond_scholar() -> None:
+    """scholar.google.com must not admit the rest of google.com (or lookalikes)."""
+    allow = WebFetchAllowlist(DEFAULT_ALLOWED_HOSTS)
+    assert not allow.is_allowed("https://www.google.com/search?q=papers")
+    assert not allow.is_allowed("https://mail.google.com/")
+    assert not allow.is_allowed("https://scholar.google.com.evil.com/x")  # suffix spoof
+    assert not allow.is_allowed("https://notarxiv.org/abs/1")
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_allows_google_scholar_with_defaults() -> None:
+    source = await web_fetch(
+        "https://scholar.google.com/scholar?q=qlora",
+        allowlist=WebFetchAllowlist(DEFAULT_ALLOWED_HOSTS),
+        fetcher=_fake_fetcher,
+        now_ms=1,
+        source_id="s1",
+    )
+    assert source.url == "https://scholar.google.com/scholar?q=qlora"
+    assert source.title
 
 
 @pytest.mark.asyncio

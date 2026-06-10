@@ -31,6 +31,26 @@ Fetcher = Callable[[str], Awaitable[tuple[str, str]]]
 # a huge page into the prompt window.
 MAX_FETCH_CHARS = 8_000
 
+# Canonical research-grounding hosts — the default for
+# ``TuringConfig.web_fetch_allowed_hosts`` (env ``TURING_WEB_FETCH_ALLOWED_HOSTS``).
+# Subdomains of each entry are allowed, so ``scholar.google.com`` admits Google
+# Scholar (paper search, citations, PDF links) without ever allowlisting
+# ``google.com`` itself. Hosts are direct-content sources only: generic
+# redirectors (doi.org and friends) stay off the list because the allowlist
+# checks the *requested* URL, not where a redirect lands.
+DEFAULT_ALLOWED_HOSTS: tuple[str, ...] = (
+    "arxiv.org",
+    "scholar.google.com",
+    "semanticscholar.org",
+    "openreview.net",
+    "aclanthology.org",
+    "paperswithcode.com",
+    "openalex.org",
+    "dblp.org",
+    "wikipedia.org",
+    "huggingface.co",
+)
+
 
 class WebFetchNotAllowedError(RuntimeError):
     """Raised when a URL's host is not on the allowlist or the scheme is unsafe."""

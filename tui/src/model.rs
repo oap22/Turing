@@ -54,6 +54,9 @@ pub fn severity_for_disk(pct: Option<f64>) -> Severity {
 }
 
 // ── queue ────────────────────────────────────────────────────────────────────
+/// Mirrors `QueueItem.to_frame()` field-for-field. The provenance and
+/// per-transition timestamp fields aren't rendered yet — kept (under
+/// `allow(dead_code)`) so the decoder is faithful to the wire protocol.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct QueueItem {
     pub id: String,
@@ -63,12 +66,33 @@ pub struct QueueItem {
     pub specialty: String,
     #[serde(default = "default_proposed")]
     pub status: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub origin_task_id: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub origin_question_id: Option<String>,
     #[serde(default)]
     pub proposed_by: String,
     #[serde(default)]
     pub episode_id: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub consumed_upstreams: Vec<String>,
     #[serde(default)]
     pub created_at_ms: i64,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub approved_at_ms: Option<i64>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub dispatched_at_ms: Option<i64>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub drafted_at_ms: Option<i64>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub curated_at_ms: Option<i64>,
     #[serde(default)]
     pub decision: Option<String>,
     #[serde(default)]
@@ -83,6 +107,11 @@ fn default_proposed() -> String {
 pub const QUEUE_COLUMNS: [&str; 5] = ["proposed", "approved", "in-flight", "drafted", "curated"];
 
 // ── chat ─────────────────────────────────────────────────────────────────────
+/// Mirrors `ChatSubtask.to_frame()` field-for-field. `episode_id` is the
+/// worker episode an operator thumb rewards; `consumed_upstreams` are the
+/// synthesis fractional-credit targets. Both are server-side concerns for the
+/// thumb endpoints, so they (and the lifecycle timestamps) aren't rendered yet
+/// — kept so the decoder is faithful to the wire protocol.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ChatSubtask {
     pub id: String,
@@ -98,8 +127,26 @@ pub struct ChatSubtask {
     pub content: String,
     #[serde(default = "default_pending")]
     pub status: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub episode_id: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub consumed_upstreams: Vec<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub created_at_ms: i64,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub completed_at_ms: Option<i64>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub curated_at_ms: Option<i64>,
     #[serde(default)]
     pub decision: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub corrected_answer: Option<String>,
 }
 
 fn default_pending() -> String {
@@ -120,12 +167,18 @@ pub struct ChatSession {
 }
 
 // ── specs / peers ─────────────────────────────────────────────────────────────
+/// Mirrors `NodeSpecs.to_dict()` (the #216 schema) field-for-field.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct NodeSpecs {
     #[serde(default)]
     pub model_name: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub os: String,
     #[serde(default)]
     pub arch: String,
+    #[serde(default)]
+    pub cpu_cores: u32,
     #[serde(default)]
     pub cpu_percent: f64,
     #[serde(default)]
@@ -142,6 +195,10 @@ pub struct NodeSpecs {
     pub uptime_seconds: u64,
     #[serde(default)]
     pub loadavg_1m: f64,
+    #[serde(default)]
+    pub loadavg_5m: f64,
+    #[serde(default)]
+    pub loadavg_15m: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -152,6 +209,12 @@ pub struct Peer {
     pub node_name: String,
     #[serde(default)]
     pub is_self: bool,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub last_seen: Option<f64>,
     #[serde(default)]
     pub specs: Option<NodeSpecs>,
     #[serde(default)]
@@ -175,6 +238,10 @@ pub struct PeerRaw {
     #[serde(default, rename = "self")]
     pub is_self: bool,
     #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub last_seen: Option<f64>,
+    #[serde(default)]
     pub specs: Option<NodeSpecs>,
     #[serde(default)]
     pub stale: bool,
@@ -186,6 +253,8 @@ impl PeerRaw {
             node_id: self.node_id,
             node_name: self.node_name,
             is_self: self.is_self,
+            capabilities: self.capabilities,
+            last_seen: self.last_seen,
             specs: self.specs,
             stale: self.stale,
         }
@@ -193,18 +262,30 @@ impl PeerRaw {
 }
 
 // ── trace / events ────────────────────────────────────────────────────────────
+/// Mirrors the telemetry sink's `message_trace` / `metric` fan-out frames.
+/// `seq` / `payload` / `priority` aren't rendered yet — kept so the decoder is
+/// faithful (ordering, redacted samples, priority routing all ride them).
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct TraceEvent {
     #[serde(default)]
     pub node_name: String,
     #[serde(default)]
     pub event_type: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub seq: u64,
     #[serde(default)]
     pub timestamp_ms: i64,
     #[serde(default)]
     pub duration_ms: Option<f64>,
     #[serde(default)]
     pub error: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub payload: serde_json::Value,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub priority: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -230,6 +311,9 @@ pub struct Alert {
     pub threshold: f64,
     #[serde(default)]
     pub state: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub fired_at_ms: i64,
     #[serde(default)]
     pub snoozed_until_ms: Option<i64>,
 }
@@ -329,16 +413,22 @@ pub fn parse_frame(raw: &str) -> Option<Frame> {
         "message_trace" => Frame::Trace(serde_json::from_value(v).unwrap_or(TraceEvent {
             node_name: String::new(),
             event_type: "message_trace".into(),
+            seq: 0,
             timestamp_ms: 0,
             duration_ms: None,
             error: None,
+            payload: serde_json::Value::Null,
+            priority: false,
         })),
         "metric" => Frame::Metric(serde_json::from_value(v).unwrap_or(TraceEvent {
             node_name: String::new(),
             event_type: "metric".into(),
+            seq: 0,
             timestamp_ms: 0,
             duration_ms: None,
             error: None,
+            payload: serde_json::Value::Null,
+            priority: false,
         })),
         "alert" => Frame::Alert(serde_json::from_value(v).ok()?),
         other => Frame::Other(other.to_string()),
@@ -389,6 +479,10 @@ mod tests {
                 assert_eq!(items[0].id, "q1");
                 assert_eq!(items[0].status, "drafted");
                 assert_eq!(items[0].episode_id.as_deref(), Some("e1"));
+                assert_eq!(items[0].drafted_at_ms, Some(20));
+                assert_eq!(items[0].approved_at_ms, None);
+                assert!(items[0].consumed_upstreams.is_empty());
+                assert_eq!(items[0].origin_task_id, None);
             }
             _ => panic!("wrong variant"),
         }
@@ -432,6 +526,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_chat_subtask_full_frame_shape() {
+        // Exact ChatSubtask.to_frame() shape — episode_id (the reward-write
+        // target) and the lifecycle timestamps must survive decoding.
+        let raw = r#"{"type":"chat.delta","action":"complete","session_id":"s1","timestamp_ms":1,
+            "subtask":{"id":"st1","session_id":"s1","index":0,"specialty":"research",
+            "prompt":"q","content":"answer","status":"completed","episode_id":"ep-7",
+            "consumed_upstreams":["up-a","up-b"],"created_at_ms":10,"completed_at_ms":20,
+            "curated_at_ms":null,"decision":null,"corrected_answer":null}}"#;
+        match parse_frame(raw).unwrap() {
+            Frame::ChatDelta { subtask, .. } => {
+                let st = subtask.unwrap();
+                assert_eq!(st.episode_id.as_deref(), Some("ep-7"));
+                assert_eq!(st.consumed_upstreams, vec!["up-a", "up-b"]);
+                assert_eq!(st.created_at_ms, 10);
+                assert_eq!(st.completed_at_ms, Some(20));
+                assert_eq!(st.curated_at_ms, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn parses_alert() {
         let raw = r#"{"type":"alert","node_id":"jetson-2","node_name":"jetson-2",
             "field":"temp_celsius","severity":"danger","value":84.0,"threshold":82.0,
@@ -441,6 +557,23 @@ mod tests {
                 assert_eq!(a.field, "temp_celsius");
                 assert_eq!(a.severity, "danger");
                 assert!((a.value - 84.0).abs() < 1e-9);
+                assert_eq!(a.fired_at_ms, 1);
+                assert_eq!(a.snoozed_until_ms, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parses_trace_seq_payload_priority() {
+        let raw = r#"{"type":"message_trace","node_name":"jetson-1","event_type":"llm_call",
+            "seq":42,"timestamp_ms":100,"duration_ms":12.5,"error":null,
+            "payload":{"prompt_sample":"…"},"priority":true}"#;
+        match parse_frame(raw).unwrap() {
+            Frame::Trace(t) => {
+                assert_eq!(t.seq, 42);
+                assert!(t.priority);
+                assert_eq!(t.payload["prompt_sample"], "…");
             }
             _ => panic!("wrong variant"),
         }
@@ -493,5 +626,27 @@ mod tests {
         let peer = resp.peers.into_iter().next().unwrap().into_peer();
         assert!(peer.is_self);
         assert_eq!(peer.node_name, "pi-alpha");
+    }
+
+    #[test]
+    fn peers_response_carries_capabilities_specs_schema() {
+        // Full /peers shape from gateway app.py + NodeSpecs.to_dict() (#216).
+        let raw = r#"{"peers":[{"node_id":"b","node_name":"jetson-1","self":false,
+            "capabilities":["research"],"last_seen":1700000000.5,
+            "specs":{"model_name":"Jetson Orin Nano","os":"Linux 6.x","arch":"aarch64",
+            "cpu_cores":6,"ram_total_bytes":8000000000,"disk_total_bytes":50000000000,
+            "cpu_percent":12.0,"mem_used_bytes":4000000000,"disk_used_bytes":10000000000,
+            "temp_celsius":55.0,"uptime_seconds":3600,
+            "loadavg_1m":0.42,"loadavg_5m":0.38,"loadavg_15m":0.31},
+            "stale":false}],"count":1}"#;
+        let resp: PeersResponse = serde_json::from_str(raw).unwrap();
+        let peer = resp.peers.into_iter().next().unwrap().into_peer();
+        assert_eq!(peer.capabilities, vec!["research"]);
+        assert_eq!(peer.last_seen, Some(1700000000.5));
+        let specs = peer.specs.unwrap();
+        assert_eq!(specs.os, "Linux 6.x");
+        assert_eq!(specs.cpu_cores, 6);
+        assert!((specs.loadavg_5m - 0.38).abs() < 1e-9);
+        assert!((specs.loadavg_15m - 0.31).abs() < 1e-9);
     }
 }
