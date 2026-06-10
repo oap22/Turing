@@ -71,5 +71,7 @@ async def test_bench_cycle_runs_two_cycles_and_every_seam_invariant_holds(
         capture_output=True,
         text=True,
     ).stdout
-    assert log.count("vault: curate accept") == 3
-    assert log.count("vault: curate edit") == 2
+    expected_accepts = 3  # c1: q-c1-accept; c2: promoted_id, q-c2-probe-a
+    expected_edits = 2  # c1: q-c1-edit; c2: frontier_ids[0]
+    assert log.count("vault: curate accept") == expected_accepts, log
+    assert log.count("vault: curate edit") == expected_edits, log
