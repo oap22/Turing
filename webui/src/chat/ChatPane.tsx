@@ -16,7 +16,7 @@
 // `chat.delta`, so a failed POST self-heals on the next frame — same contract
 // as the queue pane.
 
-import { memo, useState } from "react";
+import { memo, useMemo, useRef, useState, type RefObject } from "react";
 import type { ChatSession, ChatSubtask } from "../ws";
 import {
   acceptSubtask,
@@ -47,8 +47,10 @@ export default function ChatPane({ sessions }: Props) {
   const [pinnedId, setPinnedId] = useState<string | null>(null);
   // `sessions` arrives oldest-first (listChat), so the newest is last.
   const newest = sessions.length > 0 ? sessions[sessions.length - 1] : null;
-  const selected =
-    (pinnedId !== null && sessions.find((s) => s.id === pinnedId)) || newest;
+  const pinned = pinnedId !== null ? sessions.find((s) => s.id === pinnedId) : undefined;
+  const selected = pinned ?? newest;
+  const reversedSessions = useMemo(() => [...sessions].reverse(), [sessions]);
+  const promptRef = useRef<HTMLTextAreaElement>(null);
 
   return (
     <div
@@ -71,7 +73,7 @@ export default function ChatPane({ sessions }: Props) {
           {sessions.length === 0 && (
             <li className="p-2 text-term-dim">no threads yet</li>
           )}
-          {[...sessions].reverse().map((session) => (
+          {reversedSessions.map((session) => (
             <ThreadListItem
               key={session.id}
               session={session}
@@ -85,7 +87,7 @@ export default function ChatPane({ sessions }: Props) {
           data-testid="chat-new-thread"
           onClick={() => {
             setPinnedId(null);
-            document.getElementById("chat-prompt-input")?.focus();
+            promptRef.current?.focus();
           }}
           className={`${BTN} m-2 border-term-edge text-term-dim hover:border-term-accent hover:text-term-accent`}
         >
@@ -113,7 +115,7 @@ export default function ChatPane({ sessions }: Props) {
           )}
           {selected && <ChatThread session={selected} />}
         </div>
-        <PromptBox onSubmitted={() => setPinnedId(null)} />
+        <PromptBox onSubmitted={() => setPinnedId(null)} promptRef={promptRef} />
       </section>
     </div>
   );
@@ -140,7 +142,7 @@ const ThreadListItem = memo(function ThreadListItem({
         type="button"
         data-testid={`chat-thread-item-${session.id}`}
         data-active={active ? "true" : "false"}
-        aria-current={active ? "true" : undefined}
+        aria-pressed={active}
         onClick={onSelect}
         className={`block w-full border-b border-term-edge px-2 py-1.5 text-left ${
           active
@@ -167,7 +169,13 @@ const ThreadListItem = memo(function ThreadListItem({
   );
 });
 
-function PromptBox({ onSubmitted }: { onSubmitted: () => void }) {
+function PromptBox({
+  onSubmitted,
+  promptRef,
+}: {
+  onSubmitted: () => void;
+  promptRef: RefObject<HTMLTextAreaElement | null>;
+}) {
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -200,6 +208,7 @@ function PromptBox({ onSubmitted }: { onSubmitted: () => void }) {
         Ad-hoc task prompt
       </label>
       <textarea
+        ref={promptRef}
         id="chat-prompt-input"
         data-testid="chat-prompt-input"
         value={prompt}

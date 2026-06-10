@@ -86,7 +86,7 @@ const TABS: ReadonlyArray<{ id: TabId; label: string; hotkey: string }> = [
 
 function tabFromHash(hash: string): TabId {
   const id = hash.replace(/^#/, "");
-  return TABS.some((t) => t.id === id) ? (id as TabId) : "queue";
+  return TABS.find((t) => t.id === id)?.id ?? "queue";
 }
 
 const WS_STATUS_LABEL: Record<WsStatus, { dot: string; text: string; cls: string }> = {
@@ -239,7 +239,7 @@ export default function App() {
     function onKey(ev: KeyboardEvent) {
       const target = ev.target instanceof HTMLElement ? ev.target : null;
       if (
-        target?.closest("input, textarea, select, button") ||
+        target?.closest("input, textarea, select") ||
         target?.isContentEditable ||
         ev.metaKey ||
         ev.ctrlKey ||
@@ -283,11 +283,10 @@ export default function App() {
       ),
     [chatSessions],
   );
-  const badges: Record<TabId, number> = {
-    queue: queueBadge,
-    chat: chatBadge,
-    obs: 0,
-  };
+  const badges = useMemo<Record<TabId, number>>(
+    () => ({ queue: queueBadge, chat: chatBadge, obs: 0 }),
+    [queueBadge, chatBadge],
+  );
 
   // Selecting a trace event briefly highlights the matching call-graph edge.
   const onTraceSelect = useCallback((e: TraceEvent) => {

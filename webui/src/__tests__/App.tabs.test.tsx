@@ -43,6 +43,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   cleanup();
   frameSink = null;
+  window.history.replaceState(null, "", "/");
   window.location.hash = "";
 });
 

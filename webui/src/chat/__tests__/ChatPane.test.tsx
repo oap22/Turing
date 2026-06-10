@@ -182,7 +182,7 @@ describe("ChatPane thread", () => {
       />,
     );
     // The prompt renders in both the thread list and the detail header.
-    expect(screen.getAllByText("why is the sky blue?").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("why is the sky blue?")).toHaveLength(2);
     expect(screen.getByText("Rayleigh scattering.")).toBeInTheDocument();
     expect(
       screen.getByTestId("chat-session-s1").getAttribute("data-subtask-count"),
