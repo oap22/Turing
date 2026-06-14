@@ -34,7 +34,7 @@ dependencies = [
 [project.optional-dependencies]
 embeddings = ["onnxruntime>=1.26.0"]
 dev = [
-    "pytest>=9.0.3",
+    "pytest>=9.1.0",
     "pytest-asyncio>=1.4.0",
     "pytest-cov",
     "ruff",
