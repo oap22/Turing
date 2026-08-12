@@ -62,7 +62,9 @@ What is being added is an **objective** (how much better, at what cost, convergi
   Call `.venv/bin/pytest`, `.venv/bin/mypy`, `.venv/bin/ruff` directly — the ones on `PATH` do not see the project.
 - Tests that create git commits need `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null`
   (the container's global git config enables commit signing). With that set from the start, the
-  ~40 signing failures `CLAUDE.md` warns about do **not** occur.
+  ~40 signing failures `CLAUDE.md` warns about do **not** occur. **Scope it to the `pytest` call.**
+  Applying it to your own `git commit` strips the SSH signing config and yields Unverified commits;
+  this branch hit that and was fixed by `git rebase --exec "git commit --amend --no-edit --reset-author"`.
 - `tests/integration/` and `tests/test_integration/` **hang forever** — no docker daemon, and
   `testcontainers` blocks instead of failing fast. Exclude both. Verified baseline on this branch's
   parent: **1728 passed, 2 skipped in 75.81s**. Anything red beyond that is yours.

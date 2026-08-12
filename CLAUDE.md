@@ -37,6 +37,13 @@ Known failure modes in managed containers — work around them instead of redisc
 - **Tests that create git commits in tmp repos** (vault committer/proposer/watcher, bench cycle) fail with `git commit … exit status 128` because the container's global git config enables commit signing. Run them with a neutral config:
   `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null pytest …`
   These same failures (~40 tests) are pre-existing on any branch in this environment; they are not caused by your change.
+  **Scope that workaround to the `pytest` invocation only.** The same global config carries the SSH
+  commit-signing setup, so prefixing your *own* `git commit` with it silently produces unsigned
+  commits that GitHub marks Unverified. If it already happened:
+  `git config user.email noreply@anthropic.com && git config user.name Claude`, then
+  `git rebase --exec "git commit --amend --no-edit --reset-author" <first-bad-commit>^` and force-push.
+  Local `%G?` still reports `N` afterwards because `gpg.ssh.allowedSignersFile` is unset — that is a
+  *verification* gap, not a signing failure. Confirm with `git cat-file -p HEAD | grep gpgsig`.
 - **`tests/integration/` and `tests/test_integration/` hang forever** — there is no docker daemon in the container, and `testcontainers` blocks rather than failing fast. Symptom: `pytest tests/` sits at ~0% CPU for 30+ minutes with no output. Exclude them:
   `pytest tests/ --ignore=tests/integration --ignore=tests/test_integration`
   The rest of the suite is **1728 passed, 2 skipped in ~76s** — if a run takes minutes, it is hung, not slow. Check with `ps -o time -p <pid>`: low CPU time against high elapsed time means blocked, not working.
