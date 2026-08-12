@@ -14,7 +14,7 @@ python -m turing                          # Start the bot (needs .env)
 TURING_ENV=development python -m turing   # Explicit dev mode
 
 # Test
-pytest tests/ -v                          # Full suite (301 tests)
+pytest tests/ -v                          # Full suite (1728 tests)
 pytest tests/test_agent/ -v               # Single module
 pytest tests/test_tools/test_shell.py::TestDenylist::test_rm_rf_root -v  # Single test
 pytest tests/ -m "not slow"               # Skip slow tests
@@ -37,6 +37,9 @@ Known failure modes in managed containers — work around them instead of redisc
 - **Tests that create git commits in tmp repos** (vault committer/proposer/watcher, bench cycle) fail with `git commit … exit status 128` because the container's global git config enables commit signing. Run them with a neutral config:
   `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null pytest …`
   These same failures (~40 tests) are pre-existing on any branch in this environment; they are not caused by your change.
+- **`tests/integration/` and `tests/test_integration/` hang forever** — there is no docker daemon in the container, and `testcontainers` blocks rather than failing fast. Symptom: `pytest tests/` sits at ~0% CPU for 30+ minutes with no output. Exclude them:
+  `pytest tests/ --ignore=tests/integration --ignore=tests/test_integration`
+  The rest of the suite is **1728 passed, 2 skipped in ~76s** — if a run takes minutes, it is hung, not slow. Check with `ps -o time -p <pid>`: low CPU time against high elapsed time means blocked, not working.
 - **GitHub MCP `pull_request_read` with `method: get_status` returns 403** ("Resource not accessible by integration"). Use `method: get_check_runs` instead — it works and covers CI state.
 - **`webui/` tests need `npm ci` first** — `npm run test` fails with `vitest: not found` on a fresh clone.
 - **No pre-built venv** — `pytest`/`mypy` on PATH don't see the project. Create `.venv` per the Setup block above and call `.venv/bin/pytest` etc.
