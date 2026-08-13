@@ -206,10 +206,56 @@ regardless of what a workspace starts with.
 `term` (local shell via `portable-pty`), `queue` / `chat` / `obs` (the exact
 browser-tab components, gateway-proxied), `metrics` (tails `metrics.jsonl`/
 `metrics.json`, multi-run overlay, one series at a time via tabs, ETA strip),
-`images` (browses result images), `flywheel` (parses
+`images` (browses result images, see below), `flywheel` (parses
 `<results>/loop-*/trajectory.json` round timelines), `agents` (live
 Claude Code / Codex CLI session list + transcript tail), `agentfeed`
 (cross-session tool/assistant activity feed).
+
+### The `flywheel` pane's round timeline
+
+Each round renders as index, the cells it scored, a status glyph, and the
+driving-function numbers — per-cell primary score with gain in noise units,
+then cost and human-gate load. Status comes from the structured fields the
+loop writes, not from the prose `verdict` string (which is appended to the
+detail instead):
+
+| Glyph | Meaning |
+|---|---|
+| `✓` | improving — at least one cell beat its noise floor |
+| `✗` | failed a gate (`constraints`) |
+| `=` | saturated — no cell beat its noise floor |
+| `?` | refused — the measurement needed for the call was never made |
+| `·` | no verdict, e.g. a round 0 baseline with no parent to compare against |
+
+`?` and `=` are deliberately distinct: a refusal is not a flat round, and
+collapsing them would let a missing measurement read as a real result.
+
+### The `images` pane and follow-mode
+
+The pane merges both watched roots newest-first and, by default, **follows the
+newest image** — `[watch latest]` starts on, so a fresh plot landing under a
+watched root becomes the preview. That is the right behavior while a job runs
+and nothing has been picked: `ssh-pull-assets` mirrors remote plots every 30s
+and the pane acts as a live wall.
+
+**Selecting an image turns following off.** The pane distinguishes the
+selection it chose from the one you chose, and an image you deliberately
+selected does not change without another user action — so studying an older
+plot mid-run is no longer interrupted every 30 seconds.
+
+Getting back to following, either way:
+
+- `[watch latest]` — off → on re-selects the newest and resumes following.
+- `[N new]` — appears beside it once newer images have landed behind your
+  selection; click to jump to the newest and resume.
+
+Clicking an image enlarges it in an in-pane lightbox: `Escape` or a click on
+the backdrop dismisses, `←`/`→` step through images in the same newest-first
+order the list shows (which also moves the list highlight). Following stays
+suspended while enlarged, so an arriving image never swaps out the one you are
+looking at. The lightbox stays inside the pane's own bounds, so it composes
+with `⌘f` zoom rather than fighting it — enlarging inside a zoomed pane gives
+you the image full-window.
 
 `chat` is reserved, not active work: it is held for the future Jetson-nano
 fleet coordinator and stays dormant until the gateway/coordinator stack wakes.

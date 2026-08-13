@@ -10,9 +10,17 @@ the real app via the entrypoint's ``build_app`` helper and drive it with a
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from typing import TYPE_CHECKING
+
 import anyio
 import pytest
 from fastapi.testclient import TestClient
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from fastapi import FastAPI
 
 from turing.config import TuringConfig
 from turing.coordinator.episode_rewards import EpisodeRewardsStore, RewardSource
@@ -70,23 +78,31 @@ def test_build_assembly_refuses_empty_token_on_start() -> None:
 # ── (b) the assembled app serves /healthz, / and gates a bearer route ────────
 
 
-def _client(config: TuringConfig) -> tuple[TestClient, object]:
+@contextmanager
+def _client(config: TuringConfig) -> Iterator[TestClient]:
     """Build the entrypoint's app and a ``TestClient`` over it.
 
-    Returns the ring buffer too so the caller can close it — keeps the
-    in-memory aiosqlite handle from leaking across tests.
+    Closes the app's in-memory ring buffer on the way out. That close is not
+    housekeeping: aiosqlite runs every connection on its own **non-daemon**
+    worker thread, so a handle left open outlives the test session and keeps
+    the interpreter from exiting — the intermittent CI hang in #384, where the
+    summary prints and the process never returns. The other tests in this file
+    already close through ``finally``; these five leaked one connection each.
     """
 
-    async def _build() -> object:
+    async def _build() -> FastAPI:
         return await build_app(config)
 
     app = anyio.run(_build)
-    return TestClient(app), app
+    try:
+        yield TestClient(app)
+    finally:
+        anyio.run(app.state.ring_buffer.close)
 
 
 def test_healthz_returns_200() -> None:
-    client, _ = _client(_config())
-    res = client.get("/healthz")
+    with _client(_config()) as client:
+        res = client.get("/healthz")
     assert res.status_code == 200
     assert res.json() == {"status": "ok"}
 
@@ -94,19 +110,19 @@ def test_healthz_returns_200() -> None:
 def test_root_returns_200_landing_or_spa() -> None:
     # ``/`` is public: unauthenticated callers get the friendly landing payload
     # (or the SPA bundle if one is built). Either way it's a 200, never a 401.
-    client, _ = _client(_config())
-    res = client.get("/")
+    with _client(_config()) as client:
+        res = client.get("/")
     assert res.status_code == 200
 
 
 def test_gated_route_401_without_token() -> None:
-    client, _ = _client(_config())
-    assert client.get("/api/queue").status_code == 401
+    with _client(_config()) as client:
+        assert client.get("/api/queue").status_code == 401
 
 
 def test_gated_route_200_with_token() -> None:
-    client, _ = _client(_config())
-    res = client.get("/api/queue", headers=_HEADERS)
+    with _client(_config()) as client:
+        res = client.get("/api/queue", headers=_HEADERS)
     assert res.status_code == 200
     body = res.json()
     assert body["type"] == "queue.snapshot"
@@ -115,8 +131,8 @@ def test_gated_route_200_with_token() -> None:
 
 
 def test_gated_route_rejects_wrong_token() -> None:
-    client, _ = _client(_config())
-    res = client.get("/api/queue", headers={"Authorization": "Bearer wrong"})
+    with _client(_config()) as client:
+        res = client.get("/api/queue", headers={"Authorization": "Bearer wrong"})
     assert res.status_code == 401
 
 

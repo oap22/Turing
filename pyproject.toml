@@ -37,6 +37,7 @@ dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.4.0",
     "pytest-cov",
+    "pytest-timeout>=2.4.0",
     "ruff",
     "mypy",
     "alembic>=1.18.4",
@@ -107,6 +108,14 @@ testpaths = ["tests"]
 # from another editable checkout (#335).
 pythonpath = ["src"]
 asyncio_mode = "auto"
+# Backstop for a test that wedges mid-run (#384). Generous on purpose — the
+# slowest real test is far under this, so a trip means a genuine hang, and
+# `thread` method dumps the stack instead of killing the run silently. This
+# does NOT cover a hang *after* the session ends: nothing is running then, so
+# no per-test timer can fire. That case is the exit watchdog in
+# tests/conftest.py.
+timeout = 300
+timeout_method = "thread"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests requiring external services",
