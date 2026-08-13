@@ -52,6 +52,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     timer.daemon = True
     timer.start()
 
+
 # ---------------------------------------------------------------------------
 # LLMResponse stub (mirrors the shape used by turing.llm)
 # ---------------------------------------------------------------------------
