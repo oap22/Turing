@@ -67,6 +67,11 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         # Names alone rarely identify the culprit — "Thread-36" says nothing.
         # The stacks name the frame each straggler is parked in.
         faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        # Both streams: `os._exit` skips interpreter shutdown, so anything
+        # still sitting in a buffer is lost. Under CI, stdout is a pipe and
+        # therefore block-buffered, which is exactly where the terminal
+        # summary would go missing.
+        sys.stdout.flush()
         sys.stderr.flush()
         os._exit(exitstatus)
 

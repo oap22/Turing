@@ -3,9 +3,13 @@
 // as momentum.
 //
 // Pure geometry, no rendering: given a round count and a viewport it returns
-// SVG paths. That keeps it testable, and it means a live append recomputes
-// paths rather than re-animating history — the pane re-renders on `fs-change`
-// during a run and must not thrash.
+// SVG paths. That keeps it testable, and it means a live append is a plain
+// recompute — the pane re-renders on `fs-change` during a run and must not
+// thrash. Note that appending genuinely re-partitions the whole ring: every
+// wedge gets a new angle, because the wedges always divide a full turn
+// between them. Nothing animates (the round index is the React key and there
+// are no transitions), but the ring redistributes rather than growing into
+// spare space.
 //
 // Constraints this has to survive, all from the issue:
 //   - the pane's default preset is one third of a workspace column, and the
@@ -126,7 +130,11 @@ export function wheelGeometry(
     const a0 = start + ordinal * step;
     const a1 = a0 + step - gap;
     const mid = (a0 + a1) / 2;
-    const arcPx = rLabel * (a1 - a0);
+    // Tangential room is the usual constraint, but at 3 and 9 o'clock the
+    // text runs across the ring's thickness instead, so the band has to fit
+    // it too — otherwise a three-digit index overflows the ring in a small
+    // pane. Gate on whichever is tighter.
+    const arcPx = Math.min(rLabel * (a1 - a0), rOuter - rInner);
     const [lx, ly] = point(cx, cy, rLabel, mid);
     return {
       index,

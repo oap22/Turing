@@ -8,7 +8,7 @@
 // accumulating rounds as momentum; and `raw`. Clicking a round in either view
 // expands the full `round-NN/round.json` artifact underneath it.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { inv, subscribe } from "../tauri";
 import { parseTrajectory, type Round } from "./flywheel";
 import {
@@ -53,38 +53,72 @@ function statusGlyph(status: Round["status"]): {
     };
   }
   // A refusal is not a flat round: it means the measurement needed to make
-  // the call was never made. It must not look like either outcome.
+  // the call was never made. It must not look like either outcome — and it
+  // needs its own *colour*, not just its own glyph, because the wheel draws
+  // wedges and has no glyph to carry the distinction. Sharing `term-dim` with
+  // "no verdict" let a missing measurement read as a real result there.
   if (status === "refused") {
     return {
       glyph: "?",
-      cls: "text-term-dim",
+      cls: "text-amber-400",
       title: "refused — the call could not be made",
     };
   }
   return { glyph: "·", cls: "text-term-dim", title: "no verdict" };
 }
 
+/**
+ * Fixed-point, with the trailing `.00` trimmed so whole numbers stay short.
+ *
+ * `Object.is` guards the `-0` case: a marginal gain of -0.004 at two decimals
+ * renders "-0", which reads as a sign that isn't there.
+ */
 function fmtNum(n: number | null, digits = 2): string {
-  return n === null ? "—" : n.toFixed(digits).replace(/\.00$/, "");
+  if (n === null) return "—";
+  const s = n.toFixed(digits).replace(/\.00$/, "");
+  return s === "-0" || s === "-0.0" ? s.slice(1) : s;
+}
+
+/**
+ * Cost per unit gain spans orders of magnitude — tokens-per-point can be tens
+ * of thousands or a fraction. A fixed 0 decimals rendered anything under 0.5
+ * as "0", i.e. indistinguishable from free.
+ */
+function fmtCost(n: number | null): string {
+  if (n === null) return "—";
+  if (n === 0) return "0";
+  const abs = Math.abs(n);
+  if (abs >= 100) return n.toFixed(0);
+  if (abs >= 1) return n.toFixed(1);
+  if (abs >= 0.01) return n.toFixed(2);
+  return n.toExponential(1);
 }
 
 /** The full round artifact, expanded under the round the user clicked. */
 function RoundDetail({
   record,
   parent,
+  reason,
   onOpen,
 }: {
   record: RoundRecord | null;
   parent: RoundRecord | null;
+  reason: "loading" | "ok" | "missing" | "unparseable";
   onOpen: () => void;
 }) {
   if (!record) {
-    // Missing or unparseable round.json — say so and keep the timeline. The
-    // artifact is written after the trajectory row, so a round mid-flight
-    // legitimately has no round.json yet.
+    // "Not written yet" and "there but unreadable" are different situations
+    // and must not be reported as the same one. The artifact is written after
+    // the trajectory row, so a round mid-flight genuinely has none yet.
+    const message =
+      reason === "loading"
+        ? "reading round.json…"
+        : reason === "unparseable"
+          ? "round.json is present but could not be read"
+          : "no round.json for this round yet";
     return (
       <div className="border-l border-term-edge py-1 pl-3 text-[11px] text-term-dim">
-        no round.json for this round yet
+        {message}
       </div>
     );
   }
@@ -143,8 +177,19 @@ function RoundDetail({
               <th className="font-normal">cell</th>
               <th className="font-normal">n</th>
               <th className="font-normal">score</th>
+              <th className="font-normal" title="correctness pass rate">
+                pass
+              </th>
               <th className="font-normal">Δ</th>
-              <th className="font-normal">σ</th>
+              <th
+                className="font-normal"
+                title="the noise floor Δ is measured against"
+              >
+                floor
+              </th>
+              <th className="font-normal" title="gain in noise units">
+                σ
+              </th>
               <th className="font-normal">cost/pt</th>
             </tr>
           </thead>
@@ -156,7 +201,13 @@ function RoundDetail({
                   <td className="pr-2">{s.cell}</td>
                   <td className="pr-2 text-term-dim">{s.n ?? "—"}</td>
                   <td className="pr-2">{fmtNum(s.meanScore)}</td>
+                  <td className="pr-2 text-term-dim">
+                    {fmtNum(s.correctnessPassRate)}
+                  </td>
                   <td className="pr-2">{fmtNum(d?.marginalGain ?? null)}</td>
+                  <td className="pr-2 text-term-dim">
+                    {fmtNum(d?.noiseFloor ?? null)}
+                  </td>
                   <td
                     className={`pr-2 ${
                       d?.beatsNoiseFloor === true
@@ -176,7 +227,7 @@ function RoundDetail({
                     {fmtNum(d?.gainInNoiseUnits ?? null, 1)}
                   </td>
                   <td className="text-term-dim">
-                    {fmtNum(d?.costPerUnitGain ?? null, 0)}
+                    {fmtCost(d?.costPerUnitGain ?? null)}
                   </td>
                 </tr>
               );
@@ -194,8 +245,32 @@ function RoundDetail({
         </span>
         <span>{fmtNum(record.cost.wallClockSeconds, 0)}s</span>
         <span>{record.cost.attempts ?? "—"} attempts</span>
-        <span>{record.escalationCount ?? 0} escalations</span>
+        {/* Human-gate load is driving function #4. Rendering a missing value
+            as 0 would assert a measurement that was never made. */}
+        <span>{record.escalationCount ?? "—"} escalations</span>
       </div>
+
+      {record.saturation.length > 0 && (
+        <div className="space-y-0.5 text-term-dim">
+          {record.saturation.map((a) => (
+            <div key={`${a.cell}-${a.verdict}`}>
+              <span className="text-term-fg">{a.cell}</span>{" "}
+              <span
+                className={
+                  a.verdict === "improving"
+                    ? "text-emerald-400"
+                    : a.verdict?.startsWith("refused")
+                      ? "text-amber-400"
+                      : ""
+                }
+              >
+                {a.verdict ?? "—"}
+              </span>
+              {a.reason ? ` — ${a.reason}` : ""}
+            </div>
+          ))}
+        </div>
+      )}
 
       {record.gates.length > 0 && (
         <div className="flex flex-wrap gap-x-3">
@@ -230,12 +305,21 @@ export default function FlywheelPane() {
   const [rawView, setRawView] = useState(false);
   const [view, setView] = useState<View>("list");
   const [openRound, setOpenRound] = useState<number | null>(null);
+  // Stamped with the loop and round it describes. Rendering is gated on that
+  // stamp matching what is currently open, so a slow read can never paint one
+  // round's measurements under another round's row — the exact misattribution
+  // the comparable-to-parent check exists to prevent.
   const [detail, setDetail] = useState<{
+    loop: string;
+    index: number;
     record: RoundRecord | null;
+    /** Distinguishes "not written yet" from "there but unreadable". */
+    reason: "ok" | "missing" | "unparseable";
     parent: RoundRecord | null;
   } | null>(null);
-  const wheelBoxRef = useRef<HTMLDivElement | null>(null);
   const [box, setBox] = useState({ w: 0, h: 0 });
+  const observerRef = useRef<ResizeObserver | null>(null);
+  const reloadSeq = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -270,12 +354,23 @@ export default function FlywheelPane() {
     };
   }, []);
 
+  // Sequenced and guarded. `loops` is listed once at mount, so a loop dir
+  // removed during the session stays in the dropdown; without the catch its
+  // read would reject and leave `text` holding the *previous* loop's rounds,
+  // displayed under the new loop's name. The sequence number handles the same
+  // hazard from the other direction: two reads in flight, the slower one
+  // landing last and winning.
   async function reload(loop: string) {
-    const t = await inv<string>("fs_read_text", {
-      root: RESULTS_ROOT,
-      rel: `${loop}/trajectory.json`,
-    });
-    setText(t);
+    const seq = ++reloadSeq.current;
+    try {
+      const t = await inv<string>("fs_read_text", {
+        root: RESULTS_ROOT,
+        rel: `${loop}/trajectory.json`,
+      });
+      if (reloadSeq.current === seq) setText(t);
+    } catch {
+      if (reloadSeq.current === seq) setText("");
+    }
   }
 
   useEffect(() => {
@@ -305,30 +400,54 @@ export default function FlywheelPane() {
   // The round artifact is written after the trajectory row, so an expanded
   // round that is still in flight re-reads when its round.json lands.
   useEffect(() => {
-    if (!selected || openRound === null) {
-      setDetail(null);
-      return;
-    }
+    // Clear on *every* change, not just on close. Leaving the previous
+    // round's record in place while the next read is in flight renders one
+    // round's numbers, lineage and comparability verdict under another
+    // round's row.
+    setDetail(null);
+    if (!selected || openRound === null) return;
+    const loop = selected;
+    const index = openRound;
     let cancelled = false;
 
-    async function read(index: number): Promise<RoundRecord | null> {
+    async function read(
+      i: number,
+    ): Promise<{
+      record: RoundRecord | null;
+      reason: "ok" | "missing" | "unparseable";
+    }> {
+      let t: string;
       try {
-        const t = await inv<string>("fs_read_text", {
+        t = await inv<string>("fs_read_text", {
           root: RESULTS_ROOT,
-          rel: `${selected}/${roundDirName(index)}/round.json`,
+          rel: `${loop}/${roundDirName(i)}/round.json`,
         });
-        return parseRoundRecord(t);
       } catch {
-        return null;
+        return { record: null, reason: "missing" };
       }
+      const record = parseRoundRecord(t);
+      // A file that is there but will not parse is a different situation
+      // from one not written yet, and must not be reported as "in flight".
+      return record
+        ? { record, reason: "ok" }
+        : { record: null, reason: "unparseable" };
     }
 
     async function loadDetail() {
-      const [record, parent] = await Promise.all([
-        read(openRound!),
-        openRound! > 0 ? read(openRound! - 1) : Promise.resolve(null),
+      const [own, parent] = await Promise.all([
+        read(index),
+        index > 0
+          ? read(index - 1)
+          : Promise.resolve({ record: null, reason: "ok" as const }),
       ]);
-      if (!cancelled) setDetail({ record, parent });
+      if (cancelled) return;
+      setDetail({
+        loop,
+        index,
+        record: own.record,
+        reason: own.reason,
+        parent: parent.record,
+      });
     }
 
     void loadDetail();
@@ -352,16 +471,33 @@ export default function FlywheelPane() {
 
   // The wheel needs real pixels to decide whether it is legible at all and
   // whether labels fit, so it measures rather than scaling a viewBox.
-  useEffect(() => {
-    const el = wheelBoxRef.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
+  //
+  // A callback ref rather than an effect: the measured div is conditionally
+  // rendered, and an effect would need every condition that governs it in its
+  // deps. Missing one (`rounds === null` is not a state variable) left the
+  // observer attached to a detached node and `box` frozen at its last value —
+  // so a shrunken pane would draw a 400px ring in a 90px box, the exact
+  // "render a smudge" case the minimum radius exists to prevent. A ref
+  // callback fires precisely when the node mounts and unmounts.
+  const attachWheelBox = useCallback((el: HTMLDivElement | null) => {
+    observerRef.current?.disconnect();
+    observerRef.current = null;
+    if (!el || typeof ResizeObserver === "undefined") {
+      setBox({ w: 0, h: 0 });
+      return;
+    }
     const ro = new ResizeObserver((entries) => {
       const r = entries[0]?.contentRect;
       if (r) setBox({ w: r.width, h: r.height });
     });
     ro.observe(el);
-    return () => ro.disconnect();
-  }, [view, rawView]);
+    observerRef.current = ro;
+    // Seed synchronously; the observer's first callback is a frame away.
+    const r = el.getBoundingClientRect();
+    setBox({ w: r.width, h: r.height });
+  }, []);
+
+  useEffect(() => () => observerRef.current?.disconnect(), []);
 
   const rounds = useMemo(() => parseTrajectory(text), [text]);
   const showRaw = rawView || rounds === null;
@@ -376,6 +512,25 @@ export default function FlywheelPane() {
 
   function toggleRound(index: number) {
     setOpenRound((prev) => (prev === index ? null : index));
+  }
+
+  // Only hand the detail view a record that is stamped with the loop and
+  // round it is being rendered under. Anything else is a leftover from a
+  // previous selection whose read has not landed yet, and showing it would
+  // label one round's measurements as another's.
+  function detailFor(index: number): {
+    record: RoundRecord | null;
+    parent: RoundRecord | null;
+    reason: "loading" | "ok" | "missing" | "unparseable";
+  } {
+    if (!detail || detail.loop !== selected || detail.index !== index) {
+      return { record: null, parent: null, reason: "loading" };
+    }
+    return {
+      record: detail.record,
+      parent: detail.parent,
+      reason: detail.reason,
+    };
   }
 
   const geo = useMemo(
@@ -441,7 +596,7 @@ export default function FlywheelPane() {
           </pre>
         ) : view === "wheel" ? (
           <div className="flex h-full flex-col">
-            <div ref={wheelBoxRef} className="min-h-0 flex-1">
+            <div ref={attachWheelBox} className="min-h-0 flex-1">
               {geo ? (
                 <svg
                   width={box.w}
@@ -500,11 +655,7 @@ export default function FlywheelPane() {
             </div>
             {openRound !== null && (
               <div className="max-h-[50%] shrink-0 overflow-auto border-t border-term-edge pt-1">
-                <RoundDetail
-                  record={detail?.record ?? null}
-                  parent={detail?.parent ?? null}
-                  onOpen={openRoundDir}
-                />
+                <RoundDetail {...detailFor(openRound)} onOpen={openRoundDir} />
               </div>
             )}
           </div>
@@ -535,8 +686,7 @@ export default function FlywheelPane() {
                   </button>
                   {isOpen && (
                     <RoundDetail
-                      record={detail?.record ?? null}
-                      parent={detail?.parent ?? null}
+                      {...detailFor(r.index)}
                       onOpen={openRoundDir}
                     />
                   )}

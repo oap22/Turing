@@ -228,7 +228,16 @@ detail instead):
 | `·` | no verdict, e.g. a round 0 baseline with no parent to compare against |
 
 `?` and `=` are deliberately distinct: a refusal is not a flat round, and
-collapsing them would let a missing measurement read as a real result.
+collapsing them would let a missing measurement read as a real result. Each
+status also has its own colour, not just its own glyph — the wheel below draws
+wedges with no glyph to carry the difference.
+
+Two of the gates the loop writes, `noise_floor_available` and
+`eval_set_stable`, are the *cause* of a refusal rather than an independent
+failure, so a round is not marked `✗` for a gate that its own refusal verdict
+already explains. Running without a noise-floor report is a supported path;
+it reads `?`, not `✗`. `lineage_recorded` has no corresponding refusal and
+stays a real failure.
 
 **Click a round to expand its full artifact** — `round-NN/round.json`, the
 superset of the trajectory row — underneath it. That gives the per-cell
@@ -247,9 +256,15 @@ as momentum. Wedges are clickable, same detail as the list.
 
 The timeline stays the default: it is denser and more scannable, which matters
 most in the pane's usual size. The wheel drops its per-wedge numbers once
-wedges get too thin for them (around 50 rounds in a small pane) and keeps its
-shape, and below roughly 80px it declines to draw at all rather than render a
-smudge.
+wedges get too thin for them and keeps its shape — the round count in the hub
+still reads. How many rounds that takes depends on the pane's short side:
+roughly 25 rounds at 200px, 37 at 300px, 50 at 400px. Below about 80px it
+declines to draw at all rather than render a smudge, and `[wheel]` takes you
+back to the list.
+
+Note the wheel divides a full turn between the rounds, so a round landing
+mid-run re-partitions the whole ring rather than extending it into spare
+space. Nothing animates.
 
 ### The `images` pane and follow-mode
 
