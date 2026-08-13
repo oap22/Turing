@@ -16,7 +16,6 @@ data/
 models/
 .env
 .claude/
-.gitnexus/
 .mcp.json
 20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.txt
 
