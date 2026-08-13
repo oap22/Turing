@@ -239,11 +239,14 @@ already explains. Running without a noise-floor report is a supported path;
 it reads `?`, not `✗`. `lineage_recorded` has no corresponding refusal and
 stays a real failure.
 
-**Click a round to expand its full artifact** — `round-NN/round.json`, the
-superset of the trajectory row — underneath it. That gives the per-cell
-numbers the loop is steered by (score, Δ, gain in noise units with the
-beats-the-floor call, cost per point), the engine identity including the
-scaffold sha, the gates, and the lineage. Lineage includes an explicit
+**Click a round to expand its `round-NN/round.json`** underneath it — the
+artifact written beside the trajectory row, carrying what the row flattens
+away. The pane shows the per-cell numbers the loop is steered by (score,
+correctness pass rate, Δ, the noise floor Δ is measured against, gain in noise
+units with the beats-the-floor call, cost per point), the engine identity
+including the scaffold sha, the gates, the per-cell saturation verdicts with
+their reasons, and the lineage. The record's `problems[]` and the raw
+`noise_floors[]` samples are not rendered — read the file itself for those. Lineage includes an explicit
 **comparable-to-parent** line: rounds measured on different eval sets may not
 be compared at all, so the pane says so rather than showing a delta that means
 nothing. `[open round dir]` shells the directory out. A round still in flight

@@ -521,11 +521,6 @@ export default function DesktopShell({ surface }: Props) {
       }
     }
 
-    void inv("fs_watch", { root: "results", rel: "" }).catch(() => {
-      // Results root missing on this machine: no control file to watch.
-    });
-    void loadLayoutFile();
-
     const sub = subscribe<{ root: string; rel_path: string }>(
       "fs-change",
       (payload) => {
@@ -533,6 +528,20 @@ export default function DesktopShell({ surface }: Props) {
         if (payload.rel_path === LAYOUT_FILE_REL) void loadLayoutFile();
       },
     );
+
+    // Order matters: await `sub.ready` before asking the backend to watch, or
+    // a change landing between `fs_watch` returning and the Tauri listener
+    // attaching is dropped. It would self-heal on the next write, but a
+    // control file written once at startup would appear to be ignored.
+    void sub.ready
+      .then(() => inv("fs_watch", { root: "results", rel: "" }))
+      .catch(() => {
+        // Results root missing on this machine: no control file to watch.
+      })
+      .then(() => {
+        if (!cancelled) void loadLayoutFile();
+      });
+
     return () => {
       cancelled = true;
       sub.unsubscribe();
