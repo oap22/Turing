@@ -48,9 +48,14 @@ fn default_roots() -> Vec<RootCfg> {
             id: "vault".to_string(),
             path: expand_home("~/Owen's Awesome Vault"),
         },
+        // Project-agnostic on purpose: the watched results root lives outside
+        // any one repo, so a run in ~/Developer/active/mnist (or anywhere
+        // else) lights up the metrics/images panes without dumping artifacts
+        // into the Turing checkout. The id stays "results" — the frontend
+        // panes hardcode it.
         RootCfg {
             id: "results".to_string(),
-            path: expand_home("~/Developer/active/Turing/research/results"),
+            path: expand_home("~/research-results"),
         },
         RootCfg {
             id: "repo".to_string(),
@@ -125,6 +130,22 @@ mod tests {
         assert_eq!(cfg.gateway_token, "");
         assert_eq!(cfg.roots.len(), 5);
         assert_eq!(cfg.roots[0].id, "vault");
+    }
+
+    // The results root is deliberately repo-independent, and its id is part of
+    // the frontend contract (MetricsPane/ImagesPane/FlywheelPane look up
+    // "results" by name).
+    #[test]
+    fn results_root_is_project_agnostic() {
+        let cfg = default_config();
+        let results = cfg
+            .roots
+            .iter()
+            .find(|r| r.id == "results")
+            .expect("results root");
+        assert_eq!(results.path, expand_home("~/research-results"));
+        assert!(!results.path.contains("Turing"));
+        assert!(!results.path.starts_with('~'));
     }
 
     #[test]

@@ -12,7 +12,7 @@ import { createPtyStream } from "../ptyStream";
 import { readTermTokens } from "../theme";
 import { inv, subscribe } from "../tauri";
 import type { Runner } from "../runners";
-import { RUNNERS } from "../runners";
+import { resolveRunner, RUNNERS } from "../runners";
 
 interface Props {
   leafId: string;
@@ -116,7 +116,7 @@ export default function TermPane({ leafId, runnerId, visible }: Props) {
   const [dead, setDead] = useState(false);
 
   useEffect(() => {
-    const runner: Runner | undefined = runnerId
+    const tableRunner: Runner | undefined = runnerId
       ? RUNNERS.find((r) => r.id === runnerId)
       : undefined;
 
@@ -229,6 +229,11 @@ export default function TermPane({ leafId, runnerId, visible }: Props) {
 
     async function boot() {
       await Promise.all([outputSub.ready, exitSub.ready]);
+      if (cancelled) return;
+
+      // Table entries carry a `<RESULTS_ROOT>` placeholder; substitute the
+      // configured root before anything reaches a shell or a cwd.
+      const runner = tableRunner ? await resolveRunner(tableRunner) : undefined;
       if (cancelled) return;
 
       const cols = term.cols;

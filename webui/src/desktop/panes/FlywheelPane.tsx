@@ -1,5 +1,5 @@
-// Flywheel pane: parses the round timeline out of `research/results/loop-*/
-// trajectory.json`, newest loop selected by default with a dropdown to pin
+// Flywheel pane: parses the round timeline out of `loop-*/trajectory.json`
+// under the `results` root, newest loop selected by default with a dropdown to pin
 // an older one. Falls back to a raw tail view when the file doesn't parse.
 
 import { useEffect, useMemo, useState } from "react";

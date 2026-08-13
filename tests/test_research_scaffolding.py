@@ -220,7 +220,10 @@ def test_write_surface_contradiction_is_surfaced_not_silently_widened():
 
     The wide reading ("the whole Turing repo ... writable") voids three
     invariants at once: this repo holds the frozen-verifier enforcement, the cap
-    accounting, and the held-out score cells under ``research/results/``.
+    accounting, and — as the ADR was written — the held-out score cells. The
+    results root has since moved out of the repo to ``~/research-results``, which
+    the ADR records as an amendment rather than a rewrite; the narrow reading is
+    what this test pins, and that is unchanged.
     """
     adr = _norm(_read(ADR))
     assert "whole Turing repo plus `turing-skills` are writable" not in adr, (

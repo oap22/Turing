@@ -309,6 +309,20 @@ records**, because the Turing repo contains all three of their implementations:
 | §5 the cap | `contracts.py` `Cap` / `CapConsumption` | a self-edit can under-count its own consumption |
 | §11 held-out isolation | `research/results/` (the settings default) | held-out `TypeScore` cells are readable straight off disk |
 
+> **Amendment, 2026-08-13 — the §11 row's premise no longer holds.**
+> `ResearchLoopSettings.research_results_root` now defaults to
+> `~/research-results/` rather than the repo-relative `research/results/`, so
+> that Turing Desktop can watch one root while research code lives in any
+> project. The row is left as written because it records the state at decision
+> time, but two consequences follow and neither is closed here:
+> **(a)** the §11 hazard no longer rides on repo write access, so widening the
+> write surface to the Turing repo costs one fewer invariant than the table
+> claims; **(b)** conversely, narrowing the repo surface no longer protects the
+> held-out cells at all — they now sit in the operator's home directory,
+> reachable by anything running as the operator. §11 needs its own boundary
+> (Q11's mechanism question, again), not the repo's. §6's position below is
+> otherwise unchanged: the write surface remains `turing-skills` only.
+
 **Position taken here, and it is deliberately the narrow one:** for the purposes
 of this ADR the agent's write surface is **`turing-skills` only**. That costs
 loop 1 nothing — nothing self-edits during loop 1, so no capability is given up

@@ -248,17 +248,17 @@ written while the loop is down is picked up when it comes back.
 ```bash
 # What is waiting. This is the polling command until R3 closes.
 python -m turing.research.loop.cli \
-    --loop-dir research/results/loop-<slug>/round-00/escalations --list
+    --loop-dir ~/research-results/loop-<slug>/round-00/escalations --list
 
 # Answer one. The verdict is one of exactly three words.
 python -m turing.research.loop.cli \
-    --loop-dir research/results/loop-<slug>/round-00/escalations <request_id> continue
+    --loop-dir ~/research-results/loop-<slug>/round-00/escalations <request_id> continue
 
 python -m turing.research.loop.cli \
-    --loop-dir research/results/loop-<slug>/round-00/escalations <request_id> abandon
+    --loop-dir ~/research-results/loop-<slug>/round-00/escalations <request_id> abandon
 
 python -m turing.research.loop.cli \
-    --loop-dir research/results/loop-<slug>/round-00/escalations <request_id> extend_cap \
+    --loop-dir ~/research-results/loop-<slug>/round-00/escalations <request_id> extend_cap \
     --extra-steps 200 --extra-tokens 500000 --extra-wall-clock 3600
 ```
 
@@ -327,27 +327,33 @@ burns subscription.
 
 ## Where things land
 
+The written record — journal, questions, dead ends, briefs — stays in the repo.
+The *results* do not: they default to `~/research-results/`, outside any repo, so
+a loop driven from any project writes where Turing Desktop watches for live
+metrics and plots. `TURING_RESEARCH_RESULTS_ROOT` repoints the root.
+
 ```
-research/
+research/                         (in the repo)
   JOURNAL.md            the thread — newest entry on top, never edited in place
   OPEN-QUESTIONS.md     what is not known yet; answered ones stay, checked
   DEAD-ENDS.md          what has been ruled out, one line each — currently empty
   briefs/               the agreed brief; the source of record
-  results/
-    <YYYY-MM-DD-slug>/          a one-off run
-      run.json  config.yaml  metrics.json  stdout.log  notes.md  artifacts/
-    loop-<slug>/                the self-improvement trajectory
-      trajectory.json
-      noise-floor/  round-00/  round-01/  …
-        escalations/            <id>.request.json  ← the agent asked
-                                <id>.decision.json ← you answered (via the CLI)
+
+~/research-results/               (outside the repo; the desktop's watched root)
+  <YYYY-MM-DD-slug>/          a one-off run
+    run.json  config.yaml  metrics.json  stdout.log  notes.md  artifacts/
+  loop-<slug>/                the self-improvement trajectory
+    trajectory.json
+    noise-floor/  round-00/  round-01/  …
+      escalations/            <id>.request.json  ← the agent asked
+                              <id>.decision.json ← you answered (via the CLI)
 ```
 
 `…/round-NN/escalations` is the directory you pass to `--loop-dir`. Note that
 the agent's own working directory is **not** here: it is
 `/Users/turing/turing-workspace/<project-id>/`, outside the repo, owned by
-another user (§ One-time machine setup). What lands under `research/results/` is
-the record; what lands in the workspace is the work.
+another user (§ One-time machine setup). What lands under `~/research-results/`
+is the record; what lands in the workspace is the work.
 
 Rules that keep a long trajectory honest:
 
@@ -362,8 +368,12 @@ Rules that keep a long trajectory honest:
   different eval-set hashes raises rather than returning a number.
 - **A round that fails a constraint gate is logged, not deleted.** It is usually
   the most informative round in the sweep.
-- **Commit the record; never commit the artifacts.** `research/results/.gitignore`
-  handles it.
+- **Commit the record; never commit the artifacts.** Now that the results root is
+  `~/research-results/` — outside any repo — nothing under it is committed by
+  default. Copy the small diffable files (`run.json`, `config.yaml`,
+  `metrics.json`, `notes.md`, `trajectory.json`) into the repo when a result is
+  worth citing; leave checkpoints, plots and large outputs where they landed.
+  `research/results/.gitignore` still encodes which is which.
 
 Journal entries for negative results are written with the same care as positive
 ones, and additionally get a line in `DEAD-ENDS.md`. That is the highest-value

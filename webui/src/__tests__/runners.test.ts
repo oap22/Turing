@@ -1,9 +1,19 @@
 // Runner table tests (issue #382).
 
-import { describe, expect, it } from "vitest";
-import { RUNNERS } from "../desktop/runners";
+import { beforeEach, describe, expect, it } from "vitest";
+import {
+  __resetResultsRootForTests,
+  RESULTS_ROOT_TOKEN,
+  resolveRunner,
+  resultsRoot,
+  RUNNERS,
+} from "../desktop/runners";
 
 describe("RUNNERS", () => {
+  beforeEach(() => {
+    __resetResultsRootForTests();
+  });
+
   it("has unique ids", () => {
     const ids = RUNNERS.map((r) => r.id);
     expect(new Set(ids).size).toBe(ids.length);
@@ -32,10 +42,21 @@ describe("RUNNERS", () => {
     }
   });
 
-  // Anything that actually runs on selection must be ready to run as-is.
-  it("leaves no unfilled placeholder in an autorun runner", () => {
+  // Anything that actually runs on selection must be ready to run as-is —
+  // `<RESULTS_ROOT>` excepted, since resolveRunner() fills that in for the
+  // user before the command reaches a shell.
+  it("leaves no user-supplied placeholder in an autorun runner", () => {
     for (const r of RUNNERS.filter((x) => x.autorun)) {
-      expect(r.command, r.id).not.toMatch(/<[A-Z_]+>/);
+      expect(r.command.split(RESULTS_ROOT_TOKEN).join(""), r.id).not.toMatch(/<[A-Z_]+>/);
+    }
+  });
+
+  // Anything runnable must be fully substituted after resolution, cwd included.
+  it("resolves every autorun runner to a placeholder-free command and cwd", async () => {
+    for (const r of RUNNERS.filter((x) => x.autorun)) {
+      const resolved = await resolveRunner(r);
+      expect(resolved.command, r.id).not.toMatch(/<[A-Z_]+>/);
+      expect(resolved.cwd ?? "", r.id).not.toMatch(/<[A-Z_]+>/);
     }
   });
 
@@ -50,7 +71,27 @@ describe("RUNNERS", () => {
   it("pulls remote assets into the watched results dir on a loop", () => {
     const pull = RUNNERS.find((r) => r.id === "ssh-pull-assets");
     expect(pull?.command).toContain("rsync");
-    expect(pull?.command).toContain("research/results/rosie-live/");
+    expect(pull?.command).toContain(`${RESULTS_ROOT_TOKEN}/rosie-live/`);
     expect(pull?.command).toContain("sleep 30");
+  });
+
+  // The whole point of the placeholder: nothing may pin the watched results
+  // directory inside the Turing checkout, since research code lives in other
+  // repos.
+  it("hardcodes no in-repo results path", () => {
+    for (const r of RUNNERS) {
+      expect(r.command, r.id).not.toContain("research/results");
+      expect(r.cwd ?? "", r.id).not.toContain("research/results");
+    }
+  });
+
+  // Outside Tauri (tests, plain browser) there is no `app_config` to ask, so
+  // resolution falls back to the same default `config.rs` ships.
+  it("falls back to the project-agnostic default results root", async () => {
+    expect(await resultsRoot()).toBe("~/research-results");
+    const pull = RUNNERS.find((r) => r.id === "ssh-pull-assets")!;
+    expect((await resolveRunner(pull)).command).toContain("~/research-results/rosie-live/");
+    const results = RUNNERS.find((r) => r.id === "research-results")!;
+    expect((await resolveRunner(results)).cwd).toBe("~/research-results");
   });
 });
