@@ -29,23 +29,45 @@ _EXIT_GRACE_SECONDS = 30.0
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    import faulthandler
     import os
     import sys
     import threading
 
-    def _force_exit() -> None:
-        stragglers = [
-            t.name
+    def _stragglers() -> list[threading.Thread]:
+        return [
+            t
             for t in threading.enumerate()
             if t is not threading.current_thread() and not t.daemon and t.is_alive()
         ]
+
+    # Report immediately rather than only after the grace period. A leak that
+    # the timer would eventually paper over still shows up in a green run's
+    # log, so the next one is caught while it is cheap to fix.
+    survivors = _stragglers()
+    if survivors:
         print(
-            f"\n[conftest watchdog] process still alive {_EXIT_GRACE_SECONDS}s after "
-            f"session finish; non-daemon threads: {stragglers or 'none visible'}; "
-            f"forcing exit({exitstatus}). See issue #384.",
+            f"\n[conftest watchdog] {len(survivors)} non-daemon thread(s) survived the "
+            f"session: {[t.name for t in survivors]}. Something opened a resource and "
+            "never closed it — an aiosqlite handle runs on a non-daemon worker thread, "
+            "so this is what hangs CI. See issue #384.",
             file=sys.stderr,
             flush=True,
         )
+
+    def _force_exit() -> None:
+        print(
+            f"\n[conftest watchdog] process still alive {_EXIT_GRACE_SECONDS}s after "
+            f"session finish; non-daemon threads: "
+            f"{[t.name for t in _stragglers()] or 'none visible'}. Stacks of every "
+            f"live thread follow; forcing exit({exitstatus}). See issue #384.",
+            file=sys.stderr,
+            flush=True,
+        )
+        # Names alone rarely identify the culprit — "Thread-36" says nothing.
+        # The stacks name the frame each straggler is parked in.
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        sys.stderr.flush()
         os._exit(exitstatus)
 
     timer = threading.Timer(_EXIT_GRACE_SECONDS, _force_exit)
