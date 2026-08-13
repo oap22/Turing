@@ -330,9 +330,18 @@ That is the motivating case in one file: set up workspace 3 for agent
 observation, empty workspace 4, and switch to 3.
 
 **The file is declarative.** It states the layout it wants; the app makes
-reality match. Re-applying it changes nothing, so it is safe to rewrite on
-every change. There are no imperative "open a pane" / "close a pane"
+reality match. There are no imperative "open a pane" / "close a pane"
 operations — you open a pane by listing it and close one by leaving it out.
+
+**Re-applying the same file really does nothing**, so it is safe for an agent
+to rewrite on every turn. The app reconciles against the panes already on
+screen: a pane whose type and `runnerId` already match keeps its identity,
+and an unchanged workspace is not rebuilt. That matters because panes are
+torn down and remounted when their identity changes — for a `term` that
+means killing the pty and respawning its runner, so a naive rewrite-every-turn
+loop would kill the test run it had just started. Changing a ratio likewise
+re-splits without disturbing the panes. Your focused pane and a hand-set
+`⌘f` zoom both survive a re-apply.
 
 **Workspace keys are the numbers you press `⌘` with, `"1"` through `"5"`** —
 the same numbers as the workspace table above, not 0-based indices.
@@ -378,6 +387,13 @@ the runner table, e.g. `{ "pane": "term", "runnerId": "ssh-pull-assets" }`.
 Arbitrary command strings are deliberately not accepted: anything able to
 write into the results root would otherwise have shell execution on this
 machine. Launch something not in the table by adding a runner.
+
+Be aware of what that still permits, though. Anything that can write into the
+results root can cause any `autorun: true` runner to execute unattended — and
+some of those, `rosie-preflight` and `rosie-queue`, run `ssh` against a remote
+host. The control file is as trusted as write access to the results
+directory; treat it that way, and prefer `autorun: false` for runners with
+side effects beyond the local machine.
 
 **Rearranging never steals focus and never moves the mouse pointer.** The
 change is applied passively, so panes can be rearranged under your hands

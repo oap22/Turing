@@ -113,7 +113,18 @@ function layoutReducer(state: LayoutState, action: ShellAction): LayoutState {
     // layout, never a state captured when the watcher subscribed. A request
     // that is malformed, out of range, or asks for nothing returns null and
     // the layout is kept exactly as it was.
-    return applyLayoutRequest(state, action.req) ?? state;
+    //
+    // The catch is not decoration. This runs in React's render phase, so it
+    // is outside the watcher's own try/catch, and there is no error boundary
+    // above it — anything thrown here unmounts the whole shell, and since the
+    // offending file is still on disk it would do it again on every relaunch.
+    // `applyLayoutRequest` caps depth and size to keep that unreachable; this
+    // is the second lock on the same door.
+    try {
+      return applyLayoutRequest(state, action.req) ?? state;
+    } catch {
+      return state;
+    }
   }
   if (action.type === "setRoot") {
     const workspaces = state.workspaces.slice();

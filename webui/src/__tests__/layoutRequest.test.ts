@@ -88,9 +88,11 @@ describe("applyLayoutRequest — the motivating case", () => {
 
 describe("applyLayoutRequest — tree shapes", () => {
   it("builds an explicit nested tree with directions and ratios", () => {
+    // Workspace 5 (index 4), which starts empty — asking for this exact shape
+    // on ⌘2 would be a no-op, since it is what defaultLayout() already has.
     const next = applyLayoutRequest(defaultLayout(), {
       workspaces: {
-        "2": {
+        "5": {
           tree: {
             split: "h",
             ratio: 0.55,
@@ -105,10 +107,34 @@ describe("applyLayoutRequest — tree shapes", () => {
         },
       },
     });
-    const root = next!.workspaces[1].root!;
+    const root = next!.workspaces[4].root!;
     expect(root.kind).toBe("split");
     expect(root).toMatchObject({ kind: "split", dir: "h", ratio: 0.55 });
-    expect(paneNames(next!, 1)).toEqual(["metrics", "images", "flywheel"]);
+    expect(paneNames(next!, 4)).toEqual(["metrics", "images", "flywheel"]);
+  });
+
+  it("is a no-op when the file asks for the layout already on screen", () => {
+    // defaultLayout()'s ⌘2 is exactly this shape. Asking for it must change
+    // nothing at all rather than rebuilding identical panes.
+    expect(
+      applyLayoutRequest(defaultLayout(), {
+        workspaces: {
+          "2": {
+            tree: {
+              split: "h",
+              ratio: 0.55,
+              a: { pane: "metrics" },
+              b: {
+                split: "v",
+                ratio: 0.5,
+                a: { pane: "images" },
+                b: { pane: "flywheel" },
+              },
+            },
+          },
+        },
+      }),
+    ).toBeNull();
   });
 
   it("folds the panes shorthand into a spine", () => {
@@ -261,6 +287,153 @@ describe("applyLayoutRequest — malformed input is ignored whole", () => {
     });
     expect(next).not.toBeNull();
     expect(paneNames(next!, 0)).toEqual(["term"]);
+  });
+});
+
+describe("re-applying a file is genuinely a no-op", () => {
+  // Panes are keyed by leaf id in the shell, so a fresh id unmounts and
+  // remounts the pane. For a `term` that kills the pty and respawns an
+  // autorun runner — an agent rewriting .layout.json every turn would kill
+  // the test run it just started. Idempotency here is a hard requirement,
+  // not a nicety.
+  const req = {
+    workspaces: {
+      "3": {
+        panes: [{ pane: "agents" }, { pane: "term", runnerId: "pytest" }],
+      },
+    },
+  };
+
+  it("returns null the second time, leaving the layout untouched", () => {
+    const once = applyLayoutRequest(defaultLayout(), req)!;
+    expect(once).not.toBeNull();
+    expect(applyLayoutRequest(once, req)).toBeNull();
+  });
+
+  it("keeps the very same leaf ids across a re-apply", () => {
+    const once = applyLayoutRequest(defaultLayout(), req)!;
+    const idsBefore = allIds(once);
+    const twice = applyLayoutRequest(once, req);
+    // null means nothing changed at all, which is the strongest form of this.
+    expect(twice).toBeNull();
+    expect(allIds(once)).toEqual(idsBefore);
+  });
+
+  it("keeps the workspace object itself by reference", () => {
+    const once = applyLayoutRequest(defaultLayout(), req)!;
+    // `active: 2` is a real move (the default is workspace 1), so the request
+    // does something — but the workspace it names must be reused as-is.
+    const twice = applyLayoutRequest(once, { ...req, active: 2 })!;
+    // Only `active` moved, so the workspace must be the same object — a new
+    // object with equal contents would still remount nothing, but this
+    // proves reconciliation reused the tree rather than rebuilding it.
+    expect(twice.workspaces[2]).toBe(once.workspaces[2]);
+  });
+
+  it("preserves the pane the user focused, rather than snapping to the first", () => {
+    const once = applyLayoutRequest(defaultLayout(), req)!;
+    const second = leaves(once.workspaces[2].root)[1];
+    const moved: LayoutState = {
+      ...once,
+      workspaces: once.workspaces.map((w, i) =>
+        i === 2
+          ? { ...w, focus: second.kind === "leaf" ? second.id : null }
+          : w,
+      ),
+    };
+    expect(applyLayoutRequest(moved, req)).toBeNull();
+  });
+
+  it("preserves a hand-set zoom when nothing changed", () => {
+    const once = applyLayoutRequest(defaultLayout(), req)!;
+    const zoomed: LayoutState = {
+      ...once,
+      workspaces: once.workspaces.map((w, i) =>
+        i === 2 ? { ...w, zoom: true } : w,
+      ),
+    };
+    expect(applyLayoutRequest(zoomed, req)).toBeNull();
+  });
+
+  it("still replaces panes that genuinely changed, and only those", () => {
+    const once = applyLayoutRequest(defaultLayout(), req)!;
+    const before = leaves(once.workspaces[2].root);
+    // Swap only the second pane's type; the first must survive untouched.
+    const next = applyLayoutRequest(once, {
+      workspaces: { "3": { panes: [{ pane: "agents" }, { pane: "metrics" }] } },
+    })!;
+    const after = leaves(next.workspaces[2].root);
+    expect(after[0]).toBe(before[0]);
+    expect(after[1]).not.toBe(before[1]);
+    expect(paneNames(next, 2)).toEqual(["agents", "metrics"]);
+  });
+
+  it("treats a changed runnerId as a different pane", () => {
+    const once = applyLayoutRequest(defaultLayout(), req)!;
+    const next = applyLayoutRequest(once, {
+      workspaces: {
+        "3": {
+          panes: [
+            { pane: "agents" },
+            { pane: "term", runnerId: "pytest-full" },
+          ],
+        },
+      },
+    })!;
+    const before = leaves(once.workspaces[2].root)[1];
+    const after = leaves(next.workspaces[2].root)[1];
+    expect(after).not.toBe(before);
+    expect(after).toMatchObject({ params: { runnerId: "pytest-full" } });
+  });
+
+  it("treats a changed ratio as a change without remounting the panes", () => {
+    const once = applyLayoutRequest(defaultLayout(), req)!;
+    const next = applyLayoutRequest(once, {
+      workspaces: { "3": { ...req.workspaces["3"], ratio: 0.7 } },
+    })!;
+    expect(next.workspaces[2].root).toMatchObject({ ratio: 0.7 });
+    // The leaves are unchanged, so the panes keep their ids and their ptys.
+    expect(allIds(next)).toEqual(allIds(once));
+  });
+});
+
+describe("a hostile file cannot crash the shell", () => {
+  // The reducer runs in React's render phase, outside the watcher's
+  // try/catch and with no error boundary above it, so a throw here would
+  // unmount the whole app — and re-crash on every relaunch, since the file
+  // is still on disk.
+  function deepTree(depth: number): unknown {
+    let node: unknown = { pane: "term" };
+    for (let i = 0; i < depth; i++)
+      node = { split: "h", a: { pane: "term" }, b: node };
+    return node;
+  }
+
+  it("rejects a tree past the depth cap instead of throwing", () => {
+    const before = defaultLayout();
+    for (const depth of [40, 1000, 20000]) {
+      let result: unknown;
+      expect(() => {
+        result = applyLayoutRequest(before, {
+          workspaces: { "1": { tree: deepTree(depth) } },
+        });
+      }).not.toThrow();
+      expect(result).toBeNull();
+    }
+  });
+
+  it("still accepts a tree of reasonable depth", () => {
+    const next = applyLayoutRequest(defaultLayout(), {
+      workspaces: { "1": { tree: deepTree(8) } },
+    });
+    expect(next).not.toBeNull();
+  });
+
+  it("rejects an absurd pane count instead of building it", () => {
+    const panes = Array.from({ length: 5000 }, () => ({ pane: "term" }));
+    expect(
+      applyLayoutRequest(defaultLayout(), { workspaces: { "1": { panes } } }),
+    ).toBeNull();
   });
 });
 
