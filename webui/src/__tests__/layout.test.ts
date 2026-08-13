@@ -10,9 +10,11 @@ import {
   emptyLayout,
   focusEffect,
   focusLeaf,
+  isValidLayoutState,
   moveFocus,
   openPane,
   resize,
+  rsiLayout,
   seedIds,
   sendToWs,
   serialize,
@@ -395,5 +397,53 @@ describe("focusEffect", () => {
     const effect = focusEffect(state, moved, "keyboard");
     if (nextFocus) expect(effect).toEqual({ leafId: nextFocus, warp: true });
     else expect(effect).toBeNull();
+  });
+});
+
+describe("rsiLayout", () => {
+  it("is a valid layout state", () => {
+    const state = rsiLayout("demo", "solve x");
+    expect(isValidLayoutState(state)).toBe(true);
+  });
+
+  it("seeds ws0 with the loop terminal carrying rsi params, focused, workspace active", () => {
+    const state = rsiLayout("demo", "solve x");
+    expect(state.active).toBe(0);
+    const ws0 = state.workspaces[0];
+    expect(ws0.root?.kind).toBe("split");
+    if (ws0.root?.kind !== "split") throw new Error("expected a split");
+    expect(ws0.root.a.kind).toBe("leaf");
+    if (ws0.root.a.kind !== "leaf") throw new Error("expected a leaf");
+    expect(ws0.root.a.pane).toBe("term");
+    expect(ws0.root.a.params?.rsi).toEqual({ slug: "demo", problem: "solve x" });
+    expect(ws0.focus).toBe(ws0.root.a.id);
+    // The scratch terminal alongside it carries no rsi params.
+    expect(ws0.root.b.kind).toBe("leaf");
+    if (ws0.root.b.kind === "leaf") {
+      expect(ws0.root.b.pane).toBe("term");
+      expect(ws0.root.b.params?.rsi).toBeUndefined();
+    }
+  });
+
+  it("mirrors defaultLayout's ws1 and ws3 shapes", () => {
+    const rsi = rsiLayout("demo", "solve x");
+    const def = defaultLayout();
+
+    function paneShape(node: ReturnType<typeof rsiLayout>["workspaces"][number]["root"]): unknown {
+      if (!node) return null;
+      if (node.kind === "leaf") return node.pane;
+      return { dir: node.dir, ratio: node.ratio, a: paneShape(node.a), b: paneShape(node.b) };
+    }
+
+    expect(paneShape(rsi.workspaces[1].root)).toEqual(paneShape(def.workspaces[1].root));
+    expect(paneShape(rsi.workspaces[3].root)).toEqual(paneShape(def.workspaces[3].root));
+    expect(rsi.workspaces[2].root).toBeNull();
+    expect(rsi.workspaces[4].root).toBeNull();
+  });
+
+  it("preserves the leaf params of the loop terminal through serialize/deserialize", () => {
+    const state = rsiLayout("demo", "solve x");
+    const restored = deserialize(serialize(state))!;
+    expect(restored.workspaces[0].root).toEqual(state.workspaces[0].root);
   });
 });

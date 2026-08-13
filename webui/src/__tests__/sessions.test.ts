@@ -22,6 +22,8 @@ import {
   type SessionStorage,
 } from "../desktop/sessions";
 
+
+
 function memStorage(seed: Record<string, string> = {}): SessionStorage & { map: Map<string, string> } {
   const map = new Map<string, string>(Object.entries(seed));
   return {
@@ -269,5 +271,43 @@ describe("corrupt storage", () => {
       },
     };
     expect(() => saveSessions(throwing, emptyStore())).not.toThrow();
+  });
+});
+
+describe("session kind (RSI workstations)", () => {
+  it("sets kind on an rsi session and omits it entirely for a normal one", () => {
+    const rsi = createSession(emptyStore(), "experiment", layoutWith("a"), 1000, "s1", "rsi");
+    expect(rsi.sessions.s1.kind).toBe("rsi");
+
+    const normal = createSession(emptyStore(), "bench", layoutWith("a"), 1000, "s2");
+    expect("kind" in normal.sessions.s2).toBe(false);
+  });
+
+  it("round-trips an rsi session's kind through serialize/deserialize", () => {
+    const store = createSession(emptyStore(), "experiment", layoutWith("a"), 1000, "s1", "rsi");
+    const loaded = deserializeSessions(serializeSessions(store))!;
+    expect(loaded.sessions.s1.kind).toBe("rsi");
+  });
+
+  it("drops a session with an invalid kind while keeping valid siblings", () => {
+    const good = createSession(emptyStore(), "bench", layoutWith("a"), 1000, "s1", "rsi");
+    const raw = JSON.parse(serializeSessions(good)) as Record<string, unknown>;
+    (raw.sessions as Record<string, unknown>).s2 = {
+      id: "s2",
+      name: "broken",
+      layout: layoutWith("b"),
+      createdAt: 1,
+      updatedAt: 1,
+      kind: "bogus",
+    };
+    const loaded = loadSessions(memStorage({ [SESSIONS_KEY]: JSON.stringify(raw) }));
+    expect(Object.keys(loaded.sessions)).toEqual(["s1"]);
+    expect(loaded.sessions.s1.kind).toBe("rsi");
+  });
+
+  it("preserves kind when saveLayoutInto folds a new layout into an rsi session", () => {
+    const store = createSession(emptyStore(), "experiment", layoutWith("a"), 1000, "s1", "rsi");
+    const saved = saveLayoutInto(store, layoutWith("a", "b"), 2000);
+    expect(saved.sessions.s1.kind).toBe("rsi");
   });
 });

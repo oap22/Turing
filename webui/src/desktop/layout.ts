@@ -108,6 +108,38 @@ export function defaultLayout(): LayoutState {
   return state;
 }
 
+// The RSI-workstation seed. Mirrors `defaultLayout()`'s shape, but ws0 is
+// handed over to the loop terminal: instead of two plain shells it gets a
+// loop terminal (carrying the `rsi` params TermPane reads to pre-type
+// `scripts/rsi-loop.sh`) alongside a scratch terminal for poking around the
+// sandbox by hand. ws1 (metrics/images/flywheel) and ws3 (agents/agentfeed)
+// are identical to `defaultLayout()`'s — those are the panes that watch the
+// loop's results stream in, unchanged by what's driving it.
+export function rsiLayout(slug: string, problem: string): LayoutState {
+  const state = emptyLayout();
+
+  const loopTerm = leaf("term", nextId(), { rsi: { slug, problem } });
+  const scratchTerm = leaf("term", nextId());
+  const ws0Root = split("h", 0.6, loopTerm, scratchTerm);
+
+  const metrics = leaf("metrics", nextId());
+  const images = leaf("images", nextId());
+  const flywheel = leaf("flywheel", nextId());
+  const ws1Root = split("h", 0.55, metrics, split("v", 0.5, images, flywheel));
+
+  const agents = leaf("agents", nextId());
+  const agentfeed = leaf("agentfeed", nextId());
+  const ws3Root = split("h", 0.65, agents, agentfeed);
+
+  state.workspaces[0] = { root: ws0Root, focus: loopTerm.id, zoom: false };
+  state.workspaces[1] = { root: ws1Root, focus: metrics.id, zoom: false };
+  state.workspaces[2] = { root: null, focus: null, zoom: false };
+  state.workspaces[3] = { root: ws3Root, focus: agents.id, zoom: false };
+  state.workspaces[4] = { root: null, focus: null, zoom: false };
+  state.active = 0;
+  return state;
+}
+
 export function rects(root: Node, viewport: Rect): Map<string, Rect> {
   const out = new Map<string, Rect>();
   function walk(node: Node, rect: Rect): void {

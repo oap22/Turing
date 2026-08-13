@@ -21,7 +21,7 @@ export interface Runner {
   autorun: boolean;
 }
 
-const REPO = "~/Developer/active/Turing";
+export const REPO = "~/Developer/active/Turing";
 
 /** Stands in for the configured `results` root until `resolveRunner()` runs. */
 export const RESULTS_ROOT_TOKEN = "<RESULTS_ROOT>";

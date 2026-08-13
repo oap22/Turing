@@ -23,7 +23,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Node } from "./layout";
-import type { Session } from "./sessions";
+import type { Session, SessionKind } from "./sessions";
 import { THEMES } from "./theme";
 import UpdateOverlay from "./UpdateOverlay";
 
@@ -34,6 +34,9 @@ interface Props {
   onOpen: (id: string) => void;
   // Create a fresh workstation (first-launch preset layout) and open it.
   onCreate: (name: string) => void;
+  // Create a fresh RSI workstation (seeded loop-terminal layout, pre-typed
+  // command) and open it. `problem` is the experiment's problem statement.
+  onCreateRsi: (name: string, problem: string) => void;
   onRename: (id: string, name: string) => void;
   onRemove: (id: string) => void;
   // Escape: resume the last-used workstation without touching the list. Home
@@ -63,7 +66,15 @@ const WORDMARK: ReadonlyArray<string> = [
 
 type Mode =
   | { kind: "list" }
-  | { kind: "name"; command: "new" | "rename"; id: string | null; value: string }
+  | { kind: "pickKind"; cursor: 0 | 1 }
+  | {
+      kind: "name";
+      command: "new" | "rename";
+      workstation: SessionKind;
+      id: string | null;
+      value: string;
+    }
+  | { kind: "problem"; name: string; value: string }
   | { kind: "confirmRemove"; id: string }
   // In-app update (issue #397). Lives on Home rather than in the shell: no
   // workstation is mounted here, so nothing running is lost if it succeeds
@@ -125,6 +136,7 @@ export default function Home({
   activeId,
   onOpen,
   onCreate,
+  onCreateRsi,
   onRename,
   onRemove,
   onResume,
@@ -155,7 +167,7 @@ export default function Home({
   // Escape/Return handling.
   useEffect(() => {
     if (mode.kind === "update") return;
-    if (mode.kind === "name") inputRef.current?.focus();
+    if (mode.kind === "name" || mode.kind === "problem") inputRef.current?.focus();
     else boxRef.current?.focus();
   }, [mode.kind]);
 
@@ -168,23 +180,42 @@ export default function Home({
   const selected = sessions[clamped] ?? null;
 
   function startNew() {
-    setMode({ kind: "name", command: "new", id: null, value: "" });
+    setMode({ kind: "pickKind", cursor: 0 });
   }
 
   function startRename(session: Session) {
     // Seeded with the current name so a small edit is a small amount of typing.
-    setMode({ kind: "name", command: "rename", id: session.id, value: session.name });
+    // `workstation` is unused for renames — kept "normal" as a harmless default.
+    setMode({
+      kind: "name",
+      command: "rename",
+      workstation: "normal",
+      id: session.id,
+      value: session.name,
+    });
   }
 
   function commitName() {
     if (mode.kind !== "name") return;
     const name = mode.value.trim();
     if (name === "") return;
-    if (mode.command === "new") onCreate(name);
-    else if (mode.id) {
+    if (mode.command === "new") {
+      if (mode.workstation === "rsi") {
+        setMode({ kind: "problem", name, value: "" });
+      } else {
+        onCreate(name);
+      }
+    } else if (mode.id) {
       onRename(mode.id, name);
       setMode({ kind: "list" });
     }
+  }
+
+  function commitProblem() {
+    if (mode.kind !== "problem") return;
+    const problem = mode.value.trim();
+    if (problem === "") return;
+    onCreateRsi(mode.name, problem);
   }
 
   function onKeyDown(e: React.KeyboardEvent) {
@@ -202,10 +233,40 @@ export default function Home({
       else setMode({ kind: "list" });
       return;
     }
+    if (mode.kind === "pickKind") {
+      if (e.key === "ArrowDown" || e.key === "j") {
+        e.preventDefault();
+        setMode({ kind: "pickKind", cursor: mode.cursor === 0 ? 1 : 0 });
+        return;
+      }
+      if (e.key === "ArrowUp" || e.key === "k") {
+        e.preventDefault();
+        setMode({ kind: "pickKind", cursor: mode.cursor === 0 ? 1 : 0 });
+        return;
+      }
+      if (e.key === "Enter") {
+        e.preventDefault();
+        setMode({
+          kind: "name",
+          command: "new",
+          workstation: mode.cursor === 1 ? "rsi" : "normal",
+          id: null,
+          value: "",
+        });
+      }
+      return;
+    }
     if (mode.kind === "name") {
       if (e.key === "Enter") {
         e.preventDefault();
         commitName();
+      }
+      return;
+    }
+    if (mode.kind === "problem") {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        commitProblem();
       }
       return;
     }
@@ -312,6 +373,36 @@ export default function Home({
             </span>
           </div>
 
+          {mode.kind === "pickKind" && (
+            <div className="border-b border-term-edge px-3 py-2">
+              {(
+                [
+                  {
+                    title: "workstation",
+                    desc: "a saved pane layout — reopens the same shape with fresh shells",
+                  },
+                  {
+                    title: "rsi experiment",
+                    desc: "a sandboxed agent loops on a problem; the panes watch its results live",
+                  },
+                ] as const
+              ).map((row, i) => (
+                <div
+                  key={row.title}
+                  className={`px-2 py-1 text-xs ${
+                    mode.cursor === i ? "bg-term-raised text-term-accent" : "text-term-fg"
+                  }`}
+                >
+                  <div>{row.title}</div>
+                  <div className="text-[10px] text-term-dim">{row.desc}</div>
+                </div>
+              ))}
+              <div className="mt-1 text-[10px] text-term-dim">
+                ↑↓ choose · return continue · esc back
+              </div>
+            </div>
+          )}
+
           {mode.kind === "name" && (
             <div className="border-b border-term-edge px-3 py-2">
               <input
@@ -320,15 +411,39 @@ export default function Home({
                 onChange={(e) => setMode({ ...mode, value: e.target.value })}
                 onKeyDown={onKeyDown}
                 placeholder={
-                  mode.command === "new" ? "name for the new workstation…" : "new name…"
+                  mode.command === "new"
+                    ? mode.workstation === "rsi"
+                      ? "name for the rsi experiment…"
+                      : "name for the new workstation…"
+                    : "new name…"
                 }
                 aria-label={mode.command === "new" ? "new workstation name" : "new name"}
                 className="w-full border border-term-edge bg-term-bg px-2 py-1 text-sm text-term-fg placeholder:text-term-dim focus:outline-none"
               />
               <div className="mt-1 text-[10px] text-term-dim">
                 {mode.command === "new"
-                  ? "opens a fresh workstation with the default panes · return create · esc back"
+                  ? mode.workstation === "rsi"
+                    ? "names the experiment and its sandbox · return continue · esc back"
+                    : "opens a fresh workstation with the default panes · return create · esc back"
                   : "return save · esc back"}
+              </div>
+            </div>
+          )}
+
+          {mode.kind === "problem" && (
+            <div className="border-b border-term-edge px-3 py-2">
+              <input
+                ref={inputRef}
+                value={mode.value}
+                onChange={(e) => setMode({ ...mode, value: e.target.value })}
+                onKeyDown={onKeyDown}
+                placeholder="what should the agent iterate on?"
+                aria-label="experiment problem statement"
+                className="w-full border border-term-edge bg-term-bg px-2 py-1 text-sm text-term-fg placeholder:text-term-dim focus:outline-none"
+              />
+              <div className="mt-1 text-[10px] text-term-dim">
+                runs claude in a sandbox at ~/turing-workspace · results stream to the metrics
+                panes · return create · esc back
               </div>
             </div>
           )}
@@ -368,6 +483,11 @@ export default function Home({
                           onMouseEnter={() => setCursor(i)}
                           className="flex min-w-0 flex-1 items-baseline gap-3 text-left"
                         >
+                          {session.kind === "rsi" && (
+                            <span className="shrink-0 border border-term-accent px-1 text-[9px] uppercase tracking-wider text-term-accent">
+                              rsi
+                            </span>
+                          )}
                           <span className="min-w-0 max-w-[12rem] flex-1 truncate">
                             {session.name}
                           </span>
@@ -416,7 +536,8 @@ export default function Home({
         </div>
 
         <div className="text-center text-[10px] text-term-dim">
-          workstations reopen the same layout with fresh shells · ⌘0 comes back here
+          workstations reopen the same layout with fresh shells · ⌘0 comes back here · rsi =
+          sandboxed agent loop
         </div>
       </div>
 

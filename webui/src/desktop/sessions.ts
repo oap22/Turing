@@ -29,12 +29,22 @@ export const SESSIONS_KEY = "turing.sessions.v1";
 export const LEGACY_LAYOUT_KEY = "turing.layout.v2";
 export const DEFAULT_SESSION_NAME = "default";
 
+// "normal" (the default, and the only kind that existed before RSI
+// workstations) is a saved pane layout that reopens the same shape with
+// fresh shells. "rsi" is an experiment: it seeds a loop-terminal layout (see
+// `rsiLayout()` in layout.ts) whose loop is pre-typed, never auto-started.
+export type SessionKind = "normal" | "rsi";
+
 export interface Session {
   id: string;
   name: string;
   layout: LayoutState;
   createdAt: number;
   updatedAt: number;
+  // Absent means "normal" — normal sessions never carry this key, so their
+  // serialized shape is byte-for-byte what it was before RSI workstations
+  // existed. Only set it to "rsi"; never write "normal" explicitly.
+  kind?: SessionKind;
 }
 
 // Keyed by session id, not by name: names are user-facing, editable, and not
@@ -101,6 +111,7 @@ export function createSession(
   layout: LayoutState,
   now: number = Date.now(),
   id: string = nextSessionId(now),
+  kind?: SessionKind,
 ): SessionStore {
   const session: Session = {
     id,
@@ -108,8 +119,16 @@ export function createSession(
     layout,
     createdAt: now,
     updatedAt: now,
+    ...(kind === "rsi" ? { kind: "rsi" as const } : {}),
   };
   return { sessions: { ...store.sessions, [id]: session }, activeId: id };
+}
+
+// Wraps `createSession` with `kind: "rsi"` so DesktopShell's "new rsi
+// experiment" flow doesn't have to pass positional `now`/`id` just to reach
+// the sixth parameter.
+export function createRsiSession(store: SessionStore, name: string, layout: LayoutState): SessionStore {
+  return createSession(store, name, layout, undefined, undefined, "rsi");
 }
 
 export function renameSession(
@@ -180,7 +199,8 @@ function isSession(x: unknown): x is Session {
     typeof o.name === "string" &&
     typeof o.createdAt === "number" &&
     typeof o.updatedAt === "number" &&
-    isValidLayoutState(o.layout)
+    isValidLayoutState(o.layout) &&
+    (o.kind === undefined || o.kind === "normal" || o.kind === "rsi")
   );
 }
 
