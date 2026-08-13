@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "tauri dev",
-    "build": "mkdir -p src-tauri/target && touch src-tauri/target/.metadata_never_index && tauri build"
+    "build": "mkdir -p src-tauri/target && touch src-tauri/target/.metadata_never_index && tauri build",
+    "install-app": "../scripts/install-desktop.sh"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

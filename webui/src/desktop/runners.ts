@@ -2,6 +2,15 @@
 // pre-types the command for `autorun: false` entries instead of running it).
 // `~` is left literal — the shell expands it for `command`, and Rust's
 // `pty_spawn` expands it for `cwd` (see `expand_home` in `pty.rs`).
+//
+// The table is static, but the watched results directory is not: it is the
+// `results` root from `app_config`, which the user may repoint at any project.
+// So entries write `<RESULTS_ROOT>` and `resolveRunner()` substitutes the
+// configured path at spawn time — the same placeholder trick `<SSH_HOST>` /
+// `<REMOTE_RUN_DIR>` use, except this one is filled in for the user rather
+// than by them.
+
+import { inv, isTauri } from "./tauri";
 
 export interface Runner {
   id: string;
@@ -13,6 +22,13 @@ export interface Runner {
 }
 
 const REPO = "~/Developer/active/Turing";
+
+/** Stands in for the configured `results` root until `resolveRunner()` runs. */
+export const RESULTS_ROOT_TOKEN = "<RESULTS_ROOT>";
+
+// Mirrors `default_roots()` in `desktop/src-tauri/src/config.rs`; used when
+// there is no Tauri runtime (tests, browser) or the command fails.
+const DEFAULT_RESULTS_ROOT = "~/research-results";
 
 export const RUNNERS: readonly Runner[] = [
   {
@@ -78,7 +94,7 @@ export const RUNNERS: readonly Runner[] = [
     id: "ssh-follow-metrics",
     label: "follow remote metrics (ssh)",
     command:
-      "ssh <SSH_HOST> 'tail -n +1 -F <REMOTE_RUN_DIR>/metrics.jsonl' | tee -a ~/Developer/active/Turing/research/results/rosie-live/metrics.jsonl",
+      "ssh <SSH_HOST> 'tail -n +1 -F <REMOTE_RUN_DIR>/metrics.jsonl' | tee -a <RESULTS_ROOT>/rosie-live/metrics.jsonl",
     group: "remote",
     autorun: false,
   },
@@ -88,7 +104,7 @@ export const RUNNERS: readonly Runner[] = [
     id: "ssh-pull-assets",
     label: "pull remote assets (ssh)",
     command:
-      "while true; do rsync -az --include='*/' --include='*.png' --include='*.svg' --include='*.json*' --include='*.log' --exclude='*' <SSH_HOST>:<REMOTE_RUN_DIR>/ ~/Developer/active/Turing/research/results/rosie-live/; sleep 30; done",
+      "while true; do rsync -az --include='*/' --include='*.png' --include='*.svg' --include='*.json*' --include='*.log' --exclude='*' <SSH_HOST>:<REMOTE_RUN_DIR>/ <RESULTS_ROOT>/rosie-live/; sleep 30; done",
     group: "remote",
     autorun: false,
   },
@@ -112,8 +128,52 @@ export const RUNNERS: readonly Runner[] = [
     id: "research-results",
     label: "research results (vim)",
     command: "vim .",
-    cwd: `${REPO}/research/results`,
+    cwd: RESULTS_ROOT_TOKEN,
     group: "docs",
     autorun: true,
   },
 ];
+
+// One lookup per app run: the roots are read from disk once at startup on the
+// Rust side, so re-asking per spawned pane buys nothing.
+let resultsRootPromise: Promise<string> | null = null;
+
+interface AppConfigView {
+  roots: { id: string; path: string }[];
+}
+
+export function resultsRoot(): Promise<string> {
+  if (!resultsRootPromise) {
+    resultsRootPromise = (async () => {
+      if (!isTauri()) return DEFAULT_RESULTS_ROOT;
+      try {
+        const cfg = await inv<AppConfigView>("app_config");
+        return cfg.roots.find((r) => r.id === "results")?.path ?? DEFAULT_RESULTS_ROOT;
+      } catch {
+        // A desktop that cannot read its own config is still more useful with
+        // terminals than without them; fall back rather than fail the spawn.
+        return DEFAULT_RESULTS_ROOT;
+      }
+    })();
+  }
+  return resultsRootPromise;
+}
+
+/**
+ * Returns `runner` with `<RESULTS_ROOT>` replaced by the configured `results`
+ * root in both `command` and `cwd`. Call this before spawning; the raw table
+ * entries are not meant to reach a shell.
+ */
+export async function resolveRunner(runner: Runner): Promise<Runner> {
+  const root = await resultsRoot();
+  return {
+    ...runner,
+    command: runner.command.split(RESULTS_ROOT_TOKEN).join(root),
+    cwd: runner.cwd?.split(RESULTS_ROOT_TOKEN).join(root),
+  };
+}
+
+/** Test seam: drops the cached lookup so a fresh config can be asserted. */
+export function __resetResultsRootForTests(): void {
+  resultsRootPromise = null;
+}

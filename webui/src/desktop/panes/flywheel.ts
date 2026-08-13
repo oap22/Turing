@@ -1,4 +1,4 @@
-// Tolerant parser for `research/results/loop-*/trajectory.json` — the
+// Tolerant parser for `loop-*/trajectory.json` under the `results` root — the
 // flywheel round timeline. Accepts a JSON array, `{rounds: [...]}`, or JSONL,
 // and maps each round loosely since the trajectory shape has drifted across
 // research-loop iterations.

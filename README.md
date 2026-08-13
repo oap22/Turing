@@ -11,13 +11,16 @@ Turing is two things that meet in one repo:
    ruler. It cannot quit; it escalates with a three-word vocabulary
    (`continue / abandon / extend_cap`). Research discipline lives in the
    operator's `/research-interview` → `/research-loop` workflows; agreed briefs
-   sit in `research/briefs/`, results in `research/results/`.
+   sit in `research/briefs/`, and its own results default to `~/research-results/`
+   — the same root the desktop below watches, so a loop run from any project
+   renders live (`TURING_RESEARCH_RESULTS_ROOT` repoints it).
 2. **Turing Desktop** (`desktop/` + `webui/src/desktop/`, issue #382): a Tauri 2
    macOS app hosting the webui SPA as a Hyprland/omarchy-style tiling shell —
    real PTY terminals for coding-agent CLIs and vim, live training charts, a
    flywheel round timeline, an image viewer, and a viewer for Claude/Codex agent
-   sessions. Everything it renders is a plain file under `research/results/`,
-   so the same data is readable (and writable) by coding agents.
+   sessions. Everything it renders is a plain file under the watched results
+   root (`~/research-results/` by default, any project may write there), so
+   the same data is readable (and writable) by coding agents.
 
 The earlier fleet stack — coordinator, NATS mesh, Jetson workers, webui
 queue/chat, LoRA trainer (ADRs 0001–0010) — is **dormant in-tree, not deleted**:
@@ -29,18 +32,22 @@ pane is reserved for the future nano agent network.
 ```bash
 cd webui && npm ci --legacy-peer-deps      # once
 cd ../desktop && npm ci && npm run dev     # opens the app (tauri dev)
+
+npm --prefix desktop run install-app       # build + (re)install /Applications/turing.app
 ```
 
 - **mod = ⌘**, omarchy semantics: ⌘Return terminal · ⌘W close · ⌘hjkl/arrows
   focus (cursor warps with you) · ⌘⇧ move · ⌘1–5 workspaces · ⌘F zoom ·
   ⌘P launcher · ⌘/ cheatsheet. Layout persists.
-- **Data contract**: append `research/results/<run>/metrics.jsonl`
+- **Data contract**: append `~/research-results/<run>/metrics.jsonl`
   (`{"step": n, "total_steps": N, "ts": t, ...numeric series}`) and charts move
   live; `loop-<slug>/trajectory.json` renders the flywheel timeline; SVG/PNG
   plots land in the images pane. Agents steer the view via
-  `research/results/.viewer.json`. Remote (ssh) runs stream in through the
+  `~/research-results/.viewer.json`. Remote (ssh) runs stream in through the
   `ssh-follow-metrics` / `ssh-pull-assets` runners.
 - Config (gateway URL/token, filesystem roots): `~/.config/turing-desktop/config.json`.
+- Updating the installed app: `npm --prefix desktop run install-app`
+  (`scripts/install-desktop.sh` — build, quit, replace, re-sign, report version).
 - Full keymap, panes, runners, troubleshooting: `desktop/README.md`.
 
 ## Dormant fleet stack

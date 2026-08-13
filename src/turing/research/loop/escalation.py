@@ -29,7 +29,7 @@ waiting, because inventing a decision would erase a driving-function #4 event.
 
 The operator answers with :mod:`turing.research.loop.cli`::
 
-    python -m turing.research.loop.cli --loop-dir research/results/loop-x \\
+    python -m turing.research.loop.cli --loop-dir ~/research-results/loop-x \\
         <request_id> extend_cap --extra-steps 200
 """
 

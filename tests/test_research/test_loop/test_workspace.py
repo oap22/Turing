@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
@@ -13,9 +13,6 @@ from turing.research.problems.catalog import speedup_specs
 from turing.research.problems.speedup import SpeedupAdapter
 
 from .conftest import make_problem
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 class TestCopyTreeWorkspaceProvider:
@@ -115,9 +112,15 @@ def _assert_eval_set_absent(workspace: Path) -> None:
 class TestSettings:
     def test_defaults_do_not_require_a_dotenv(self) -> None:
         settings = ResearchLoopSettings(_env_file=None)
-        assert settings.research_results_root.as_posix().endswith("research/results")
+        assert settings.research_results_root == Path.home() / "research-results"
         assert settings.operator_ntfy_topic is None
         assert settings.research_escalation_repush_seconds == pytest.approx(1800.0)
+
+    def test_the_results_root_is_absolute_and_outside_the_repo(self) -> None:
+        # The desktop app watches ~/research-results, so a loop driven from any
+        # project must land there rather than under whatever cwd it started in.
+        settings = ResearchLoopSettings(_env_file=None)
+        assert settings.research_results_root.is_absolute()
 
     def test_env_vars_use_the_repo_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("TURING_OPERATOR_NTFY_TOPIC", "turing-research")
@@ -125,6 +128,11 @@ class TestSettings:
         settings = ResearchLoopSettings(_env_file=None)
         assert settings.operator_ntfy_topic == "turing-research"
         assert settings.research_escalation_poll_seconds == pytest.approx(0.5)
+
+    def test_the_results_root_is_overridable_by_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TURING_RESEARCH_RESULTS_ROOT", "/tmp/elsewhere/results")
+        settings = ResearchLoopSettings(_env_file=None)
+        assert settings.research_results_root == Path("/tmp/elsewhere/results")
 
     def test_a_non_positive_poll_interval_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("TURING_RESEARCH_ESCALATION_POLL_SECONDS", "0")

@@ -96,10 +96,14 @@ while the thing the artifact was supposed to guarantee does not hold.
   brief states both ("Whole Turing repo + `turing-skills` writable" in Settled
   decisions; "self-edits reach skills, **never Turing's source**" in
   § Multi-agent workflow boundary). This is not doc hygiene: the Turing repo
-  holds `contracts.py` (the frozen-verifier enforcement), the cap accounting, and
-  `research/results/` (where **held-out** score cells are written), so the wide
-  reading lets a self-edit relax its own bar, under-count its own cap, and read
-  held-out results off disk. ADR 0011 §6 takes the narrow reading as the
+  holds `contracts.py` (the frozen-verifier enforcement) and the cap accounting,
+  so the wide reading lets a self-edit relax its own bar and under-count its own
+  cap. The third hazard — reading **held-out** score cells off disk — no longer
+  rides on the repo boundary at all: the results root moved to
+  `~/research-results/` (outside any repo), which means repo write access no
+  longer implies results access, but equally that *narrowing the repo surface no
+  longer protects the held-out cells*. They need their own boundary. ADR 0011 §6
+  takes the narrow reading as the
   operative one — it costs loop 1 nothing, since nothing self-edits — and leaves
   the widening as an explicit operator decision that must arrive with a
   mechanism (Q11) rather than by default.

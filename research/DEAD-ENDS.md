@@ -33,7 +33,8 @@ change how the rest of the record should be read:
 ## Scope note — what belongs here
 
 Directions and approaches ruled out **by a measured run of this program**, each
-citing its run ID under `research/results/`.
+citing its run ID under the results root (`~/research-results/` by default;
+`TURING_RESEARCH_RESULTS_ROOT` repoints it).
 
 Two things deliberately do **not** get copied here:
 

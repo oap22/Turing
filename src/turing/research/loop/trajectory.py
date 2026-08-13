@@ -1,8 +1,12 @@
-"""On-disk trajectory: ``research/results/loop-<slug>/`` and ``trajectory.json``.
+"""On-disk trajectory: ``<results-root>/loop-<slug>/`` and ``trajectory.json``.
+
+The results root comes from ``ResearchLoopSettings.research_results_root``,
+``~/research-results`` by default — outside any repo, so the desktop app watches
+one root no matter which project the loop runs from.
 
 The layout is the one ``driving-functions.md`` prescribes::
 
-    research/results/loop-<slug>/
+    ~/research-results/loop-<slug>/
       trajectory.json        one object per round
       noise-floor/           the pre-round-0 seed runs
       round-00/              baseline (the un-improved starting point)

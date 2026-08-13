@@ -3,7 +3,7 @@
 // additional runs to overlay for comparison. Shows one series at a time via
 // tabs (rather than every series stacked, which read as jumbled and clipped
 // its own top tick label against the row above it — see Chart.tsx for the
-// tick-clipping fix). Also watches `research/results/.viewer.json` so a
+// tick-clipping fix). Also watches `.viewer.json` at the results root so a
 // coding agent can point the pane at a specific series/run set — see
 // desktop/README.md's "Agent-driven viewing" section for the file format.
 

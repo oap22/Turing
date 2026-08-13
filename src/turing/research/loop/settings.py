@@ -32,8 +32,10 @@ class ResearchLoopSettings(BaseSettings):
 
     # ── Artifacts ────────────────────────────────────────────────────────
     research_results_root: Path = Field(
-        default=Path("research/results"),
-        description="Directory holding loop-<slug>/ trajectories",
+        default=Path.home() / "research-results",
+        description="Directory holding loop-<slug>/ trajectories. Home-anchored "
+        "rather than repo-relative so the loop can run from any project and "
+        "still land where the desktop app watches for metrics and plots",
     )
     research_workspace_root: Path = Field(
         default=Path.home() / "turing-workspace",
