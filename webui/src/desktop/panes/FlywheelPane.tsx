@@ -15,10 +15,38 @@ interface Entry {
 
 const RESULTS_ROOT = "results";
 
-function statusGlyph(status: Round["status"]): { glyph: string; cls: string } {
-  if (status === "pass") return { glyph: "✓", cls: "text-emerald-400" };
-  if (status === "fail") return { glyph: "✗", cls: "text-rose-400" };
-  return { glyph: "·", cls: "text-term-dim" };
+function statusGlyph(status: Round["status"]): {
+  glyph: string;
+  cls: string;
+  title: string;
+} {
+  if (status === "pass") {
+    return {
+      glyph: "✓",
+      cls: "text-emerald-400",
+      title: "improving — a cell beat its noise floor",
+    };
+  }
+  if (status === "fail") {
+    return { glyph: "✗", cls: "text-rose-400", title: "failed a gate" };
+  }
+  if (status === "saturated") {
+    return {
+      glyph: "=",
+      cls: "text-term-fg",
+      title: "saturated — no cell beat its noise floor",
+    };
+  }
+  // A refusal is not a flat round: it means the measurement needed to make
+  // the call was never made. It must not look like either outcome.
+  if (status === "refused") {
+    return {
+      glyph: "?",
+      cls: "text-term-dim",
+      title: "refused — the call could not be made",
+    };
+  }
+  return { glyph: "·", cls: "text-term-dim", title: "no verdict" };
 }
 
 export default function FlywheelPane() {
@@ -31,7 +59,10 @@ export default function FlywheelPane() {
     let cancelled = false;
     async function load() {
       await inv("fs_watch", { root: RESULTS_ROOT, rel: "" });
-      const entries = await inv<Entry[]>("fs_list", { root: RESULTS_ROOT, rel: "" });
+      const entries = await inv<Entry[]>("fs_list", {
+        root: RESULTS_ROOT,
+        rel: "",
+      });
       if (cancelled) return;
       const trajectoryFiles = entries.filter(
         (e) => !e.is_dir && e.rel_path.endsWith("/trajectory.json"),
@@ -72,10 +103,14 @@ export default function FlywheelPane() {
 
   useEffect(() => {
     let cancelled = false;
-    const sub = subscribe<{ root: string; rel_path: string }>("fs-change", (payload) => {
-      if (cancelled || payload.root !== RESULTS_ROOT || !selected) return;
-      if (payload.rel_path === `${selected}/trajectory.json`) void reload(selected);
-    });
+    const sub = subscribe<{ root: string; rel_path: string }>(
+      "fs-change",
+      (payload) => {
+        if (cancelled || payload.root !== RESULTS_ROOT || !selected) return;
+        if (payload.rel_path === `${selected}/trajectory.json`)
+          void reload(selected);
+      },
+    );
     return () => {
       cancelled = true;
       sub.unsubscribe();
@@ -115,13 +150,22 @@ export default function FlywheelPane() {
         ) : (
           <ol className="space-y-0.5">
             {[...(rounds ?? [])].reverse().map((r) => {
-              const { glyph, cls } = statusGlyph(r.status);
+              const { glyph, cls, title } = statusGlyph(r.status);
               return (
-                <li key={`${r.index}-${r.label}`} className="flex gap-2 font-mono">
-                  <span className="text-term-dim">{String(r.index).padStart(2, "0")}</span>
-                  <span className="text-term-fg">{r.label}</span>
-                  <span className={cls}>{glyph}</span>
-                  <span className="truncate text-term-dim">{r.detail}</span>
+                <li
+                  key={`${r.index}-${r.label}`}
+                  className="flex gap-2 font-mono"
+                >
+                  <span className="text-term-dim">
+                    {String(r.index).padStart(2, "0")}
+                  </span>
+                  <span className="shrink-0 text-term-fg">{r.label}</span>
+                  <span className={cls} title={title}>
+                    {glyph}
+                  </span>
+                  <span className="truncate text-term-dim" title={r.detail}>
+                    {r.detail}
+                  </span>
                 </li>
               );
             })}
