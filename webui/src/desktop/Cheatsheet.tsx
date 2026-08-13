@@ -16,15 +16,17 @@ const ROWS: ReadonlyArray<[string, string]> = [
   ["⌘ t", "toggle split direction (moved off ⌘j — collides with focus-down)"],
   ["⌘ -", "shrink focused pane"],
   ["⌘ =", "grow focused pane"],
+  ["⌘ 0", "home — the workstation list"],
   ["⌘ p", "launcher — panes, runners and sessions"],
   ["⌘ /", "this cheatsheet (moved off ⌘k — collides with focus-up)"],
 ];
 
-// Saved sessions are named pane layouts. They deliberately have no ⌘-chords of
-// their own (see Launcher.tsx: the ⌘ space is scarce and these are occasional
-// commands), so the cheatsheet lists what to type into ⌘p instead — otherwise
-// the feature is undiscoverable.
+// Workstations (a.k.a. saved sessions) are named pane layouts. Home (⌘0) is
+// the surface for the ones you keep coming back to — open, new, rename,
+// remove — while ⌘p carries the in-flight commands that only make sense with a
+// layout already on screen, chiefly "save what's here under a new name".
 const SESSION_ROWS: ReadonlyArray<[string, string]> = [
+  ["⌘ 0", "home — open, create, rename or remove a workstation"],
   ["⌘ p → save", "save the current layout as a new named session"],
   ["⌘ p → rename", "rename the current session"],
   ["⌘ p → switch to …", "load another saved session (fresh shells)"],

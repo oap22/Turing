@@ -128,7 +128,13 @@ markers = [
 ]
 
 [tool.mypy]
-python_version = "3.11"
+# No `python_version` pin: mypy targets whatever interpreter it runs under,
+# which is exactly what the CI matrix already means. Pinning it to "3.11" made
+# mypy parse *every* file against 3.11 syntax — including third-party stubs —
+# and broke the moment numpy 2.5 (requires-python >=3.12, PEP 695 `type`
+# statements in its stubs) became installable on the 3.12/3.13 jobs. The 3.11
+# job still checks 3.11 semantics, which is the guarantee the pin was there to
+# give. See #395.
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

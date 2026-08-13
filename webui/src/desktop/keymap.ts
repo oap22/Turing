@@ -17,7 +17,11 @@ export type Action =
   | { type: "toggleDir" }
   | { type: "resize"; delta: number }
   | { type: "cheatsheet" }
-  | { type: "launcher" };
+  | { type: "launcher" }
+  // Back to the home page (the workstation list). ⌘0 rather than a letter:
+  // every ⌘-letter worth having is spoken for, and 0 sits next to the ⌘1–5
+  // workspace keys it is the "all of them, from outside" companion to.
+  | { type: "home" };
 
 // Window event the shell fires when a `term` pane becomes the focused leaf.
 // A terminal's real focus target is xterm's own hidden textarea, which only
@@ -97,6 +101,7 @@ export function actionFor(e: KeyEventLike): Action | null {
   if (key === "f") return { type: "zoom" };
   if (key === "t") return { type: "toggleDir" };
   if (key === "p") return { type: "launcher" };
+  if (key === "0") return { type: "home" };
   if (key === "/") return { type: "cheatsheet" };
   if (key === "-") return { type: "resize", delta: -0.05 };
   if (key === "=") return { type: "resize", delta: 0.05 };

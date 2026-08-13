@@ -21,3 +21,9 @@ models/
 
 # plan-then-ship pipeline specs (local only)
 .plan-then-ship/
+
+# uv lockfile — this project installs with pip (see CLAUDE.md); uv only
+# appears in docs/hardware/jetson-orin-nano.md in `uv pip` compat mode,
+# which never writes a lockfile. Anything here is a stray `uv lock`/`uv
+# sync` that nothing regenerates, so it would drift from pyproject.toml.
+uv.lock

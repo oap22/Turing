@@ -89,6 +89,11 @@ describe("actionFor", () => {
     expect(actionFor(key("p"))).toEqual({ type: "launcher" });
   });
 
+  it("⌘0 goes home, without disturbing the ⌘1–5 workspace keys", () => {
+    expect(actionFor(key("0"))).toEqual({ type: "home" });
+    expect(actionFor(key("1"))).toEqual({ type: "ws", i: 0 });
+  });
+
   it("⌘/ opens the cheatsheet (moved off ⌘k to avoid the focus-up collision)", () => {
     expect(actionFor(key("/"))).toEqual({ type: "cheatsheet" });
     expect(actionFor(key("k"))).toEqual({ type: "focus", dir: "up" });
