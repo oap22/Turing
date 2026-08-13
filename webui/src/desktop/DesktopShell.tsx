@@ -47,7 +47,7 @@ import {
   type Split,
 } from "./layout";
 import { applyGaps, GAPS_IN_PX, GAPS_OUT_PX } from "./gaps";
-import SessionPicker from "./SessionPicker";
+import Home from "./Home";
 import {
   activeSession,
   createSession,
@@ -280,9 +280,13 @@ export default function DesktopShell({ surface }: Props) {
   // picker below needs to know how many sessions there are.
   const [sessions, setSessions] = useState<SessionStore>(() => loadSessions(localStorage));
   const [state, dispatch] = useReducer(layoutReducer, sessions, initLayout);
-  // Only ever blocks startup when there is a genuine choice. One session (the
-  // migrated "default", or a brand-new install's) boots straight through.
-  const [picking, setPicking] = useState(() => listSessions(sessions).length > 1);
+  // The app opens on Home — always, not just when there is more than one saved
+  // workstation. It is the only surface that lists what you have and the only
+  // place a finished workstation can be torn down without entering it first, so
+  // hiding it from single-workstation users hid the feature from exactly the
+  // people who had never discovered it. Escape (or Return on the pre-selected
+  // last-used row) is one keystroke back to where they left off.
+  const [home, setHome] = useState(true);
   const [overlay, setOverlay] = useState<"launcher" | "cheatsheet" | null>(null);
   const [theme, setTheme] = useState(() => localStorage.getItem("turing.theme") ?? "turing");
   const [now, setNow] = useState(() => new Date());
@@ -354,15 +358,15 @@ export default function DesktopShell({ surface }: Props) {
   // so it always closes over the newest store, and adding `sessions` to the
   // deps would re-run it on the very `setSessions` it just performed.
   useEffect(() => {
-    // Nothing is on screen yet while the picker is up, and writing then would
-    // bump the last-used session's timestamp and re-order the very list the
-    // user is arrowing through.
-    if (picking) return;
+    // Nothing is on screen while Home is up, and writing then would bump the
+    // last-used workstation's timestamp and re-order the very list the user is
+    // arrowing through — or, worse, re-create a workstation they just removed.
+    if (home) return;
     const next = saveLayoutInto(sessions, state);
     setSessions(next);
     saveSessions(localStorage, next);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state, picking]);
+  }, [state, home]);
 
   function commitSessions(next: SessionStore) {
     setSessions(next);
@@ -379,7 +383,43 @@ export default function DesktopShell({ surface }: Props) {
     if (!target) return;
     commitSessions(next);
     dispatchFrom({ type: "setLayout", layout: target.layout }, "passive");
-    setPicking(false);
+    setHome(false);
+  }
+
+  // Home's "new": a fresh workstation on the first-launch preset, saved under
+  // the given name and entered immediately. Distinct from ⌘p's "save layout
+  // as…", which snapshots whatever is already on screen.
+  function createWorkstation(name: string) {
+    const layout = defaultLayout();
+    const next = createSession(sessions, name, layout);
+    commitSessions(next);
+    dispatchFrom({ type: "setLayout", layout }, "passive");
+    setHome(false);
+  }
+
+  function renameWorkstation(id: string, name: string) {
+    commitSessions(renameSession(sessions, id, name));
+  }
+
+  // Removing from Home never has to touch the live layout: the shell is not
+  // mounted, and whichever workstation is opened next replaces `state`
+  // wholesale. `deleteSession` re-points `activeId` on its own, so removing the
+  // last-used one leaves Escape pointing at the next most recent.
+  function removeWorkstation(id: string) {
+    commitSessions(deleteSession(sessions, id));
+  }
+
+  // Escape on Home: resume the last-used workstation. With nothing saved at all
+  // there is nothing to resume, so fall through to the first-launch preset —
+  // autosave writes it back as a fresh "default" the moment the shell mounts.
+  function resumeLastUsed() {
+    const current = activeSession(sessions);
+    if (current) {
+      goToSession(current.id);
+      return;
+    }
+    dispatchFrom({ type: "setLayout", layout: defaultLayout() }, "passive");
+    setHome(false);
   }
 
   // Snapshot the live layout under a new name and make it current, so further
@@ -424,9 +464,9 @@ export default function DesktopShell({ surface }: Props) {
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      // The startup picker owns the keyboard outright — the shell it would be
-      // acting on isn't even mounted yet.
-      if (picking) return;
+      // Home owns the keyboard outright — the shell these actions would act on
+      // isn't even mounted yet.
+      if (home) return;
       if (overlay) {
         if (e.key === "Escape") {
           setOverlay(null);
@@ -454,24 +494,40 @@ export default function DesktopShell({ surface }: Props) {
         setOverlay("cheatsheet");
         return;
       }
+      if (action.type === "home") {
+        // The layout is already saved — autosave ran on the last edit — so
+        // going home is just a screen change, and coming back re-mounts the
+        // panes with fresh shells.
+        setOverlay(null);
+        setHome(true);
+        return;
+      }
       dispatchFrom({ type: "keymap", action }, movesFocus(action) ? "keyboard" : "passive");
     }
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [overlay, picking]);
+  }, [overlay, home]);
 
   const sessionList = listSessions(sessions);
   const current = activeSession(sessions);
 
   // Rendered *instead of* the shell, not over it: mounting the pane tree
   // underneath would spawn PTYs for a layout the user is about to replace.
-  if (picking) {
+  if (home) {
     return (
-      <SessionPicker
+      <Home
         sessions={sessionList}
         activeId={current?.id ?? null}
-        onPick={goToSession}
-        onSkip={() => setPicking(false)}
+        onOpen={goToSession}
+        onCreate={createWorkstation}
+        onRename={renameWorkstation}
+        onRemove={removeWorkstation}
+        onResume={resumeLastUsed}
+        theme={theme}
+        onThemeChange={(id) => {
+          applyTheme(id);
+          setTheme(id);
+        }}
       />
     );
   }
@@ -540,9 +596,17 @@ export default function DesktopShell({ surface }: Props) {
         <span className={`ml-2 ${wsStatusInfo.cls}`}>
           {wsStatusInfo.dot} {wsStatusInfo.text}
         </span>
-        {/* Which saved session these panes belong to — without it, "⌘p →
-            session: rename" is aimed at something invisible. */}
-        {current && <span className="text-term-dim">session: {current.name}</span>}
+        {/* Which saved workstation these panes belong to — without it, "⌘p →
+            session: rename" is aimed at something invisible. Clicking it goes
+            back to Home, so the way out is where the name already is. */}
+        <button
+          type="button"
+          onClick={() => setHome(true)}
+          title="workstations (⌘0)"
+          className="text-term-dim hover:text-term-accent"
+        >
+          {current ? `⌂ ${current.name}` : "⌂ workstations"}
+        </button>
         <select
           value={theme}
           onChange={(e) => {
