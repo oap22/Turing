@@ -1,0 +1,18 @@
+# research/results — commit the record, never the artifacts.
+#
+# Per research-loop conventions.md § Version Control: run.json, config.yaml,
+# metrics.json, notes.md, stdout.log and trajectory.json are small, diffable,
+# and the entire point — they get committed. Checkpoints, plots and large
+# outputs do not.
+#
+# This file also keeps the otherwise-empty results/ directory in git. Paths are
+# relative to this directory.
+#
+# If stdout.log is enormous, truncate the middle and say so *in the file*
+# rather than ignoring it.
+
+**/artifacts/
+*.ckpt
+*.pt
+*.safetensors
+*.parquet
