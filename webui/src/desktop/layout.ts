@@ -5,16 +5,24 @@
 // the same inputs it returns the same (new) state, which is what makes the
 // suite below exhaustive.
 
-export type PaneType =
-  | "term"
-  | "queue"
-  | "chat"
-  | "obs"
-  | "metrics"
-  | "images"
-  | "flywheel"
-  | "agents"
-  | "agentfeed";
+// The array is the single source of truth and `PaneType` derives from it, so
+// anything that has to *validate* a pane name at runtime (the agent control
+// file in `layoutRequest.ts`) checks against the same list the type is built
+// from. Declaring the union separately would let the two drift apart, and the
+// drift would only show up as a silently-rejected pane name.
+export const PANE_TYPES = [
+  "term",
+  "queue",
+  "chat",
+  "obs",
+  "metrics",
+  "images",
+  "flywheel",
+  "agents",
+  "agentfeed",
+] as const;
+
+export type PaneType = (typeof PANE_TYPES)[number];
 
 export type Leaf = {
   kind: "leaf";
@@ -22,9 +30,19 @@ export type Leaf = {
   pane: PaneType;
   params?: Record<string, unknown>;
 };
-export type Split = { kind: "split"; dir: "h" | "v"; ratio: number; a: Node; b: Node };
+export type Split = {
+  kind: "split";
+  dir: "h" | "v";
+  ratio: number;
+  a: Node;
+  b: Node;
+};
 export type Node = Leaf | Split;
-export type Workspace = { root: Node | null; focus: string | null; zoom: boolean };
+export type Workspace = {
+  root: Node | null;
+  focus: string | null;
+  zoom: boolean;
+};
 export type LayoutState = { workspaces: Workspace[]; active: number };
 
 export type Rect = { x: number; y: number; w: number; h: number };
@@ -49,7 +67,11 @@ export function emptyLayout(): LayoutState {
   return { workspaces, active: 0 };
 }
 
-function leaf(pane: PaneType, id: string, params?: Record<string, unknown>): Leaf {
+function leaf(
+  pane: PaneType,
+  id: string,
+  params?: Record<string, unknown>,
+): Leaf {
   return { kind: "leaf", id, pane, params };
 }
 
@@ -154,23 +176,36 @@ function removeLeaf(node: Node, id: string): Node | null {
   return node;
 }
 
-function findParent(node: Node, id: string): { parent: Split; isA: boolean } | null {
+function findParent(
+  node: Node,
+  id: string,
+): { parent: Split; isA: boolean } | null {
   if (node.kind === "leaf") return null;
-  if (node.a.kind === "leaf" && node.a.id === id) return { parent: node, isA: true };
-  if (node.b.kind === "leaf" && node.b.id === id) return { parent: node, isA: false };
+  if (node.a.kind === "leaf" && node.a.id === id)
+    return { parent: node, isA: true };
+  if (node.b.kind === "leaf" && node.b.id === id)
+    return { parent: node, isA: false };
   return findParent(node.a, id) ?? findParent(node.b, id);
 }
 
 function withRatio(node: Node, target: Split, ratio: number): Node {
   if (node === target) return { ...node, ratio };
   if (node.kind === "leaf") return node;
-  return { ...node, a: withRatio(node.a, target, ratio), b: withRatio(node.b, target, ratio) };
+  return {
+    ...node,
+    a: withRatio(node.a, target, ratio),
+    b: withRatio(node.b, target, ratio),
+  };
 }
 
 function withDir(node: Node, target: Split, dir: "h" | "v"): Node {
   if (node === target) return { ...node, dir };
   if (node.kind === "leaf") return node;
-  return { ...node, a: withDir(node.a, target, dir), b: withDir(node.b, target, dir) };
+  return {
+    ...node,
+    a: withDir(node.a, target, dir),
+    b: withDir(node.b, target, dir),
+  };
 }
 
 function center(r: Rect): { x: number; y: number } {
@@ -181,7 +216,11 @@ function clamp(n: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, n));
 }
 
-function updateWs(state: LayoutState, index: number, ws: Workspace): LayoutState {
+function updateWs(
+  state: LayoutState,
+  index: number,
+  ws: Workspace,
+): LayoutState {
   const workspaces = state.workspaces.slice();
   workspaces[index] = ws;
   return { ...state, workspaces };
@@ -205,7 +244,11 @@ function nearestLeafId(root: Node, fromRect: Rect): string | null {
 
 type Dir4 = "left" | "right" | "up" | "down";
 
-function inDirection(dir: Dir4, from: { x: number; y: number }, to: { x: number; y: number }): boolean {
+function inDirection(
+  dir: Dir4,
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+): boolean {
   if (dir === "left") return to.x < from.x;
   if (dir === "right") return to.x > from.x;
   if (dir === "up") return to.y < from.y;
@@ -235,7 +278,10 @@ function pickNeighbor(root: Node, focusId: string, dir: Dir4): string | null {
     if (!inDirection(dir, curCenter, c)) continue;
     const dist = Math.hypot(c.x - curCenter.x, c.y - curCenter.y);
     const overlap = perpendicularOverlap(dir, cur, r);
-    if (dist < bestDist - 1e-9 || (Math.abs(dist - bestDist) <= 1e-9 && overlap > bestOverlap)) {
+    if (
+      dist < bestDist - 1e-9 ||
+      (Math.abs(dist - bestDist) <= 1e-9 && overlap > bestOverlap)
+    ) {
       best = id;
       bestDist = dist;
       bestOverlap = overlap;
@@ -250,14 +296,18 @@ function insertLeafInto(
   newLeaf: Leaf,
 ): { root: Node; focus: string } {
   if (!root) return { root: newLeaf, focus: newLeaf.id };
-  const targetId = (focusId && findLeaf(root, focusId)) ? focusId : firstLeafId(root);
+  const targetId =
+    focusId && findLeaf(root, focusId) ? focusId : firstLeafId(root);
   const targetLeaf = findLeaf(root, targetId);
   if (!targetLeaf) return { root: newLeaf, focus: newLeaf.id };
   const rectMap = rects(root, NOMINAL_VIEWPORT);
   const r = rectMap.get(targetId) ?? NOMINAL_VIEWPORT;
   const dir: "h" | "v" = r.w >= r.h ? "h" : "v";
   const newSplit = split(dir, 0.5, targetLeaf, newLeaf);
-  return { root: replaceLeafWithNode(root, targetId, newSplit), focus: newLeaf.id };
+  return {
+    root: replaceLeafWithNode(root, targetId, newSplit),
+    focus: newLeaf.id,
+  };
 }
 
 export function openPane(
@@ -282,7 +332,11 @@ export function closeFocused(state: LayoutState): LayoutState {
       ? nearestLeafId(newRoot, closedRect)
       : firstLeafId(newRoot)
     : null;
-  return updateWs(state, state.active, { root: newRoot, focus: newFocus, zoom: false });
+  return updateWs(state, state.active, {
+    root: newRoot,
+    focus: newFocus,
+    zoom: false,
+  });
 }
 
 // Like `closeFocused`, but closes a specific leaf by id in a specific
@@ -293,7 +347,11 @@ export function closeFocused(state: LayoutState): LayoutState {
 // closed leaf was the one that had focus, otherwise the existing focus is
 // left untouched. An invalid workspace index or an id not present in that
 // workspace's tree is a no-op.
-export function closeLeafById(state: LayoutState, wsIdx: number, leafId: string): LayoutState {
+export function closeLeafById(
+  state: LayoutState,
+  wsIdx: number,
+  leafId: string,
+): LayoutState {
   if (wsIdx < 0 || wsIdx >= state.workspaces.length) return state;
   const ws = state.workspaces[wsIdx];
   if (!ws.root || !findLeaf(ws.root, leafId)) return state;
@@ -388,7 +446,11 @@ export function swap(state: LayoutState, dir: Dir4): LayoutState {
     [targetId, focusLeaf],
   ]);
   const newRoot = mapLeaves(ws.root, replacements);
-  return updateWs(state, state.active, { ...ws, root: newRoot, focus: ws.focus });
+  return updateWs(state, state.active, {
+    ...ws,
+    root: newRoot,
+    focus: ws.focus,
+  });
 }
 
 export function resize(state: LayoutState, delta: number): LayoutState {
@@ -436,7 +498,11 @@ export function sendToWs(state: LayoutState, i: number): LayoutState {
       ? nearestLeafId(newSrcRoot, closedRect)
       : firstLeafId(newSrcRoot)
     : null;
-  const srcWs: Workspace = { root: newSrcRoot, focus: newSrcFocus, zoom: false };
+  const srcWs: Workspace = {
+    root: newSrcRoot,
+    focus: newSrcFocus,
+    zoom: false,
+  };
 
   const targetWs = state.workspaces[i];
   const { root: newTargetRoot, focus: newTargetFocus } = insertLeafInto(
@@ -447,7 +513,12 @@ export function sendToWs(state: LayoutState, i: number): LayoutState {
 
   const workspaces = state.workspaces.map((w, idx) => {
     if (idx === state.active) return srcWs;
-    if (idx === i) return { root: newTargetRoot, focus: newTargetFocus, zoom: targetWs.zoom };
+    if (idx === i)
+      return {
+        root: newTargetRoot,
+        focus: newTargetFocus,
+        zoom: targetWs.zoom,
+      };
     return w;
   });
   return { ...state, workspaces };
@@ -489,9 +560,14 @@ function isWorkspace(x: unknown): x is Workspace {
 export function isValidLayoutState(x: unknown): x is LayoutState {
   if (!x || typeof x !== "object") return false;
   const o = x as Record<string, unknown>;
-  if (!Array.isArray(o.workspaces) || o.workspaces.length !== WORKSPACE_COUNT) return false;
+  if (!Array.isArray(o.workspaces) || o.workspaces.length !== WORKSPACE_COUNT)
+    return false;
   if (!o.workspaces.every(isWorkspace)) return false;
-  return Number.isInteger(o.active) && (o.active as number) >= 0 && (o.active as number) < WORKSPACE_COUNT;
+  return (
+    Number.isInteger(o.active) &&
+    (o.active as number) >= 0 &&
+    (o.active as number) < WORKSPACE_COUNT
+  );
 }
 
 export function deserialize(s: string): LayoutState | null {

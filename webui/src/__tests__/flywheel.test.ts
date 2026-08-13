@@ -59,6 +59,40 @@ describe("parseTrajectory", () => {
     const rounds = parseTrajectory(text);
     expect(rounds?.[0].status).toBe("other");
   });
+
+  it("keeps legacy detail when a legacy row also carries a verdict string", () => {
+    // `verdict` is a real-schema key, so the real-schema formatter claimed
+    // this row and dropped everything else it had. Legacy rows have to win
+    // for detail, not just for label and status.
+    const text = JSON.stringify([
+      {
+        phase: "probe",
+        ok: true,
+        verdict: "looks good",
+        score: 0.91,
+        tokens: 4200,
+      },
+    ]);
+    const detail = parseTrajectory(text)?.[0].detail ?? "";
+    expect(detail).toContain("score");
+    expect(detail).toContain("0.91");
+    expect(detail).toContain("tokens");
+  });
+
+  it("keeps legacy detail when a legacy row carries a cost object", () => {
+    const text = JSON.stringify([
+      {
+        cell: "x",
+        passed: false,
+        cost: { tokens: 99 },
+        score: 0.5,
+        attempts: 3,
+      },
+    ]);
+    const detail = parseTrajectory(text)?.[0].detail ?? "";
+    expect(detail).toContain("score");
+    expect(detail).toContain("attempts");
+  });
 });
 
 // The real producer is `src/turing/research/loop/trajectory.py`. REAL_ROW is a
@@ -209,6 +243,52 @@ describe("parseTrajectory — the real trajectory.json schema", () => {
     expect(parseTrajectory(JSON.stringify([refused]))?.[0].status).toBe(
       "refused",
     );
+  });
+
+  it("does not read a refusal's own cause as a failed round", () => {
+    // The runner writes `noise_floor_available: false` and
+    // `refused_no_noise_floor` together — running without a noise-floor
+    // report is a supported path it only warns about. Counting that gate as
+    // a failure painted every round of such a run red.
+    const row = {
+      ...REAL_ROW,
+      constraints: {
+        eval_set_stable: true,
+        lineage_recorded: true,
+        noise_floor_available: false,
+      },
+      saturation: [assessment("refused_no_noise_floor")],
+    };
+    expect(parseTrajectory(JSON.stringify([row]))?.[0].status).toBe("refused");
+  });
+
+  it("does not read a changed eval set as a failed round either", () => {
+    const row = {
+      ...REAL_ROW,
+      constraints: { eval_set_stable: false, lineage_recorded: true },
+      saturation: [assessment("refused_eval_set_changed")],
+    };
+    expect(parseTrajectory(JSON.stringify([row]))?.[0].status).toBe("refused");
+  });
+
+  it("still fails on a gate that no refusal explains", () => {
+    // `lineage_recorded` has no corresponding refusal verdict, so it stays a
+    // real failure even alongside one.
+    const row = {
+      ...REAL_ROW,
+      constraints: { lineage_recorded: false, noise_floor_available: false },
+      saturation: [assessment("refused_no_noise_floor")],
+    };
+    expect(parseTrajectory(JSON.stringify([row]))?.[0].status).toBe("fail");
+  });
+
+  it("still fails on a false gate when no refusal is present at all", () => {
+    const row = {
+      ...REAL_ROW,
+      constraints: { noise_floor_available: false },
+      saturation: [assessment("improving")],
+    };
+    expect(parseTrajectory(JSON.stringify([row]))?.[0].status).toBe("fail");
   });
 
   it("does not claim a baseline round improved just because its gates are green", () => {

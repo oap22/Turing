@@ -382,7 +382,15 @@ def encode_trajectory_row(
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    # ``allow_nan=False`` because Python emits bare ``NaN``/``Infinity``, which
+    # is not JSON: every other reader rejects the file outright. The desktop
+    # flywheel pane would blank rather than show one bad number, and a NaN that
+    # reached here would mean a driving function was computed wrong anyway —
+    # better to fail at the write, where the traceback still names the round.
+    tmp.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
     tmp.replace(path)
 
 

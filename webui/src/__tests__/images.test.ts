@@ -26,8 +26,13 @@ const files = [newest, middle, oldest];
 describe("nextSelection", () => {
   it("auto-selects the newest when nothing is chosen yet", () => {
     expect(nextSelection(files, null, true)).toBe(newest);
-    // Still correct with following off — first load has nothing to preserve.
-    expect(nextSelection(files, null, false)).toBe(newest);
+  });
+
+  it("does not auto-select when the user turned following off first", () => {
+    // Turning [watch latest] off before any image has landed is still an
+    // instruction not to follow; honouring it only once something has been
+    // selected would ignore it exactly when it was given.
+    expect(nextSelection(files, null, false)).toBeNull();
   });
 
   it("follows the newest while following is on", () => {
@@ -76,9 +81,16 @@ describe("newerCount", () => {
     expect(newerCount(files, newest)).toBe(0);
   });
 
-  it("is zero with no selection, and for a selection no longer on disk", () => {
+  it("is zero with no selection", () => {
     expect(newerCount(files, null)).toBe(0);
-    expect(newerCount(files, img("gone.png", 999))).toBe(0);
+  });
+
+  it("counts everything as newer when the selection has gone from the list", () => {
+    // Deleted, or pushed out of the MAX_ENTRIES window by a long run. The
+    // list highlight is already gone; reporting 0 would also hide [N new],
+    // leaving no way back to following at the moment it is most needed.
+    expect(newerCount(files, img("gone.png", 999))).toBe(3);
+    expect(newerCount([], img("gone.png", 999))).toBe(0);
   });
 });
 

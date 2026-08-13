@@ -66,7 +66,8 @@ import FlywheelPane from "./panes/FlywheelPane";
 import ImagesPane from "./panes/ImagesPane";
 import MetricsPane from "./panes/MetricsPane";
 import TermPane from "./panes/TermPane";
-import { inv, isTauri } from "./tauri";
+import { inv, isTauri, subscribe } from "./tauri";
+import { LAYOUT_FILE_REL, applyLayoutRequest } from "./layoutRequest";
 import { applyTheme, initTheme, THEMES } from "./theme";
 
 const TITLE_ROW_PX = 20;
@@ -96,7 +97,8 @@ type ShellAction =
   | { type: "setRoot"; ws: number; root: Node }
   | { type: "closeLeaf"; ws: number; leafId: string }
   | { type: "focusLeaf"; leafId: string }
-  | { type: "setLayout"; layout: LayoutState };
+  | { type: "setLayout"; layout: LayoutState }
+  | { type: "layoutRequest"; req: unknown };
 
 function layoutReducer(state: LayoutState, action: ShellAction): LayoutState {
   if (action.type === "setLayout") {
@@ -105,6 +107,24 @@ function layoutReducer(state: LayoutState, action: ShellAction): LayoutState {
     // them before it can collide with the next `nextId()`.
     seedIds(action.layout);
     return action.layout;
+  }
+  if (action.type === "layoutRequest") {
+    // Applied inside the reducer so it always compiles against the live
+    // layout, never a state captured when the watcher subscribed. A request
+    // that is malformed, out of range, or asks for nothing returns null and
+    // the layout is kept exactly as it was.
+    //
+    // The catch is not decoration. This runs in React's render phase, so it
+    // is outside the watcher's own try/catch, and there is no error boundary
+    // above it — anything thrown here unmounts the whole shell, and since the
+    // offending file is still on disk it would do it again on every relaunch.
+    // `applyLayoutRequest` caps depth and size to keep that unreachable; this
+    // is the second lock on the same door.
+    try {
+      return applyLayoutRequest(state, action.req) ?? state;
+    } catch {
+      return state;
+    }
   }
   if (action.type === "setRoot") {
     const workspaces = state.workspaces.slice();
@@ -187,20 +207,50 @@ function collectBoundaries(node: Node, rect: Rect, out: Boundary[]): void {
   if (node.kind === "leaf") return;
   if (node.dir === "h") {
     const boundaryX = rect.x + rect.w * node.ratio;
-    out.push({ split: node, axis: "h", at: boundaryX, from: rect.y, to: rect.y + rect.h });
-    collectBoundaries(node.a, { x: rect.x, y: rect.y, w: rect.w * node.ratio, h: rect.h }, out);
+    out.push({
+      split: node,
+      axis: "h",
+      at: boundaryX,
+      from: rect.y,
+      to: rect.y + rect.h,
+    });
+    collectBoundaries(
+      node.a,
+      { x: rect.x, y: rect.y, w: rect.w * node.ratio, h: rect.h },
+      out,
+    );
     collectBoundaries(
       node.b,
-      { x: rect.x + rect.w * node.ratio, y: rect.y, w: rect.w * (1 - node.ratio), h: rect.h },
+      {
+        x: rect.x + rect.w * node.ratio,
+        y: rect.y,
+        w: rect.w * (1 - node.ratio),
+        h: rect.h,
+      },
       out,
     );
   } else {
     const boundaryY = rect.y + rect.h * node.ratio;
-    out.push({ split: node, axis: "v", at: boundaryY, from: rect.x, to: rect.x + rect.w });
-    collectBoundaries(node.a, { x: rect.x, y: rect.y, w: rect.w, h: rect.h * node.ratio }, out);
+    out.push({
+      split: node,
+      axis: "v",
+      at: boundaryY,
+      from: rect.x,
+      to: rect.x + rect.w,
+    });
+    collectBoundaries(
+      node.a,
+      { x: rect.x, y: rect.y, w: rect.w, h: rect.h * node.ratio },
+      out,
+    );
     collectBoundaries(
       node.b,
-      { x: rect.x, y: rect.y + rect.h * node.ratio, w: rect.w, h: rect.h * (1 - node.ratio) },
+      {
+        x: rect.x,
+        y: rect.y + rect.h * node.ratio,
+        w: rect.w,
+        h: rect.h * (1 - node.ratio),
+      },
       out,
     );
   }
@@ -209,12 +259,18 @@ function collectBoundaries(node: Node, rect: Rect, out: Boundary[]): void {
 function withRatioAt(node: Node, target: Split, ratio: number): Node {
   if (node === target) return { ...node, ratio };
   if (node.kind === "leaf") return node;
-  return { ...node, a: withRatioAt(node.a, target, ratio), b: withRatioAt(node.b, target, ratio) };
+  return {
+    ...node,
+    a: withRatioAt(node.a, target, ratio),
+    b: withRatioAt(node.b, target, ratio),
+  };
 }
 
 function paneLabel(leaf: Leaf): string {
   const runnerId = leaf.params?.runnerId;
-  return typeof runnerId === "string" ? `${leaf.pane} — ${runnerId}` : leaf.pane;
+  return typeof runnerId === "string"
+    ? `${leaf.pane} — ${runnerId}`
+    : leaf.pane;
 }
 
 // Move the OS pointer to the centre of a pane. JS cannot move the cursor, so
@@ -235,13 +291,25 @@ function warpCursorToCenter(el: HTMLElement): void {
   }).catch(() => {});
 }
 
-function PaneBody({ leaf, visible, surface }: { leaf: Leaf; visible: boolean; surface: Surface }) {
+function PaneBody({
+  leaf,
+  visible,
+  surface,
+}: {
+  leaf: Leaf;
+  visible: boolean;
+  surface: Surface;
+}) {
   switch (leaf.pane) {
     case "term":
       return (
         <TermPane
           leafId={leaf.id}
-          runnerId={typeof leaf.params?.runnerId === "string" ? leaf.params.runnerId : undefined}
+          runnerId={
+            typeof leaf.params?.runnerId === "string"
+              ? leaf.params.runnerId
+              : undefined
+          }
           visible={visible}
         />
       );
@@ -278,7 +346,9 @@ export default function DesktopShell({ surface }: Props) {
   // Read storage exactly once, before the reducer, and hand the same store to
   // both: the reducer needs the active session's layout to boot with, and the
   // picker below needs to know how many sessions there are.
-  const [sessions, setSessions] = useState<SessionStore>(() => loadSessions(localStorage));
+  const [sessions, setSessions] = useState<SessionStore>(() =>
+    loadSessions(localStorage),
+  );
   const [state, dispatch] = useReducer(layoutReducer, sessions, initLayout);
   // The app opens on Home — always, not just when there is more than one saved
   // workstation. It is the only surface that lists what you have and the only
@@ -291,7 +361,12 @@ export default function DesktopShell({ surface }: Props) {
   const [theme, setTheme] = useState(() => localStorage.getItem("turing.theme") ?? "turing");
   const [now, setNow] = useState(() => new Date());
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const [viewport, setViewport] = useState<Rect>({ x: 0, y: 0, w: 1600, h: 900 });
+  const [viewport, setViewport] = useState<Rect>({
+    x: 0,
+    y: 0,
+    w: 1600,
+    h: 900,
+  });
 
   // Hyprland-style focus-follow. `layoutReducer` is pure and can't know what
   // provoked a transition, so the provocation is recorded here at the
@@ -340,7 +415,9 @@ export default function DesktopShell({ surface }: Props) {
     } else {
       // preventScroll: the pane is already positioned absolutely at its tile;
       // letting the browser scroll it into view would shift the whole grid.
-      el.querySelector<HTMLElement>("[data-pane-body]")?.focus({ preventScroll: true });
+      el.querySelector<HTMLElement>("[data-pane-body]")?.focus({
+        preventScroll: true,
+      });
     }
 
     if (effect.warp) warpCursorToCenter(el);
@@ -443,8 +520,68 @@ export default function DesktopShell({ surface }: Props) {
     const next = deleteSession(sessions, current.id);
     commitSessions(next);
     const target = activeSession(next);
-    dispatchFrom({ type: "setLayout", layout: target?.layout ?? defaultLayout() }, "passive");
+    dispatchFrom(
+      { type: "setLayout", layout: target?.layout ?? defaultLayout() },
+      "passive",
+    );
   }
+
+  // Agent-driven pane control (#388). Watches `.layout.json` under the
+  // results root, the same way the metrics pane watches `.viewer.json`, and
+  // rearranges the workspaces live — no relaunch, and no hand-editing the
+  // persisted layout blob, which is how this had to be done before.
+  //
+  // Dispatched "passive" on purpose: an agent rearranging panes must never
+  // pull DOM focus out of whatever Owen is typing in, and must never warp the
+  // cursor. `focusEffect` returns null for passive, so neither can happen.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+
+    async function loadLayoutFile() {
+      try {
+        const text = await inv<string>("fs_read_text", {
+          root: "results",
+          rel: LAYOUT_FILE_REL,
+        });
+        if (cancelled) return;
+        dispatchFrom(
+          { type: "layoutRequest", req: JSON.parse(text) },
+          "passive",
+        );
+      } catch {
+        // Absent, unreadable, or mid-write and not yet valid JSON — nothing
+        // to apply. The next fs-change brings the finished file.
+      }
+    }
+
+    const sub = subscribe<{ root: string; rel_path: string }>(
+      "fs-change",
+      (payload) => {
+        if (cancelled || payload.root !== "results") return;
+        if (payload.rel_path === LAYOUT_FILE_REL) void loadLayoutFile();
+      },
+    );
+
+    // Order matters: await `sub.ready` before asking the backend to watch, or
+    // a change landing between `fs_watch` returning and the Tauri listener
+    // attaching is dropped. It would self-heal on the next write, but a
+    // control file written once at startup would appear to be ignored.
+    void sub.ready
+      .then(() => inv("fs_watch", { root: "results", rel: "" }))
+      .catch(() => {
+        // Results root missing on this machine: no control file to watch.
+      })
+      .then(() => {
+        if (!cancelled) void loadLayoutFile();
+      });
+
+    return () => {
+      cancelled = true;
+      sub.unsubscribe();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     const id = setInterval(() => setNow(new Date()), 30_000);
@@ -584,7 +721,12 @@ export default function DesktopShell({ surface }: Props) {
           <button
             key={i}
             type="button"
-            onClick={() => dispatchFrom({ type: "keymap", action: { type: "ws", i } }, "pointer")}
+            onClick={() =>
+              dispatchFrom(
+                { type: "keymap", action: { type: "ws", i } },
+                "pointer",
+              )
+            }
             className={`flex items-center gap-1 px-1.5 ${
               i === state.active ? "text-term-accent" : "text-term-dim"
             }`}
@@ -623,10 +765,15 @@ export default function DesktopShell({ surface }: Props) {
         </select>
         <span className="tabular-nums text-term-dim">{clock}</span>
       </header>
-      <div ref={containerRef} className="relative min-h-0 flex-1 overflow-hidden">
+      <div
+        ref={containerRef}
+        className="relative min-h-0 flex-1 overflow-hidden"
+      >
         {allLeaves.map(({ ws: wsIdx, leaf }) => {
           const isActiveWs = wsIdx === state.active;
-          const isZoomedOut = state.workspaces[wsIdx].zoom && leaf.id !== state.workspaces[wsIdx].focus;
+          const isZoomedOut =
+            state.workspaces[wsIdx].zoom &&
+            leaf.id !== state.workspaces[wsIdx].focus;
           const visible = isActiveWs && !isZoomedOut;
           // Half the inner gap per pane: two neighbours each give up half, so
           // the visible seam between them is exactly GAPS_IN_PX. A zoomed (or
@@ -640,7 +787,8 @@ export default function DesktopShell({ surface }: Props) {
               : tiled,
             GAPS_IN_PX / 2,
           );
-          const focused = isActiveWs && state.workspaces[wsIdx].focus === leaf.id;
+          const focused =
+            isActiveWs && state.workspaces[wsIdx].focus === leaf.id;
           return (
             <div
               key={leaf.id}
@@ -670,13 +818,18 @@ export default function DesktopShell({ surface }: Props) {
                 style={{ height: TITLE_ROW_PX }}
                 className="flex shrink-0 items-center gap-2 border-b border-term-edge px-2 text-[10px] lowercase text-term-dim"
               >
-                <span className="min-w-0 flex-1 truncate">{paneLabel(leaf)}</span>
+                <span className="min-w-0 flex-1 truncate">
+                  {paneLabel(leaf)}
+                </span>
                 <button
                   type="button"
                   aria-label={`close ${paneLabel(leaf)}`}
                   onClick={(e) => {
                     e.stopPropagation();
-                    dispatchFrom({ type: "closeLeaf", ws: wsIdx, leafId: leaf.id }, "pointer");
+                    dispatchFrom(
+                      { type: "closeLeaf", ws: wsIdx, leafId: leaf.id },
+                      "pointer",
+                    );
                   }}
                   className="shrink-0 px-1 leading-none text-term-dim hover:text-term-accent"
                 >
@@ -686,7 +839,11 @@ export default function DesktopShell({ surface }: Props) {
               {/* tabIndex -1 makes this programmatically focusable (but not
                   a Tab stop), so a non-term pane can take real keyboard
                   focus and be scrolled/keyed without a click. */}
-              <div className="min-h-0 flex-1 outline-none" data-pane-body tabIndex={-1}>
+              <div
+                className="min-h-0 flex-1 outline-none"
+                data-pane-body
+                tabIndex={-1}
+              >
                 <PaneBody leaf={leaf} visible={visible} surface={surface} />
               </div>
             </div>
@@ -727,9 +884,14 @@ export default function DesktopShell({ surface }: Props) {
       {overlay === "launcher" && (
         <Launcher
           onClose={() => setOverlay(null)}
-          onOpenPane={(pane) => dispatchFrom({ type: "openPane", pane }, "keyboard")}
+          onOpenPane={(pane) =>
+            dispatchFrom({ type: "openPane", pane }, "keyboard")
+          }
           onOpenRunner={(runnerId) =>
-            dispatchFrom({ type: "openPane", pane: "term", params: { runnerId } }, "keyboard")
+            dispatchFrom(
+              { type: "openPane", pane: "term", params: { runnerId } },
+              "keyboard",
+            )
           }
           sessions={sessionList}
           activeSession={current}
@@ -739,7 +901,9 @@ export default function DesktopShell({ surface }: Props) {
           onDeleteSession={deleteActiveSession}
         />
       )}
-      {overlay === "cheatsheet" && <Cheatsheet onClose={() => setOverlay(null)} />}
+      {overlay === "cheatsheet" && (
+        <Cheatsheet onClose={() => setOverlay(null)} />
+      )}
     </div>
   );
 }

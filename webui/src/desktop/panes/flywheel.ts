@@ -86,17 +86,40 @@ function cellLabel(obj: Obj): string | null {
  * reasons), so it is shown as detail rather than decoded into a glyph. The
  * machine-readable signals are the gates and the per-cell saturation verdicts.
  */
-function realStatus(obj: Obj): RoundStatus | null {
-  const gates = isObj(obj.constraints) ? Object.values(obj.constraints) : [];
-  // A round that failed a gate is usually the most informative round in the
-  // sweep — it is logged, not deleted, and it should not read as "flat".
-  if (gates.some((g) => g === false)) return "fail";
+// Two of the three gates the runner writes are the *cause* of a refusal, not
+// an independent failure. `noise_floor_available: false` is exactly the
+// condition that produces `refused_no_noise_floor`, and `eval_set_stable:
+// false` produces `refused_eval_set_changed`. Counting those as failures made
+// every round of a perfectly ordinary run — one started without a noise-floor
+// report, which the runner explicitly supports with a warning — render as a
+// failed round. That is worse than the "flat" misreading refusals were kept
+// distinct to avoid.
+//
+// `lineage_recorded` has no corresponding refusal and stays a real failure.
+const REFUSAL_EXPLAINED_GATES: Record<string, string> = {
+  noise_floor_available: "refused_no_noise_floor",
+  eval_set_stable: "refused_eval_set_changed",
+};
 
+function realStatus(obj: Obj): RoundStatus | null {
   const assessments = Array.isArray(obj.saturation) ? obj.saturation : [];
   const verdicts = assessments
     .filter(isObj)
     .map((a) => a.verdict)
     .filter((v): v is string => typeof v === "string");
+  const seen = new Set(verdicts);
+
+  const gates = isObj(obj.constraints) ? Object.entries(obj.constraints) : [];
+  const failed = gates.some(([name, value]) => {
+    if (value !== false) return false;
+    const explanation = REFUSAL_EXPLAINED_GATES[name];
+    return explanation === undefined || !seen.has(explanation);
+  });
+  // A round that failed a gate for its own reasons is usually the most
+  // informative round in the sweep — it is logged, not deleted, and it should
+  // not read as "flat".
+  if (failed) return "fail";
+
   // Gates passing says the round was valid, not that it improved — a round 0
   // baseline has no parent to be assessed against and carries no verdicts at
   // all. Claiming "improving" there would invent a result.
@@ -187,9 +210,11 @@ function toRound(raw: unknown, position: number): Round | null {
 
   // Legacy keys win when present so old loop dirs render exactly as before.
   let label: string | null = null;
+  let labelKeyUsed = false;
   for (const k of LABEL_KEYS) {
     if (obj[k] !== undefined && obj[k] !== null) {
       label = String(obj[k]);
+      labelKeyUsed = true;
       break;
     }
   }
@@ -208,7 +233,16 @@ function toRound(raw: unknown, position: number): Round | null {
 
   const used = new Set<string>([...INDEX_KEYS, ...LABEL_KEYS]);
   if (statusKeyUsed) used.add(statusKeyUsed);
-  const detail = realDetail(obj) ?? legacyDetail(obj, used);
+  // "Legacy wins when present" has to hold for detail too, not just label and
+  // status. `realDetail` returns non-null as soon as it finds *any* field it
+  // recognises — a `verdict` string, or a `cost` object — so a legacy row
+  // carrying either would silently lose every other field it had. A row that
+  // identified itself as legacy through its label or status key gets the
+  // legacy detail.
+  const isLegacyRow = labelKeyUsed || statusKeyUsed !== null;
+  const detail = isLegacyRow
+    ? legacyDetail(obj, used)
+    : (realDetail(obj) ?? legacyDetail(obj, used));
 
   return { index, label, status, detail };
 }

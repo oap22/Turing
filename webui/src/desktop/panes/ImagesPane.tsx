@@ -28,7 +28,12 @@ const LIST_DEBOUNCE_MS = 1000;
 export default function ImagesPane() {
   const [files, setFiles] = useState<ImageEntry[]>([]);
   const [selected, setSelected] = useState<ImageEntry | null>(null);
-  const [dataUri, setDataUri] = useState<string | null>(null);
+  // Bytes stay tagged with the entry they were read from. Rendering is gated
+  // on that tag matching the selection, so a failed or slow read can never
+  // caption one image with another's name.
+  const [image, setImage] = useState<{ entry: ImageEntry; uri: string } | null>(
+    null,
+  );
   const [watchLatest, setWatchLatest] = useState(true);
   const [enlarged, setEnlarged] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -36,6 +41,7 @@ export default function ImagesPane() {
   const watchLatestRef = useRef(true);
   const filesRef = useRef<ImageEntry[]>([]);
   const enlargedRef = useRef(false);
+  const lightboxRef = useRef<HTMLDivElement | null>(null);
   selectedRef.current = selected;
   watchLatestRef.current = watchLatest;
   filesRef.current = files;
@@ -121,7 +127,7 @@ export default function ImagesPane() {
 
   useEffect(() => {
     if (!selected) {
-      setDataUri(null);
+      setImage(null);
       return;
     }
     let cancelled = false;
@@ -131,46 +137,61 @@ export default function ImagesPane() {
     })
       .then((b64) => {
         if (!cancelled)
-          setDataUri(`data:${mimeFor(selected.rel_path)};base64,${b64}`);
+          setImage({
+            entry: selected,
+            uri: `data:${mimeFor(selected.rel_path)};base64,${b64}`,
+          });
       })
       .catch(() => {
         // Deleted or truncated mid-view — a real case while rsync mirrors
-        // into the watched roots. Keep showing the last good bytes rather
-        // than blanking to a broken image; the next refresh drops the entry
-        // from the list.
+        // into the watched roots. The bytes stay tagged with the entry they
+        // came from, so the pane keeps showing the last good image *and*
+        // keeps calling it by its own name; the next refresh drops the dead
+        // entry from the list. Showing old pixels under a new caption would
+        // be worse than showing nothing.
       });
     return () => {
       cancelled = true;
     };
   }, [selected]);
 
-  // Lightbox keys. Bare Escape and bare arrows are never claimed by the
-  // shell's global handler — `actionFor` returns null without `metaKey` — so
-  // a pane-local listener is safe here. It only binds while enlarged, which
-  // also keeps it from firing under the ⌘p/⌘/ overlay.
-  useEffect(() => {
-    if (!enlarged) return;
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        setEnlarged(false);
-        return;
-      }
-      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+  // Lightbox keys, bound to the lightbox element rather than to `window`.
+  //
+  // A window listener was wrong in two ways that both broke the pane's own
+  // invariant. Panes in inactive workspaces stay mounted (rendered with
+  // `display: none`), so an enlarged pane on another workspace consumed
+  // arrows meant for the visible one. And the shell only stops propagation
+  // for Escape and ⌘-digits while the ⌘p/⌘/ overlay is open, so a bare arrow
+  // pressed while editing the launcher's query reached this handler, moved
+  // the pinned image and silently ended follow-mode.
+  //
+  // Keying off the focused element scopes both away: a hidden element cannot
+  // hold focus, and the launcher's input takes it while the overlay is up.
+  function onLightboxKey(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (e.key === "Escape") {
       e.preventDefault();
-      // Newest-first order: ArrowRight walks toward older images, matching
-      // the direction the list reads.
-      const next = stepSelection(
-        filesRef.current,
-        selectedRef.current,
-        e.key === "ArrowRight" ? 1 : -1,
-      );
-      // Stepping is a user action, so it also ends follow-mode and keeps the
-      // list highlight in sync.
-      if (next) selectByUser(next);
+      setEnlarged(false);
+      return;
     }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    // Newest-first order: ArrowRight walks toward older images, matching
+    // the direction the list reads.
+    const next = stepSelection(
+      filesRef.current,
+      selectedRef.current,
+      e.key === "ArrowRight" ? 1 : -1,
+    );
+    // Stepping is a user action, so it also ends follow-mode and keeps the
+    // list highlight in sync.
+    if (next) selectByUser(next);
+  }
+
+  // Focus the lightbox when it opens so it receives those keys. This follows
+  // a click on this pane, so it takes nothing the user had elsewhere, and it
+  // moves no pointer.
+  useEffect(() => {
+    if (enlarged) lightboxRef.current?.focus();
   }, [enlarged]);
 
   function openSelected() {
@@ -182,6 +203,9 @@ export default function ImagesPane() {
   }
 
   const now = Date.now();
+  // Only show bytes that belong to the current selection. Anything else is a
+  // stale read, and captioning it with the new name would mislabel a plot.
+  const shown = image && sameEntry(image.entry, selected) ? image : null;
   const newer = newerCount(files, selected);
 
   return (
@@ -252,10 +276,10 @@ export default function ImagesPane() {
       {/* `relative` scopes the lightbox to the pane's own rect, so it cannot
           escape its tile and never touches the layout reducer. */}
       <div className="relative flex flex-1 items-center justify-center overflow-auto p-2">
-        {dataUri ? (
+        {shown ? (
           <img
-            src={dataUri}
-            alt={selected?.rel_path ?? ""}
+            src={shown.uri}
+            alt={shown.entry.rel_path}
             onClick={() => setEnlarged(true)}
             className="cursor-zoom-in"
             style={{
@@ -265,17 +289,22 @@ export default function ImagesPane() {
             }}
           />
         ) : (
-          <span className="text-[11px] text-term-dim">select an image</span>
+          <span className="text-[11px] text-term-dim">
+            {selected ? "reading image…" : "select an image"}
+          </span>
         )}
-        {enlarged && dataUri && (
+        {enlarged && shown && (
           <div
+            ref={lightboxRef}
             role="presentation"
+            tabIndex={-1}
+            onKeyDown={onLightboxKey}
             onClick={() => setEnlarged(false)}
-            className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-term-bg/90 p-2"
+            className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-term-bg/90 p-2 outline-none"
           >
             <img
-              src={dataUri}
-              alt={selected?.rel_path ?? ""}
+              src={shown.uri}
+              alt={shown.entry.rel_path}
               onClick={(e) => {
                 // Clicking the image itself dismisses too, but stop the event
                 // so it isn't also counted as a backdrop click.
@@ -290,7 +319,7 @@ export default function ImagesPane() {
               }}
             />
             <div className="pointer-events-none mt-1 shrink-0 truncate text-[11px] text-term-dim">
-              {relTail(selected?.rel_path ?? "")} · ←/→ step · esc close
+              {relTail(shown.entry.rel_path)} · ←/→ step · esc close
             </div>
           </div>
         )}

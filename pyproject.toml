@@ -109,13 +109,19 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
 # Backstop for a test that wedges mid-run (#384). Generous on purpose — the
-# slowest real test is far under this, so a trip means a genuine hang, and
-# `thread` method dumps the stack instead of killing the run silently. This
-# does NOT cover a hang *after* the session ends: nothing is running then, so
-# no per-test timer can fire. That case is the exit watchdog in
+# slowest real test is far under this, so a trip means a genuine hang.
+#
+# The method is left to pytest-timeout, which picks `signal` wherever SIGALRM
+# exists (Linux CI, macOS). That turns a hang into an ordinary failure of the
+# offending test with the rest of the suite still running and the coverage
+# report intact; the `thread` method ends in `os._exit(1)`, which aborts the
+# whole session and reports an exit code indistinguishable from a normal test
+# failure.
+#
+# This does NOT cover a hang *after* the session ends: nothing is running
+# then, so no per-test timer can fire. That case is the exit watchdog in
 # tests/conftest.py.
 timeout = 300
-timeout_method = "thread"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests requiring external services",

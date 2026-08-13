@@ -65,8 +65,12 @@ export function nextSelection(
 ): ImageEntry | null {
   const newest = merged[0];
   if (!newest) return null;
-  // Nothing chosen yet — auto-select is correct here and always has been.
-  if (!prev) return newest;
+  // Nothing chosen yet — auto-select, but only while following. Turning
+  // `[watch latest]` off before the first image lands (empty roots at mount,
+  // a slow rsync) is still an instruction not to follow, and honouring it
+  // only once something has been selected would ignore it exactly when the
+  // user gave it.
+  if (!prev) return watchLatest ? newest : null;
   if (!watchLatest) return null;
   return sameEntry(prev, newest) ? null : newest;
 }
@@ -76,6 +80,11 @@ export function nextSelection(
  *
  * `files` is newest-first, so the selection's index is the count directly.
  * Drives the `[N new]` affordance that gets the user back to following.
+ *
+ * A selection that is no longer in the list — deleted, or pushed out of the
+ * `MAX_ENTRIES` window by a long run — counts as *everything* being newer.
+ * Reporting 0 there hid the way back at the one moment the user most needs
+ * it: no highlighted row, no `[N new]`, and a preview of a file that is gone.
  */
 export function newerCount(
   files: ImageEntry[],
@@ -83,7 +92,8 @@ export function newerCount(
 ): number {
   if (!selected) return 0;
   const i = files.findIndex((f) => sameEntry(selected, f));
-  return i > 0 ? i : 0;
+  if (i === -1) return files.length;
+  return i;
 }
 
 /**

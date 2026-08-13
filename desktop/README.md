@@ -228,7 +228,46 @@ detail instead):
 | `·` | no verdict, e.g. a round 0 baseline with no parent to compare against |
 
 `?` and `=` are deliberately distinct: a refusal is not a flat round, and
-collapsing them would let a missing measurement read as a real result.
+collapsing them would let a missing measurement read as a real result. Each
+status also has its own colour, not just its own glyph — the wheel below draws
+wedges with no glyph to carry the difference.
+
+Two of the gates the loop writes, `noise_floor_available` and
+`eval_set_stable`, are the *cause* of a refusal rather than an independent
+failure, so a round is not marked `✗` for a gate that its own refusal verdict
+already explains. Running without a noise-floor report is a supported path;
+it reads `?`, not `✗`. `lineage_recorded` has no corresponding refusal and
+stays a real failure.
+
+**Click a round to expand its `round-NN/round.json`** underneath it — the
+artifact written beside the trajectory row, carrying what the row flattens
+away. The pane shows the per-cell numbers the loop is steered by (score,
+correctness pass rate, Δ, the noise floor Δ is measured against, gain in noise
+units with the beats-the-floor call, cost per point), the engine identity
+including the scaffold sha, the gates, the per-cell saturation verdicts with
+their reasons, and the lineage. The record's `problems[]` and the raw
+`noise_floors[]` samples are not rendered — read the file itself for those. Lineage includes an explicit
+**comparable-to-parent** line: rounds measured on different eval sets may not
+be compared at all, so the pane says so rather than showing a delta that means
+nothing. `[open round dir]` shells the directory out. A round still in flight
+has no `round.json` yet and says so instead of blanking.
+
+**`[wheel]`** swaps the timeline for a ring — one wedge per round, clockwise
+from 12 o'clock, coloured by the same status glyphs, with the round count in
+the hub. The loop visibly closes on itself and a run accumulating rounds reads
+as momentum. Wedges are clickable, same detail as the list.
+
+The timeline stays the default: it is denser and more scannable, which matters
+most in the pane's usual size. The wheel drops its per-wedge numbers once
+wedges get too thin for them and keeps its shape — the round count in the hub
+still reads. How many rounds that takes depends on the pane's short side:
+roughly 25 rounds at 200px, 37 at 300px, 50 at 400px. Below about 80px it
+declines to draw at all rather than render a smudge, and `[wheel]` takes you
+back to the list.
+
+Note the wheel divides a full turn between the rounds, so a round landing
+mid-run re-partitions the whole ring rather than extending it into spare
+space. Nothing animates.
 
 ### The `images` pane and follow-mode
 
@@ -303,6 +342,109 @@ Malformed JSON, an unknown series name, run labels that match nothing, a
 ignored silently — the pane just keeps showing whatever it already had. A
 half-finished hand edit therefore degrades to "show less", never to a blank
 pane.
+
+## Agent-driven pane control
+
+The same idea one level up: `.layout.json`, also in the results root, says
+**which panes exist, where, and on which workspace**. The running app
+rearranges itself on save — no relaunch, and no hand-editing the persisted
+layout blob in the WebKit localStorage store, which is how this had to be
+done before.
+
+```json
+{
+  "workspaces": {
+    "3": {
+      "dir": "h",
+      "ratio": 0.65,
+      "panes": [{ "pane": "agents" }, { "pane": "agentfeed" }]
+    },
+    "4": null
+  },
+  "active": 3
+}
+```
+
+That is the motivating case in one file: set up workspace 3 for agent
+observation, empty workspace 4, and switch to 3.
+
+**The file is declarative.** It states the layout it wants; the app makes
+reality match. There are no imperative "open a pane" / "close a pane"
+operations — you open a pane by listing it and close one by leaving it out.
+
+**Re-applying the same file really does nothing**, so it is safe for an agent
+to rewrite on every turn. The app reconciles against the panes already on
+screen: a pane whose type and `runnerId` already match keeps its identity,
+and an unchanged workspace is not rebuilt. That matters because panes are
+torn down and remounted when their identity changes — for a `term` that
+means killing the pty and respawning its runner, so a naive rewrite-every-turn
+loop would kill the test run it had just started. Changing a ratio likewise
+re-splits without disturbing the panes. Your focused pane and a hand-set
+`⌘f` zoom both survive a re-apply.
+
+**Workspace keys are the numbers you press `⌘` with, `"1"` through `"5"`** —
+the same numbers as the workspace table above, not 0-based indices.
+
+**A workspace the file mentions is replaced wholesale; one it does not
+mention is left completely alone.** That is what lets a file rearrange
+workspace 3 without disturbing the terminals you have open on workspace 1.
+`null` empties a workspace.
+
+Per workspace, give either:
+
+- `panes` — a flat list, folded into a spine using `dir` (`"h"` or `"v"`,
+  default `h`) and `ratio` (default `0.5`); or
+- `tree` — an explicit nested shape, for layouts a single spine can't
+  express:
+
+```json
+{
+  "workspaces": {
+    "2": {
+      "tree": {
+        "split": "h",
+        "ratio": 0.55,
+        "a": { "pane": "metrics" },
+        "b": {
+          "split": "v",
+          "ratio": 0.5,
+          "a": { "pane": "images" },
+          "b": { "pane": "flywheel" }
+        }
+      }
+    }
+  }
+}
+```
+
+`pane` is any of the pane types listed under [Panes](#panes). Ratios are
+limited to `0.1`–`0.9`, the same range dragging a divider can reach.
+`active` (optional, also 1-based) switches the visible workspace.
+
+**A `term` pane may name a `runnerId`, and only a `runnerId`** — an id from
+the runner table, e.g. `{ "pane": "term", "runnerId": "ssh-pull-assets" }`.
+Arbitrary command strings are deliberately not accepted: anything able to
+write into the results root would otherwise have shell execution on this
+machine. Launch something not in the table by adding a runner.
+
+Be aware of what that still permits, though. Anything that can write into the
+results root can cause any `autorun: true` runner to execute unattended — and
+some of those, `rosie-preflight` and `rosie-queue`, run `ssh` against a remote
+host. The control file is as trusted as write access to the results
+directory; treat it that way, and prefer `autorun: false` for runners with
+side effects beyond the local machine.
+
+**Rearranging never steals focus and never moves the mouse pointer.** The
+change is applied passively, so panes can be rearranged under your hands
+while you keep typing. `active` moves which workspace is shown, but not
+keyboard focus.
+
+**Malformed input is ignored whole.** Bad JSON (including a file caught
+mid-write), an unknown pane type, a workspace number out of range, a ratio
+outside the allowed span, or a runner id not in the table rejects the
+**entire** request and the layout stays exactly as it was — never a
+half-applied tree with one workspace changed and another not. Unrecognised
+*extra* keys are ignored so the format can grow.
 
 ## Runners (⌘p → type to filter)
 
