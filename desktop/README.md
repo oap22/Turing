@@ -7,8 +7,8 @@ live metrics/flywheel/agent panes, and an authenticated Rust-side proxy to
 the `turing-gateway` so Queue/Chat/Observability stay live outside the
 browser. See issue #382 and `.plan-then-ship/SPEC.md` for the full design.
 
-No packaging: `bundle.active` is `false` in `tauri.conf.json`, there are no
-app icons, and `tauri dev` is the only supported run path.
+It runs either from source (`npm run dev`) or as an installed
+`/Applications/turing.app` — see [Packaging](#packaging).
 
 ## Prereqs
 
@@ -29,9 +29,60 @@ npm ci
 npm run dev     # = `tauri dev`; boots the webui Vite dev server, then the window
 ```
 
-`npm run build` (`tauri build`) compiles the release binary; since bundling
-is disabled it just produces the executable in `src-tauri/target/release/`,
-useful as a build smoke test.
+## Packaging
+
+```bash
+cd desktop
+npm run build                                    # = `tauri build`
+rm -rf /Applications/turing.app
+cp -R src-tauri/target/release/bundle/macos/turing.app /Applications/
+```
+
+`tauri build` produces both bundles under `src-tauri/target/release/bundle/`:
+`macos/turing.app` and `dmg/turing_<version>_aarch64.dmg`. The app is
+**ad-hoc signed** (`bundle.macOS.signingIdentity: "-"`) and not notarized —
+Owen is the only user, and a locally built app carries no
+`com.apple.quarantine` attribute, so Gatekeeper never gates it. `spctl -a`
+reports `rejected` for exactly that reason; it is expected, not a failure.
+The `.dmg` exists for moving the app to another Mac — do that and macOS
+*will* quarantine it, so clear it there with
+`xattr -dr com.apple.quarantine /Applications/turing.app`.
+
+The `build` script drops a `.metadata_never_index` marker in `target/`
+before bundling, so Spotlight doesn't index the freshly built
+`bundle/macos/turing.app` alongside the installed one — without it, ⌘Space
+and the launcher offer two identical `turing` apps. The marker itself can't
+be committed (`target/` is gitignored), which is why the script recreates
+it on every build.
+
+Bundling is on for macOS only in practice; the config carries no
+Windows/Linux-specific bundle settings.
+
+### Icon
+
+The mark is a bracketed capital T — `[T]` — in the default `turing` palette
+(`--t-bg` plate, `--t-fg` brackets, `--t-accent` letter), chosen to stay
+legible down to the 32px Finder size.
+
+`src-tauri/icons/make_icon.py` is the single source of truth: geometry
+constants at the top drive both `icon.svg` (vector master) and
+`icon-source.png` (the 1024px raster the icon set is derived from). To
+change the mark, edit the constants and regenerate:
+
+```bash
+cd desktop/src-tauri/icons
+python3 make_icon.py
+cd ../.. && npx tauri icon src-tauri/icons/icon-source.png
+rm -rf src-tauri/icons/ios src-tauri/icons/android \
+       src-tauri/icons/Square*Logo.png src-tauri/icons/StoreLogo.png
+```
+
+That last `rm` drops the iOS/Android/Windows-Store variants `tauri icon`
+emits unconditionally; this is a desktop-only app and `bundle.icon` lists
+only the five files it actually uses. The script needs Pillow
+(`pip install pillow`) — it draws the geometry directly rather than
+rasterizing the SVG, because no SVG rasterizer is assumed present and
+macOS' `qlmanage` bakes a drop shadow into its output.
 
 ## Config
 
