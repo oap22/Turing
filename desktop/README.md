@@ -304,6 +304,93 @@ ignored silently — the pane just keeps showing whatever it already had. A
 half-finished hand edit therefore degrades to "show less", never to a blank
 pane.
 
+## Agent-driven pane control
+
+The same idea one level up: `.layout.json`, also in the results root, says
+**which panes exist, where, and on which workspace**. The running app
+rearranges itself on save — no relaunch, and no hand-editing the persisted
+layout blob in the WebKit localStorage store, which is how this had to be
+done before.
+
+```json
+{
+  "workspaces": {
+    "3": {
+      "dir": "h",
+      "ratio": 0.65,
+      "panes": [{ "pane": "agents" }, { "pane": "agentfeed" }]
+    },
+    "4": null
+  },
+  "active": 3
+}
+```
+
+That is the motivating case in one file: set up workspace 3 for agent
+observation, empty workspace 4, and switch to 3.
+
+**The file is declarative.** It states the layout it wants; the app makes
+reality match. Re-applying it changes nothing, so it is safe to rewrite on
+every change. There are no imperative "open a pane" / "close a pane"
+operations — you open a pane by listing it and close one by leaving it out.
+
+**Workspace keys are the numbers you press `⌘` with, `"1"` through `"5"`** —
+the same numbers as the workspace table above, not 0-based indices.
+
+**A workspace the file mentions is replaced wholesale; one it does not
+mention is left completely alone.** That is what lets a file rearrange
+workspace 3 without disturbing the terminals you have open on workspace 1.
+`null` empties a workspace.
+
+Per workspace, give either:
+
+- `panes` — a flat list, folded into a spine using `dir` (`"h"` or `"v"`,
+  default `h`) and `ratio` (default `0.5`); or
+- `tree` — an explicit nested shape, for layouts a single spine can't
+  express:
+
+```json
+{
+  "workspaces": {
+    "2": {
+      "tree": {
+        "split": "h",
+        "ratio": 0.55,
+        "a": { "pane": "metrics" },
+        "b": {
+          "split": "v",
+          "ratio": 0.5,
+          "a": { "pane": "images" },
+          "b": { "pane": "flywheel" }
+        }
+      }
+    }
+  }
+}
+```
+
+`pane` is any of the pane types listed under [Panes](#panes). Ratios are
+limited to `0.1`–`0.9`, the same range dragging a divider can reach.
+`active` (optional, also 1-based) switches the visible workspace.
+
+**A `term` pane may name a `runnerId`, and only a `runnerId`** — an id from
+the runner table, e.g. `{ "pane": "term", "runnerId": "ssh-pull-assets" }`.
+Arbitrary command strings are deliberately not accepted: anything able to
+write into the results root would otherwise have shell execution on this
+machine. Launch something not in the table by adding a runner.
+
+**Rearranging never steals focus and never moves the mouse pointer.** The
+change is applied passively, so panes can be rearranged under your hands
+while you keep typing. `active` moves which workspace is shown, but not
+keyboard focus.
+
+**Malformed input is ignored whole.** Bad JSON (including a file caught
+mid-write), an unknown pane type, a workspace number out of range, a ratio
+outside the allowed span, or a runner id not in the table rejects the
+**entire** request and the layout stays exactly as it was — never a
+half-applied tree with one workspace changed and another not. Unrecognised
+*extra* keys are ignored so the format can grow.
+
 ## Runners (⌘p → type to filter)
 
 One-click commands the launcher spawns into a new terminal pane. `~` is a
