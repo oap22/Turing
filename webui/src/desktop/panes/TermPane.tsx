@@ -225,7 +225,9 @@ export default function TermPane({ leafId, runnerId, visible }: Props) {
     const outputSub = subscribe<{ id: number; data: string }>("pty-output", (p) =>
       stream.output(p.id, p.data),
     );
-    const exitSub = subscribe<{ id: number }>("pty-exit", (p) => stream.exit(p.id));
+    const exitSub = subscribe<{ id: number; code: number | null }>("pty-exit", (p) =>
+      stream.exit(p.id, p.code),
+    );
 
     async function boot() {
       await Promise.all([outputSub.ready, exitSub.ready]);

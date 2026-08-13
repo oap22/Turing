@@ -30,6 +30,11 @@ struct PtyOutput {
 #[derive(Clone, Serialize)]
 struct PtyExit {
     id: u32,
+    /// The child's exit code, when it could be reaped here. `None` when the
+    /// entry was already removed (a `pty_kill` won the race) or the wait
+    /// failed — consumers that care about success (the update flow) treat
+    /// `None` as failure, and the plain terminal pane ignores it entirely.
+    code: Option<u32>,
 }
 
 /// Give the pty child the terminal environment a GUI-launched app never has.
@@ -240,11 +245,14 @@ pub fn pty_spawn(
             .lock()
             .unwrap()
             .remove(&id);
+        let mut code: Option<u32> = None;
         if let Some(mut entry) = removed {
             let _ = entry.child.kill();
-            let _ = entry.child.wait();
+            // On the normal EOF path the child has already exited, so the
+            // kill above is a no-op and this wait reports the real status.
+            code = entry.child.wait().ok().map(|status| status.exit_code());
         }
-        let _ = app_for_reader.emit("pty-exit", PtyExit { id });
+        let _ = app_for_reader.emit("pty-exit", PtyExit { id, code });
     });
 
     Ok(id)

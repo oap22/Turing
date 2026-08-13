@@ -10,10 +10,10 @@ import { createPtyStream, MAX_PENDING_CHUNKS_PER_ID } from "../desktop/ptyStream
 
 function harness() {
   const written: string[] = [];
-  const exits: number[] = [];
+  const exits: Array<number | null> = [];
   const stream = createPtyStream({
     write: (d) => written.push(d),
-    onExit: () => exits.push(1),
+    onExit: (code) => exits.push(code),
   });
   return { stream, written, exits };
 }
@@ -63,21 +63,33 @@ describe("createPtyStream", () => {
   it("reports an exit that landed before the id was known, after its output", () => {
     const { stream, written, exits } = harness();
     stream.output(3, "bye");
-    stream.exit(3);
+    stream.exit(3, 0);
     expect(exits).toHaveLength(0);
 
     stream.adopt(3);
     expect(written).toEqual(["bye"]);
-    expect(exits).toHaveLength(1);
+    expect(exits).toEqual([0]);
   });
 
   it("reports a live exit only for the adopted id", () => {
     const { stream, exits } = harness();
     stream.adopt(5);
-    stream.exit(9);
+    stream.exit(9, 0);
     expect(exits).toHaveLength(0);
-    stream.exit(5);
+    stream.exit(5, 0);
     expect(exits).toHaveLength(1);
+  });
+
+  it("carries the exit code through, buffered and live", () => {
+    const early = harness();
+    early.stream.exit(3, 42);
+    early.stream.adopt(3);
+    expect(early.exits).toEqual([42]);
+
+    const live = harness();
+    live.stream.adopt(4);
+    live.stream.exit(4, null);
+    expect(live.exits).toEqual([null]);
   });
 
   it("caps the pre-adoption buffer, keeping the most recent chunks", () => {

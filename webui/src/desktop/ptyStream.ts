@@ -29,15 +29,19 @@ export const MAX_PENDING_CHUNKS_PER_ID = 256;
 export interface PtyStreamOptions {
   /** Called with output belonging to the adopted id, always in arrival order. */
   write: (data: string) => void;
-  /** Called once, when the adopted id's pty has exited. */
-  onExit: () => void;
+  /**
+   * Called once, when the adopted id's pty has exited. `code` is the child's
+   * exit code, or `null` when Rust could not reap it (killed, or the wait
+   * failed) — treat `null` as "not a clean success".
+   */
+  onExit: (code: number | null) => void;
 }
 
 export interface PtyStream {
   /** Feed in a `pty-output` event for any id. */
   output: (id: number, data: string) => void;
   /** Feed in a `pty-exit` event for any id. */
-  exit: (id: number) => void;
+  exit: (id: number, code: number | null) => void;
   /** Declare which id is ours; replays that id's buffered output in order. */
   adopt: (id: number) => void;
   /** The adopted id, or null before `adopt()`. Exposed for assertions. */
@@ -47,7 +51,8 @@ export interface PtyStream {
 export function createPtyStream({ write, onExit }: PtyStreamOptions): PtyStream {
   let adopted: number | null = null;
   const pending = new Map<number, string[]>();
-  const exitedEarly = new Set<number>();
+  // id -> exit code, for exits arriving before adopt() names our id.
+  const exitedEarly = new Map<number, number | null>();
 
   function output(id: number, data: string): void {
     if (adopted !== null) {
@@ -66,12 +71,12 @@ export function createPtyStream({ write, onExit }: PtyStreamOptions): PtyStream 
     while (chunks.length > MAX_PENDING_CHUNKS_PER_ID) chunks.shift();
   }
 
-  function exit(id: number): void {
+  function exit(id: number, code: number | null): void {
     if (adopted !== null) {
-      if (id === adopted) onExit();
+      if (id === adopted) onExit(code);
       return;
     }
-    exitedEarly.add(id);
+    exitedEarly.set(id, code);
   }
 
   function adopt(id: number): void {
@@ -84,7 +89,7 @@ export function createPtyStream({ write, onExit }: PtyStreamOptions): PtyStream 
     pending.clear();
     // A pty that exited before we learned its id still has to report it; the
     // exit is delivered after its output, never before.
-    if (exitedEarly.has(id)) onExit();
+    if (exitedEarly.has(id)) onExit(exitedEarly.get(id) ?? null);
     exitedEarly.clear();
   }
 

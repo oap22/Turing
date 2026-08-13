@@ -197,4 +197,42 @@ describe("Home", () => {
       expect(relativeTime(0, 48 * 60 * min)).toBe("2d ago");
     });
   });
+
+  describe("update", () => {
+    it("opens the update overlay on u", () => {
+      const { dialog } = setup();
+      fireEvent.keyDown(dialog, { key: "u" });
+      expect(screen.getByRole("dialog", { name: "Update" })).toBeInTheDocument();
+    });
+
+    it("reports there is no Tauri runtime instead of pretending to update", () => {
+      // jsdom has no __TAURI_INTERNALS__, so the overlay must land in the
+      // failed state without ever trying to spawn anything.
+      const { dialog } = setup();
+      fireEvent.keyDown(dialog, { key: "u" });
+      expect(screen.getByTestId("update-status").textContent).toContain(
+        "needs the desktop app",
+      );
+    });
+
+    it("escape closes the overlay and returns to the list", () => {
+      const { dialog } = setup();
+      fireEvent.keyDown(dialog, { key: "u" });
+      const overlay = screen.getByRole("dialog", { name: "Update" });
+      fireEvent.keyDown(overlay, { key: "Escape" });
+      expect(screen.queryByRole("dialog", { name: "Update" })).not.toBeInTheDocument();
+      // Home is still up behind it, not resumed into a workstation.
+      expect(screen.getByText("bench")).toBeInTheDocument();
+    });
+
+    it("keys typed while the overlay is open do not drive the list", () => {
+      const { dialog, onOpen, onRemove } = setup();
+      fireEvent.keyDown(dialog, { key: "u" });
+      const overlay = screen.getByRole("dialog", { name: "Update" });
+      fireEvent.keyDown(overlay, { key: "Enter" });
+      fireEvent.keyDown(overlay, { key: "d" });
+      expect(onOpen).not.toHaveBeenCalled();
+      expect(onRemove).not.toHaveBeenCalled();
+    });
+  });
 });
