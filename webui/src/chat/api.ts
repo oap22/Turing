@@ -7,14 +7,13 @@
 // (best-effort: the authoritative state still arrives as a `chat.delta` over
 // the WS, so the UI never depends on this response).
 
+import { gatewayFetch } from "../desktop/gateway";
 import type { ChatSession, ChatSubtask } from "../ws";
 
 async function postJSON<T>(path: string, body: unknown): Promise<T | null> {
   try {
-    const res = await fetch(path, {
+    const res = await gatewayFetch(path, {
       method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body ?? {}),
     });
     if (!res.ok) return null;

@@ -22,6 +22,9 @@ import {
   listChat,
   type ChatState,
 } from "./chat/reducer";
+import DesktopShell, { type Surface } from "./desktop/DesktopShell";
+import { gatewayFetch } from "./desktop/gateway";
+import { isTauri } from "./desktop/tauri";
 import { emptyState, markStale, reduce, type Frame } from "./graph/reducer";
 import ObservabilityView from "./ObservabilityView";
 import QueuePane from "./queue/QueuePane";
@@ -61,7 +64,7 @@ const HIGHLIGHT_MS = 1_500;
 const PEERS_POLL_MS = 10_000;
 const DEBUG_RING_CAP = 500;
 
-type WsStatus = "open" | "closed" | "reconnecting";
+export type WsStatus = "open" | "closed" | "reconnecting";
 
 // Memoized panes: a frame for one surface (e.g. a trace event) no longer
 // re-renders the others — each pane only re-renders when its own props change.
@@ -89,7 +92,7 @@ function tabFromHash(hash: string): TabId | null {
   return TABS.find((t) => t.id === id)?.id ?? null;
 }
 
-const WS_STATUS_LABEL: Record<WsStatus, { dot: string; text: string; cls: string }> = {
+export const WS_STATUS_LABEL: Record<WsStatus, { dot: string; text: string; cls: string }> = {
   open: { dot: "●", text: "live", cls: "text-emerald-400" },
   reconnecting: { dot: "◌", text: "reconnecting", cls: "text-amber-400" },
   closed: { dot: "●", text: "offline", cls: "text-rose-400" },
@@ -206,7 +209,7 @@ export default function App() {
     let cancelled = false;
     async function poll() {
       try {
-        const res = await fetch("/peers", { credentials: "same-origin" });
+        const res = await gatewayFetch("/peers");
         if (!res.ok) return;
         const body = (await res.json()) as {
           peers?: Array<{
@@ -308,6 +311,26 @@ export default function App() {
   }, []);
 
   const ws = WS_STATUS_LABEL[wsStatus];
+
+  // Bundles the props the three gateway-backed views already receive below,
+  // so the desktop shell's tiling panes can render the exact same components
+  // outside the tabbed layout (issue #382).
+  const surface: Surface = {
+    queue: { items: queueItems },
+    chat: { sessions: chatSessions },
+    obs: {
+      graphState: visibleState,
+      highlightedEdge,
+      specsRows,
+      liveTrace,
+      onTraceSelect,
+    },
+    wsStatus,
+  };
+
+  if (isTauri()) {
+    return <DesktopShell surface={surface} />;
+  }
 
   return (
     <div className="flex h-full flex-col bg-term-bg text-term-fg">

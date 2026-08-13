@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { gatewayFetch } from "../desktop/gateway";
 import { applyFilter, toQuery } from "./filter";
 import { EMPTY_FILTER, type TraceEvent, type TraceFilter } from "./types";
 
@@ -33,9 +34,7 @@ export default function TracePane({ liveEvents, onSelect }: Props) {
   // Initial paint: fetch the last few minutes of history.
   useEffect(() => {
     const since = Date.now() - 5 * 60 * 1000;
-    fetch(`/api/events?${toQuery(filter, since)}&limit=${HISTORY_PAGE}`, {
-      credentials: "include",
-    })
+    gatewayFetch(`/api/events?${toQuery(filter, since)}&limit=${HISTORY_PAGE}`)
       .then((r) => (r.ok ? r.json() : { events: [] }))
       .then((body: { events: TraceEvent[] }) => setHistory(body.events ?? []))
       .catch(() => setHistory([]));

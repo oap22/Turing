@@ -1,0 +1,207 @@
+// Metrics pane parsing/aggregation tests (issue #382), plus a render test
+// for the Chart component the pane stacks per series.
+
+import { createElement } from "react";
+import { render } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  etaOf,
+  parseMetricsText,
+  parseViewerFile,
+  pickSeries,
+  seriesOf,
+} from "../desktop/panes/metrics";
+import Chart from "../desktop/panes/Chart";
+
+describe("parseMetricsText", () => {
+  it("skips unparseable and non-object lines", () => {
+    const text = [
+      '{"step":1,"loss":0.5}',
+      "not json at all",
+      "42",
+      '["array", "line"]',
+      '{"step":2,"loss":0.3}',
+    ].join("\n");
+    const points = parseMetricsText(text);
+    expect(points).toEqual([{ step: 1, loss: 0.5 }, { step: 2, loss: 0.3 }]);
+  });
+
+  it("accepts a whole-file JSON array", () => {
+    const text = JSON.stringify([{ step: 0, loss: 1.0 }, { step: 1, loss: 0.8 }]);
+    const points = parseMetricsText(text);
+    expect(points).toEqual([{ step: 0, loss: 1.0 }, { step: 1, loss: 0.8 }]);
+  });
+
+  it("keeps only finite-number values", () => {
+    const text = '{"step":1,"loss":0.5,"tag":"x","bad":null,"inf":Infinity}';
+    // NaN/Infinity aren't valid JSON literals, so this line is unparseable —
+    // exercise the finite-filter with a parseable line containing a string.
+    const parseable = '{"step":1,"loss":0.5,"tag":"x"}';
+    expect(parseMetricsText(text)).toEqual([]);
+    expect(parseMetricsText(parseable)).toEqual([{ step: 1, loss: 0.5 }]);
+  });
+
+  it("returns an empty array for empty input", () => {
+    expect(parseMetricsText("")).toEqual([]);
+    expect(parseMetricsText("   \n  \n")).toEqual([]);
+  });
+});
+
+describe("seriesOf", () => {
+  it("extracts every numeric key except step/total_steps/ts, x from step", () => {
+    const points = [
+      { step: 0, loss: 1.0, acc: 0.1, total_steps: 100, ts: 1000 },
+      { step: 1, loss: 0.8, acc: 0.2, total_steps: 100, ts: 1001 },
+    ];
+    const series = seriesOf(points);
+    expect(Array.from(series.keys()).sort()).toEqual(["acc", "loss"]);
+    expect(series.get("loss")).toEqual([[0, 1.0], [1, 0.8]]);
+    expect(series.get("acc")).toEqual([[0, 0.1], [1, 0.2]]);
+  });
+
+  it("falls back to index for x when step is absent", () => {
+    const points = [{ loss: 1.0 }, { loss: 0.5 }];
+    const series = seriesOf(points);
+    expect(series.get("loss")).toEqual([[0, 1.0], [1, 0.5]]);
+  });
+});
+
+describe("etaOf", () => {
+  it("computes a rate from ts-in-seconds deltas and an ETA when total_steps is present", () => {
+    const points = [
+      { step: 0, ts: 1000, total_steps: 100 },
+      { step: 10, ts: 1010, total_steps: 100 },
+    ];
+    const eta = etaOf(points, []);
+    expect(eta.stepsPerSec).toBeCloseTo(1);
+    expect(eta.totalSteps).toBe(100);
+    expect(eta.lastStep).toBe(10);
+    expect(eta.etaSec).toBeCloseTo(90);
+  });
+
+  it("returns a null ETA when total_steps is never present", () => {
+    const points = [
+      { step: 0, ts: 1000 },
+      { step: 10, ts: 1010 },
+    ];
+    const eta = etaOf(points, []);
+    expect(eta.stepsPerSec).toBeCloseTo(1);
+    expect(eta.totalSteps).toBeNull();
+    expect(eta.etaSec).toBeNull();
+  });
+});
+
+describe("pickSeries", () => {
+  it("keeps the stored series when it's still available", () => {
+    expect(pickSeries(["acc", "loss", "grad_norm"], "grad_norm")).toBe("grad_norm");
+  });
+
+  it("falls back to loss when the stored series is missing", () => {
+    expect(pickSeries(["acc", "loss"], "nonexistent")).toBe("loss");
+    expect(pickSeries(["acc", "loss"], null)).toBe("loss");
+  });
+
+  it("falls back to the first series alphabetically when loss isn't present", () => {
+    expect(pickSeries(["grad_norm", "acc"], null)).toBe("acc");
+    expect(pickSeries(["grad_norm", "acc"], "nonexistent")).toBe("acc");
+  });
+
+  it("returns null when there are no series at all", () => {
+    expect(pickSeries([], null)).toBeNull();
+    expect(pickSeries([], "loss")).toBeNull();
+  });
+});
+
+describe("Chart", () => {
+  // jsdom has no ResizeObserver; Chart's `useSize` hook falls back to its
+  // initial {w, h} state when the observer never fires a callback, which is
+  // enough to render and assert against.
+  beforeEach(() => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("renders one polyline per series and a bordered (not white-filled) plot area", () => {
+    const series = [
+      { label: "run1/loss", points: [[0, 1], [1, 0.5], [2, 0.25]] as Array<[number, number]> },
+      { label: "run2/loss", points: [[0, 1.2], [1, 0.6]] as Array<[number, number]> },
+    ];
+    const { container } = render(createElement(Chart, { series }));
+    const polylines = container.querySelectorAll("polyline");
+    expect(polylines.length).toBe(2);
+    expect(polylines[0].getAttribute("points")?.split(" ").length).toBe(3);
+    expect(polylines[1].getAttribute("points")?.split(" ").length).toBe(2);
+
+    // The plot area is a themed outline, not a filled (white) background —
+    // the dark terminal aesthetic carries through instead of a print-style
+    // white chart background.
+    const border = container.querySelector('[data-testid="chart-plot-border"]');
+    expect(border).not.toBeNull();
+    expect(border?.getAttribute("fill")).toBe("none");
+    expect(border?.getAttribute("stroke")).toBe("var(--t-edge)");
+  });
+});
+
+describe("parseViewerFile", () => {
+  it("reads series and runs", () => {
+    expect(parseViewerFile('{"series":"loss","runs":["run-42"]}')).toEqual({
+      series: "loss",
+      runs: ["run-42"],
+    });
+  });
+
+  it("applies a titles map", () => {
+    expect(parseViewerFile('{"series":"loss","titles":{"loss":"DPO loss — run 42"}}')).toEqual({
+      series: "loss",
+      titles: { loss: "DPO loss — run 42" },
+    });
+  });
+
+  it("ignores titles that are not a string map", () => {
+    // Each of these is silently dropped rather than failing the whole file,
+    // so a half-finished hand edit degrades to "no titles".
+    for (const bad of [
+      '{"titles":"loss"}',
+      '{"titles":42}',
+      '{"titles":null}',
+      '{"titles":["loss"]}',
+      '{"titles":{"loss":42}}',
+      '{"titles":{"loss":{"nested":"no"}}}',
+    ]) {
+      expect(parseViewerFile(bad), bad).toEqual({});
+    }
+  });
+
+  it("accepts an empty titles map", () => {
+    expect(parseViewerFile('{"titles":{}}')).toEqual({ titles: {} });
+  });
+
+  it("ignores unknown keys", () => {
+    expect(parseViewerFile('{"series":"loss","nope":123}')).toEqual({ series: "loss" });
+  });
+
+  it("drops individually malformed keys but keeps the valid ones", () => {
+    expect(parseViewerFile('{"series":7,"runs":["a"],"titles":{"a":"A"}}')).toEqual({
+      runs: ["a"],
+      titles: { a: "A" },
+    });
+    expect(parseViewerFile('{"runs":["a",2]}')).toEqual({});
+  });
+
+  it("returns null for malformed or non-object JSON", () => {
+    expect(parseViewerFile("not json")).toBeNull();
+    expect(parseViewerFile("null")).toBeNull();
+    expect(parseViewerFile("42")).toBeNull();
+    expect(parseViewerFile('"loss"')).toBeNull();
+  });
+});
