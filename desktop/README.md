@@ -230,6 +230,27 @@ detail instead):
 `?` and `=` are deliberately distinct: a refusal is not a flat round, and
 collapsing them would let a missing measurement read as a real result.
 
+**Click a round to expand its full artifact** — `round-NN/round.json`, the
+superset of the trajectory row — underneath it. That gives the per-cell
+numbers the loop is steered by (score, Δ, gain in noise units with the
+beats-the-floor call, cost per point), the engine identity including the
+scaffold sha, the gates, and the lineage. Lineage includes an explicit
+**comparable-to-parent** line: rounds measured on different eval sets may not
+be compared at all, so the pane says so rather than showing a delta that means
+nothing. `[open round dir]` shells the directory out. A round still in flight
+has no `round.json` yet and says so instead of blanking.
+
+**`[wheel]`** swaps the timeline for a ring — one wedge per round, clockwise
+from 12 o'clock, coloured by the same status glyphs, with the round count in
+the hub. The loop visibly closes on itself and a run accumulating rounds reads
+as momentum. Wedges are clickable, same detail as the list.
+
+The timeline stays the default: it is denser and more scannable, which matters
+most in the pane's usual size. The wheel drops its per-wedge numbers once
+wedges get too thin for them (around 50 rounds in a small pane) and keeps its
+shape, and below roughly 80px it declines to draw at all rather than render a
+smudge.
+
 ### The `images` pane and follow-mode
 
 The pane merges both watched roots newest-first and, by default, **follows the
