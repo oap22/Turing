@@ -29,13 +29,47 @@ npm ci
 npm run dev     # = `tauri dev`; boots the webui Vite dev server, then the window
 ```
 
+## Updating the installed app
+
+One command, from anywhere in the repo:
+
+```bash
+npm --prefix desktop run install-app
+```
+
+That runs `scripts/install-desktop.sh`, which builds (`tauri build`, which
+chains the `webui` build itself), quits a running `turing.app` if one is
+open, replaces `/Applications/turing.app`, re-signs it ad-hoc, clears
+`com.apple.quarantine` if present, and prints the installed version. No
+`sudo` — if `/Applications` isn't writable it stops and tells you what to
+run. Flags (pass them after `--`):
+
+```bash
+npm --prefix desktop run install-app -- --no-build   # reinstall the last build
+npm --prefix desktop run install-app -- --open       # launch when done
+```
+
+The install path builds `--bundles app` only. The `.dmg` is not needed to
+install locally, and its bundling step fails outright when an earlier
+interrupted build has left a `/Volumes/dmg.*` volume mounted — clear one with
+`diskutil eject /Volumes/dmg.<id>` if you hit it while building a dmg
+deliberately.
+
+The app is **ad-hoc signed**, not notarized (details under
+[Packaging](#packaging)). Locally built, it carries no quarantine attribute,
+so Gatekeeper stays out of the way; a copy moved to another Mac *is*
+quarantined there and needs a one-time right-click → Open.
+
 ## Packaging
+
+Manual equivalent of the above, if you want the steps separately:
 
 ```bash
 cd desktop
 npm run build                                    # = `tauri build`
 rm -rf /Applications/turing.app
 cp -R src-tauri/target/release/bundle/macos/turing.app /Applications/
+codesign --force --deep --sign - /Applications/turing.app
 ```
 
 `tauri build` produces both bundles under `src-tauri/target/release/bundle/`:
@@ -97,7 +131,7 @@ present, replaces the default root list wholesale.
   "gateway_token": "",
   "roots": [
     { "id": "vault", "path": "~/Owen's Awesome Vault" },
-    { "id": "results", "path": "~/Developer/active/Turing/research/results" },
+    { "id": "results", "path": "~/research-results" },
     { "id": "repo", "path": "~/Developer/active/Turing" },
     { "id": "claude-sessions", "path": "~/.claude/projects" },
     { "id": "codex-sessions", "path": "~/.codex/sessions" }
@@ -108,6 +142,13 @@ present, replaces the default root list wholesale.
 The gateway token, if set, never reaches the webview — Rust attaches it to
 proxied requests and the WS handshake; the frontend only ever sees
 `gateway_token_set: bool` via the `app_config` command.
+
+The `results` root is deliberately **not** inside the Turing checkout: any
+project (`~/Developer/active/mnist`, a scratch notebook, a cluster mirror) can
+write `<run-id>/metrics.jsonl` under `~/research-results/` and light up the
+metrics, images and flywheel panes, without leaving untracked artifacts in a
+repo. Repoint it here if you keep results elsewhere; keep the id `results`,
+which those panes look up by name.
 
 ## Keymap
 
@@ -166,7 +207,7 @@ regardless of what a workspace starts with.
 browser-tab components, gateway-proxied), `metrics` (tails `metrics.jsonl`/
 `metrics.json`, multi-run overlay, one series at a time via tabs, ETA strip),
 `images` (browses result images), `flywheel` (parses
-`research/results/loop-*/trajectory.json` round timelines), `agents` (live
+`<results>/loop-*/trajectory.json` round timelines), `agents` (live
 Claude Code / Codex CLI session list + transcript tail), `agentfeed`
 (cross-session tool/assistant activity feed).
 
@@ -177,7 +218,8 @@ is wired and intentionally kept.
 
 ## Agent-driven viewing
 
-The `metrics` pane also watches `research/results/.viewer.json`. A coding
+The `metrics` pane also watches `.viewer.json` at the root of the results
+directory. A coding
 agent can write this file to point Owen's metrics pane at what it wants him
 to see — the pane re-reads it on every change:
 
@@ -189,8 +231,8 @@ to see — the pane re-reads it on every change:
 }
 ```
 
-It is a plain file in `research/results/`, so writing it by hand (`vim
-research/results/.viewer.json`) is as supported as an agent writing it; the
+It is a plain file in the results root, so writing it by hand (`vim
+~/research-results/.viewer.json`) is as supported as an agent writing it; the
 pane re-reads on save either way.
 
 All keys are optional and applied independently:
@@ -200,8 +242,8 @@ All keys are optional and applied independently:
   `localStorage["turing.metrics.series"]`). Ignored if no run currently
   selected has a series by this name.
 - `runs` — an array of run labels (the directory name under
-  `research/results/`, e.g. `"demo-run"` for
-  `research/results/demo-run/metrics.jsonl`). Replaces the pane's run
+  the results root, e.g. `"demo-run"` for
+  `~/research-results/demo-run/metrics.jsonl`). Replaces the pane's run
   selection with whichever of these labels match a discovered run; labels
   that don't match anything are ignored.
 - `titles` — a map of series name → display title. The chart's label row
@@ -220,7 +262,9 @@ pane.
 
 One-click commands the launcher spawns into a new terminal pane. `~` is a
 literal in every `command`/`cwd` — the shell (and, for `cwd`, `pty_spawn`)
-expands it.
+expands it. `<RESULTS_ROOT>` is substituted with the configured `results` root
+before the command reaches a shell, so these entries follow the config rather
+than hardcoding a repo.
 
 | id | group | command | cwd | autorun |
 |---|---|---|---|---|
@@ -231,11 +275,11 @@ expands it.
 | webui-test | verify | `npm run test` | repo/webui | true |
 | rosie-preflight | remote | `ssh -o BatchMode=yes -o ConnectTimeout=5 ROSIE 'echo ok' && ssh ROSIE 'sinfo -s; squeue -u $USER'` | — | true |
 | rosie-queue | remote | `ssh ROSIE 'squeue -u $USER'` | — | true |
-| ssh-follow-metrics | remote | `ssh <SSH_HOST> 'tail -n +1 -F <REMOTE_RUN_DIR>/metrics.jsonl' \| tee -a ~/Developer/active/Turing/research/results/rosie-live/metrics.jsonl` | — | **false** (pre-typed, not run) |
-| ssh-pull-assets | remote | `while true; do rsync -az --include='*/' --include='*.png' --include='*.svg' --include='*.json*' --include='*.log' --exclude='*' <SSH_HOST>:<REMOTE_RUN_DIR>/ ~/Developer/active/Turing/research/results/rosie-live/; sleep 30; done` | — | **false** (pre-typed, not run) |
+| ssh-follow-metrics | remote | `ssh <SSH_HOST> 'tail -n +1 -F <REMOTE_RUN_DIR>/metrics.jsonl' \| tee -a <RESULTS_ROOT>/rosie-live/metrics.jsonl` | — | **false** (pre-typed, not run) |
+| ssh-pull-assets | remote | `while true; do rsync -az --include='*/' --include='*.png' --include='*.svg' --include='*.json*' --include='*.log' --exclude='*' <SSH_HOST>:<REMOTE_RUN_DIR>/ <RESULTS_ROOT>/rosie-live/; sleep 30; done` | — | **false** (pre-typed, not run) |
 | vault-vim | docs | `vim .` | `~/Owen's Awesome Vault` | true |
 | research-notes | docs | `vim JOURNAL.md` | repo/research | true |
-| research-results | docs | `vim .` | repo/research/results | true |
+| research-results | docs | `vim .` | results | true |
 
 The `remote` group is host-agnostic. `<SSH_HOST>` and `<REMOTE_RUN_DIR>` are
 placeholders you edit before pressing Enter — which is exactly why those two
@@ -244,7 +288,7 @@ rosie-specific conveniences is just one example host: it is an alias from
 `~/.ssh/config`, and any other alias works the same way.
 
 `ssh-pull-assets` mirrors remote plots and metrics into
-`research/results/rosie-live/` every 30s, so the `images` and `metrics` panes
+`<results>/rosie-live/` every 30s, so the `images` and `metrics` panes
 keep updating live while a cluster job runs.
 
 There is no markdown/wikilink renderer — docs are read via `vim` in a
