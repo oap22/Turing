@@ -482,7 +482,11 @@ function isWorkspace(x: unknown): x is Workspace {
   return rootOk && focusOk && typeof o.zoom === "boolean";
 }
 
-function isValidLayoutState(x: unknown): x is LayoutState {
+// Exported so `sessions.ts` can validate a layout that arrives already parsed
+// (nested inside a stored session) without re-serializing it just to hand it
+// to `deserialize`, and without growing a second definition of "is this a
+// layout" that could drift from this one.
+export function isValidLayoutState(x: unknown): x is LayoutState {
   if (!x || typeof x !== "object") return false;
   const o = x as Record<string, unknown>;
   if (!Array.isArray(o.workspaces) || o.workspaces.length !== WORKSPACE_COUNT) return false;

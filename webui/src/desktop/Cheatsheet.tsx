@@ -16,8 +16,19 @@ const ROWS: ReadonlyArray<[string, string]> = [
   ["⌘ t", "toggle split direction (moved off ⌘j — collides with focus-down)"],
   ["⌘ -", "shrink focused pane"],
   ["⌘ =", "grow focused pane"],
-  ["⌘ p", "launcher"],
+  ["⌘ p", "launcher — panes, runners and sessions"],
   ["⌘ /", "this cheatsheet (moved off ⌘k — collides with focus-up)"],
+];
+
+// Saved sessions are named pane layouts. They deliberately have no ⌘-chords of
+// their own (see Launcher.tsx: the ⌘ space is scarce and these are occasional
+// commands), so the cheatsheet lists what to type into ⌘p instead — otherwise
+// the feature is undiscoverable.
+const SESSION_ROWS: ReadonlyArray<[string, string]> = [
+  ["⌘ p → save", "save the current layout as a new named session"],
+  ["⌘ p → rename", "rename the current session"],
+  ["⌘ p → switch to …", "load another saved session (fresh shells)"],
+  ["⌘ p → delete", "delete the current session"],
 ];
 
 export default function Cheatsheet({ onClose }: Props) {
@@ -41,6 +52,21 @@ export default function Cheatsheet({ onClose }: Props) {
         <table className="w-full text-xs">
           <tbody>
             {ROWS.map(([keys, desc]) => (
+              <tr key={keys} className="border-t border-term-edge/60">
+                <td className="whitespace-nowrap py-1 pr-3 font-mono text-term-accent">
+                  {keys}
+                </td>
+                <td className="py-1 text-term-fg">{desc}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <div className="mb-2 mt-3 text-[11px] uppercase tracking-widest text-term-dim">
+          sessions
+        </div>
+        <table className="w-full text-xs">
+          <tbody>
+            {SESSION_ROWS.map(([keys, desc]) => (
               <tr key={keys} className="border-t border-term-edge/60">
                 <td className="whitespace-nowrap py-1 pr-3 font-mono text-term-accent">
                   {keys}

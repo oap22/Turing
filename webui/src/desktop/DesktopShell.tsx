@@ -26,7 +26,6 @@ import {
   closeFocused,
   closeLeafById,
   defaultLayout,
-  deserialize,
   focusEffect,
   focusLeaf,
   moveFocus,
@@ -35,7 +34,6 @@ import {
   resize,
   sendToWs,
   seedIds,
-  serialize,
   swap,
   switchWs,
   toggleDir,
@@ -48,6 +46,20 @@ import {
   type Rect,
   type Split,
 } from "./layout";
+import { applyGaps, GAPS_IN_PX, GAPS_OUT_PX } from "./gaps";
+import SessionPicker from "./SessionPicker";
+import {
+  activeSession,
+  createSession,
+  deleteSession,
+  listSessions,
+  loadSessions,
+  renameSession,
+  saveLayoutInto,
+  saveSessions,
+  switchSession,
+  type SessionStore,
+} from "./sessions";
 import AgentFeedPane from "./panes/AgentFeedPane";
 import AgentsPane from "./panes/AgentsPane";
 import FlywheelPane from "./panes/FlywheelPane";
@@ -57,7 +69,6 @@ import TermPane from "./panes/TermPane";
 import { inv, isTauri } from "./tauri";
 import { applyTheme, initTheme, THEMES } from "./theme";
 
-const LAYOUT_KEY = "turing.layout.v2";
 const TITLE_ROW_PX = 20;
 const TOP_BAR_PX = 24;
 const SPLITTER_HIT_PX = 4;
@@ -84,9 +95,17 @@ type ShellAction =
   | { type: "openPane"; pane: PaneType; params?: Record<string, unknown> }
   | { type: "setRoot"; ws: number; root: Node }
   | { type: "closeLeaf"; ws: number; leafId: string }
-  | { type: "focusLeaf"; leafId: string };
+  | { type: "focusLeaf"; leafId: string }
+  | { type: "setLayout"; layout: LayoutState };
 
 function layoutReducer(state: LayoutState, action: ShellAction): LayoutState {
+  if (action.type === "setLayout") {
+    // Wholesale replacement — restoring a saved session. Ids in the incoming
+    // tree were minted by whichever run created that session, so seed past
+    // them before it can collide with the next `nextId()`.
+    seedIds(action.layout);
+    return action.layout;
+  }
   if (action.type === "setRoot") {
     const workspaces = state.workspaces.slice();
     workspaces[action.ws] = { ...workspaces[action.ws], root: action.root };
@@ -129,16 +148,20 @@ function layoutReducer(state: LayoutState, action: ShellAction): LayoutState {
   }
 }
 
-function initLayout(): LayoutState {
-  const stored = localStorage.getItem(LAYOUT_KEY);
-  const restored = stored ? deserialize(stored) : null;
-  if (restored) {
+// The layout to boot with: the last-active saved session's, or the
+// first-launch preset when there is nothing saved at all. `sessions.ts` has
+// already done the legacy-blob migration by the time the store gets here, so
+// an existing user's single persisted layout arrives as a session named
+// "default" and they come straight up on it, exactly as before.
+function initLayout(store: SessionStore): LayoutState {
+  const current = activeSession(store);
+  if (current) {
     // Restored leaf ids were minted by a previous module instance; bump the
     // module-local id counter past them so the next `nextId()` call (e.g.
     // ⌘Return for a new terminal) can't collide with an id already in the
     // tree. `defaultLayout()` mints its own fresh ids and needs no seeding.
-    seedIds(restored);
-    return restored;
+    seedIds(current.layout);
+    return current.layout;
   }
   return defaultLayout();
 }
@@ -252,7 +275,14 @@ function PaneBody({ leaf, visible, surface }: { leaf: Leaf; visible: boolean; su
 }
 
 export default function DesktopShell({ surface }: Props) {
-  const [state, dispatch] = useReducer(layoutReducer, undefined, initLayout);
+  // Read storage exactly once, before the reducer, and hand the same store to
+  // both: the reducer needs the active session's layout to boot with, and the
+  // picker below needs to know how many sessions there are.
+  const [sessions, setSessions] = useState<SessionStore>(() => loadSessions(localStorage));
+  const [state, dispatch] = useReducer(layoutReducer, sessions, initLayout);
+  // Only ever blocks startup when there is a genuine choice. One session (the
+  // migrated "default", or a brand-new install's) boots straight through.
+  const [picking, setPicking] = useState(() => listSessions(sessions).length > 1);
   const [overlay, setOverlay] = useState<"launcher" | "cheatsheet" | null>(null);
   const [theme, setTheme] = useState(() => localStorage.getItem("turing.theme") ?? "turing");
   const [now, setNow] = useState(() => new Date());
@@ -317,9 +347,64 @@ export default function DesktopShell({ surface }: Props) {
     initTheme();
   }, []);
 
+  // Autosave. Every layout edit folds into the *currently active* session
+  // rather than a global blob, which is the whole point of the feature: park
+  // "bench", open "triage", and neither one leaks into the other. Depending on
+  // `state` alone is deliberate — the effect body is re-created every render,
+  // so it always closes over the newest store, and adding `sessions` to the
+  // deps would re-run it on the very `setSessions` it just performed.
   useEffect(() => {
-    localStorage.setItem(LAYOUT_KEY, serialize(state));
-  }, [state]);
+    // Nothing is on screen yet while the picker is up, and writing then would
+    // bump the last-used session's timestamp and re-order the very list the
+    // user is arrowing through.
+    if (picking) return;
+    const next = saveLayoutInto(sessions, state);
+    setSessions(next);
+    saveSessions(localStorage, next);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state, picking]);
+
+  function commitSessions(next: SessionStore) {
+    setSessions(next);
+    saveSessions(localStorage, next);
+  }
+
+  // Load a session's layout into the shell. The outgoing layout needs no
+  // explicit save — autosave has already written every edit into the session
+  // being left. Panes mount fresh: a restored session re-opens the same shape,
+  // not the same processes.
+  function goToSession(id: string) {
+    const next = switchSession(sessions, id);
+    const target = next.sessions[id];
+    if (!target) return;
+    commitSessions(next);
+    dispatchFrom({ type: "setLayout", layout: target.layout }, "passive");
+    setPicking(false);
+  }
+
+  // Snapshot the live layout under a new name and make it current, so further
+  // edits keep landing in the session the user just named.
+  function saveSessionAs(name: string) {
+    commitSessions(createSession(sessions, name, state));
+  }
+
+  function renameActiveSession(name: string) {
+    const current = activeSession(sessions);
+    if (!current) return;
+    commitSessions(renameSession(sessions, current.id, name));
+  }
+
+  // Deleting the session you are in leaves you somewhere: the next most
+  // recently used session, or the first-launch preset if that was the last
+  // one (which autosave immediately re-saves as a fresh "default").
+  function deleteActiveSession() {
+    const current = activeSession(sessions);
+    if (!current) return;
+    const next = deleteSession(sessions, current.id);
+    commitSessions(next);
+    const target = activeSession(next);
+    dispatchFrom({ type: "setLayout", layout: target?.layout ?? defaultLayout() }, "passive");
+  }
 
   useEffect(() => {
     const id = setInterval(() => setNow(new Date()), 30_000);
@@ -339,6 +424,9 @@ export default function DesktopShell({ surface }: Props) {
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
+      // The startup picker owns the keyboard outright — the shell it would be
+      // acting on isn't even mounted yet.
+      if (picking) return;
       if (overlay) {
         if (e.key === "Escape") {
           setOverlay(null);
@@ -370,18 +458,39 @@ export default function DesktopShell({ surface }: Props) {
     }
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [overlay]);
+  }, [overlay, picking]);
+
+  const sessionList = listSessions(sessions);
+  const current = activeSession(sessions);
+
+  // Rendered *instead of* the shell, not over it: mounting the pane tree
+  // underneath would spawn PTYs for a layout the user is about to replace.
+  if (picking) {
+    return (
+      <SessionPicker
+        sessions={sessionList}
+        activeId={current?.id ?? null}
+        onPick={goToSession}
+        onSkip={() => setPicking(false)}
+      />
+    );
+  }
 
   const ws = state.workspaces[state.active];
-  const rectMap = ws.root ? rects(ws.root, viewport) : new Map<string, Rect>();
+  // The tiling area is the viewport minus the outer gap; everything
+  // positional (leaf rects, splitter boundaries, drag spans) is measured
+  // against it rather than the raw viewport. See `gaps.ts` for why the gaps
+  // live here and not in the layout math.
+  const tiled = applyGaps(viewport, GAPS_OUT_PX);
+  const rectMap = ws.root ? rects(ws.root, tiled) : new Map<string, Rect>();
   const boundaries: Boundary[] = [];
-  if (ws.root) collectBoundaries(ws.root, viewport, boundaries);
+  if (ws.root) collectBoundaries(ws.root, tiled, boundaries);
 
   function startDrag(b: Boundary, downEvent: React.PointerEvent) {
     downEvent.preventDefault();
     const startRatio = b.split.ratio;
     const startCoord = b.axis === "h" ? downEvent.clientX : downEvent.clientY;
-    const span = b.axis === "h" ? viewport.w : viewport.h;
+    const span = b.axis === "h" ? tiled.w : tiled.h;
     function onMove(e: PointerEvent) {
       const coord = b.axis === "h" ? e.clientX : e.clientY;
       const delta = (coord - startCoord) / span;
@@ -413,14 +522,14 @@ export default function DesktopShell({ surface }: Props) {
     <div className="flex h-full flex-col bg-term-bg text-term-fg">
       <header
         style={{ height: TOP_BAR_PX }}
-        className="flex shrink-0 items-center gap-3 border-b border-term-edge bg-term-panel px-2 text-[11px]"
+        className="flex shrink-0 items-center gap-3 border-b border-term-edge bg-term-panel px-3 text-[11px]"
       >
         {state.workspaces.map((w, i) => (
           <button
             key={i}
             type="button"
             onClick={() => dispatchFrom({ type: "keymap", action: { type: "ws", i } }, "pointer")}
-            className={`flex items-center gap-1 px-1 ${
+            className={`flex items-center gap-1 px-1.5 ${
               i === state.active ? "text-term-accent" : "text-term-dim"
             }`}
           >
@@ -431,6 +540,9 @@ export default function DesktopShell({ surface }: Props) {
         <span className={`ml-2 ${wsStatusInfo.cls}`}>
           {wsStatusInfo.dot} {wsStatusInfo.text}
         </span>
+        {/* Which saved session these panes belong to — without it, "⌘p →
+            session: rename" is aimed at something invisible. */}
+        {current && <span className="text-term-dim">session: {current.name}</span>}
         <select
           value={theme}
           onChange={(e) => {
@@ -452,11 +564,18 @@ export default function DesktopShell({ surface }: Props) {
           const isActiveWs = wsIdx === state.active;
           const isZoomedOut = state.workspaces[wsIdx].zoom && leaf.id !== state.workspaces[wsIdx].focus;
           const visible = isActiveWs && !isZoomedOut;
-          const rect = isActiveWs
-            ? state.workspaces[wsIdx].zoom
-              ? viewport
-              : (rectMap.get(leaf.id) ?? viewport)
-            : viewport;
+          // Half the inner gap per pane: two neighbours each give up half, so
+          // the visible seam between them is exactly GAPS_IN_PX. A zoomed (or
+          // inactive-workspace) pane fills the tiling area, which is already
+          // inset from the window edge by GAPS_OUT_PX.
+          const rect = applyGaps(
+            isActiveWs
+              ? state.workspaces[wsIdx].zoom
+                ? tiled
+                : (rectMap.get(leaf.id) ?? tiled)
+              : tiled,
+            GAPS_IN_PX / 2,
+          );
           const focused = isActiveWs && state.workspaces[wsIdx].focus === leaf.id;
           return (
             <div
@@ -485,7 +604,7 @@ export default function DesktopShell({ surface }: Props) {
             >
               <div
                 style={{ height: TITLE_ROW_PX }}
-                className="flex shrink-0 items-center gap-1 border-b border-term-edge px-1 text-[10px] lowercase text-term-dim"
+                className="flex shrink-0 items-center gap-2 border-b border-term-edge px-2 text-[10px] lowercase text-term-dim"
               >
                 <span className="min-w-0 flex-1 truncate">{paneLabel(leaf)}</span>
                 <button
@@ -548,6 +667,12 @@ export default function DesktopShell({ surface }: Props) {
           onOpenRunner={(runnerId) =>
             dispatchFrom({ type: "openPane", pane: "term", params: { runnerId } }, "keyboard")
           }
+          sessions={sessionList}
+          activeSession={current}
+          onSaveSession={saveSessionAs}
+          onRenameSession={renameActiveSession}
+          onSwitchSession={goToSession}
+          onDeleteSession={deleteActiveSession}
         />
       )}
       {overlay === "cheatsheet" && <Cheatsheet onClose={() => setOverlay(null)} />}
