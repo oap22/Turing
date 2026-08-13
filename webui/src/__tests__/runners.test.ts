@@ -1,0 +1,56 @@
+// Runner table tests (issue #382).
+
+import { describe, expect, it } from "vitest";
+import { RUNNERS } from "../desktop/runners";
+
+describe("RUNNERS", () => {
+  it("has unique ids", () => {
+    const ids = RUNNERS.map((r) => r.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("has a non-empty command for every runner", () => {
+    for (const r of RUNNERS) {
+      expect(r.command.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("uses every group present in the runner table (the spec's table has no 'research' entries, only verify/remote/docs)", () => {
+    const groups = new Set(RUNNERS.map((r) => r.group));
+    expect(groups).toEqual(new Set(["verify", "remote", "docs"]));
+  });
+
+  // Both remote streamers carry placeholders, so they must be pre-typed for
+  // editing rather than run on selection.
+  it("marks the placeholder-bearing ssh runners as autorun: false", () => {
+    for (const id of ["ssh-follow-metrics", "ssh-pull-assets"]) {
+      const runner = RUNNERS.find((r) => r.id === id);
+      expect(runner, id).toBeDefined();
+      expect(runner?.autorun, id).toBe(false);
+      expect(runner?.command).toContain("<SSH_HOST>");
+      expect(runner?.command).toContain("<REMOTE_RUN_DIR>");
+    }
+  });
+
+  // Anything that actually runs on selection must be ready to run as-is.
+  it("leaves no unfilled placeholder in an autorun runner", () => {
+    for (const r of RUNNERS.filter((x) => x.autorun)) {
+      expect(r.command, r.id).not.toMatch(/<[A-Z_]+>/);
+    }
+  });
+
+  it("keeps the rosie-specific conveniences pointed at the ROSIE alias", () => {
+    for (const id of ["rosie-preflight", "rosie-queue"]) {
+      const runner = RUNNERS.find((r) => r.id === id);
+      expect(runner?.group, id).toBe("remote");
+      expect(runner?.command, id).toContain("ROSIE");
+    }
+  });
+
+  it("pulls remote assets into the watched results dir on a loop", () => {
+    const pull = RUNNERS.find((r) => r.id === "ssh-pull-assets");
+    expect(pull?.command).toContain("rsync");
+    expect(pull?.command).toContain("research/results/rosie-live/");
+    expect(pull?.command).toContain("sleep 30");
+  });
+});

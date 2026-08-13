@@ -19,3 +19,6 @@ models/
 .gitnexus/
 .mcp.json
 20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.txt
+
+# plan-then-ship pipeline specs (local only)
+.plan-then-ship/

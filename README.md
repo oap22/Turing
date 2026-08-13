@@ -1,80 +1,96 @@
 # Turing
-Hybrid agentic orchestration and self improvement framework for research applications
 
-## Local fleet
+Research tool for the new age of development — an autonomous research agent with a
+keyboard-first desktop operator surface.
 
-Bring up the 4-node Docker Compose simulation (Ollama + NATS + 4 turing nodes):
+Turing is two things that meet in one repo:
+
+1. **A research agent** (`src/turing/research/`, ADR 0011): given a
+   `(goal, verifier)` pair it iterates until the frozen verifier passes or a cap
+   trips. The verifier is frozen — the agent invents, the operator holds the
+   ruler. It cannot quit; it escalates with a three-word vocabulary
+   (`continue / abandon / extend_cap`). Research discipline lives in the
+   operator's `/research-interview` → `/research-loop` workflows; agreed briefs
+   sit in `research/briefs/`, results in `research/results/`.
+2. **Turing Desktop** (`desktop/` + `webui/src/desktop/`, issue #382): a Tauri 2
+   macOS app hosting the webui SPA as a Hyprland/omarchy-style tiling shell —
+   real PTY terminals for coding-agent CLIs and vim, live training charts, a
+   flywheel round timeline, an image viewer, and a viewer for Claude/Codex agent
+   sessions. Everything it renders is a plain file under `research/results/`,
+   so the same data is readable (and writable) by coding agents.
+
+The earlier fleet stack — coordinator, NATS mesh, Jetson workers, webui
+queue/chat, LoRA trainer (ADRs 0001–0010) — is **dormant in-tree, not deleted**:
+loop 1 runs Mac-local with heavy jobs dispatched to an ssh cluster. The chat
+pane is reserved for the future nano agent network.
+
+## Turing Desktop
 
 ```bash
-./scripts/dev/fleet-up.sh    # requires a populated .env
-./scripts/dev/fleet-down.sh  # stop (preserves volumes; pass -v on `docker compose down` to nuke)
+cd webui && npm ci --legacy-peer-deps      # once
+cd ../desktop && npm ci && npm run dev     # opens the app (tauri dev)
 ```
 
-`fleet-up.sh` tails pi-alpha for ~10s so first-boot errors surface, then
-prints the gateway URL (default `http://localhost:8765/`).
+- **mod = ⌘**, omarchy semantics: ⌘Return terminal · ⌘W close · ⌘hjkl/arrows
+  focus (cursor warps with you) · ⌘⇧ move · ⌘1–5 workspaces · ⌘F zoom ·
+  ⌘P launcher · ⌘/ cheatsheet. Layout persists.
+- **Data contract**: append `research/results/<run>/metrics.jsonl`
+  (`{"step": n, "total_steps": N, "ts": t, ...numeric series}`) and charts move
+  live; `loop-<slug>/trajectory.json` renders the flywheel timeline; SVG/PNG
+  plots land in the images pane. Agents steer the view via
+  `research/results/.viewer.json`. Remote (ssh) runs stream in through the
+  `ssh-follow-metrics` / `ssh-pull-assets` runners.
+- Config (gateway URL/token, filesystem roots): `~/.config/turing-desktop/config.json`.
+- Full keymap, panes, runners, troubleshooting: `desktop/README.md`.
 
-## Entry points
+## Dormant fleet stack
+
+<details>
+<summary>Multi-node simulation, gateway, browser webui, TUI (ADR 0009/0010 era)</summary>
+
+### Local fleet
+
+```bash
+./scripts/dev/fleet-up.sh    # 4-node Docker Compose sim (Ollama + NATS); needs .env
+./scripts/dev/fleet-down.sh
+```
+
+### Entry points
 
 | Command | Purpose |
 |---------|---------|
 | `turing` | Run a node (coordinator or worker, per `.env`). |
-| `turing-gateway` | Standalone gateway process — webui static + WebSocket + chat/queue API (ADR 0010 §6). Opt-in only; see below. |
+| `turing-gateway` | Standalone gateway — webui static + WS + chat/queue API (ADR 0010 §6). Opt-in. |
 | `turing-ui` | Resolve + token-handoff and open the webui in the browser. |
-| `turing-vault-watcher` | Daemon that reindexes the operator's Obsidian vault by diffing each new git commit. |
-| `turing-tui` | Rust/ratatui terminal operator surface (built from `tui/`; see `tui/README.md`). |
+| `turing-vault-watcher` | Reindex the operator's Obsidian vault per git commit. |
+| `turing-tui` | Rust/ratatui terminal operator surface (`tui/`). |
 
-## Operator surfaces
+### Browser webui / TUI
 
-The **webui** (served by the gateway) is the primary operator surface since the
-Discord retirement (ADR 0010). It is **interactive**, not read-only — it owns
-both fleet observability and work direction:
-
-- **Question-queue manager** — the human-gated research frontier
-  (`proposed → approved → in-flight → drafted → curated`), the hero pane.
-- **Chat pane** — ad-hoc task submission.
-- **Fleet specs** — per-node CPU/mem/disk/temp/uptime with hardware-risk
-  colour-shifting; stale peers dim.
-- **Message trace** — recent inter-node messages and intra-node LLM/tool calls
-  with redacted, truncated prompt samples.
-- **Alerts** — a persistent top banner driven by `alert` WebSocket frames, with
-  **ntfy** push as the closed-laptop fallback.
-
-The **TUI** (`turing-tui`) is the keyboard-first counterpart — a standalone Rust
-client of the *same* gateway HTTP/WS API, mirroring the queue / chat / specs /
-trace / alert panes with byte-identical curation reward semantics. Chosen for
-latency (native render loop, idle CPU ≈ 0). See `tui/README.md`.
-
-Open either over the Tailnet:
+The browser webui (queue manager, chat, fleet specs, message trace, alerts) is
+unchanged by the desktop shell — the SPA renders the tab UI outside Tauri. The
+TUI is a standalone Rust client of the same gateway API. Connect over the
+Tailnet:
 
 ```bash
 pip install -e .
-export TURING_GATEWAY_TOKEN=…                 # the random string in the coordinator's .env
-# webui:
-export TURING_GATEWAY_HOST=100.x.y.z          # coordinator's Tailscale IP
-turing-ui                                     # opens the browser
-# TUI:
-export TURING_GATEWAY_URL=http://100.x.y.z:8765
+export TURING_GATEWAY_TOKEN=…                 # coordinator's .env token
+export TURING_GATEWAY_HOST=100.x.y.z          # webui: coordinator's Tailscale IP
+turing-ui
+export TURING_GATEWAY_URL=http://100.x.y.z:8765   # TUI
 ./tui/target/release/turing-tui
 ```
 
 `turing-ui` validates the token via `/healthz`, then hands it off through
-`/token-handoff?token=…` so the token never sits in the address bar after the
-first hop. The session lives in an http-only cookie until the browser tab
-closes. See `docs/operator/connectivity.md` for the full Tailnet setup.
+`/token-handoff?token=…`; the session lives in an http-only cookie. See
+`docs/operator/connectivity.md`.
 
-**Where the gateway runs.** A deployed coordinator runs the gateway
-**in-process** (`TURING_GATEWAY_ENABLED`, default `false`; the coordinator
-flips it on). The standalone `turing-gateway` unit is opt-in via
-`TURING_GATEWAY_STANDALONE` and exists for the future three-unit coordinator
-split — until an IPC channel lands it serves *empty* projections, so it is not
-the default path. (See `src/turing/gateway/__main__.py`.)
+A deployed coordinator runs the gateway **in-process**
+(`TURING_GATEWAY_ENABLED`, default `false`). Standalone `turing-gateway`
+(`TURING_GATEWAY_STANDALONE`) serves empty projections until an IPC channel
+lands.
 
-### Preview locally with seeded data
-
-`scripts/dev/demo_gateway.py` boots the real gateway wiring and seeds every pane
-(queue across all five columns, a chat thread, a Surface + 4 Jetson specs panel
-with a hot/danger temp, a trace backlog, a firing alert) so you can drive the
-webui **and** TUI without a live fleet:
+### Preview with seeded data
 
 ```bash
 TURING_GATEWAY_TOKEN=demo .venv/bin/python scripts/dev/demo_gateway.py --port 8765
@@ -83,24 +99,18 @@ TURING_GATEWAY_TOKEN=demo .venv/bin/python scripts/dev/demo_gateway.py --port 87
 #        ./tui/target/release/turing-tui
 ```
 
-State is in-memory and resets on restart.
+</details>
 
 ## Database migrations
 
-Schema lives under `alembic/versions/` as raw-SQL migrations authored with
-`alembic.op.create_table`/`op.execute` — the project does **not** define
-SQLAlchemy declarative models, so `alembic/env.py` exposes
-`target_metadata = None`.
-
-Supported commands:
+Raw-SQL alembic migrations under `alembic/versions/` (no declarative models;
+`target_metadata = None`):
 
 ```bash
-alembic upgrade head    # apply pending migrations
-alembic current         # show current revision
-alembic history         # list revisions
+alembic upgrade head    # apply
+alembic current         # show
+alembic history         # list
 ```
 
-**`alembic check` is not supported.** Without a `MetaData` object it cannot
-diff models against the DB; running it errors with "environment script
-alembic/env.py does not provide a MetaData object". Drift is caught by
-hand-written migration tests under `tests/test_alembic_*.py` instead.
+**`alembic check` is not supported** (no `MetaData` to diff). Drift is caught by
+`tests/test_alembic_*.py`.

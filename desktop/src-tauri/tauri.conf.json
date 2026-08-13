@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "turing",
+  "version": "0.1.0",
+  "identifier": "dev.owen.turing",
+  "build": {
+    "beforeDevCommand": "npm --prefix ../webui run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm --prefix ../webui run build",
+    "frontendDist": "../../webui/dist"
+  },
+  "app": {
+    "windows": [{ "title": "turing", "width": 1512, "height": 945 }],
+    "security": { "csp": null }
+  },
+  "bundle": { "active": false }
+}

@@ -4,6 +4,9 @@
  * /token-handoff, so no token has to live in JS.
  */
 
+import { connectTauriWS } from "./desktop/gateway";
+import { isTauri } from "./desktop/tauri";
+
 // ── Question-queue frames (ADR 0010 Slice C) ────────────────────────────────
 //
 // The webui queue pane's wire contract with `turing-gateway`. Mirrors the
@@ -158,6 +161,18 @@ const MIN_DELAY_MS = 250;
 const MAX_DELAY_MS = 15_000;
 
 export function connectGatewayWS<T = unknown>(opts: ConnectOptions<T>): () => void {
+  if (isTauri()) {
+    return connectTauriWS(
+      (raw) => {
+        try {
+          opts.onFrame(JSON.parse(raw) as T);
+        } catch {
+          // ignore malformed frames
+        }
+      },
+      (s) => opts.onStatus?.(s),
+    );
+  }
   let ws: WebSocket | null = null;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let backoff = MIN_DELAY_MS;

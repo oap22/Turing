@@ -10,6 +10,10 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@xterm/addon-canvas": "^0.7.0",
+    "@xterm/addon-fit": "^0.10",
+    "@xterm/xterm": "^5",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "reactflow": "^11.11.4"

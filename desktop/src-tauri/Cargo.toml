@@ -1,0 +1,33 @@
+[package]
+name = "turing-desktop"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "turing_desktop_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "turing-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+portable-pty = "0.9"
+notify = "8"
+base64 = "0.22"
+dirs = "6"
+open = "5"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+http = "1"
+
+[dev-dependencies]
+tempfile = "3"

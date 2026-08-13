@@ -5,20 +5,107 @@
  * near-black canvas, one cyan accent, emerald/amber/rose reserved for
  * semantics, dim grey chrome, monospace everywhere, sharp 1px borders.
  */
-@theme {
+@theme inline {
   --font-mono:
     "JetBrains Mono", ui-monospace, "SFMono-Regular", "Cascadia Mono", Menlo,
     Consolas, "Liberation Mono", monospace;
   /* The whole console is set in mono — it is a computer, after all. */
   --font-sans: var(--font-mono);
 
-  --color-term-bg: #060809;
-  --color-term-panel: #0b0e10;
-  --color-term-raised: #11151a;
-  --color-term-edge: #1d2329;
-  --color-term-fg: #c9d1d9;
-  --color-term-dim: #6b7280;
-  --color-term-accent: #22d3ee;
+  --color-term-bg: var(--t-bg);
+  --color-term-panel: var(--t-panel);
+  --color-term-raised: var(--t-raised);
+  --color-term-edge: var(--t-edge);
+  --color-term-fg: var(--t-fg);
+  --color-term-dim: var(--t-dim);
+  --color-term-accent: var(--t-accent);
+}
+
+/*
+ * Omarchy-style color themes (desktop shell, issue #382). `:root` carries the
+ * default "turing" palette; `[data-theme="<id>"]` overrides it app-wide,
+ * including inside open xterm panes (`theme.ts` reads these back).
+ */
+:root {
+  --t-bg: #060809;
+  --t-panel: #0b0e10;
+  --t-raised: #11151a;
+  --t-edge: #1d2329;
+  --t-fg: #c9d1d9;
+  --t-dim: #6b7280;
+  --t-accent: #22d3ee;
+}
+[data-theme="tokyo-night"] {
+  --t-bg: #1a1b26;
+  --t-panel: #16161e;
+  --t-raised: #1f2335;
+  --t-edge: #292e42;
+  --t-fg: #c0caf5;
+  --t-dim: #565f89;
+  --t-accent: #7aa2f7;
+}
+[data-theme="gruvbox"] {
+  --t-bg: #282828;
+  --t-panel: #1d2021;
+  --t-raised: #32302f;
+  --t-edge: #3c3836;
+  --t-fg: #ebdbb2;
+  --t-dim: #928374;
+  --t-accent: #fabd2f;
+}
+[data-theme="catppuccin"] {
+  --t-bg: #1e1e2e;
+  --t-panel: #181825;
+  --t-raised: #313244;
+  --t-edge: #45475a;
+  --t-fg: #cdd6f4;
+  --t-dim: #6c7086;
+  --t-accent: #89b4fa;
+}
+[data-theme="nord"] {
+  --t-bg: #2e3440;
+  --t-panel: #292e39;
+  --t-raised: #3b4252;
+  --t-edge: #434c5e;
+  --t-fg: #d8dee9;
+  --t-dim: #616e88;
+  --t-accent: #88c0d0;
+}
+[data-theme="everforest"] {
+  --t-bg: #2d353b;
+  --t-panel: #272e33;
+  --t-raised: #374145;
+  --t-edge: #414b50;
+  --t-fg: #d3c6aa;
+  --t-dim: #859289;
+  --t-accent: #a7c080;
+}
+[data-theme="kanagawa"] {
+  --t-bg: #1f1f28;
+  --t-panel: #16161d;
+  --t-raised: #2a2a37;
+  --t-edge: #363646;
+  --t-fg: #dcd7ba;
+  --t-dim: #727169;
+  --t-accent: #7e9cd8;
+}
+[data-theme="rose-pine"] {
+  --t-bg: #191724;
+  --t-panel: #1f1d2e;
+  --t-raised: #26233a;
+  --t-edge: #403d52;
+  --t-fg: #e0def4;
+  --t-dim: #6e6a86;
+  --t-accent: #ebbcba;
+}
+[data-theme="matte-black"] {
+  --t-bg: #121212;
+  --t-panel: #0e0e0e;
+  --t-raised: #1a1a1a;
+  --t-edge: #2a2a2a;
+  --t-fg: #bebebe;
+  --t-dim: #7a7a7a;
+  --t-accent: #cacaca;
 }
 
 html,

@@ -3,6 +3,7 @@
 // window instead of the button.
 
 import { useEffect, useState } from "react";
+import { gatewayFetch } from "../desktop/gateway";
 import type { Alert } from "./types";
 
 interface Props {
@@ -55,14 +56,12 @@ export default function AlertBanner({ alerts }: Props) {
   async function handleSnooze(alert: Alert): Promise<void> {
     const key = rowKey(alert);
     try {
-      const res = await fetch(
+      const res = await gatewayFetch(
         `/alerts/${encodeURIComponent(alert.node_id)}/${encodeURIComponent(
           alert.field,
         )}/snooze`,
         {
           method: "POST",
-          credentials: "same-origin",
-          headers: { "Content-Type": "application/json" },
           body: "{}",
         },
       );

@@ -1,0 +1,556 @@
+// The Hyprland/omarchy-style tiling shell rendered in place of the browser
+// tab UI when `isTauri()`. Owns the `LayoutState` (persisted layout across
+// restarts), the global keymap, and the pane chrome; every gateway-backed
+// pane below renders the *same* component the browser tab UI uses, just fed
+// from `surface` instead of App's own hooks.
+
+import { useEffect, useReducer, useRef, useState } from "react";
+import type { ChatSession, QueueItem } from "../ws";
+import type { GraphState } from "../graph/types";
+import type { PeerSpecsRow } from "../specs/types";
+import type { TraceEvent } from "../trace/types";
+import QueuePane from "../queue/QueuePane";
+import ChatPane from "../chat/ChatPane";
+import ObservabilityView from "../ObservabilityView";
+import { WS_STATUS_LABEL, type WsStatus } from "../App";
+import Cheatsheet from "./Cheatsheet";
+import Launcher from "./Launcher";
+import {
+  actionFor,
+  movesFocus,
+  PANE_FOCUS_EVENT,
+  type Action,
+  type PaneFocusDetail,
+} from "./keymap";
+import {
+  closeFocused,
+  closeLeafById,
+  defaultLayout,
+  deserialize,
+  focusEffect,
+  focusLeaf,
+  moveFocus,
+  openPane,
+  rects,
+  resize,
+  sendToWs,
+  seedIds,
+  serialize,
+  swap,
+  switchWs,
+  toggleDir,
+  toggleZoom,
+  type FocusSource,
+  type LayoutState,
+  type Leaf,
+  type Node,
+  type PaneType,
+  type Rect,
+  type Split,
+} from "./layout";
+import AgentFeedPane from "./panes/AgentFeedPane";
+import AgentsPane from "./panes/AgentsPane";
+import FlywheelPane from "./panes/FlywheelPane";
+import ImagesPane from "./panes/ImagesPane";
+import MetricsPane from "./panes/MetricsPane";
+import TermPane from "./panes/TermPane";
+import { inv, isTauri } from "./tauri";
+import { applyTheme, initTheme, THEMES } from "./theme";
+
+const LAYOUT_KEY = "turing.layout.v2";
+const TITLE_ROW_PX = 20;
+const TOP_BAR_PX = 24;
+const SPLITTER_HIT_PX = 4;
+
+export interface Surface {
+  queue: { items: QueueItem[] };
+  chat: { sessions: ChatSession[] };
+  obs: {
+    graphState: GraphState;
+    highlightedEdge: string | null;
+    specsRows: PeerSpecsRow[];
+    liveTrace: TraceEvent[];
+    onTraceSelect: (e: TraceEvent) => void;
+  };
+  wsStatus: WsStatus;
+}
+
+interface Props {
+  surface: Surface;
+}
+
+type ShellAction =
+  | { type: "keymap"; action: Action }
+  | { type: "openPane"; pane: PaneType; params?: Record<string, unknown> }
+  | { type: "setRoot"; ws: number; root: Node }
+  | { type: "closeLeaf"; ws: number; leafId: string }
+  | { type: "focusLeaf"; leafId: string };
+
+function layoutReducer(state: LayoutState, action: ShellAction): LayoutState {
+  if (action.type === "setRoot") {
+    const workspaces = state.workspaces.slice();
+    workspaces[action.ws] = { ...workspaces[action.ws], root: action.root };
+    return { ...state, workspaces };
+  }
+  if (action.type === "openPane") {
+    return openPane(state, action.pane, action.params);
+  }
+  if (action.type === "focusLeaf") {
+    return focusLeaf(state, action.leafId);
+  }
+  if (action.type === "closeLeaf") {
+    // Closes THAT pane's title-row × button targets, which may not be the
+    // focused pane (and may be in a non-active workspace, though in
+    // practice only active-workspace panes render an × to click).
+    return closeLeafById(state, action.ws, action.leafId);
+  }
+  const a = action.action;
+  switch (a.type) {
+    case "newTerm":
+      return openPane(state, "term");
+    case "close":
+      return closeFocused(state);
+    case "focus":
+      return moveFocus(state, a.dir);
+    case "swap":
+      return swap(state, a.dir);
+    case "ws":
+      return switchWs(state, a.i);
+    case "sendWs":
+      return sendToWs(state, a.i);
+    case "zoom":
+      return toggleZoom(state);
+    case "toggleDir":
+      return toggleDir(state);
+    case "resize":
+      return resize(state, a.delta);
+    default:
+      return state;
+  }
+}
+
+function initLayout(): LayoutState {
+  const stored = localStorage.getItem(LAYOUT_KEY);
+  const restored = stored ? deserialize(stored) : null;
+  if (restored) {
+    // Restored leaf ids were minted by a previous module instance; bump the
+    // module-local id counter past them so the next `nextId()` call (e.g.
+    // ⌘Return for a new terminal) can't collide with an id already in the
+    // tree. `defaultLayout()` mints its own fresh ids and needs no seeding.
+    seedIds(restored);
+    return restored;
+  }
+  return defaultLayout();
+}
+
+function collectLeaves(node: Node, out: Leaf[]): void {
+  if (node.kind === "leaf") {
+    out.push(node);
+    return;
+  }
+  collectLeaves(node.a, out);
+  collectLeaves(node.b, out);
+}
+
+interface Boundary {
+  split: Split;
+  axis: "h" | "v";
+  at: number;
+  from: number;
+  to: number;
+}
+
+function collectBoundaries(node: Node, rect: Rect, out: Boundary[]): void {
+  if (node.kind === "leaf") return;
+  if (node.dir === "h") {
+    const boundaryX = rect.x + rect.w * node.ratio;
+    out.push({ split: node, axis: "h", at: boundaryX, from: rect.y, to: rect.y + rect.h });
+    collectBoundaries(node.a, { x: rect.x, y: rect.y, w: rect.w * node.ratio, h: rect.h }, out);
+    collectBoundaries(
+      node.b,
+      { x: rect.x + rect.w * node.ratio, y: rect.y, w: rect.w * (1 - node.ratio), h: rect.h },
+      out,
+    );
+  } else {
+    const boundaryY = rect.y + rect.h * node.ratio;
+    out.push({ split: node, axis: "v", at: boundaryY, from: rect.x, to: rect.x + rect.w });
+    collectBoundaries(node.a, { x: rect.x, y: rect.y, w: rect.w, h: rect.h * node.ratio }, out);
+    collectBoundaries(
+      node.b,
+      { x: rect.x, y: rect.y + rect.h * node.ratio, w: rect.w, h: rect.h * (1 - node.ratio) },
+      out,
+    );
+  }
+}
+
+function withRatioAt(node: Node, target: Split, ratio: number): Node {
+  if (node === target) return { ...node, ratio };
+  if (node.kind === "leaf") return node;
+  return { ...node, a: withRatioAt(node.a, target, ratio), b: withRatioAt(node.b, target, ratio) };
+}
+
+function paneLabel(leaf: Leaf): string {
+  const runnerId = leaf.params?.runnerId;
+  return typeof runnerId === "string" ? `${leaf.pane} — ${runnerId}` : leaf.pane;
+}
+
+// Move the OS pointer to the centre of a pane. JS cannot move the cursor, so
+// this hands window-content coordinates (CSS px, exactly what
+// getBoundingClientRect returns) to Rust, which converts them to the
+// screen-relative position the platform API wants.
+//
+// Best-effort by design: a no-op in a plain browser, and errors are
+// swallowed. If the platform ever refuses the move, focus-follow still works
+// and the pointer simply stays put — a degraded feature, not a broken app.
+function warpCursorToCenter(el: HTMLElement): void {
+  if (!isTauri()) return;
+  const r = el.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) return;
+  void inv("warp_cursor", {
+    x: r.left + r.width / 2,
+    y: r.top + r.height / 2,
+  }).catch(() => {});
+}
+
+function PaneBody({ leaf, visible, surface }: { leaf: Leaf; visible: boolean; surface: Surface }) {
+  switch (leaf.pane) {
+    case "term":
+      return (
+        <TermPane
+          leafId={leaf.id}
+          runnerId={typeof leaf.params?.runnerId === "string" ? leaf.params.runnerId : undefined}
+          visible={visible}
+        />
+      );
+    case "queue":
+      return <QueuePane items={surface.queue.items} />;
+    case "chat":
+      return <ChatPane sessions={surface.chat.sessions} />;
+    case "obs":
+      return (
+        <ObservabilityView
+          graphState={surface.obs.graphState}
+          highlightedEdge={surface.obs.highlightedEdge}
+          specsRows={surface.obs.specsRows}
+          liveTrace={surface.obs.liveTrace}
+          onTraceSelect={surface.obs.onTraceSelect}
+        />
+      );
+    case "metrics":
+      return <MetricsPane />;
+    case "images":
+      return <ImagesPane />;
+    case "flywheel":
+      return <FlywheelPane />;
+    case "agents":
+      return <AgentsPane />;
+    case "agentfeed":
+      return <AgentFeedPane />;
+    default:
+      return null;
+  }
+}
+
+export default function DesktopShell({ surface }: Props) {
+  const [state, dispatch] = useReducer(layoutReducer, undefined, initLayout);
+  const [overlay, setOverlay] = useState<"launcher" | "cheatsheet" | null>(null);
+  const [theme, setTheme] = useState(() => localStorage.getItem("turing.theme") ?? "turing");
+  const [now, setNow] = useState(() => new Date());
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [viewport, setViewport] = useState<Rect>({ x: 0, y: 0, w: 1600, h: 900 });
+
+  // Hyprland-style focus-follow. `layoutReducer` is pure and can't know what
+  // provoked a transition, so the provocation is recorded here at the
+  // dispatch site and consumed once by the effect below. It resets to
+  // "passive" every time, so a render triggered by anything else (persistence,
+  // viewport resize, surface props) can never move focus or the pointer.
+  const focusSourceRef = useRef<FocusSource>("passive");
+  const prevStateRef = useRef<LayoutState>(state);
+  // Read inside the effect rather than closed over, so the guard sees the
+  // overlay state as of the commit.
+  const overlayRef = useRef(overlay);
+  overlayRef.current = overlay;
+
+  function dispatchFrom(action: ShellAction, source: FocusSource) {
+    focusSourceRef.current = source;
+    dispatch(action);
+  }
+
+  useEffect(() => {
+    const prev = prevStateRef.current;
+    prevStateRef.current = state;
+    // Consume the source exactly once, whatever happens next.
+    const source = focusSourceRef.current;
+    focusSourceRef.current = "passive";
+
+    // An open Launcher/Cheatsheet owns the keyboard; pulling focus into a
+    // pane underneath would break typing in the overlay's own input.
+    if (overlayRef.current) return;
+
+    const effect = focusEffect(prev, state, source);
+    if (!effect) return;
+
+    const el = containerRef.current?.querySelector<HTMLElement>(
+      `[data-leaf-id="${CSS.escape(effect.leafId)}"]`,
+    );
+    if (!el) return;
+
+    if (el.dataset.paneType === "term") {
+      // xterm's focusable element is its own hidden textarea; only TermPane
+      // can reach it, so ask rather than reaching in.
+      window.dispatchEvent(
+        new CustomEvent<PaneFocusDetail>(PANE_FOCUS_EVENT, {
+          detail: { leafId: effect.leafId },
+        }),
+      );
+    } else {
+      // preventScroll: the pane is already positioned absolutely at its tile;
+      // letting the browser scroll it into view would shift the whole grid.
+      el.querySelector<HTMLElement>("[data-pane-body]")?.focus({ preventScroll: true });
+    }
+
+    if (effect.warp) warpCursorToCenter(el);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state]);
+
+  useEffect(() => {
+    initTheme();
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(LAYOUT_KEY, serialize(state));
+  }, [state]);
+
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), 30_000);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      const r = entries[0]?.contentRect;
+      if (r) setViewport({ x: 0, y: 0, w: r.width, h: r.height });
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (overlay) {
+        if (e.key === "Escape") {
+          setOverlay(null);
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        const action = actionFor(e);
+        if (action?.type === "ws") {
+          dispatchFrom({ type: "keymap", action }, "keyboard");
+          e.preventDefault();
+          e.stopPropagation();
+        }
+        return;
+      }
+      const action = actionFor(e);
+      if (!action) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (action.type === "launcher") {
+        setOverlay("launcher");
+        return;
+      }
+      if (action.type === "cheatsheet") {
+        setOverlay("cheatsheet");
+        return;
+      }
+      dispatchFrom({ type: "keymap", action }, movesFocus(action) ? "keyboard" : "passive");
+    }
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [overlay]);
+
+  const ws = state.workspaces[state.active];
+  const rectMap = ws.root ? rects(ws.root, viewport) : new Map<string, Rect>();
+  const boundaries: Boundary[] = [];
+  if (ws.root) collectBoundaries(ws.root, viewport, boundaries);
+
+  function startDrag(b: Boundary, downEvent: React.PointerEvent) {
+    downEvent.preventDefault();
+    const startRatio = b.split.ratio;
+    const startCoord = b.axis === "h" ? downEvent.clientX : downEvent.clientY;
+    const span = b.axis === "h" ? viewport.w : viewport.h;
+    function onMove(e: PointerEvent) {
+      const coord = b.axis === "h" ? e.clientX : e.clientY;
+      const delta = (coord - startCoord) / span;
+      const newRatio = Math.min(0.9, Math.max(0.1, startRatio + delta));
+      if (!ws.root) return;
+      const newRoot = withRatioAt(ws.root, b.split, newRatio);
+      dispatch({ type: "setRoot", ws: state.active, root: newRoot });
+    }
+    function onUp() {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    }
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  const allLeaves: Array<{ ws: number; leaf: Leaf }> = [];
+  state.workspaces.forEach((w, i) => {
+    if (!w.root) return;
+    const leaves: Leaf[] = [];
+    collectLeaves(w.root, leaves);
+    for (const l of leaves) allLeaves.push({ ws: i, leaf: l });
+  });
+
+  const wsStatusInfo = WS_STATUS_LABEL[surface.wsStatus];
+  const clock = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+
+  return (
+    <div className="flex h-full flex-col bg-term-bg text-term-fg">
+      <header
+        style={{ height: TOP_BAR_PX }}
+        className="flex shrink-0 items-center gap-3 border-b border-term-edge bg-term-panel px-2 text-[11px]"
+      >
+        {state.workspaces.map((w, i) => (
+          <button
+            key={i}
+            type="button"
+            onClick={() => dispatchFrom({ type: "keymap", action: { type: "ws", i } }, "pointer")}
+            className={`flex items-center gap-1 px-1 ${
+              i === state.active ? "text-term-accent" : "text-term-dim"
+            }`}
+          >
+            {i + 1}
+            <span aria-hidden="true">{w.root ? "●" : "○"}</span>
+          </button>
+        ))}
+        <span className={`ml-2 ${wsStatusInfo.cls}`}>
+          {wsStatusInfo.dot} {wsStatusInfo.text}
+        </span>
+        <select
+          value={theme}
+          onChange={(e) => {
+            applyTheme(e.target.value);
+            setTheme(e.target.value);
+          }}
+          className="ml-auto border border-term-edge bg-term-bg text-term-fg"
+        >
+          {THEMES.map((t) => (
+            <option key={t.id} value={t.id}>
+              {t.label}
+            </option>
+          ))}
+        </select>
+        <span className="tabular-nums text-term-dim">{clock}</span>
+      </header>
+      <div ref={containerRef} className="relative min-h-0 flex-1 overflow-hidden">
+        {allLeaves.map(({ ws: wsIdx, leaf }) => {
+          const isActiveWs = wsIdx === state.active;
+          const isZoomedOut = state.workspaces[wsIdx].zoom && leaf.id !== state.workspaces[wsIdx].focus;
+          const visible = isActiveWs && !isZoomedOut;
+          const rect = isActiveWs
+            ? state.workspaces[wsIdx].zoom
+              ? viewport
+              : (rectMap.get(leaf.id) ?? viewport)
+            : viewport;
+          const focused = isActiveWs && state.workspaces[wsIdx].focus === leaf.id;
+          return (
+            <div
+              key={leaf.id}
+              data-leaf-id={leaf.id}
+              data-pane-type={leaf.pane}
+              // Click coherence: pointing at a pane focuses it, so the accent
+              // border follows the mouse as well as the keyboard. Pointer-down
+              // (not click) so focus lands before any inner control reacts,
+              // and "pointer" source so this never warps the cursor — it is
+              // already exactly where the user put it.
+              onPointerDown={() => {
+                if (!isActiveWs || focused) return;
+                dispatchFrom({ type: "focusLeaf", leafId: leaf.id }, "pointer");
+              }}
+              style={{
+                position: "absolute",
+                left: rect.x,
+                top: rect.y,
+                width: rect.w,
+                height: rect.h,
+                display: visible ? "flex" : "none",
+                flexDirection: "column",
+              }}
+              className={`border ${focused ? "border-term-accent" : "border-term-edge"}`}
+            >
+              <div
+                style={{ height: TITLE_ROW_PX }}
+                className="flex shrink-0 items-center gap-1 border-b border-term-edge px-1 text-[10px] lowercase text-term-dim"
+              >
+                <span className="min-w-0 flex-1 truncate">{paneLabel(leaf)}</span>
+                <button
+                  type="button"
+                  aria-label={`close ${paneLabel(leaf)}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    dispatchFrom({ type: "closeLeaf", ws: wsIdx, leafId: leaf.id }, "pointer");
+                  }}
+                  className="shrink-0 px-1 leading-none text-term-dim hover:text-term-accent"
+                >
+                  ×
+                </button>
+              </div>
+              {/* tabIndex -1 makes this programmatically focusable (but not
+                  a Tab stop), so a non-term pane can take real keyboard
+                  focus and be scrolled/keyed without a click. */}
+              <div className="min-h-0 flex-1 outline-none" data-pane-body tabIndex={-1}>
+                <PaneBody leaf={leaf} visible={visible} surface={surface} />
+              </div>
+            </div>
+          );
+        })}
+        {!ws.zoom &&
+          boundaries.map((b, i) => (
+            <div
+              key={i}
+              onPointerDown={(e) => startDrag(b, e)}
+              style={
+                b.axis === "h"
+                  ? {
+                      position: "absolute",
+                      left: b.at - SPLITTER_HIT_PX / 2,
+                      top: b.from,
+                      width: SPLITTER_HIT_PX,
+                      height: b.to - b.from,
+                      cursor: "col-resize",
+                    }
+                  : {
+                      position: "absolute",
+                      left: b.from,
+                      top: b.at - SPLITTER_HIT_PX / 2,
+                      width: b.to - b.from,
+                      height: SPLITTER_HIT_PX,
+                      cursor: "row-resize",
+                    }
+              }
+            />
+          ))}
+        {allLeaves.length === 0 && (
+          <div className="flex h-full items-center justify-center text-term-dim">
+            ⌘ Return for a terminal · ⌘ p for the launcher
+          </div>
+        )}
+      </div>
+      {overlay === "launcher" && (
+        <Launcher
+          onClose={() => setOverlay(null)}
+          onOpenPane={(pane) => dispatchFrom({ type: "openPane", pane }, "keyboard")}
+          onOpenRunner={(runnerId) =>
+            dispatchFrom({ type: "openPane", pane: "term", params: { runnerId } }, "keyboard")
+          }
+        />
+      )}
+      {overlay === "cheatsheet" && <Cheatsheet onClose={() => setOverlay(null)} />}
+    </div>
+  );
+}

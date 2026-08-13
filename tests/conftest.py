@@ -15,6 +15,45 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 # ---------------------------------------------------------------------------
+# Exit watchdog (issue #384)
+# ---------------------------------------------------------------------------
+# The suite intermittently finishes (summary printed, coverage written) but the
+# process never exits — a lingering non-daemon thread or unclosed loop keeps
+# Python alive and CI hangs until the workflow timeout. A daemon timer armed at
+# session finish force-exits with the *real* pytest status after a grace
+# period; on a normal run the process exits first and the timer dies with it.
+# Before exiting it names the surviving non-daemon threads so the next hang
+# identifies its culprit instead of stalling silently.
+
+_EXIT_GRACE_SECONDS = 30.0
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    import os
+    import sys
+    import threading
+
+    def _force_exit() -> None:
+        stragglers = [
+            t.name
+            for t in threading.enumerate()
+            if t is not threading.current_thread() and not t.daemon and t.is_alive()
+        ]
+        print(
+            f"\n[conftest watchdog] process still alive {_EXIT_GRACE_SECONDS}s after "
+            f"session finish; non-daemon threads: {stragglers or 'none visible'}; "
+            f"forcing exit({exitstatus}). See issue #384.",
+            file=sys.stderr,
+            flush=True,
+        )
+        os._exit(exitstatus)
+
+    timer = threading.Timer(_EXIT_GRACE_SECONDS, _force_exit)
+    timer.daemon = True
+    timer.start()
+
+
+# ---------------------------------------------------------------------------
 # LLMResponse stub (mirrors the shape used by turing.llm)
 # ---------------------------------------------------------------------------
 

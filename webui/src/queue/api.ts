@@ -7,14 +7,13 @@
 // failure (best-effort: the authoritative state still arrives as a
 // `queue.delta` over the WS, so the UI never depends on this response).
 
+import { gatewayFetch } from "../desktop/gateway";
 import type { QueueItem } from "../ws";
 
 async function postCuration(path: string, body: unknown): Promise<QueueItem | null> {
   try {
-    const res = await fetch(path, {
+    const res = await gatewayFetch(path, {
       method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body ?? {}),
     });
     if (!res.ok) return null;
