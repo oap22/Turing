@@ -7,11 +7,12 @@ interface Props {
 
 const ROWS: ReadonlyArray<[string, string]> = [
   ["⌘ Return", "new terminal"],
-  ["⌘ w", "close focused pane"],
+  ["⌘ w", "close focused pane — or the workspace itself, when it's empty"],
   ["⌘ hjkl / arrows", "move focus"],
   ["⌘ shift + hjkl / arrows", "swap focused pane"],
-  ["⌘ 1..5", "switch workspace"],
-  ["⌘ shift + 1..5", "send focused pane to workspace"],
+  ["⌘ 1..9", "switch workspace"],
+  ["⌘ shift + 1..9", "send focused pane to workspace"],
+  ["⌘ n", "new workspace (past the seeded three, up to nine)"],
   ["⌘ f", "toggle zoom"],
   ["⌘ t", "toggle split direction (moved off ⌘j — collides with focus-down)"],
   ["⌘ -", "shrink focused pane"],

@@ -7,7 +7,9 @@
 // deliberately instead of by accident.
 //
 // What a session stores is exactly a `LayoutState`: the pane tree, pane types
-// and params, all five workspaces, and focus. It deliberately does NOT store
+// and params, every one of its workspaces (however many there are — the
+// count is no longer fixed, see `MIN_WORKSPACES`/`MAX_WORKSPACES` in
+// layout.ts), and focus. It deliberately does NOT store
 // anything live — no PTY handles, no scrollback, no running agent. Restoring a
 // session re-opens the same *shape* with fresh shells; process resurrection is
 // a different (much harder) feature and pretending to do it here would be a

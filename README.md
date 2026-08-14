@@ -36,8 +36,9 @@ cd ../desktop && npm ci && npm run dev     # opens the app (tauri dev)
 npm --prefix desktop run install-app       # build + (re)install /Applications/turing.app
 ```
 
-- **mod = ⌘**, omarchy semantics: ⌘Return terminal · ⌘W close · ⌘hjkl/arrows
-  focus (cursor warps with you) · ⌘⇧ move · ⌘1–5 workspaces · ⌘F zoom ·
+- **mod = ⌘**, omarchy semantics: ⌘Return terminal · ⌘W close (pane, or an
+  empty trailing workspace) · ⌘hjkl/arrows focus (cursor warps with you) ·
+  ⌘⇧ move · ⌘1–9 workspaces (3 seeded, ⌘N adds up to 9) · ⌘F zoom ·
   ⌘P launcher · ⌘/ cheatsheet. Layout persists.
 - **Data contract**: append `~/research-results/<run>/metrics.jsonl`
   (`{"step": n, "total_steps": N, "ts": t, ...numeric series}`) and charts move

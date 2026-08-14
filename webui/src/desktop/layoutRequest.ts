@@ -326,7 +326,7 @@ export function applyLayoutRequest(
     const compiled: Array<{ idx: number; proto: ProtoNode | null }> = [];
     for (const [key, spec] of Object.entries(req.workspaces)) {
       // 1-based on purpose: the file speaks in the numbers on the keys the
-      // user presses (⌘1..⌘5) and in the README's workspace table. A 0 here
+      // user presses (⌘1..⌘9) and in the README's workspace table. A 0 here
       // is out of range and rejects the request, which is a far better
       // failure than 0-based keys silently targeting the wrong workspace.
       if (!/^\d+$/.test(key)) return null;

@@ -4,6 +4,7 @@
 
 import { describe, expect, it } from "vitest";
 import { defaultLayout, emptyLayout, openPane, serialize, type LayoutState } from "../desktop/layout";
+import { layoutReducer } from "../desktop/DesktopShell";
 import {
   activeSession,
   createSession,
@@ -70,6 +71,49 @@ describe("save/load round-trip", () => {
     store = createSession(store, "new", layoutWith("b"), 2000, "s2");
     store = renameSession(store, "s1", "old", 3000);
     expect(listSessions(store).map((s) => s.id)).toEqual(["s1", "s2"]);
+  });
+});
+
+describe("legacy five-workspace sessions are not migrated on load", () => {
+  // A layout persisted before the seeded default shrank from five workspaces
+  // to three. `loadSessions`/`isValidLayoutState` must accept it exactly as
+  // it is — dropping the two extra workspaces here would be silent data loss
+  // for anyone who had panes open on ⌘4 or ⌘5 when they last quit. This used
+  // to be true only at load time and false again the moment the user did
+  // anything: the old prune rule swept every trailing empty workspace after
+  // *any* close or plain workspace switch, so a restored ws4/ws5-empty
+  // layout lost both on the very first ⌘W or ⌘-digit press. With pruning
+  // narrowed to "the active workspace just got emptied, and it's last," a
+  // close anywhere else in the layout can no longer touch ws4 or ws5 at all
+  // — see the second test below.
+  function fiveWorkspaceLayout(): LayoutState {
+    let state = layoutWith("a", "b");
+    while (state.workspaces.length < 5) {
+      state = { ...state, workspaces: [...state.workspaces, { root: null, focus: null, zoom: false }] };
+    }
+    return state;
+  }
+
+  it("round-trips a five-workspace session through localStorage unchanged", () => {
+    const layout = fiveWorkspaceLayout();
+    const store = createSession(emptyStore(), "old-style", layout, 1000, "s1");
+    const storage = memStorage();
+    saveSessions(storage, store);
+
+    const loaded = loadSessions(storage);
+    const restored = activeSession(loaded);
+    expect(restored?.layout.workspaces).toHaveLength(5);
+    expect(serialize(restored!.layout)).toBe(serialize(layout));
+  });
+
+  it("survives a close in a populated non-trailing workspace with all five workspaces intact", () => {
+    // ws0 (populated, non-trailing) is where the user is working; ws1..ws4
+    // are the empty leftovers from the old fixed-five scheme, including the
+    // trailing ws4. Closing a pane in ws0 must never reach for ws4 — pruning
+    // only ever looks at the *active* workspace.
+    const layout = { ...fiveWorkspaceLayout(), active: 0 };
+    const closed = layoutReducer(layout, { type: "keymap", action: { type: "close" } });
+    expect(closed.workspaces).toHaveLength(5);
   });
 });
 

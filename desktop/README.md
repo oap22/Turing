@@ -1,11 +1,12 @@
 # turing-desktop
 
 A Tauri 2 shell that hosts the `webui` React SPA and turns it into a
-keyboard-first, Hyprland/omarchy-style tiling operator surface: 5 numbered
-workspaces of binary-split panes, local PTY terminals, one-click runners,
-live metrics/flywheel/agent panes, and an authenticated Rust-side proxy to
-the `turing-gateway` so Queue/Chat/Observability stay live outside the
-browser. See issue #382 and `.plan-then-ship/SPEC.md` for the full design.
+keyboard-first, Hyprland/omarchy-style tiling operator surface: numbered
+workspaces (three seeded, growable up to nine with ⌘N) of binary-split
+panes, local PTY terminals, one-click runners, live metrics/flywheel/agent
+panes, and an authenticated Rust-side proxy to the `turing-gateway` so
+Queue/Chat/Observability stay live outside the browser. See issue #382 and
+`.plan-then-ship/SPEC.md` for the full design.
 
 It runs either from source (`npm run dev`) or as an installed
 `/Applications/turing.app` — see [Packaging](#packaging).
@@ -168,11 +169,12 @@ documents this too.
 | Keys | Action |
 |---|---|
 | ⌘ Return | new terminal |
-| ⌘ w | close focused pane |
+| ⌘ w | close focused pane — or, if the workspace is empty, close the workspace itself |
 | ⌘ hjkl / arrows | move focus |
 | ⌘ shift + hjkl / arrows | swap focused pane with the neighbor |
-| ⌘ 1..5 | switch workspace |
-| ⌘ shift + 1..5 | send focused pane to a workspace (you stay put) |
+| ⌘ 1..9 | switch workspace |
+| ⌘ shift + 1..9 | send focused pane to a workspace (you stay put) |
+| ⌘ n | new workspace (past the seeded three, up to nine) |
 | ⌘ f | toggle zoom (focused pane full-size) |
 | ⌘ t | toggle split direction *(moved off ⌘j — collides with focus-down)* |
 | ⌘ - / ⌘ = | shrink / grow focused pane |
@@ -182,11 +184,17 @@ documents this too.
 > in a focused terminal, ⌘k clears the buffer — use arrows/⌘↑ to focus upward from a terminal
 
 Focus follows the tiling focus, Hyprland-style: any keyboard action that moves
-focus (the six rows above through ⌘shift 1..5, plus opening a pane from the
+focus (the rows above through ⌘shift 1..9, plus opening a pane from the
 launcher) gives the newly focused pane real keyboard focus — a terminal starts
 accepting keystrokes with no click — and warps the mouse pointer to that pane's
 centre. Clicking a pane focuses it too, without moving the pointer; overlays
 (⌘p, ⌘/) and layout restore on launch never steal focus or the cursor.
+
+⌘W folds an empty *trailing* extra workspace away entirely (down to a floor of
+three seeded workspaces) — it never touches a workspace that still holds a
+pane, and never touches one that isn't last, so a middle workspace you're
+mid-setup on is never at risk. ⌘N and the header strip's trailing `+` button
+are the way back to a fourth workspace.
 
 ## Themes
 
@@ -198,17 +206,18 @@ Omarchy-style palettes, switched from the top-bar `<select>` (persists to
 ## Workspace presets (first launch only)
 
 `defaultLayout()` only seeds a brand-new install — once anything is
-persisted to `localStorage["turing.layout.v2"]` these presets never apply
-again, and every pane type below is always reachable via the ⌘p launcher
-regardless of what a workspace starts with.
+persisted to a saved session these presets never apply again, and every pane
+type below is always reachable via the ⌘p launcher regardless of what a
+workspace starts with. Exactly three workspaces are seeded; there is no
+seeded *empty* filler workspace anymore. Press ⌘N (or the header strip's
+trailing `+`) for a fourth, up to a ceiling of nine — and ⌘W folds it away
+again if you leave it empty.
 
 | Workspace | Preset |
 |---|---|
-| ⌘1 | code — two terminals, split |
-| ⌘2 | train — metrics / images / flywheel |
-| ⌘3 | empty |
-| ⌘4 | agents — agent session list / cross-session feed |
-| ⌘5 | empty |
+| ⌘1 | terminals — two shells, split |
+| ⌘2 | results — metrics / images / flywheel |
+| ⌘3 | agent debug — agent session list / cross-session feed |
 
 ## Panes
 
@@ -363,19 +372,24 @@ done before.
 ```json
 {
   "workspaces": {
-    "3": {
+    "4": {
       "dir": "h",
       "ratio": 0.65,
-      "panes": [{ "pane": "agents" }, { "pane": "agentfeed" }]
+      "panes": [{ "pane": "queue" }, { "pane": "chat" }]
     },
-    "4": null
+    "5": null
   },
-  "active": 3
+  "active": 4
 }
 ```
 
-That is the motivating case in one file: set up workspace 3 for agent
-observation, empty workspace 4, and switch to 3.
+That is the motivating case in one file: set up a fourth workspace beyond
+the seeded three, empty a fifth, and switch to the fourth. (Workspace 3 is
+already the agent-debug view by default now — the compiler is driven
+entirely by how many workspaces currently exist, not by a fixed count of
+five. Unlike ⌘N, a request cannot grow that count itself — see below — so
+this example presumes at least five workspaces already exist, created by
+pressing ⌘N twice or by an earlier request.)
 
 **The file is declarative.** It states the layout it wants; the app makes
 reality match. There are no imperative "open a pane" / "close a pane"
@@ -391,8 +405,10 @@ loop would kill the test run it had just started. Changing a ratio likewise
 re-splits without disturbing the panes. Your focused pane and a hand-set
 `⌘f` zoom both survive a re-apply.
 
-**Workspace keys are the numbers you press `⌘` with, `"1"` through `"5"`** —
-the same numbers as the workspace table above, not 0-based indices.
+**Workspace keys are the numbers you press `⌘` with, `"1"` through `"9"`** —
+the same numbers as the workspace table above, not 0-based indices. A key
+naming a workspace beyond however many currently exist rejects the whole
+request; create it first with ⌘N (or a prior request) if you need it.
 
 **A workspace the file mentions is replaced wholesale; one it does not
 mention is left completely alone.** That is what lets a file rearrange

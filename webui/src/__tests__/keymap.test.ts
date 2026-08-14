@@ -55,21 +55,38 @@ describe("actionFor", () => {
     expect(actionFor(key("!", { shiftKey: true }))).toEqual({ type: "sendWs", i: 0 });
   });
 
-  it("real macOS shifted-digit symbols map to workspaces 1..5", () => {
-    const symbols = ["!", "@", "#", "$", "%"];
+  it("real macOS shifted-digit symbols map to workspaces 1..9", () => {
+    const symbols = ["!", "@", "#", "$", "%", "^", "&", "*", "("];
     symbols.forEach((sym, idx) => {
       expect(actionFor(key(sym, { shiftKey: true }))).toEqual({ type: "sendWs", i: idx });
     });
   });
 
-  it("digits 1..5 switch workspace, shift+digit sends to it", () => {
-    for (let i = 1; i <= 5; i++) {
+  it("digits 1..9 switch workspace, shift+digit sends to it", () => {
+    for (let i = 1; i <= 9; i++) {
       expect(actionFor(key(String(i)))).toEqual({ type: "ws", i: i - 1 });
       expect(actionFor(key(String(i), { shiftKey: true }))).toEqual({
         type: "sendWs",
         i: i - 1,
       });
     }
+  });
+
+  it("⌘6..⌘9 switch to workspaces 5..8, ⌘⇧6..⌘⇧9 send to them", () => {
+    // Called out separately from the 1..9 loop above because these are the
+    // indices that only exist once ⌘N has grown the workspace count past the
+    // seeded three — the whole point of widening the keymap.
+    for (let i = 6; i <= 9; i++) {
+      expect(actionFor(key(String(i)))).toEqual({ type: "ws", i: i - 1 });
+    }
+    const shiftedTail: Record<string, number> = { "^": 5, "&": 6, "*": 7, "(": 8 };
+    for (const [sym, i] of Object.entries(shiftedTail)) {
+      expect(actionFor(key(sym, { shiftKey: true }))).toEqual({ type: "sendWs", i });
+    }
+  });
+
+  it("⌘n creates a new workspace", () => {
+    expect(actionFor(key("n"))).toEqual({ type: "newWs" });
   });
 
   it("⌘f toggles zoom", () => {
@@ -89,7 +106,7 @@ describe("actionFor", () => {
     expect(actionFor(key("p"))).toEqual({ type: "launcher" });
   });
 
-  it("⌘0 goes home, without disturbing the ⌘1–5 workspace keys", () => {
+  it("⌘0 goes home, without disturbing the ⌘1–9 workspace keys", () => {
     expect(actionFor(key("0"))).toEqual({ type: "home" });
     expect(actionFor(key("1"))).toEqual({ type: "ws", i: 0 });
   });
@@ -136,5 +153,9 @@ describe("movesFocus", () => {
   it("is false for the overlay actions", () => {
     expect(movesFocus({ type: "launcher" })).toBe(false);
     expect(movesFocus({ type: "cheatsheet" })).toBe(false);
+  });
+
+  it("is false for newWs — it switches to a workspace with no leaf to focus", () => {
+    expect(movesFocus({ type: "newWs" })).toBe(false);
   });
 });

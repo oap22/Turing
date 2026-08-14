@@ -47,7 +47,20 @@ export type LayoutState = { workspaces: Workspace[]; active: number };
 
 export type Rect = { x: number; y: number; w: number; h: number };
 
-const WORKSPACE_COUNT = 5;
+// The workspace count is no longer fixed. `MIN_WORKSPACES` is the floor
+// `closeEmptyActiveWorkspace()` will never cross — the three seeded
+// workspaces below are always there even if every one of them is emptied
+// out by hand.
+// `MAX_WORKSPACES` is the ceiling `addWorkspace()` stops at: ⌘0 is already
+// claimed by Home, so 9 is as far as a direct ⌘-digit chord can reach anyway.
+export const MIN_WORKSPACES = 3;
+export const MAX_WORKSPACES = 9;
+// How many empty workspaces `emptyLayout()` seeds. Kept as its own name
+// rather than reusing `MIN_WORKSPACES` at every call site: the two happen to
+// be the same number today, but one is "the fewest you may ever prune down
+// to" and the other is "how many a brand-new layout starts with" — different
+// questions that should be free to diverge later without a silent coupling.
+const DEFAULT_WORKSPACE_COUNT = MIN_WORKSPACES;
 // A nominal 16:9 viewport used whenever layout math needs concrete pixels
 // (dwindle split-direction choice, spatial focus navigation) but no real
 // viewport is available (e.g. from a reducer action, off-screen).
@@ -61,7 +74,7 @@ export function nextId(): string {
 
 export function emptyLayout(): LayoutState {
   const workspaces: Workspace[] = [];
-  for (let i = 0; i < WORKSPACE_COUNT; i++) {
+  for (let i = 0; i < DEFAULT_WORKSPACE_COUNT; i++) {
     workspaces.push({ root: null, focus: null, zoom: false });
   }
   return { workspaces, active: 0 };
@@ -79,11 +92,18 @@ function split(dir: "h" | "v", ratio: number, a: Node, b: Node): Split {
   return { kind: "split", dir, ratio, a, b };
 }
 
-// First-launch preset. Note ws2 (⌘3) is intentionally left empty — queue,
-// chat, and obs remain fully available via the ⌘P launcher, this only
-// changes what greets a brand-new install. Existing persisted layouts
-// (`localStorage["turing.layout.v2"]`) are untouched by this default; it
-// only applies when there's nothing to restore.
+// First-launch preset — three seeded workspaces, not five. ws0 is the two
+// terminals you land on; ws1 is the results view (metrics beside
+// images/flywheel); ws2 is the agent debug view (agents beside the agent
+// feed), which used to sit at ⌘4 back when there was a fixed five-workspace
+// spread. queue, chat and obs are still not preset at all — they stay
+// reachable via the ⌘P launcher — and there is no seeded *empty* workspace
+// anymore either: press ⌘N when you actually want a fourth one, and it
+// folds away on its own (`closeEmptyActiveWorkspace`) the moment you close
+// out of it while it is still empty.
+// Existing persisted layouts (`localStorage["turing.sessions.v1"]`, and the
+// legacy `turing.layout.v2`) are untouched by this default; it only applies
+// when there's nothing to restore.
 export function defaultLayout(): LayoutState {
   const state = emptyLayout();
 
@@ -98,13 +118,11 @@ export function defaultLayout(): LayoutState {
 
   const agents = leaf("agents", nextId());
   const agentfeed = leaf("agentfeed", nextId());
-  const ws3Root = split("h", 0.65, agents, agentfeed);
+  const ws2Root = split("h", 0.65, agents, agentfeed);
 
   state.workspaces[0] = { root: ws0Root, focus: t1.id, zoom: false };
   state.workspaces[1] = { root: ws1Root, focus: metrics.id, zoom: false };
-  state.workspaces[2] = { root: null, focus: null, zoom: false };
-  state.workspaces[3] = { root: ws3Root, focus: agents.id, zoom: false };
-  state.workspaces[4] = { root: null, focus: null, zoom: false };
+  state.workspaces[2] = { root: ws2Root, focus: agents.id, zoom: false };
   return state;
 }
 
@@ -112,7 +130,7 @@ export function defaultLayout(): LayoutState {
 // handed over to the loop terminal: instead of two plain shells it gets a
 // loop terminal (carrying the `rsi` params TermPane reads to pre-type
 // `scripts/rsi-loop.sh`) alongside a scratch terminal for poking around the
-// sandbox by hand. ws1 (metrics/images/flywheel) and ws3 (agents/agentfeed)
+// sandbox by hand. ws1 (metrics/images/flywheel) and ws2 (agents/agentfeed)
 // are identical to `defaultLayout()`'s — those are the panes that watch the
 // loop's results stream in, unchanged by what's driving it.
 export function rsiLayout(slug: string, problem: string): LayoutState {
@@ -129,13 +147,11 @@ export function rsiLayout(slug: string, problem: string): LayoutState {
 
   const agents = leaf("agents", nextId());
   const agentfeed = leaf("agentfeed", nextId());
-  const ws3Root = split("h", 0.65, agents, agentfeed);
+  const ws2Root = split("h", 0.65, agents, agentfeed);
 
   state.workspaces[0] = { root: ws0Root, focus: loopTerm.id, zoom: false };
   state.workspaces[1] = { root: ws1Root, focus: metrics.id, zoom: false };
-  state.workspaces[2] = { root: null, focus: null, zoom: false };
-  state.workspaces[3] = { root: ws3Root, focus: agents.id, zoom: false };
-  state.workspaces[4] = { root: null, focus: null, zoom: false };
+  state.workspaces[2] = { root: ws2Root, focus: agents.id, zoom: false };
   state.active = 0;
   return state;
 }
@@ -511,6 +527,67 @@ export function toggleZoom(state: LayoutState): LayoutState {
   return updateWs(state, state.active, { ...ws, zoom: !ws.zoom });
 }
 
+// Creates a workspace beyond the seeded three and switches to it in one
+// step: pressing ⌘N is "I want a place to put something new," not "add a
+// row to the header strip," so landing anywhere else would just make the
+// user press ⌘9 (or whatever the new index is) right afterward. No-ops —
+// returning the very same `state` object — at `MAX_WORKSPACES`, which lets a
+// caller tell "did this do anything" with `===` instead of re-deriving it
+// from array length.
+export function addWorkspace(state: LayoutState): LayoutState {
+  if (state.workspaces.length >= MAX_WORKSPACES) return state;
+  const workspaces = [
+    ...state.workspaces,
+    { root: null, focus: null, zoom: false },
+  ];
+  return { workspaces, active: workspaces.length - 1 };
+}
+
+// Folds away the single workspace the user just emptied out of, and nothing
+// else. This replaces an earlier version that swept *every* trailing empty
+// workspace after *any* close or plain workspace switch, which had two bugs
+// baked into the rule itself: ⌘N followed by glancing at ⌘1 destroyed the
+// workspace ⌘N had just created (switching away lifted the "never drop
+// active" guard, so the fresh empty ws4 vanished the instant it stopped
+// being active — before the user had touched it at all), and a legacy
+// five-workspace layout lost ws5 and then ws4 on the very first close or
+// switch after restoring it, because a plain switch was enough to trigger
+// the sweep.
+//
+// The fix is to prune only in direct response to the one action that can
+// make a *specific* workspace disposable: closing something out of it. The
+// condition is narrow on purpose — active, last, and empty — because that is
+// the only shape that is unambiguous: the workspace the user is standing in,
+// at the end of the row, with nothing left in it. Nothing about switching
+// workspaces, and nothing about any workspace other than the active one, is
+// ever enough to trigger this. `MIN_WORKSPACES` is still the floor — the
+// seeded three never fold away no matter how empty they get.
+//
+// This one rule is also what makes ⌘W double as "close the workspace" when
+// there is no pane left to close: ⌘W closes the focused *thing*, and when a
+// workspace is empty there is no leaf to focus, so `closeFocused` is
+// already a no-op there — the workspace itself is the thing left to close,
+// and this is what closes it. Same call, same helper, no special case.
+//
+// Returns the same `state` object when the active workspace does not
+// qualify, which is what lets this be called unconditionally after every
+// action that could plausibly have just emptied it — see `DesktopShell.tsx`
+// — without forcing an extra re-render each time.
+export function closeEmptyActiveWorkspace(state: LayoutState): LayoutState {
+  const lastIndex = state.workspaces.length - 1;
+  if (
+    state.workspaces.length <= MIN_WORKSPACES ||
+    state.active !== lastIndex ||
+    state.workspaces[lastIndex].root !== null
+  ) {
+    return state;
+  }
+  return {
+    workspaces: state.workspaces.slice(0, lastIndex),
+    active: lastIndex - 1,
+  };
+}
+
 export function switchWs(state: LayoutState, i: number): LayoutState {
   if (i < 0 || i >= state.workspaces.length) return state;
   return { ...state, active: i };
@@ -589,16 +666,28 @@ function isWorkspace(x: unknown): x is Workspace {
 // (nested inside a stored session) without re-serializing it just to hand it
 // to `deserialize`, and without growing a second definition of "is this a
 // layout" that could drift from this one.
+// Accepts any workspace count from `MIN_WORKSPACES` through `MAX_WORKSPACES`
+// inclusive — not just `DEFAULT_WORKSPACE_COUNT`. This is deliberately NOT a
+// migration point: a layout persisted back when the preset seeded five
+// workspaces validates and loads exactly as it was written, five workspaces
+// and all. Nothing here truncates or pads an existing layout to the new
+// default; only `defaultLayout()`/`rsiLayout()` (brand-new layouts, nothing
+// to restore) seed three. Dropping a returning user's fourth and fifth
+// workspace on load would be silent data loss dressed up as a migration.
 export function isValidLayoutState(x: unknown): x is LayoutState {
   if (!x || typeof x !== "object") return false;
   const o = x as Record<string, unknown>;
-  if (!Array.isArray(o.workspaces) || o.workspaces.length !== WORKSPACE_COUNT)
+  if (
+    !Array.isArray(o.workspaces) ||
+    o.workspaces.length < MIN_WORKSPACES ||
+    o.workspaces.length > MAX_WORKSPACES
+  )
     return false;
   if (!o.workspaces.every(isWorkspace)) return false;
   return (
     Number.isInteger(o.active) &&
     (o.active as number) >= 0 &&
-    (o.active as number) < WORKSPACE_COUNT
+    (o.active as number) < o.workspaces.length
   );
 }
 

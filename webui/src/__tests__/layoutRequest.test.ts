@@ -12,10 +12,22 @@ import {
 import {
   type LayoutState,
   type Node,
+  addWorkspace,
   defaultLayout,
   isValidLayoutState,
   seedIds,
 } from "../desktop/layout";
+
+// `defaultLayout()` now seeds only three workspaces, all of them populated.
+// Several of the tests below exercise workspace numbers past that (⌘4, ⌘5)
+// to prove the compiler is driven entirely by `state.workspaces.length`, not
+// a baked-in count — so they need a workspace beyond the seeded three to
+// exist first, the same way pressing ⌘N would create one.
+function withExtraWorkspaces(n: number): LayoutState {
+  let state = defaultLayout();
+  for (let i = 0; i < n; i++) state = addWorkspace(state);
+  return state;
+}
 
 function leaves(node: Node | null): Node[] {
   if (!node) return [];
@@ -36,22 +48,26 @@ function allIds(state: LayoutState): string[] {
 
 describe("applyLayoutRequest — the motivating case", () => {
   it("sets up one workspace and empties another in a single file", () => {
-    const before = defaultLayout();
+    // ⌘3 (index 2) is already the agents/agentfeed shape in the new default,
+    // so this test needs workspaces the request can actually *change*: the
+    // 4th workspace (⌘4, added the way ⌘N would) starts empty, and ⌘2 (the
+    // results view) starts populated.
+    const before = withExtraWorkspaces(1);
     const next = applyLayoutRequest(before, {
       workspaces: {
-        "3": {
+        "4": {
           panes: [{ pane: "agents" }, { pane: "agentfeed" }],
           dir: "h",
           ratio: 0.65,
         },
-        "4": null,
+        "2": null,
       },
     });
     expect(next).not.toBeNull();
-    // ⌘3 is index 2, ⌘4 is index 3 — the file speaks in the numbers on the keys.
-    expect(paneNames(next!, 2)).toEqual(["agents", "agentfeed"]);
-    expect(next!.workspaces[3].root).toBeNull();
-    expect(next!.workspaces[3].focus).toBeNull();
+    // ⌘4 is index 3, ⌘2 is index 1 — the file speaks in the numbers on the keys.
+    expect(paneNames(next!, 3)).toEqual(["agents", "agentfeed"]);
+    expect(next!.workspaces[1].root).toBeNull();
+    expect(next!.workspaces[1].focus).toBeNull();
   });
 
   it("leaves workspaces the file does not mention alone", () => {
@@ -73,7 +89,11 @@ describe("applyLayoutRequest — the motivating case", () => {
   });
 
   it("switches the visible workspace when asked", () => {
-    const next = applyLayoutRequest(defaultLayout(), { active: 4 });
+    // `active: 0` here, not whatever `addWorkspace` left it at, so the
+    // request to move to workspace 4 is a genuine change rather than a
+    // same-index no-op.
+    const before = { ...withExtraWorkspaces(1), active: 0 };
+    const next = applyLayoutRequest(before, { active: 4 });
     expect(next?.active).toBe(3);
   });
 
@@ -90,7 +110,8 @@ describe("applyLayoutRequest — tree shapes", () => {
   it("builds an explicit nested tree with directions and ratios", () => {
     // Workspace 5 (index 4), which starts empty — asking for this exact shape
     // on ⌘2 would be a no-op, since it is what defaultLayout() already has.
-    const next = applyLayoutRequest(defaultLayout(), {
+    // Needs a 5th workspace beyond the seeded three, same as ⌘N would create.
+    const next = applyLayoutRequest(withExtraWorkspaces(2), {
       workspaces: {
         "5": {
           tree: {

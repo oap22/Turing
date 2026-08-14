@@ -3,6 +3,8 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  addWorkspace,
+  closeEmptyActiveWorkspace,
   closeFocused,
   closeLeafById,
   defaultLayout,
@@ -11,6 +13,8 @@ import {
   focusEffect,
   focusLeaf,
   isValidLayoutState,
+  MAX_WORKSPACES,
+  MIN_WORKSPACES,
   moveFocus,
   openPane,
   resize,
@@ -269,16 +273,174 @@ describe("serialize / deserialize", () => {
   });
 });
 
+describe("isValidLayoutState", () => {
+  function withWorkspaceCount(n: number): Record<string, unknown> {
+    return {
+      workspaces: Array.from({ length: n }, () => ({
+        root: null,
+        focus: null,
+        zoom: false,
+      })),
+      active: 0,
+    };
+  }
+
+  it("accepts a legacy five-workspace blob — a returning user's layout is not migrated on load", () => {
+    expect(isValidLayoutState(withWorkspaceCount(5))).toBe(true);
+  });
+
+  it("accepts the new three-workspace default", () => {
+    expect(isValidLayoutState(withWorkspaceCount(3))).toBe(true);
+  });
+
+  it("rejects a length below MIN_WORKSPACES", () => {
+    expect(isValidLayoutState(withWorkspaceCount(2))).toBe(false);
+  });
+
+  it("rejects a length above MAX_WORKSPACES", () => {
+    expect(isValidLayoutState(withWorkspaceCount(10))).toBe(false);
+  });
+
+  it("bounds `active` against the actual array length, not a constant", () => {
+    expect(isValidLayoutState({ ...withWorkspaceCount(5), active: 4 })).toBe(true);
+    expect(isValidLayoutState({ ...withWorkspaceCount(5), active: 5 })).toBe(false);
+    expect(isValidLayoutState({ ...withWorkspaceCount(3), active: 2 })).toBe(true);
+    expect(isValidLayoutState({ ...withWorkspaceCount(3), active: 3 })).toBe(false);
+  });
+});
+
 describe("defaultLayout", () => {
-  it("leaves ws2 (⌘3) empty on first launch; queue/chat/obs stay reachable via the launcher, not preset here", () => {
+  it("seeds exactly three workspaces: terminals, results, agent debug — no empty filler workspace", () => {
     const state = defaultLayout();
-    expect(state.workspaces).toHaveLength(5);
-    expect(state.workspaces[2]).toEqual({ root: null, focus: null, zoom: false });
-    // The other presets are unchanged: ws0/ws1/ws3 populated, ws4 empty.
-    expect(state.workspaces[0].root).not.toBeNull();
-    expect(state.workspaces[1].root).not.toBeNull();
-    expect(state.workspaces[3].root).not.toBeNull();
-    expect(state.workspaces[4]).toEqual({ root: null, focus: null, zoom: false });
+    expect(state.workspaces).toHaveLength(3);
+    expect(state.active).toBe(0);
+
+    // ws0: two terminals, split h 0.5, focused on the first.
+    const ws0 = state.workspaces[0];
+    expect(ws0.root).toMatchObject({ kind: "split", dir: "h", ratio: 0.5 });
+    if (ws0.root?.kind === "split" && ws0.root.a.kind === "leaf") {
+      expect(ws0.root.a).toMatchObject({ kind: "leaf", pane: "term" });
+      expect(ws0.root.b).toMatchObject({ kind: "leaf", pane: "term" });
+      expect(ws0.focus).toBe(ws0.root.a.id);
+    }
+
+    // ws1: the results view — metrics | (images / flywheel).
+    const ws1 = state.workspaces[1];
+    expect(ws1.root).toMatchObject({ kind: "split", dir: "h", ratio: 0.55 });
+    if (ws1.root?.kind === "split" && ws1.root.a.kind === "leaf") {
+      expect(ws1.root.a).toMatchObject({ kind: "leaf", pane: "metrics" });
+      expect(ws1.root.b).toMatchObject({ kind: "split", dir: "v", ratio: 0.5 });
+      expect(ws1.focus).toBe(ws1.root.a.id);
+      if (ws1.root.b.kind === "split") {
+        expect(ws1.root.b.a).toMatchObject({ kind: "leaf", pane: "images" });
+        expect(ws1.root.b.b).toMatchObject({ kind: "leaf", pane: "flywheel" });
+      }
+    }
+
+    // ws2: the agent debug view — what used to live at ⌘4.
+    const ws2 = state.workspaces[2];
+    expect(ws2.root).toMatchObject({ kind: "split", dir: "h", ratio: 0.65 });
+    if (ws2.root?.kind === "split" && ws2.root.a.kind === "leaf") {
+      expect(ws2.root.a).toMatchObject({ kind: "leaf", pane: "agents" });
+      expect(ws2.root.b).toMatchObject({ kind: "leaf", pane: "agentfeed" });
+      expect(ws2.focus).toBe(ws2.root.a.id);
+    }
+  });
+});
+
+describe("emptyLayout", () => {
+  it("seeds MIN_WORKSPACES empty workspaces, all-null and active on the first", () => {
+    const state = emptyLayout();
+    expect(state.workspaces).toHaveLength(MIN_WORKSPACES);
+    expect(state.active).toBe(0);
+    for (const ws of state.workspaces) {
+      expect(ws).toEqual({ root: null, focus: null, zoom: false });
+    }
+  });
+});
+
+describe("addWorkspace", () => {
+  it("appends one empty workspace and focuses it", () => {
+    const before = defaultLayout();
+    const after = addWorkspace(before);
+    expect(after.workspaces).toHaveLength(before.workspaces.length + 1);
+    expect(after.active).toBe(after.workspaces.length - 1);
+    expect(after.workspaces[after.active]).toEqual({
+      root: null,
+      focus: null,
+      zoom: false,
+    });
+    // Every existing workspace survives untouched.
+    before.workspaces.forEach((ws, i) => expect(after.workspaces[i]).toBe(ws));
+  });
+
+  it("no-ops at MAX_WORKSPACES, returning the very same state object", () => {
+    let state = defaultLayout();
+    while (state.workspaces.length < MAX_WORKSPACES) {
+      state = addWorkspace(state);
+    }
+    expect(state.workspaces).toHaveLength(MAX_WORKSPACES);
+    expect(addWorkspace(state)).toBe(state);
+  });
+});
+
+describe("closeEmptyActiveWorkspace", () => {
+  // The rule this replaces used to sweep every trailing empty workspace
+  // after *any* close or plain workspace switch. That swept away a
+  // workspace ⌘N had just created the instant the user glanced elsewhere
+  // (switching away lifted the only guard protecting it), and it silently
+  // shrank a returning user's legacy five-workspace layout on their first
+  // close or switch. The replacement only ever acts on the workspace the
+  // user is currently standing in, and only when it is both last and empty.
+
+  it("drops a trailing empty ACTIVE workspace above the floor", () => {
+    let state = defaultLayout(); // 3 populated
+    state = addWorkspace(state); // ws4 (index 3), empty, and active
+    expect(state.active).toBe(3);
+    const next = closeEmptyActiveWorkspace(state);
+    expect(next.workspaces).toHaveLength(3);
+    expect(next.active).toBe(2);
+  });
+
+  it("does NOT drop a trailing empty workspace that is not active", () => {
+    let state = defaultLayout();
+    state = addWorkspace(state); // ws4, empty, active
+    state = switchWs(state, 0); // step off it — ws4 is now trailing, empty, and NOT active
+    expect(state.workspaces).toHaveLength(4);
+    const next = closeEmptyActiveWorkspace(state);
+    expect(next).toBe(state); // same reference: nothing qualifies
+    expect(next.workspaces).toHaveLength(4);
+  });
+
+  it("never drops below MIN_WORKSPACES even when the active workspace is empty", () => {
+    // All-empty and already at the floor: nothing eligible to trim without
+    // going under MIN_WORKSPACES, so this must be a true no-op.
+    const state = emptyLayout();
+    expect(state.workspaces).toHaveLength(MIN_WORKSPACES);
+    expect(closeEmptyActiveWorkspace(state)).toBe(state);
+  });
+
+  it("does NOT drop a non-trailing empty workspace, even if it is active", () => {
+    let state = defaultLayout();
+    state = addWorkspace(state); // ws4, empty
+    state = addWorkspace(state); // ws5, empty, active
+    state = switchWs(state, 3); // ws4 (index 3) is now active, but not last
+    const next = closeEmptyActiveWorkspace(state);
+    expect(next).toBe(state);
+    expect(next.workspaces).toHaveLength(5);
+  });
+
+  it("is the identity (same reference) when nothing qualifies", () => {
+    const state = defaultLayout();
+    expect(closeEmptyActiveWorkspace(state)).toBe(state);
+  });
+
+  it("leaves `active` pointing at a valid workspace after dropping", () => {
+    let state = defaultLayout();
+    state = addWorkspace(state);
+    const next = closeEmptyActiveWorkspace(state);
+    expect(next.active).toBeGreaterThanOrEqual(0);
+    expect(next.active).toBeLessThan(next.workspaces.length);
   });
 });
 
@@ -425,9 +587,10 @@ describe("rsiLayout", () => {
     }
   });
 
-  it("mirrors defaultLayout's ws1 and ws3 shapes", () => {
+  it("mirrors defaultLayout's ws1 (results) and ws2 (agent debug) shapes, and has exactly three workspaces", () => {
     const rsi = rsiLayout("demo", "solve x");
     const def = defaultLayout();
+    expect(rsi.workspaces).toHaveLength(3);
 
     function paneShape(node: ReturnType<typeof rsiLayout>["workspaces"][number]["root"]): unknown {
       if (!node) return null;
@@ -436,9 +599,7 @@ describe("rsiLayout", () => {
     }
 
     expect(paneShape(rsi.workspaces[1].root)).toEqual(paneShape(def.workspaces[1].root));
-    expect(paneShape(rsi.workspaces[3].root)).toEqual(paneShape(def.workspaces[3].root));
-    expect(rsi.workspaces[2].root).toBeNull();
-    expect(rsi.workspaces[4].root).toBeNull();
+    expect(paneShape(rsi.workspaces[2].root)).toEqual(paneShape(def.workspaces[2].root));
   });
 
   it("preserves the leaf params of the loop terminal through serialize/deserialize", () => {

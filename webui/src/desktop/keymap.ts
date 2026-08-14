@@ -8,6 +8,7 @@ export type Dir4 = "left" | "right" | "up" | "down";
 
 export type Action =
   | { type: "newTerm" }
+  | { type: "newWs" }
   | { type: "close" }
   | { type: "focus"; dir: Dir4 }
   | { type: "swap"; dir: Dir4 }
@@ -19,7 +20,7 @@ export type Action =
   | { type: "cheatsheet" }
   | { type: "launcher" }
   // Back to the home page (the workstation list). ⌘0 rather than a letter:
-  // every ⌘-letter worth having is spoken for, and 0 sits next to the ⌘1–5
+  // every ⌘-letter worth having is spoken for, and 0 sits next to the ⌘1–9
   // workspace keys it is the "all of them, from outside" companion to.
   | { type: "home" };
 
@@ -51,6 +52,15 @@ export function movesFocus(a: Action): boolean {
     case "newTerm":
     case "close":
       return true;
+    // `newWs` switches to a workspace that is empty by construction — there
+    // is no leaf anywhere in it yet, so there is nothing for the cursor to
+    // warp to. Contrast with `ws`, which returns true even though the target
+    // workspace *might* also be empty: `ws` visits a workspace that could
+    // already hold something, so DOM focus still needs to try. `newWs` never
+    // has that case, so it is false unconditionally rather than "true but a
+    // no-op most of the time."
+    case "newWs":
+      return false;
     default:
       return false;
   }
@@ -80,13 +90,19 @@ const FOCUS_KEYS: Record<string, Dir4> = {
 // digit arrives as its shifted symbol on a US layout ("!" for ⌘⇧1). Map
 // those symbols back to the workspace index they correspond to, while still
 // accepting a plain shifted digit (some layouts/browsers report that
-// instead).
+// instead). Covers 1..9 now that the workspace count can grow past five —
+// ⌘⇧6 through ⌘⇧9 send to a workspace that only exists once ⌘N has created
+// it, same as their unshifted counterparts.
 const SHIFTED_DIGIT_SYMBOLS: Record<string, number> = {
   "!": 1,
   "@": 2,
   "#": 3,
   $: 4,
   "%": 5,
+  "^": 6,
+  "&": 7,
+  "*": 8,
+  "(": 9,
 };
 
 export function actionFor(e: KeyEventLike): Action | null {
@@ -101,6 +117,7 @@ export function actionFor(e: KeyEventLike): Action | null {
   if (key === "f") return { type: "zoom" };
   if (key === "t") return { type: "toggleDir" };
   if (key === "p") return { type: "launcher" };
+  if (key === "n") return { type: "newWs" };
   if (key === "0") return { type: "home" };
   if (key === "/") return { type: "cheatsheet" };
   if (key === "-") return { type: "resize", delta: -0.05 };
@@ -109,7 +126,13 @@ export function actionFor(e: KeyEventLike): Action | null {
   const dir = FOCUS_KEYS[key];
   if (dir) return e.shiftKey ? { type: "swap", dir } : { type: "focus", dir };
 
-  if (/^[1-5]$/.test(key)) {
+  // 1..9, not 1..5: the workspace count can now grow past the seeded three
+  // (via ⌘N, up to `MAX_WORKSPACES`), and every direct ⌘-digit chord should
+  // be able to reach one once it exists. `switchWs`/`sendToWs` themselves
+  // guard against an index past the *current* workspace count, so pressing
+  // ⌘7 with only three workspaces open is a harmless no-op rather than
+  // something this layer needs to know about.
+  if (/^[1-9]$/.test(key)) {
     const i = Number(key) - 1;
     return e.shiftKey ? { type: "sendWs", i } : { type: "ws", i };
   }

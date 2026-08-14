@@ -271,13 +271,14 @@ describe("Home", () => {
       layout = openPane(layout, "metrics", undefined, "c");
       const session = createSession(emptyStore(), "x", layout, 1, "s").sessions.s;
       expect(paneSummary(session)).toBe("2 term · metrics");
-      expect(workspaceMarks(session)).toBe("●····");
+      // `emptyLayout()` now seeds MIN_WORKSPACES (3) workspaces, not 5.
+      expect(workspaceMarks(session)).toBe("●··");
     });
 
     it("says so when a workstation has no panes at all", () => {
       const session = createSession(emptyStore(), "x", emptyLayout(), 1, "s").sessions.s;
       expect(paneSummary(session)).toBe("empty");
-      expect(workspaceMarks(session)).toBe("·····");
+      expect(workspaceMarks(session)).toBe("···");
     });
 
     it("reports recency coarsely", () => {

@@ -23,11 +23,14 @@ import {
   type PaneFocusDetail,
 } from "./keymap";
 import {
+  addWorkspace,
+  closeEmptyActiveWorkspace,
   closeFocused,
   closeLeafById,
   defaultLayout,
   focusEffect,
   focusLeaf,
+  MAX_WORKSPACES,
   moveFocus,
   openPane,
   rects,
@@ -94,7 +97,11 @@ interface Props {
   surface: Surface;
 }
 
-type ShellAction =
+// Exported (along with `layoutReducer` below) so the pruning wiring — which
+// action types can trigger `closeEmptyActiveWorkspace` — is unit-testable
+// the same way `layout.ts`'s pure functions are, rather than only through a
+// full component render.
+export type ShellAction =
   | { type: "keymap"; action: Action }
   | { type: "openPane"; pane: PaneType; params?: Record<string, unknown> }
   | { type: "setRoot"; ws: number; root: Node }
@@ -103,7 +110,56 @@ type ShellAction =
   | { type: "setLayout"; layout: LayoutState }
   | { type: "layoutRequest"; req: unknown };
 
-function layoutReducer(state: LayoutState, action: ShellAction): LayoutState {
+// Whether `closeEmptyActiveWorkspace` should be given a chance to fold the
+// active workspace away.
+//
+// This used to be decided from the ACTION TYPE alone — "could a `closeLeaf`,
+// `layoutRequest`, or keymap `close` have emptied something, so give the fold
+// a look every time one of those runs." That was the bug: the fold itself
+// only re-checks the RESULTING state ("is the active workspace empty and
+// last"), never whether *this* action is what emptied it. So ⌘N creates ws4
+// (empty, active), and then any `layoutRequest` that edits a completely
+// different workspace and happens to omit `active` — which leaves `active`
+// sitting on ws4 — or any `closeLeaf` targeting a leaf in some other
+// workspace, gets waved through by the type check and the fold destroys ws4
+// anyway, even though neither action ever touched it. Same failure mode as
+// the plain-workspace-switch bug this replaced (see `closeEmptyActiveWorkspace`
+// in layout.ts): a trigger keyed off "what kind of action is this" instead of
+// "did this action actually do the thing" will eventually fire on an action
+// that didn't.
+//
+// The fix compares BEFORE/AFTER state, which only the wrapper here can see
+// (the pure reducer functions in layout.ts each see one side or the other,
+// never both). Fold when either:
+//   (a) the active workspace's index didn't change, and its `root` went from
+//       non-null before to null after — this action is what emptied it; or
+//   (b) the action is the keymap `close` (⌘W) — the explicit "dispose of
+//       this" gesture, which must still fold an already-empty extra
+//       workspace even though the action changed nothing (there was no leaf
+//       left for `closeFocused` to remove).
+// Everything else — including a `layoutRequest` or `closeLeaf` that leaves
+// the active workspace untouched — must not fold, no matter what type it is.
+function shouldPruneEmptyActiveWorkspace(
+  prev: LayoutState,
+  next: LayoutState,
+  action: ShellAction,
+): boolean {
+  if (action.type === "keymap" && action.action.type === "close") return true;
+  return (
+    next.active === prev.active &&
+    prev.workspaces[prev.active]?.root !== null &&
+    next.workspaces[next.active]?.root === null
+  );
+}
+
+export function layoutReducer(state: LayoutState, action: ShellAction): LayoutState {
+  const next = layoutReducerCore(state, action);
+  return shouldPruneEmptyActiveWorkspace(state, next, action)
+    ? closeEmptyActiveWorkspace(next)
+    : next;
+}
+
+function layoutReducerCore(state: LayoutState, action: ShellAction): LayoutState {
   if (action.type === "setLayout") {
     // Wholesale replacement — restoring a saved session. Ids in the incoming
     // tree were minted by whichever run created that session, so seed past
@@ -150,6 +206,8 @@ function layoutReducer(state: LayoutState, action: ShellAction): LayoutState {
   switch (a.type) {
     case "newTerm":
       return openPane(state, "term");
+    case "newWs":
+      return addWorkspace(state);
     case "close":
       return closeFocused(state);
     case "focus":
@@ -752,6 +810,26 @@ export default function DesktopShell({ surface }: Props) {
             <span aria-hidden="true">{w.root ? "●" : "○"}</span>
           </button>
         ))}
+        {/* The strip only ever shows workspaces that already exist, so with
+            nothing on it hinting otherwise a first-time user has no way to
+            learn ⌘N is a thing — this is the discoverable form of the same
+            action, not a second feature. Hidden rather than disabled past
+            the ceiling: a greyed-out control invites a click that then does
+            nothing, and there is nothing useful to say about a tenth
+            workspace that doesn't exist. */}
+        {state.workspaces.length < MAX_WORKSPACES && (
+          <button
+            type="button"
+            onClick={() =>
+              dispatchFrom({ type: "keymap", action: { type: "newWs" } }, "passive")
+            }
+            title="New workspace (⌘N)"
+            aria-label="New workspace (⌘N)"
+            className="flex items-center gap-1 px-1.5 text-term-dim hover:text-term-accent"
+          >
+            +
+          </button>
+        )}
         <span className={`ml-2 ${wsStatusInfo.cls}`}>
           {wsStatusInfo.dot} {wsStatusInfo.text}
         </span>

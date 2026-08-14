@@ -11,7 +11,8 @@
 // workstation doesn't mean entering it first just to delete it from ⌘p.
 //
 // "Workstation" is the user-facing word for what `sessions.ts` calls a Session:
-// a named, saved pane layout across all five workspaces. Restoring one re-opens
+// a named, saved pane layout across all of its workspaces (seeded at three,
+// growable to nine with ⌘N). Restoring one re-opens
 // the same *shape* with fresh shells — no PTYs, scrollback or running processes
 // come back — and the footer says so, because the row's "4 panes" would
 // otherwise read as a promise the shell can't keep.
@@ -96,9 +97,12 @@ export function paneCount(session: Session): number {
   return n;
 }
 
-// Which of the five workspaces have anything in them, as a fixed-width row of
-// filled/empty marks. Fixed width on purpose: the marks line up column-wise
-// down the list, so "this one has stuff on ⌘2" is readable at a glance.
+// Which of a workstation's workspaces have anything in them, as a row of
+// filled/empty marks — one mark per workspace, in order. Two sessions with
+// different workspace counts (a five-workspace layout from before this
+// feature existed, sitting next to a fresh three-workspace one) legitimately
+// print different-length rows; that is accurate, not a bug to paper over
+// with padding.
 export function workspaceMarks(session: Session): string {
   return session.layout.workspaces.map((ws) => (ws.root ? "●" : "·")).join("");
 }
