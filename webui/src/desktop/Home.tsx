@@ -356,11 +356,11 @@ export default function Home({
         <div className="flex flex-col items-center gap-2 select-none">
           <pre
             aria-label="turing"
-            className="overflow-hidden text-[10px] leading-[1.15] text-term-accent sm:text-xs"
+            className="overflow-hidden text-xs leading-[1.15] text-term-accent sm:text-sm md:text-base lg:text-lg"
           >
             {WORDMARK.join("\n")}
           </pre>
-          <div className="text-[10px] tracking-[0.3em] text-term-dim uppercase">
+          <div className="text-[11px] tracking-[0.3em] text-term-dim uppercase">
             operator surface
           </div>
         </div>
