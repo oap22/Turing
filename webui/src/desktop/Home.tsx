@@ -25,6 +25,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Node } from "./layout";
 import type { Session } from "./sessions";
 import { THEMES } from "./theme";
+import UpdateOverlay from "./UpdateOverlay";
 
 interface Props {
   sessions: ReadonlyArray<Session>;
@@ -63,7 +64,11 @@ const WORDMARK: ReadonlyArray<string> = [
 type Mode =
   | { kind: "list" }
   | { kind: "name"; command: "new" | "rename"; id: string | null; value: string }
-  | { kind: "confirmRemove"; id: string };
+  | { kind: "confirmRemove"; id: string }
+  // In-app update (issue #397). Lives on Home rather than in the shell: no
+  // workstation is mounted here, so nothing running is lost if it succeeds
+  // and the app relaunches.
+  | { kind: "update" };
 
 function walkLeaves(root: Node | null, visit: (leaf: Extract<Node, { kind: "leaf" }>) => void) {
   const stack: Node[] = root ? [root] : [];
@@ -145,8 +150,11 @@ export default function Home({
   const clamped = Math.min(cursor, Math.max(0, sessions.length - 1));
 
   // In list mode the dialog itself holds focus (there is no input to hold it),
-  // so tabIndex -1 plus this. In name mode the input takes over.
+  // so tabIndex -1 plus this. In name mode the input takes over, and the
+  // update overlay focuses itself — grabbing focus back here would steal its
+  // Escape/Return handling.
   useEffect(() => {
+    if (mode.kind === "update") return;
     if (mode.kind === "name") inputRef.current?.focus();
     else boxRef.current?.focus();
   }, [mode.kind]);
@@ -182,6 +190,10 @@ export default function Home({
   function onKeyDown(e: React.KeyboardEvent) {
     // Never swallow the shell's own ⌘-chords (theme select, ⌘q, …).
     if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+    // The update overlay owns the keyboard while open (it stops propagation
+    // itself; this is belt and braces for events that land on the box).
+    if (mode.kind === "update") return;
 
     if (e.key === "Escape") {
       e.preventDefault();
@@ -224,6 +236,11 @@ export default function Home({
     if (e.key === "r") {
       e.preventDefault();
       if (selected) startRename(selected);
+      return;
+    }
+    if (e.key === "u") {
+      e.preventDefault();
+      setMode({ kind: "update" });
       return;
     }
     if (e.key === "d" || e.key === "Backspace" || e.key === "Delete") {
@@ -394,7 +411,7 @@ export default function Home({
           </ul>
 
           <div className="border-t border-term-edge px-3 py-2 text-[10px] text-term-dim">
-            ↑↓ choose · return open · n new · r rename · d remove · esc last used
+            ↑↓ choose · return open · n new · r rename · d remove · u update app · esc last used
           </div>
         </div>
 
@@ -402,6 +419,8 @@ export default function Home({
           workstations reopen the same layout with fresh shells · ⌘0 comes back here
         </div>
       </div>
+
+      {mode.kind === "update" && <UpdateOverlay onClose={() => setMode({ kind: "list" })} />}
     </div>
   );
 }

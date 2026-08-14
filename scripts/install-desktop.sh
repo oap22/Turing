@@ -4,6 +4,7 @@
 #   scripts/install-desktop.sh              # build + install
 #   scripts/install-desktop.sh --no-build   # reinstall the last build
 #   scripts/install-desktop.sh --open       # ... and launch it afterwards
+#   scripts/install-desktop.sh --in-place   # self-update: don't quit the app
 #
 # No sudo, no notarization, no updater: the app is ad-hoc signed and this
 # just replaces the installed bundle in place.
@@ -20,13 +21,18 @@ DEST_APP="${DEST_DIR}/${APP_NAME}"
 
 DO_BUILD=1
 DO_OPEN=0
+IN_PLACE=0
 
 usage() {
     cat <<'EOF'
-Usage: scripts/install-desktop.sh [--no-build] [--open]
+Usage: scripts/install-desktop.sh [--no-build] [--open] [--in-place]
 
   --no-build   skip `tauri build`; install whatever is already bundled
   --open       launch the installed app when done
+  --in-place   don't quit a running instance; install over it. For the app's
+               own in-app update flow: replacing a running bundle is safe on
+               macOS (the running process keeps its inodes), and the caller
+               relaunches itself when the script exits 0.
   -h, --help   this message
 EOF
 }
@@ -35,6 +41,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-build) DO_BUILD=0 ;;
         --open) DO_OPEN=1 ;;
+        --in-place) IN_PLACE=1 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "install-desktop: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
     esac
@@ -90,9 +97,13 @@ fi
 # --- quit a running instance ------------------------------------------------
 # The executable is `turing-desktop`, not `turing`; match on the bundle path so
 # this keeps working whatever the binary ends up being called.
+#
+# Skipped entirely under --in-place: that flag exists so the app can run this
+# script on itself (the in-app update flow). Quitting would kill the pty this
+# script is writing to, taking the script down with it mid-install.
 app_running() { pgrep -f "${DEST_APP}/Contents/MacOS/" >/dev/null 2>&1; }
 
-if app_running; then
+if [[ "${IN_PLACE}" -eq 0 ]] && app_running; then
     echo "==> quitting the running app"
     osascript -e 'tell application id "dev.owen.turing" to quit' >/dev/null 2>&1 \
         || osascript -e "quit app \"${DEST_APP}\"" >/dev/null 2>&1 \

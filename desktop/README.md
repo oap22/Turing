@@ -31,7 +31,16 @@ npm run dev     # = `tauri dev`; boots the webui Vite dev server, then the windo
 
 ## Updating the installed app
 
-One command, from anywhere in the repo:
+**From inside the app:** press `u` on the home screen (⌘0). That runs
+`git pull --ff-only && scripts/install-desktop.sh --in-place` in a pty and
+shows the build log in an overlay; on success, Return relaunches into the
+new build. `--in-place` skips the script's quit-the-running-app step —
+replacing the bundle under a running process is safe (it keeps its inodes),
+and the relaunch is what actually picks up the new binary. This automates
+the local workflow below; the repo checkout and toolchain are still
+required.
+
+**From a terminal**, one command, from anywhere in the repo:
 
 ```bash
 npm --prefix desktop run install-app

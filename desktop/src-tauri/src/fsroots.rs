@@ -175,7 +175,7 @@ pub fn fs_list(
     let max = max.unwrap_or(DEFAULT_MAX_ENTRIES);
     let mut out = Vec::new();
     walk(&base_full, &base_full, 0, &exts, max, &mut out);
-    out.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    out.sort_by_key(|e| std::cmp::Reverse(e.mtime_ms));
     Ok(out)
 }
 

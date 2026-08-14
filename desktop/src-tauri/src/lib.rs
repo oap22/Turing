@@ -7,6 +7,16 @@ mod window;
 use tauri::menu::{MenuBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::Manager;
 
+/// Relaunch the app: exec the binary at the same bundle path, which after an
+/// in-place update (`install-desktop.sh --in-place`) is the freshly installed
+/// build. `request_restart` rather than `restart`: commands run off the main
+/// thread, and this variant just flags the restart and asks the event loop to
+/// exit, so the IPC response can complete and cleanup runs normally.
+#[tauri::command]
+fn app_relaunch(app: tauri::AppHandle) {
+    app.request_restart();
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -69,6 +79,7 @@ pub fn run() {
             gateway::gateway_fetch,
             gateway::gateway_ws_start,
             window::warp_cursor,
+            app_relaunch,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
