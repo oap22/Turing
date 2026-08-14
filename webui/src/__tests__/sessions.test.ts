@@ -176,6 +176,106 @@ describe("five-workspace sessions: reseeded once, then left alone", () => {
     const closed = layoutReducer(layout, { type: "keymap", action: { type: "close" } });
     expect(closed.workspaces).toHaveLength(5);
   });
+
+  it("recovers an rsi workstation's loop terminal from a non-zero workspace", () => {
+    // The send-to-workspace chord (⌘⇧1..5) can move the loop terminal off
+    // workspace 0. `reseedLayouts` has to search every workspace for the rsi
+    // params, or a moved loop terminal is silently lost — the session keeps
+    // `kind: "rsi"` (the spread preserves it) but gets rebuilt from
+    // `defaultLayout()`, and since the reseed is one-time there is no second
+    // chance to recover it.
+    // Build a layout the same way a real send-to-workspace move would leave
+    // one: the loop terminal (with its rsi params) ends up on workspace 1
+    // instead of workspace 0.
+    const seed = rsiLayout("moved-1", "make it faster");
+    const layout: LayoutState = {
+      ...seed,
+      workspaces: [{ root: null, focus: null, zoom: false }, seed.workspaces[0], seed.workspaces[2]],
+    };
+    expect(layout.workspaces[0].root).toBeNull();
+
+    const store = createRsiSession(emptyStore(), "moved", layout);
+    const storage = unseededStorage();
+    saveSessions(storage, store);
+
+    const restored = activeSession(loadSessions(storage));
+    expect(restored?.kind).toBe("rsi");
+    expect(shapeOf(restored!.layout)).toBe(shapeOf(rsiLayout("moved-1", "make it faster")));
+  });
+
+  describe("a marker write that silently fails to persist", () => {
+    // Real, documented localStorage behavior: near a quota boundary,
+    // overwriting an *existing* key can succeed (no new allocation needed)
+    // while writing a *brand-new* key throws `QuotaExceededError`. Safari
+    // private mode has a similar shape — some writes are silently accepted
+    // without persisting. Either way, `setItem` not throwing is not proof a
+    // new key landed, which is exactly the trap `RESEED_KEY` falls into on
+    // the very first reseed (it has never been written before).
+    function nearFullStorage(seed: Record<string, string> = {}): SessionStorage & { map: Map<string, string> } {
+      const map = new Map<string, string>(Object.entries(seed));
+      return {
+        map,
+        getItem: (k) => map.get(k) ?? null,
+        setItem: (k, v) => {
+          if (!map.has(k)) return; // new-key allocation silently no-ops
+          map.set(k, v);
+        },
+      };
+    }
+
+    it("never destroys the user's layout, on this launch or any later one", () => {
+      const arranged = createSession(emptyStore(), "hand-arranged", fiveWorkspaceLayout(), 1000, "s1");
+      // SESSIONS_KEY already exists (overwrites succeed); RESEED_KEY does not
+      // (new-key allocation silently no-ops) — the near-quota shape.
+      const storage = nearFullStorage({ [SESSIONS_KEY]: serializeSessions(emptyStore()) });
+      saveSessions(storage, arranged);
+      // RESEED_KEY was never written before, so it's exactly the "allocate a
+      // brand-new key" case this storage stub silently swallows.
+      expect(storage.map.get(RESEED_KEY)).toBeUndefined();
+
+      for (let launch = 0; launch < 3; launch++) {
+        const restored = activeSession(loadSessions(storage, 1000 + launch));
+        expect(restored?.name).toBe("hand-arranged");
+        expect(shapeOf(restored!.layout)).toBe(shapeOf(fiveWorkspaceLayout()));
+      }
+      // The marker still never landed — that's *why* it kept skipping the
+      // reseed rather than running it once and moving on. Once storage frees
+      // up (not modeled here), a later launch can still record it and
+      // reseed for real.
+      expect(storage.map.get(RESEED_KEY)).toBeUndefined();
+    });
+
+    it("still reseeds exactly once on the happy path, and never again", () => {
+      const storage = unseededStorage();
+      saveSessions(storage, createSession(emptyStore(), "old-style", fiveWorkspaceLayout(), 1000, "s1"));
+
+      const first = activeSession(loadSessions(storage, 1000));
+      expect(shapeOf(first!.layout)).toBe(shapeOf(defaultLayout()));
+      expect(storage.map.get(RESEED_KEY)).toBeDefined();
+
+      // Rearrange after the reseed — this must survive every later launch.
+      const rearranged = createSession(emptyStore(), "old-style", fiveWorkspaceLayout(), 1000, "s1");
+      saveSessions(storage, rearranged);
+      const second = activeSession(loadSessions(storage, 2000));
+      expect(second?.layout.workspaces).toHaveLength(5);
+      expect(serialize(second!.layout)).toBe(serialize(rearranged.sessions.s1.layout));
+    });
+
+    it("writes the reseeded layouts to storage, not just to memory", () => {
+      // The shell's autosave is gated on having left Home, and the app boots
+      // on Home. Without a write here, launching, reading the workstation
+      // list and quitting would burn the marker while the store on disk
+      // stayed on the old preset — the migration recorded as done, having
+      // changed nothing, with no second chance.
+      const storage = unseededStorage();
+      saveSessions(storage, createSession(emptyStore(), "old-style", fiveWorkspaceLayout(), 1000, "s1"));
+      loadSessions(storage, 1000);
+
+      // Read the raw blob back, bypassing loadSessions and its reseed entirely.
+      const onDisk = deserializeSessions(storage.map.get(SESSIONS_KEY)!)!;
+      expect(shapeOf(onDisk.sessions.s1.layout)).toBe(shapeOf(defaultLayout()));
+    });
+  });
 });
 
 describe("migration from the legacy single-layout blob", () => {
