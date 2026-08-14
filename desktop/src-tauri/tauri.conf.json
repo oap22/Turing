@@ -10,7 +10,14 @@
     "frontendDist": "../../webui/dist"
   },
   "app": {
-    "windows": [{ "title": "turing", "width": 1512, "height": 945 }],
+    "windows": [
+      {
+        "title": "turing",
+        "width": 1512,
+        "height": 945,
+        "maximized": true
+      }
+    ],
     "security": { "csp": null }
   },
   "bundle": {

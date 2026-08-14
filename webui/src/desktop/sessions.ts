@@ -22,9 +22,20 @@
 // layouts are checked with `layout.ts`'s own `isValidLayoutState`, so there is
 // exactly one definition of "is this a layout" in the codebase.
 
-import { deserialize, isValidLayoutState, type LayoutState } from "./layout";
+import {
+  defaultLayout,
+  deserialize,
+  isValidLayoutState,
+  rsiLayout,
+  type LayoutState,
+  type Node,
+} from "./layout";
 
 export const SESSIONS_KEY = "turing.sessions.v1";
+// Marks that the one-time reseed below has already run for this profile. Its
+// presence is the entire record — the reseed must never repeat, or every
+// launch would bulldoze whatever the user arranged since the last one.
+export const RESEED_KEY = "turing.sessions.reseed.v1";
 // The pre-sessions single-layout key. Read once, on the first launch under the
 // new scheme, and then left alone — never written and never deleted, so an
 // older build (or a rolled-back one) still finds the layout it expects.
@@ -228,6 +239,52 @@ export function deserializeSessions(s: string): SessionStore | null {
   }
 }
 
+// Pull the `rsi` params back out of a stored layout. An RSI workstation's
+// identity — which sandbox it drives, which problem it was given — lives
+// nowhere but the loop terminal's leaf params, so reseeding one without
+// recovering these first would silently demote it to an ordinary desktop
+// with the same name.
+function findRsiParams(root: Node | null): { slug: string; problem: string } | null {
+  if (!root) return null;
+  if (root.kind === "split") return findRsiParams(root.a) ?? findRsiParams(root.b);
+  const rsi = root.params?.rsi;
+  if (rsi && typeof rsi === "object") {
+    const o = rsi as Record<string, unknown>;
+    if (typeof o.slug === "string" && typeof o.problem === "string") {
+      return { slug: o.slug, problem: o.problem };
+    }
+  }
+  return null;
+}
+
+// Replace every stored layout with the current preset, keeping the workstation
+// itself — id, name, kind, createdAt — intact.
+//
+// Owen asked for this explicitly after the seeded set went from five
+// workspaces to three: a saved workstation reopens the *shape* it was saved
+// with, so changing `defaultLayout()` alone left every existing workstation
+// still on the old five-workspace spread, and the new default was only ever
+// visible on a workstation created after the change. This is the override.
+//
+// It is deliberately a reseed, not a reshape: there is no honest way to map an
+// arbitrary five-workspace arrangement onto the three-workspace preset, and a
+// half-migrated tree would be worse than a clean one. Pane *arrangement* is
+// what's discarded; nothing live is, since layouts never stored processes or
+// scrollback in the first place. RSI workstations keep their loop terminal by
+// rebuilding through `rsiLayout()` with the params recovered above.
+export function reseedLayouts(store: SessionStore, now: number = Date.now()): SessionStore {
+  const sessions: Record<string, Session> = {};
+  for (const [id, session] of Object.entries(store.sessions)) {
+    const rsi = session.kind === "rsi" ? findRsiParams(session.layout.workspaces[0]?.root ?? null) : null;
+    sessions[id] = {
+      ...session,
+      layout: rsi ? rsiLayout(rsi.slug, rsi.problem) : defaultLayout(),
+      updatedAt: now,
+    };
+  }
+  return { sessions, activeId: store.activeId };
+}
+
 // Read the store, migrating on the way if this is the first launch under the
 // sessions scheme. Precedence:
 //
@@ -247,9 +304,23 @@ export function loadSessions(storage: SessionStorage, now: number = Date.now()):
     return emptyStore();
   }
 
+  // The reseed is checked before anything is returned, and the marker is
+  // written whether or not there was a store to reseed — a profile that
+  // reaches this line has, by definition, now been through it, and skipping
+  // the write on an empty store would leave the reseed armed to fire later
+  // against workstations the user creates *after* the change.
+  let reseeded = true;
+  try {
+    reseeded = storage.getItem(RESEED_KEY) !== null;
+    if (!reseeded) storage.setItem(RESEED_KEY, String(now));
+  } catch {
+    // Unreadable storage is handled below by the same paths that already
+    // treat it as "no saved state"; never let it throw out of here.
+  }
+
   if (raw) {
     const parsed = deserializeSessions(raw);
-    if (parsed) return parsed;
+    if (parsed) return reseeded ? parsed : reseedLayouts(parsed, now);
   }
 
   let legacyRaw: string | null = null;
@@ -262,7 +333,13 @@ export function loadSessions(storage: SessionStorage, now: number = Date.now()):
     // `deserialize` is layout.ts's own parse-and-validate; a legacy blob is
     // literally what it was written to read.
     const legacy = deserialize(legacyRaw);
-    if (legacy) return createSession(emptyStore(), DEFAULT_SESSION_NAME, legacy, now);
+    if (legacy) {
+      // Reseeded on the same terms as the sessions blob above: a layout this
+      // old is guaranteed to predate the three-workspace preset, so adopting
+      // it verbatim would reintroduce exactly what the reseed exists to clear.
+      const adopted = createSession(emptyStore(), DEFAULT_SESSION_NAME, legacy, now);
+      return reseeded ? adopted : reseedLayouts(adopted, now);
+    }
   }
 
   return emptyStore();
