@@ -1,5 +1,5 @@
-// Pure-SVG line chart — no library, no animation. Used by MetricsPane, one
-// instance per series name (union across the selected runs).
+// Pure-SVG line chart — no library, no animation. Used by MetricsPane: one
+// instance showing the active series, with one polyline per selected run.
 //
 // Responsive by measurement, not by `preserveAspectRatio="none"`: that
 // attribute stretches text glyphs along with the lines, which makes tick
@@ -28,7 +28,12 @@ interface Props {
   height?: number;
 }
 
-const PALETTE = ["#7aa2f7", "#a7c080", "#ebbcba", "#fabd2f", "#88c0d0"];
+// Curve colors come from the active theme's categorical palette
+// (`--t-series-1..8`, defined per `[data-theme]` in index.css) rather than one
+// hardcoded list, so overlaid runs are tellable apart without any theme having
+// to host colors from outside its own palette. `--t-series-1` is each theme's
+// accent, so a single-run chart is unchanged.
+const SERIES_COLOR_COUNT = 8;
 const TICK_COLOR = "var(--t-dim)";
 const PLOT_BORDER_COLOR = "var(--t-edge)";
 const LEFT_GUTTER = 48;
@@ -41,8 +46,7 @@ const BOTTOM_GUTTER = 18;
 const TOP_GUTTER = 16;
 
 function colorFor(index: number): string {
-  if (index === 0) return "var(--t-accent)";
-  return PALETTE[(index - 1) % PALETTE.length];
+  return `var(--t-series-${(index % SERIES_COLOR_COUNT) + 1})`;
 }
 
 // 4-significant-digit formatting for axis ticks and the latest-value label

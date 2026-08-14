@@ -11,10 +11,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { inv, subscribe } from "../tauri";
 import Chart from "./Chart";
 import {
+  dedupeRunFiles,
   etaOf,
   parseMetricsText,
   parseViewerFile,
   pickSeries,
+  runLabelOf,
   seriesOf,
   type Point,
   type ViewerFile,
@@ -38,11 +40,6 @@ interface RunState {
 const RESULTS_ROOT = "results";
 const SERIES_STORAGE_KEY = "turing.metrics.series";
 const VIEWER_FILE_REL = ".viewer.json";
-
-function runLabelOf(relPath: string): string {
-  const parts = relPath.split("/");
-  return parts.length > 1 ? parts[0] : relPath;
-}
 
 interface RunMultiSelectProps {
   runFiles: Entry[];
@@ -132,7 +129,8 @@ export default function MetricsPane() {
         const base = e.rel_path.split("/").pop() ?? "";
         return base === "metrics.jsonl" || base === "metrics.json";
       });
-      setRunFiles(filtered);
+      // At most one file per run, so a run can never be pinned twice.
+      setRunFiles(dedupeRunFiles(filtered));
     }
     void load();
     return () => {
@@ -248,15 +246,32 @@ export default function MetricsPane() {
 
   const chartSeries = useMemo(() => {
     if (!activeSeries) return [];
+    // Second guard behind `dedupeRunFiles`: whatever the run set looks like,
+    // a given label is plotted exactly once, so no curve is ever drawn on top
+    // of an identical copy of itself.
+    const seen = new Set<string>();
     return activePaths
       .map((path) => runsRef.current.get(path))
       .filter((r): r is RunState => r !== undefined)
       .map((run) => ({
         label: `${run.label}/${titles[activeSeries] ?? activeSeries}`,
         points: seriesOf(run.points).get(activeSeries) ?? [],
-      }));
+      }))
+      .filter((s) => {
+        if (seen.has(s.label)) return false;
+        seen.add(s.label);
+        return true;
+      });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activePaths, activeSeries, titles, tick]);
+
+  // Drop every plotted run. The accumulated tail state goes with it, so
+  // re-pinning a run re-reads it from the top rather than resuming mid-file.
+  function clearRuns() {
+    setSelected([]);
+    runsRef.current.clear();
+    forceRender((n) => n + 1);
+  }
 
   return (
     <div className="flex h-full flex-col text-xs">
@@ -269,6 +284,14 @@ export default function MetricsPane() {
             `string[]` contract and "auto" sentinel as before, just built from
             toggleable rows. */}
         <RunMultiSelect runFiles={runFiles} selected={selected} onChange={setSelected} />
+        <button
+          type="button"
+          onClick={clearRuns}
+          disabled={selected.length === 0}
+          className="shrink-0 border border-term-edge px-2 py-0.5 text-[11px] lowercase text-term-dim hover:text-term-accent disabled:opacity-40 disabled:hover:text-term-dim"
+        >
+          clear
+        </button>
         {eta && (
           <div className="ml-2 font-mono text-term-dim">
             <span>steps/s: {eta.stepsPerSec?.toFixed(2) ?? "—"}</span>
@@ -297,10 +320,12 @@ export default function MetricsPane() {
         ))}
       </div>
       <div className="min-h-0 flex-1 p-2">
-        {activeSeries ? (
+        {activeSeries && chartSeries.length > 0 ? (
           <Chart series={chartSeries} />
         ) : (
-          <div className="p-4 text-term-dim">no metrics yet</div>
+          <div className="p-4 text-term-dim">
+            {selected.length === 0 ? "no runs selected" : "no metrics yet"}
+          </div>
         )}
       </div>
     </div>

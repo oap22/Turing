@@ -5,10 +5,12 @@ import { createElement } from "react";
 import { render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  dedupeRunFiles,
   etaOf,
   parseMetricsText,
   parseViewerFile,
   pickSeries,
+  runLabelOf,
   seriesOf,
 } from "../desktop/panes/metrics";
 import Chart from "../desktop/panes/Chart";
@@ -44,6 +46,38 @@ describe("parseMetricsText", () => {
   it("returns an empty array for empty input", () => {
     expect(parseMetricsText("")).toEqual([]);
     expect(parseMetricsText("   \n  \n")).toEqual([]);
+  });
+});
+
+describe("runLabelOf", () => {
+  it("uses the run directory, or the whole path when there isn't one", () => {
+    expect(runLabelOf("run-42/metrics.jsonl")).toBe("run-42");
+    expect(runLabelOf("run-42/ckpt/metrics.json")).toBe("run-42");
+    expect(runLabelOf("metrics.jsonl")).toBe("metrics.jsonl");
+  });
+});
+
+describe("dedupeRunFiles", () => {
+  it("keeps only the newest file per run so a run can't be plotted twice", () => {
+    const files = [
+      { rel_path: "run-a/metrics.jsonl", mtime_ms: 100 },
+      { rel_path: "run-a/ckpt/metrics.json", mtime_ms: 300 },
+      { rel_path: "run-b/metrics.jsonl", mtime_ms: 200 },
+      { rel_path: "run-a/metrics.json", mtime_ms: 50 },
+    ];
+    expect(dedupeRunFiles(files)).toEqual([
+      { rel_path: "run-a/ckpt/metrics.json", mtime_ms: 300 },
+      { rel_path: "run-b/metrics.jsonl", mtime_ms: 200 },
+    ]);
+  });
+
+  it("preserves input order and leaves already-unique lists alone", () => {
+    const files = [
+      { rel_path: "run-b/metrics.jsonl", mtime_ms: 2 },
+      { rel_path: "run-a/metrics.jsonl", mtime_ms: 1 },
+    ];
+    expect(dedupeRunFiles(files)).toEqual(files);
+    expect(dedupeRunFiles([])).toEqual([]);
   });
 });
 
@@ -149,6 +183,35 @@ describe("Chart", () => {
     expect(border).not.toBeNull();
     expect(border?.getAttribute("fill")).toBe("none");
     expect(border?.getAttribute("stroke")).toBe("var(--t-edge)");
+  });
+
+  it("gives every overlaid series its own theme-palette color", () => {
+    const series = Array.from({ length: 8 }, (_, i) => ({
+      label: `run${i}/loss`,
+      points: [[0, i], [1, i + 1]] as Array<[number, number]>,
+    }));
+    const { container } = render(createElement(Chart, { series }));
+    const strokes = Array.from(container.querySelectorAll("polyline")).map((p) =>
+      p.getAttribute("stroke"),
+    );
+    expect(strokes).toEqual([
+      "var(--t-series-1)",
+      "var(--t-series-2)",
+      "var(--t-series-3)",
+      "var(--t-series-4)",
+      "var(--t-series-5)",
+      "var(--t-series-6)",
+      "var(--t-series-7)",
+      "var(--t-series-8)",
+    ]);
+    // Past the palette length the colors cycle rather than going undefined.
+    const wrapped = render(
+      createElement(Chart, {
+        series: [...series, { label: "run8/loss", points: [[0, 0]] as Array<[number, number]> }],
+      }),
+    );
+    const wrappedStrokes = Array.from(wrapped.container.querySelectorAll("polyline"));
+    expect(wrappedStrokes[8].getAttribute("stroke")).toBe("var(--t-series-1)");
   });
 });
 
