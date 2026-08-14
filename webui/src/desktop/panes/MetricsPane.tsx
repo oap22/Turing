@@ -1,11 +1,18 @@
 // Live metrics pane: tails every `metrics.jsonl`/`metrics.json` under the
-// `results` root, auto-follows the newest run, and lets the operator pin
-// additional runs to overlay for comparison. Shows one series at a time via
-// tabs (rather than every series stacked, which read as jumbled and clipped
-// its own top tick label against the row above it — see Chart.tsx for the
-// tick-clipping fix). Also watches `.viewer.json` at the results root so a
-// coding agent can point the pane at a specific series/run set — see
-// desktop/README.md's "Agent-driven viewing" section for the file format.
+// `results` root, follows the newest run, and lets the operator pin additional
+// runs to compare against it. Shows one series at a time via tabs (rather than
+// every series stacked, which read as jumbled and clipped its own top tick
+// label against the row above it — see Chart.tsx for the tick-clipping fix),
+// with one line per selected run.
+//
+// The selection state machine (auto resolution, the 8-line cap, sticky-empty
+// clearing) lives in `runSelection.ts` and the per-run color stickiness in
+// `seriesColors.ts`, both pure and unit-tested; this file is the wiring. The
+// behavior contract is `.scratch/prd-metrics-run-comparison.md`.
+//
+// Also watches `.viewer.json` at the results root so a coding agent can point
+// the pane at a specific series/run set — see desktop/README.md's
+// "Agent-driven viewing" section for the file format.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { inv, subscribe } from "../tauri";
@@ -21,6 +28,23 @@ import {
   type Point,
   type ViewerFile,
 } from "./metrics";
+import {
+  // aliased: the local memo below owns the bare name
+  activePaths as activePathsOf,
+  applyViewerRuns,
+  autoPath,
+  canPick,
+  clearAll,
+  INITIAL_SELECTION,
+  isHeldByAuto,
+  lineCount,
+  MAX_LINES,
+  toggleAuto,
+  togglePin,
+  removePath,
+  type RunSelection,
+} from "./runSelection";
+import { assignColors, colorForSlot, type ColorAssignment } from "./seriesColors";
 
 interface Entry {
   rel_path: string;
@@ -41,30 +65,22 @@ const RESULTS_ROOT = "results";
 const SERIES_STORAGE_KEY = "turing.metrics.series";
 const VIEWER_FILE_REL = ".viewer.json";
 
-interface RunMultiSelectProps {
+interface RunPickerProps {
   runFiles: Entry[];
-  selected: string[];
-  onChange: (selected: string[]) => void;
+  selection: RunSelection;
+  onToggleAuto: () => void;
+  onTogglePin: (path: string) => void;
 }
 
-// Custom multi-select listbox standing in for `<select multiple size={4}>` —
-// same visual vocabulary as Select.tsx (bordered term-panel box, term-raised/
-// term-accent highlighted rows), same `string[]` state and "auto" sentinel.
-// Each row is an independent toggle rather than a single commit-on-Enter
-// cursor, so this doesn't reuse Select.tsx's single-select state machine.
-function RunMultiSelect({ runFiles, selected, onChange }: RunMultiSelectProps) {
-  const options = [
-    { value: "auto", label: "auto (newest)" },
-    ...runFiles.map((f) => ({ value: f.rel_path, label: runLabelOf(f.rel_path) })),
-  ];
-
-  function toggle(value: string) {
-    if (selected.includes(value)) {
-      onChange(selected.filter((v) => v !== value));
-    } else {
-      onChange([...selected, value]);
-    }
-  }
+// Hand-rolled listbox standing in for `<select multiple size={4}>` — WKWebView
+// draws its own OS bezel around the native control and frequently ignores
+// author `option:checked` backgrounds, so (same reasoning as Select.tsx) this
+// is built from toggleable rows CSS can actually reach. Each row is an
+// independent toggle rather than a single commit-on-Enter cursor, so it
+// doesn't reuse Select.tsx's single-select state machine.
+function RunPicker({ runFiles, selection, onToggleAuto, onTogglePin }: RunPickerProps) {
+  const held = autoPath(selection, runFiles);
+  const heldLabel = held ? runLabelOf(held) : null;
 
   return (
     <ul
@@ -75,20 +91,47 @@ function RunMultiSelect({ runFiles, selected, onChange }: RunMultiSelectProps) {
       // doesn't reflow.
       className="max-h-[88px] min-w-[160px] overflow-auto border border-term-edge bg-term-panel"
     >
-      {options.map((opt) => {
-        const isSelected = selected.includes(opt.value);
+      <li role="presentation">
+        <button
+          type="button"
+          role="option"
+          aria-selected={selection.auto}
+          onClick={onToggleAuto}
+          className={`block w-full whitespace-nowrap px-2 py-0.5 text-left text-xs ${
+            selection.auto ? "bg-term-raised text-term-accent" : "text-term-fg"
+          }`}
+        >
+          {/* Auto resolves visibly: naming the run it currently points at is
+              what keeps it from reading as a second, mystery selection. */}
+          {heldLabel ? `auto → ${heldLabel}` : "auto (no runs)"}
+        </button>
+      </li>
+      {runFiles.map((f) => {
+        const path = f.rel_path;
+        const pinned = selection.pinned.includes(path);
+        const dimmed = isHeldByAuto(selection, runFiles, path);
+        const enabled = canPick(selection, runFiles, path);
         return (
-          <li key={opt.value} role="presentation">
+          <li key={path} role="presentation">
             <button
               type="button"
               role="option"
-              aria-selected={isSelected}
-              onClick={() => toggle(opt.value)}
+              aria-selected={pinned}
+              disabled={!enabled}
+              onClick={() => onTogglePin(path)}
+              // The auto-held row stays clickable even though it's dimmed —
+              // clicking it promotes the run to an explicit pin, which is a
+              // real action, not a disabled control.
+              title={dimmed ? "held by auto — click to pin it explicitly" : undefined}
               className={`block w-full whitespace-nowrap px-2 py-0.5 text-left text-xs ${
-                isSelected ? "bg-term-raised text-term-accent" : "text-term-fg"
-              }`}
+                pinned
+                  ? "bg-term-raised text-term-accent"
+                  : dimmed
+                    ? "text-term-dim italic"
+                    : "text-term-fg"
+              } ${enabled ? "" : "cursor-not-allowed opacity-40"}`}
             >
-              {opt.label}
+              {runLabelOf(path)}
             </button>
           </li>
         );
@@ -99,7 +142,7 @@ function RunMultiSelect({ runFiles, selected, onChange }: RunMultiSelectProps) {
 
 export default function MetricsPane() {
   const [runFiles, setRunFiles] = useState<Entry[]>([]);
-  const [selected, setSelected] = useState<string[]>(["auto"]);
+  const [selection, setSelection] = useState<RunSelection>(INITIAL_SELECTION);
   const runsRef = useRef<Map<string, RunState>>(new Map());
   const [tick, setTick] = useState(0);
   const forceRender = (updater: (n: number) => number) => setTick(updater);
@@ -159,13 +202,22 @@ export default function MetricsPane() {
     forceRender((n) => n + 1);
   }
 
-  const activePaths = useMemo(() => {
-    const newest = runFiles[0]?.rel_path;
-    const pinned = selected.filter((s) => s !== "auto");
-    const paths = new Set(pinned);
-    if (selected.includes("auto") && newest) paths.add(newest);
-    return Array.from(paths);
-  }, [runFiles, selected]);
+  const activePaths = useMemo(
+    () => activePathsOf(selection, runFiles),
+    [selection, runFiles],
+  );
+
+  // Sticky per-run colors. `assignColors` is idempotent for a given key set —
+  // re-running it on its own output returns that output — so threading the
+  // previous assignment through a ref is safe under StrictMode's double
+  // render, and a run keeps its color across metric-tab switches and across
+  // other runs being added or removed.
+  const colorsRef = useRef<ColorAssignment>(new Map());
+  const colors = useMemo(() => {
+    const next = assignColors(colorsRef.current, activePaths);
+    colorsRef.current = next;
+    return next;
+  }, [activePaths]);
 
   useEffect(() => {
     for (const path of activePaths) {
@@ -198,10 +250,10 @@ export default function MetricsPane() {
     }
     setTitles(parsed.titles ?? {});
     if (parsed.runs && parsed.runs.length > 0) {
-      const matched = runFilesRef.current
-        .filter((f) => parsed.runs?.includes(runLabelOf(f.rel_path)))
-        .map((f) => f.rel_path);
-      if (matched.length > 0) setSelected(matched);
+      const runs = parsed.runs;
+      // `applyViewerRuns` is the one that knows a manual clear outranks the
+      // file until the operator picks something by hand again.
+      setSelection((sel) => applyViewerRuns(sel, runFilesRef.current, runs));
     }
   }
 
@@ -246,48 +298,38 @@ export default function MetricsPane() {
 
   const chartSeries = useMemo(() => {
     if (!activeSeries) return [];
-    // Second guard behind `dedupeRunFiles`: whatever the run set looks like,
-    // a given label is plotted exactly once, so no curve is ever drawn on top
-    // of an identical copy of itself.
-    const seen = new Set<string>();
     return activePaths
-      .map((path) => runsRef.current.get(path))
-      .filter((r): r is RunState => r !== undefined)
-      .map((run) => ({
+      .map((path) => ({ path, run: runsRef.current.get(path) }))
+      .filter((r): r is { path: string; run: RunState } => r.run !== undefined)
+      .map(({ path, run }) => ({
         label: `${run.label}/${titles[activeSeries] ?? activeSeries}`,
         points: seriesOf(run.points).get(activeSeries) ?? [],
-      }))
-      .filter((s) => {
-        if (seen.has(s.label)) return false;
-        seen.add(s.label);
-        return true;
-      });
+        color: colorForSlot(colors.get(path) ?? 0),
+        // The legend `×` always means "this line goes away" — including for
+        // auto's line, which it switches auto off to remove.
+        onRemove: () => setSelection((sel) => removePath(sel, runFilesRef.current, path)),
+      }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePaths, activeSeries, titles, tick]);
+  }, [activePaths, activeSeries, titles, colors, tick]);
 
-  // Drop every plotted run. The accumulated tail state goes with it, so
-  // re-pinning a run re-reads it from the top rather than resuming mid-file.
-  function clearRuns() {
-    setSelected([]);
-    runsRef.current.clear();
-    forceRender((n) => n + 1);
-  }
+  const lines = lineCount(selection, runFiles);
 
   return (
     <div className="flex h-full flex-col text-xs">
       <div className="flex items-center gap-2 border-b border-term-edge p-2">
-        <span className="text-[10px] uppercase tracking-wider text-term-dim">runs</span>
-        {/* WKWebView draws its own OS bezel around `<select multiple>` and
-            frequently ignores author `option:checked` backgrounds, so — same
-            reasoning as Select.tsx — this is a hand-rolled multi-select
-            listbox instead of a native control CSS can't fully reach. Same
-            `string[]` contract and "auto" sentinel as before, just built from
-            toggleable rows. */}
-        <RunMultiSelect runFiles={runFiles} selected={selected} onChange={setSelected} />
+        <span className="text-[10px] uppercase tracking-wider text-term-dim">
+          runs ({lines}/{MAX_LINES})
+        </span>
+        <RunPicker
+          runFiles={runFiles}
+          selection={selection}
+          onToggleAuto={() => setSelection((sel) => toggleAuto(sel, runFiles))}
+          onTogglePin={(path) => setSelection((sel) => togglePin(sel, runFiles, path))}
+        />
         <button
           type="button"
-          onClick={clearRuns}
-          disabled={selected.length === 0}
+          onClick={() => setSelection(clearAll)}
+          disabled={lines === 0}
           className="shrink-0 border border-term-edge px-2 py-0.5 text-[11px] lowercase text-term-dim hover:text-term-accent disabled:opacity-40 disabled:hover:text-term-dim"
         >
           clear
@@ -324,7 +366,7 @@ export default function MetricsPane() {
           <Chart series={chartSeries} />
         ) : (
           <div className="p-4 text-term-dim">
-            {selected.length === 0 ? "no runs selected" : "no metrics yet"}
+            {lines === 0 ? "no runs selected" : "no metrics yet"}
           </div>
         )}
       </div>

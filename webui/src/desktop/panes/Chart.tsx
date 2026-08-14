@@ -16,11 +16,19 @@
 // outside the plot area, never over a curve) plus a subtle plot-area border.
 
 import { useEffect, useRef, useState } from "react";
+import { colorForSlot } from "./seriesColors";
 
 interface Series {
   label: string;
   points: Array<[number, number]>;
   color?: string;
+  /**
+   * Drops this line. Rendered as an `×` on the legend entry — the legend is
+   * already where the eye is when a curve turns out to be noise, so removing
+   * it shouldn't mean re-opening the run picker. Omit for a display-only
+   * legend.
+   */
+  onRemove?: () => void;
 }
 
 interface Props {
@@ -28,12 +36,6 @@ interface Props {
   height?: number;
 }
 
-// Curve colors come from the active theme's categorical palette
-// (`--t-series-1..8`, defined per `[data-theme]` in index.css) rather than one
-// hardcoded list, so overlaid runs are tellable apart without any theme having
-// to host colors from outside its own palette. `--t-series-1` is each theme's
-// accent, so a single-run chart is unchanged.
-const SERIES_COLOR_COUNT = 8;
 const TICK_COLOR = "var(--t-dim)";
 const PLOT_BORDER_COLOR = "var(--t-edge)";
 const LEFT_GUTTER = 48;
@@ -45,8 +47,11 @@ const BOTTOM_GUTTER = 18;
 // enough that the top tick's full glyph height fits inside the svg.
 const TOP_GUTTER = 16;
 
+// Callers that assign sticky per-run colors pass `color` explicitly; the
+// positional fallback is for charts that just want distinct lines and don't
+// care which run holds which color.
 function colorFor(index: number): string {
-  return `var(--t-series-${(index % SERIES_COLOR_COUNT) + 1})`;
+  return colorForSlot(index);
 }
 
 // 4-significant-digit formatting for axis ticks and the latest-value label
@@ -119,9 +124,28 @@ export default function Chart({ series, height = 120 }: Props) {
         {series.map((s, i) => {
           const latest = s.points.length > 0 ? s.points[s.points.length - 1][1] : null;
           return (
-            <span key={s.label} style={{ color: s.color ?? colorFor(i) }}>
-              {s.label}
-              {latest !== null ? `: ${formatSig(latest)}` : ""}
+            <span
+              key={s.label}
+              className="inline-flex items-center gap-1"
+              style={{ color: s.color ?? colorFor(i) }}
+            >
+              <span>
+                {s.label}
+                {latest !== null ? `: ${formatSig(latest)}` : ""}
+              </span>
+              {s.onRemove && (
+                <button
+                  type="button"
+                  onClick={s.onRemove}
+                  aria-label={`remove ${s.label}`}
+                  data-testid={`chart-remove-${s.label}`}
+                  // Inherits the series color so it reads as part of the entry
+                  // rather than as pane chrome that happens to sit nearby.
+                  className="px-0.5 leading-none opacity-60 hover:opacity-100"
+                >
+                  ×
+                </button>
+              )}
             </span>
           );
         })}

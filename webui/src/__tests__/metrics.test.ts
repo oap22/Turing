@@ -213,6 +213,30 @@ describe("Chart", () => {
     const wrappedStrokes = Array.from(wrapped.container.querySelectorAll("polyline"));
     expect(wrappedStrokes[8].getAttribute("stroke")).toBe("var(--t-series-1)");
   });
+
+  it("prefers an explicitly assigned color over the positional fallback", () => {
+    // MetricsPane assigns sticky per-run colors, so the run in slot 0 of the
+    // chart is not necessarily the run holding series-1.
+    const series = [
+      { label: "run-b/loss", points: [[0, 1]] as Array<[number, number]>, color: "var(--t-series-4)" },
+    ];
+    const { container } = render(createElement(Chart, { series }));
+    expect(container.querySelector("polyline")?.getAttribute("stroke")).toBe("var(--t-series-4)");
+  });
+
+  it("renders a legend remove button only for series that can be removed", () => {
+    const onRemove = vi.fn();
+    const series = [
+      { label: "run-a/loss", points: [[0, 1]] as Array<[number, number]>, onRemove },
+      { label: "run-b/loss", points: [[0, 2]] as Array<[number, number]> },
+    ];
+    const { container } = render(createElement(Chart, { series }));
+    const buttons = container.querySelectorAll("button");
+    expect(buttons.length).toBe(1);
+    expect(buttons[0].getAttribute("aria-label")).toBe("remove run-a/loss");
+    (buttons[0] as HTMLButtonElement).click();
+    expect(onRemove).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("parseViewerFile", () => {
