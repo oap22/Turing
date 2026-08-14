@@ -179,7 +179,12 @@ documents this too.
 | ⌘ p | launcher (panes + runners, fuzzy filter) |
 | ⌘ / | cheatsheet *(moved off ⌘k — collides with focus-up)* |
 
-> in a focused terminal, ⌘k clears the buffer — use arrows/⌘↑ to focus upward from a terminal
+> Every ⌘ chord in this table belongs to the shell, in a focused terminal too:
+> `DesktopShell` listens on `window` with `capture: true` and swallows any chord
+> `actionFor` recognizes, so it always fires before xterm's own listener. A pane
+> cannot claim one back — ⌘k focuses up even with a terminal focused. ⌃/⌥ chords
+> are left unbound for exactly that reason and pass through untouched, so clear
+> a terminal with ⌃l or `clear`.
 
 Focus follows the tiling focus, Hyprland-style: any keyboard action that moves
 focus (the six rows above through ⌘shift 1..5, plus opening a pane from the

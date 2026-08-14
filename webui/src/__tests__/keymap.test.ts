@@ -99,6 +99,24 @@ describe("actionFor", () => {
     expect(actionFor(key("k"))).toEqual({ type: "focus", dir: "up" });
   });
 
+  it("plain ⌘k is focus-up unconditionally — no pane may claim it", () => {
+    // TermPane once handled ⌘k as "clear the terminal buffer", which could
+    // never run: DesktopShell's capturing window listener swallows every
+    // chord actionFor recognizes before xterm's listener (on its own hidden
+    // textarea) sees it. The keymap is exclusive; a pane-local chord has to
+    // be one actionFor returns null for. ⌃/⌥ are reserved for that.
+    expect(actionFor(key("k"))).toEqual({ type: "focus", dir: "up" });
+    expect(actionFor(key("K", { shiftKey: true }))).toEqual({ type: "swap", dir: "up" });
+    expect(actionFor(key("l", { ctrlKey: true, metaKey: false }))).toBeNull();
+  });
+
+  it("leaves the chords TermPane handles locally unbound", () => {
+    // Copy/paste in a terminal (⌘c/⌘v) work precisely because the keymap
+    // does not recognize them, so the shell never preventDefaults them.
+    expect(actionFor(key("c"))).toBeNull();
+    expect(actionFor(key("v"))).toBeNull();
+  });
+
   it("returns null for non-mod events", () => {
     expect(actionFor(key("w", { metaKey: false }))).toBeNull();
     expect(actionFor(key("Enter", { metaKey: false }))).toBeNull();
