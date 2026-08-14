@@ -79,8 +79,8 @@ export default function Cheatsheet({ onClose }: Props) {
           </tbody>
         </table>
         <div className="mt-2 text-[10px] text-term-dim">
-          in a focused terminal, ⌘k clears the buffer — use arrows/⌘↑ to focus upward from a
-          terminal
+          ⌘ chords always belong to the shell, in a focused terminal too — ⌃ and ⌥ chords pass
+          through, so clear a terminal with ⌃l
         </div>
       </div>
     </div>

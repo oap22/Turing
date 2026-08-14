@@ -160,23 +160,13 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
     disposedRef.current = false;
 
     term.attachCustomKeyEventHandler((e) => {
-      // Standard macOS terminal "clear" behavior. Must be checked before
-      // `actionFor` below, since plain ⌘k is otherwise the global
-      // focus-up binding — this is a deliberate, documented exception that
-      // only applies while a terminal has keyboard focus (Cheatsheet.tsx
-      // and desktop/README.md both note it; arrows/⌘↑ still focus upward
-      // from a terminal).
-      if (
-        e.metaKey &&
-        !e.ctrlKey &&
-        !e.altKey &&
-        !e.shiftKey &&
-        e.key.toLowerCase() === "k" &&
-        e.type === "keydown"
-      ) {
-        term.clear();
-        return false;
-      }
+      // No pane-local ⌘ chord may shadow the keymap. DesktopShell listens on
+      // `window` with capture:true and preventDefault/stopPropagation's every
+      // chord `actionFor` recognizes, so it wins before xterm's own listener
+      // on its hidden textarea ever sees the event — a handler here for e.g.
+      // ⌘k (once wired to clear the buffer) is simply unreachable. Clearing a
+      // terminal is the shell's job anyway: ⌃l, or `clear`. ⌃/⌥ chords are
+      // deliberately left unclaimed by the keymap and pass straight through.
       if (
         actionFor({
           metaKey: e.metaKey,
