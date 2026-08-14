@@ -23,7 +23,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import DesktopShell, { type Surface } from "../DesktopShell";
 import { emptyLayout, openPane } from "../layout";
-import { createSession, emptyStore, saveSessions } from "../sessions";
+import { createSession, emptyStore, RESEED_KEY, saveSessions } from "../sessions";
 
 // Node 20+ ships its own experimental global `localStorage`, which throws
 // without a `--localstorage-file` flag — it shadows jsdom's window.localStorage
@@ -67,6 +67,12 @@ function seedSession() {
   const layout = openPane(emptyLayout(), "queue", undefined, "q1");
   const store = createSession(emptyStore(), "bench", layout, 1000, "s1");
   saveSessions(localStorage, store);
+  // Park the profile in its steady state. This test is about *when* the
+  // ResizeObserver attaches, not about the one-time layout reseed — leaving
+  // the marker unset would hand the shell a reseeded preset instead of the
+  // single `queue` pane seeded above, and that pane was chosen deliberately
+  // (see the header) because it mounts under jsdom without a Tauri runtime.
+  localStorage.setItem(RESEED_KEY, "1");
 }
 
 function surface(): Surface {
@@ -80,7 +86,7 @@ function surface(): Surface {
       liveTrace: [],
       onTraceSelect: vi.fn(),
     },
-    wsStatus: "open",
+    wsBadge: null,
   };
 }
 

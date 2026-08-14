@@ -3,10 +3,18 @@
 // stub with no DOM involved.
 
 import { describe, expect, it } from "vitest";
-import { defaultLayout, emptyLayout, openPane, serialize, type LayoutState } from "../desktop/layout";
+import {
+  defaultLayout,
+  emptyLayout,
+  openPane,
+  rsiLayout,
+  serialize,
+  type LayoutState,
+} from "../desktop/layout";
 import { layoutReducer } from "../desktop/DesktopShell";
 import {
   activeSession,
+  createRsiSession,
   createSession,
   deleteSession,
   deserializeSessions,
@@ -15,6 +23,7 @@ import {
   listSessions,
   loadSessions,
   renameSession,
+  RESEED_KEY,
   saveLayoutInto,
   saveSessions,
   serializeSessions,
@@ -25,7 +34,18 @@ import {
 
 
 
+// Storage in its *steady state*: the one-time layout reseed has already run,
+// so `loadSessions` returns what was stored rather than reseeding it. This is
+// the state a profile is in for every launch after the first, and therefore
+// the right default for tests that are about anything other than the reseed
+// itself. Use `unseededStorage` for those.
 function memStorage(seed: Record<string, string> = {}): SessionStorage & { map: Map<string, string> } {
+  return unseededStorage({ [RESEED_KEY]: "1", ...seed });
+}
+
+function unseededStorage(
+  seed: Record<string, string> = {},
+): SessionStorage & { map: Map<string, string> } {
   const map = new Map<string, string>(Object.entries(seed));
   return {
     map,
@@ -34,6 +54,14 @@ function memStorage(seed: Record<string, string> = {}): SessionStorage & { map: 
       map.set(k, v);
     },
   };
+}
+
+// Layouts compared by *shape*, not identity: every seed mints fresh leaf ids
+// from a module-local counter, so two structurally identical layouts never
+// serialize equal. Stripping the ids is what lets a test say "this is the
+// preset" and mean it.
+function shapeOf(layout: LayoutState): string {
+  return serialize(layout).replace(/"(id|focus)":"leaf-\d+"/g, '"$1":"_"');
 }
 
 function layoutWith(...panes: string[]): LayoutState {
@@ -74,18 +102,16 @@ describe("save/load round-trip", () => {
   });
 });
 
-describe("legacy five-workspace sessions are not migrated on load", () => {
+describe("five-workspace sessions: reseeded once, then left alone", () => {
   // A layout persisted before the seeded default shrank from five workspaces
-  // to three. `loadSessions`/`isValidLayoutState` must accept it exactly as
-  // it is — dropping the two extra workspaces here would be silent data loss
-  // for anyone who had panes open on ⌘4 or ⌘5 when they last quit. This used
-  // to be true only at load time and false again the moment the user did
-  // anything: the old prune rule swept every trailing empty workspace after
-  // *any* close or plain workspace switch, so a restored ws4/ws5-empty
-  // layout lost both on the very first ⌘W or ⌘-digit press. With pruning
-  // narrowed to "the active workspace just got emptied, and it's last," a
-  // close anywhere else in the layout can no longer touch ws4 or ws5 at all
-  // — see the second test below.
+  // to three. `isValidLayoutState` still accepts it — the shape is legal, and
+  // pruning can never reach ⌘4/⌘5 on its own (the last test here proves it).
+  // What changed is the *load* path: Owen asked for the new preset to be
+  // pushed onto existing workstations rather than only appearing on ones
+  // created after the change, so the first load per profile reseeds every
+  // stored layout and records that it did. Every load after that is a plain
+  // restore again, which is what keeps the reseed from bulldozing arrangements
+  // the user builds from here on.
   function fiveWorkspaceLayout(): LayoutState {
     let state = layoutWith("a", "b");
     while (state.workspaces.length < 5) {
@@ -94,16 +120,51 @@ describe("legacy five-workspace sessions are not migrated on load", () => {
     return state;
   }
 
-  it("round-trips a five-workspace session through localStorage unchanged", () => {
-    const layout = fiveWorkspaceLayout();
-    const store = createSession(emptyStore(), "old-style", layout, 1000, "s1");
-    const storage = memStorage();
+  it("reseeds a five-workspace session to the three-workspace preset on first load", () => {
+    const store = createSession(emptyStore(), "old-style", fiveWorkspaceLayout(), 1000, "s1");
+    const storage = unseededStorage();
     saveSessions(storage, store);
 
-    const loaded = loadSessions(storage);
-    const restored = activeSession(loaded);
+    const restored = activeSession(loadSessions(storage));
+    // The workstation survives; only its layout is replaced.
+    expect(restored?.name).toBe("old-style");
+    expect(restored?.createdAt).toBe(1000);
+    expect(shapeOf(restored!.layout)).toBe(shapeOf(defaultLayout()));
+  });
+
+  it("records the reseed so the next load restores rather than reseeds", () => {
+    const storage = unseededStorage();
+    saveSessions(storage, createSession(emptyStore(), "old-style", fiveWorkspaceLayout(), 1000, "s1"));
+    loadSessions(storage);
+    expect(storage.map.get(RESEED_KEY)).toBeDefined();
+
+    // Whatever the user arranges from here must survive every later launch.
+    const arranged = createSession(emptyStore(), "old-style", fiveWorkspaceLayout(), 1000, "s1");
+    saveSessions(storage, arranged);
+    const restored = activeSession(loadSessions(storage));
     expect(restored?.layout.workspaces).toHaveLength(5);
-    expect(serialize(restored!.layout)).toBe(serialize(layout));
+    expect(serialize(restored!.layout)).toBe(serialize(arranged.sessions.s1.layout));
+  });
+
+  it("arms the reseed marker even when there is nothing stored to reseed", () => {
+    // Otherwise a brand-new install leaves it armed, and the *next* launch
+    // reseeds the workstations the user just made.
+    const storage = unseededStorage();
+    expect(loadSessions(storage)).toEqual({ sessions: {}, activeId: null });
+    expect(storage.map.get(RESEED_KEY)).toBeDefined();
+  });
+
+  it("keeps an rsi workstation's loop terminal through the reseed", () => {
+    // The slug/problem live only in the loop terminal's leaf params, so a
+    // reseed that rebuilt from `defaultLayout()` would quietly demote an rsi
+    // experiment to an ordinary desktop with the same name.
+    const store = createRsiSession(emptyStore(), "sweep", rsiLayout("sweep-1", "make it faster"));
+    const storage = unseededStorage();
+    saveSessions(storage, store);
+
+    const restored = activeSession(loadSessions(storage));
+    expect(restored?.kind).toBe("rsi");
+    expect(shapeOf(restored!.layout)).toBe(shapeOf(rsiLayout("sweep-1", "make it faster")));
   });
 
   it("survives a close in a populated non-trailing workspace with all five workspaces intact", () => {

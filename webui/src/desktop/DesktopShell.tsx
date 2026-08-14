@@ -100,7 +100,10 @@ export interface Surface {
     liveTrace: TraceEvent[];
     onTraceSelect: (e: TraceEvent) => void;
   };
-  wsStatus: WsStatus;
+  // Null while there is nothing worth saying about the gateway socket — see
+  // `wsBadgeFor`. The top bar renders no badge at all in that case rather
+  // than a permanent all-clear.
+  wsBadge: WsStatus | null;
 }
 
 interface Props {
@@ -819,7 +822,8 @@ export default function DesktopShell({ surface }: Props) {
     for (const l of leaves) allLeaves.push({ ws: i, leaf: l });
   });
 
-  const wsStatusInfo = WS_STATUS_LABEL[surface.wsStatus];
+  const wsStatusInfo =
+    surface.wsBadge === null ? null : WS_STATUS_LABEL[surface.wsBadge];
   const clock = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
 
   return (
@@ -866,9 +870,15 @@ export default function DesktopShell({ surface }: Props) {
             +
           </button>
         )}
-        <span className={`ml-2 ${wsStatusInfo.cls}`}>
-          {wsStatusInfo.dot} {wsStatusInfo.text}
-        </span>
+        {wsStatusInfo !== null && (
+          <span
+            data-testid="ws-status"
+            data-status={surface.wsBadge}
+            className={`ml-2 ${wsStatusInfo.cls}`}
+          >
+            {wsStatusInfo.dot} {wsStatusInfo.text}
+          </span>
+        )}
         {/* Which saved workstation these panes belong to — without it, "⌘p →
             session: rename" is aimed at something invisible. Clicking it goes
             back to Home, so the way out is where the name already is. */}
