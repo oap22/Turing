@@ -98,6 +98,18 @@ export const WS_STATUS_LABEL: Record<WsStatus, { dot: string; text: string; cls:
   closed: { dot: "●", text: "offline", cls: "text-rose-400" },
 };
 
+// What the chrome should actually render for a socket state — `null` meaning
+// "say nothing". A gateway that has never answered is the normal case when
+// you're driving the app without one running, and a badge that sits amber
+// from launch to quit just teaches you to ignore the one spot in the chrome
+// that's supposed to mean something is wrong. So the badge stays silent until
+// a connection has actually existed, and silent again while that connection
+// is healthy; it speaks only when a live socket drops.
+export function wsBadgeFor(status: WsStatus, everConnected: boolean): WsStatus | null {
+  if (!everConnected || status === "open") return null;
+  return status;
+}
+
 export default function App() {
   const [state, dispatch] = useReducer(
     (s: ReturnType<typeof emptyState>, f: Frame) => reduce(s, f),
@@ -116,6 +128,10 @@ export default function App() {
   const [now, setNow] = useState(() => Date.now());
   const [specsRows, setSpecsRows] = useState<PeerSpecsRow[]>([]);
   const [wsStatus, setWsStatus] = useState<WsStatus>("reconnecting");
+  // Latched on the first successful connect and never cleared: it separates
+  // "never reached the gateway" from "lost the gateway", which is the whole
+  // distinction the badge is worth showing for.
+  const [everConnected, setEverConnected] = useState(false);
   const [tab, setTab] = useState<TabId>(
     () => tabFromHash(window.location.hash) ?? "queue",
   );
@@ -154,7 +170,10 @@ export default function App() {
   useEffect(() => {
     const stop = connectGatewayWS<Frame>({
       url: window.location.origin.replace(/^http/, "ws") + "/ws",
-      onStatus: (status) => setWsStatus(status),
+      onStatus: (status) => {
+        setWsStatus(status);
+        if (status === "open") setEverConnected(true);
+      },
       onFrame: (frame) => {
         debugRing.current = [
           ...debugRing.current.slice(-(DEBUG_RING_CAP - 1)),
@@ -310,7 +329,8 @@ export default function App() {
     setTimeout(() => setHighlightedEdge(null), HIGHLIGHT_MS);
   }, []);
 
-  const ws = WS_STATUS_LABEL[wsStatus];
+  const wsBadge = wsBadgeFor(wsStatus, everConnected);
+  const ws = wsBadge === null ? null : WS_STATUS_LABEL[wsBadge];
 
   // Bundles the props the three gateway-backed views already receive below,
   // so the desktop shell's tiling panes can render the exact same components
@@ -325,7 +345,7 @@ export default function App() {
       liveTrace,
       onTraceSelect,
     },
-    wsStatus,
+    wsBadge,
   };
 
   if (isTauri()) {
@@ -386,9 +406,11 @@ export default function App() {
             </kbd>{" "}
             debug
           </span>
-          <span data-testid="ws-status" data-status={wsStatus} className={ws.cls}>
-            {ws.dot} {ws.text}
-          </span>
+          {ws !== null && (
+            <span data-testid="ws-status" data-status={wsBadge} className={ws.cls}>
+              {ws.dot} {ws.text}
+            </span>
+          )}
         </span>
       </header>
       <main id="operator-surface" className="flex min-h-0 flex-1 overflow-hidden">

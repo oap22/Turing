@@ -86,7 +86,7 @@ function surface(): Surface {
       liveTrace: [],
       onTraceSelect: vi.fn(),
     },
-    wsStatus: "open",
+    wsBadge: null,
   };
 }
 
