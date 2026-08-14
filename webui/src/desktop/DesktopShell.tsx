@@ -32,6 +32,7 @@ import {
   openPane,
   rects,
   resize,
+  rsiLayout,
   sendToWs,
   seedIds,
   swap,
@@ -50,6 +51,7 @@ import { applyGaps, GAPS_IN_PX, GAPS_OUT_PX } from "./gaps";
 import Home from "./Home";
 import {
   activeSession,
+  createRsiSession,
   createSession,
   deleteSession,
   listSessions,
@@ -60,6 +62,7 @@ import {
   switchSession,
   type SessionStore,
 } from "./sessions";
+import { isRsiParams, rsiSlug } from "./rsi";
 import AgentFeedPane from "./panes/AgentFeedPane";
 import AgentsPane from "./panes/AgentsPane";
 import FlywheelPane from "./panes/FlywheelPane";
@@ -310,6 +313,7 @@ function PaneBody({
               ? leaf.params.runnerId
               : undefined
           }
+          rsi={isRsiParams(leaf.params?.rsi) ? leaf.params.rsi : undefined}
           visible={visible}
         />
       );
@@ -469,6 +473,18 @@ export default function DesktopShell({ surface }: Props) {
   function createWorkstation(name: string) {
     const layout = defaultLayout();
     const next = createSession(sessions, name, layout);
+    commitSessions(next);
+    dispatchFrom({ type: "setLayout", layout }, "passive");
+    setHome(false);
+  }
+
+  // Home's "new rsi experiment": seed the RSI layout, whose loop terminal
+  // pre-types the sandbox loop command, and persist the session with
+  // kind: "rsi" so Home can label it. The loop does not start until the
+  // user presses Enter in that terminal.
+  function createRsiWorkstation(name: string, problem: string) {
+    const layout = rsiLayout(rsiSlug(name), problem);
+    const next = createRsiSession(sessions, name, layout);
     commitSessions(next);
     dispatchFrom({ type: "setLayout", layout }, "passive");
     setHome(false);
@@ -657,6 +673,7 @@ export default function DesktopShell({ surface }: Props) {
         activeId={current?.id ?? null}
         onOpen={goToSession}
         onCreate={createWorkstation}
+        onCreateRsi={createRsiWorkstation}
         onRename={renameWorkstation}
         onRemove={removeWorkstation}
         onResume={resumeLastUsed}

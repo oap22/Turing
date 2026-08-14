@@ -13,10 +13,12 @@ import { readTermTokens } from "../theme";
 import { inv, subscribe } from "../tauri";
 import type { Runner } from "../runners";
 import { resolveRunner, RUNNERS } from "../runners";
+import { rsiRunner, type RsiParams } from "../rsi";
 
 interface Props {
   leafId: string;
   runnerId?: string;
+  rsi?: RsiParams;
   visible: boolean;
 }
 
@@ -95,7 +97,7 @@ function xtermTheme() {
   };
 }
 
-export default function TermPane({ leafId, runnerId, visible }: Props) {
+export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -116,9 +118,11 @@ export default function TermPane({ leafId, runnerId, visible }: Props) {
   const [dead, setDead] = useState(false);
 
   useEffect(() => {
-    const tableRunner: Runner | undefined = runnerId
-      ? RUNNERS.find((r) => r.id === runnerId)
-      : undefined;
+    const tableRunner: Runner | undefined = rsi
+      ? rsiRunner(rsi)
+      : runnerId
+        ? RUNNERS.find((r) => r.id === runnerId)
+        : undefined;
 
     const cssMonoVar = getComputedStyle(document.documentElement)
       .getPropertyValue("--font-mono")

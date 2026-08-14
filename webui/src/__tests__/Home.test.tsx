@@ -40,6 +40,7 @@ function setup(sessions: Session[] = twoSessions(), activeId: string | null = "s
   const handlers = {
     onOpen: vi.fn(),
     onCreate: vi.fn(),
+    onCreateRsi: vi.fn(),
     onRename: vi.fn(),
     onRemove: vi.fn(),
     onResume: vi.fn(),
@@ -137,6 +138,8 @@ describe("Home", () => {
     it("prompts for a name and creates on return", () => {
       const { dialog, onCreate } = setup();
       fireEvent.keyDown(dialog, { key: "n" });
+      // The kind chooser defaults to "workstation" (cursor 0); Enter accepts it.
+      fireEvent.keyDown(dialog, { key: "Enter" });
       const input = screen.getByLabelText("new workstation name");
       fireEvent.change(input, { target: { value: "  writing  " } });
       fireEvent.keyDown(input, { key: "Enter" });
@@ -146,6 +149,7 @@ describe("Home", () => {
     it("refuses an empty name rather than creating an unnamed workstation", () => {
       const { dialog, onCreate } = setup();
       fireEvent.keyDown(dialog, { key: "n" });
+      fireEvent.keyDown(dialog, { key: "Enter" });
       fireEvent.keyDown(screen.getByLabelText("new workstation name"), { key: "Enter" });
       expect(onCreate).not.toHaveBeenCalled();
     });
@@ -155,6 +159,9 @@ describe("Home", () => {
       expect(screen.getByText(/no workstations yet/)).toBeInTheDocument();
       fireEvent.keyDown(dialog, { key: "Enter" });
       expect(onOpen).not.toHaveBeenCalled();
+      // Enter on the empty list opens the kind chooser; a second Enter accepts
+      // the default "workstation" selection.
+      fireEvent.keyDown(dialog, { key: "Enter" });
       fireEvent.change(screen.getByLabelText("new workstation name"), {
         target: { value: "first" },
       });
@@ -171,6 +178,90 @@ describe("Home", () => {
     fireEvent.change(input, { target: { value: "triage-2" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onRename).toHaveBeenCalledWith("s2", "triage-2");
+  });
+
+  describe("kind chooser (RSI workstations)", () => {
+    it("shows both option labels and description lines on n", () => {
+      const { dialog } = setup();
+      fireEvent.keyDown(dialog, { key: "n" });
+      expect(screen.getByText("workstation")).toBeInTheDocument();
+      expect(
+        screen.getByText("a saved pane layout — reopens the same shape with fresh shells"),
+      ).toBeInTheDocument();
+      expect(screen.getByText("rsi experiment")).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          "a sandboxed agent loops on a problem; the panes watch its results live",
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it("creates an rsi workstation via chooser → name → problem", () => {
+      const { dialog, onCreateRsi, onCreate } = setup();
+      fireEvent.keyDown(dialog, { key: "n" });
+      fireEvent.keyDown(dialog, { key: "ArrowDown" });
+      fireEvent.keyDown(dialog, { key: "Enter" });
+
+      const nameInput = screen.getByLabelText("new workstation name");
+      expect(nameInput).toHaveAttribute("placeholder", "name for the rsi experiment…");
+      fireEvent.change(nameInput, { target: { value: "flywheel-tune" } });
+      fireEvent.keyDown(nameInput, { key: "Enter" });
+
+      const problemInput = screen.getByLabelText("experiment problem statement");
+      expect(problemInput).toHaveAttribute("placeholder", "what should the agent iterate on?");
+      fireEvent.change(problemInput, { target: { value: "improve the sampler" } });
+      fireEvent.keyDown(problemInput, { key: "Enter" });
+
+      expect(onCreateRsi).toHaveBeenCalledWith("flywheel-tune", "improve the sampler");
+      expect(onCreate).not.toHaveBeenCalled();
+    });
+
+    it("the default selection still creates a normal workstation", () => {
+      const { dialog, onCreate, onCreateRsi } = setup();
+      fireEvent.keyDown(dialog, { key: "n" });
+      fireEvent.keyDown(dialog, { key: "Enter" });
+      const nameInput = screen.getByLabelText("new workstation name");
+      fireEvent.change(nameInput, { target: { value: "bench-2" } });
+      fireEvent.keyDown(nameInput, { key: "Enter" });
+      expect(onCreate).toHaveBeenCalledWith("bench-2");
+      expect(onCreateRsi).not.toHaveBeenCalled();
+    });
+
+    it("refuses an empty problem rather than creating an unnamed experiment", () => {
+      const { dialog, onCreateRsi } = setup();
+      fireEvent.keyDown(dialog, { key: "n" });
+      fireEvent.keyDown(dialog, { key: "ArrowDown" });
+      fireEvent.keyDown(dialog, { key: "Enter" });
+      fireEvent.change(screen.getByLabelText("new workstation name"), {
+        target: { value: "flywheel-tune" },
+      });
+      fireEvent.keyDown(screen.getByLabelText("new workstation name"), { key: "Enter" });
+      fireEvent.keyDown(screen.getByLabelText("experiment problem statement"), { key: "Enter" });
+      expect(onCreateRsi).not.toHaveBeenCalled();
+    });
+
+    it("escapes back to the list without firing a callback", () => {
+      const { dialog, onCreate, onCreateRsi } = setup();
+      fireEvent.keyDown(dialog, { key: "n" });
+      fireEvent.keyDown(dialog, { key: "Escape" });
+      expect(screen.getByRole("dialog")).toBeInTheDocument();
+      expect(onCreate).not.toHaveBeenCalled();
+      expect(onCreateRsi).not.toHaveBeenCalled();
+    });
+
+    it("renders the rsi badge only for rsi sessions", () => {
+      let store = createSession(emptyStore(), "bench", openPane(emptyLayout(), "term", undefined, "a"), 1000, "s1");
+      store = createSession(
+        store,
+        "exp",
+        openPane(emptyLayout(), "term", undefined, "b"),
+        2000,
+        "s2",
+        "rsi",
+      );
+      setup(listSessions(store), "s2");
+      expect(screen.getAllByText("rsi")).toHaveLength(1);
+    });
   });
 
   describe("row summaries", () => {
