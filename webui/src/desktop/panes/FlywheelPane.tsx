@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { inv, subscribe } from "../tauri";
 import { parseTrajectory, type Round } from "./flywheel";
+import Select from "../Select";
 import {
   parseRoundRecord,
   roundDirName,
@@ -552,17 +553,13 @@ export default function FlywheelPane() {
   return (
     <div className="flex h-full flex-col text-xs">
       <div className="flex items-center gap-2 border-b border-term-edge p-2">
-        <select
+        <Select
           value={selected ?? ""}
-          onChange={(e) => setSelected(e.target.value)}
-          className="border border-term-edge bg-term-bg text-term-fg"
-        >
-          {loops.map((l) => (
-            <option key={l} value={l}>
-              {l}
-            </option>
-          ))}
-        </select>
+          options={loops.map((l) => ({ value: l, label: l }))}
+          onChange={setSelected}
+          label="loop"
+          className="w-40"
+        />
         <button
           type="button"
           onClick={() => {

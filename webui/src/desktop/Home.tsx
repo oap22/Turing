@@ -24,6 +24,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Node } from "./layout";
 import type { Session, SessionKind } from "./sessions";
+import Select from "./Select";
 import { THEMES } from "./theme";
 import UpdateOverlay from "./UpdateOverlay";
 
@@ -334,18 +335,14 @@ export default function Home({
           is the screen where a session's look gets chosen. */}
       <div className="flex w-full shrink-0 items-center gap-3 px-3 py-2 text-[10px] text-term-dim">
         <span className="uppercase tracking-widest">turing desktop</span>
-        <select
+        <Select
           value={theme}
-          onChange={(e) => onThemeChange(e.target.value)}
-          aria-label="theme"
-          className="ml-auto border border-term-edge bg-term-bg px-1 text-[10px] text-term-dim"
-        >
-          {THEMES.map((t) => (
-            <option key={t.id} value={t.id}>
-              {t.label}
-            </option>
-          ))}
-        </select>
+          options={THEMES.map((t) => ({ value: t.id, label: t.label }))}
+          onChange={onThemeChange}
+          label="theme"
+          size="xs"
+          className="ml-auto w-24"
+        />
       </div>
 
       <div className="flex w-full flex-1 flex-col items-center justify-center gap-6 px-6 py-6">
