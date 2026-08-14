@@ -4,7 +4,7 @@
 // pane below renders the *same* component the browser tab UI uses, just fed
 // from `surface` instead of App's own hooks.
 
-import { useEffect, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import type { ChatSession, QueueItem } from "../ws";
 import type { GraphState } from "../graph/types";
 import type { PeerSpecsRow } from "../specs/types";
@@ -52,6 +52,7 @@ import {
 } from "./layout";
 import { applyGaps, GAPS_IN_PX, GAPS_OUT_PX } from "./gaps";
 import Home from "./Home";
+import Select from "./Select";
 import {
   activeSession,
   createRsiSession,
@@ -79,6 +80,15 @@ import { applyTheme, initTheme, THEMES } from "./theme";
 const TITLE_ROW_PX = 20;
 const TOP_BAR_PX = 24;
 const SPLITTER_HIT_PX = 4;
+
+// Placeholder viewport for the window before the real one can be measured —
+// used only when `getBoundingClientRect()` comes back 0×0, which in practice
+// means jsdom (no real layout engine) rather than a genuinely collapsed
+// window. Feeding a real 0×0 rect into `rects()`/`applyGaps()` is safe (they
+// clamp rather than divide), but it is not a *useful* size to render or to
+// assert against in a test, so tests get the same reasonable placeholder a
+// human would see for one frame on a real machine.
+const FALLBACK_VIEWPORT: Rect = { x: 0, y: 0, w: 1600, h: 900 };
 
 export interface Surface {
   queue: { items: QueueItem[] };
@@ -423,12 +433,8 @@ export default function DesktopShell({ surface }: Props) {
   const [theme, setTheme] = useState(() => localStorage.getItem("turing.theme") ?? "turing");
   const [now, setNow] = useState(() => new Date());
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const [viewport, setViewport] = useState<Rect>({
-    x: 0,
-    y: 0,
-    w: 1600,
-    h: 900,
-  });
+  const viewportObserverRef = useRef<ResizeObserver | null>(null);
+  const [viewport, setViewport] = useState<Rect>(FALLBACK_VIEWPORT);
 
   // Hyprland-style focus-follow. `layoutReducer` is pure and can't know what
   // provoked a transition, so the provocation is recorded here at the
@@ -662,15 +668,45 @@ export default function DesktopShell({ surface }: Props) {
     return () => clearInterval(id);
   }, []);
 
-  useEffect(() => {
-    const el = containerRef.current;
+  // Measures the real window and keeps `viewport` in sync with it. A callback
+  // ref rather than a `useEffect(() => {...}, [])` on `containerRef`: the
+  // tiling area only exists in the DOM once `home` flips to false (see the
+  // early return below that renders `<Home>` *instead of* the shell), and an
+  // effect with an empty dep array runs exactly once, at first mount — while
+  // `home` is still true and `containerRef.current` is still null. It would
+  // silently no-op for the rest of the session, which is exactly how the
+  // shell ended up permanently laid out against a hardcoded 1600×900 phantom
+  // viewport regardless of the real window size. A ref callback instead fires
+  // precisely when the container node mounts and unmounts — on the way into a
+  // workstation, on the way back out through ⌘0, and into whichever
+  // workstation comes after — so attach/detach can never be skipped by a
+  // conditional render sitting above it. (Same reasoning as `attachWheelBox`
+  // in FlywheelPane.tsx.)
+  const attachContainer = useCallback((el: HTMLDivElement | null) => {
+    containerRef.current = el;
+    viewportObserverRef.current?.disconnect();
+    viewportObserverRef.current = null;
     if (!el) return;
+    // Seed synchronously from a real measurement rather than waiting for the
+    // observer's first callback (a frame away): otherwise the very first
+    // painted frame renders at the FALLBACK_VIEWPORT size and then snaps to
+    // the real one, which is the flash-then-jump this fix removes.
+    const r = el.getBoundingClientRect();
+    setViewport(
+      r.width > 0 && r.height > 0
+        ? { x: 0, y: 0, w: r.width, h: r.height }
+        : FALLBACK_VIEWPORT,
+    );
     const ro = new ResizeObserver((entries) => {
-      const r = entries[0]?.contentRect;
-      if (r) setViewport({ x: 0, y: 0, w: r.width, h: r.height });
+      const entry = entries[0]?.contentRect;
+      // jsdom (tests) reports 0×0 for elements it never actually lays out;
+      // latching onto that would blank a real, previously-measured layout.
+      if (entry && entry.width > 0 && entry.height > 0) {
+        setViewport({ x: 0, y: 0, w: entry.width, h: entry.height });
+      }
     });
     ro.observe(el);
-    return () => ro.disconnect();
+    viewportObserverRef.current = ro;
   }, []);
 
   useEffect(() => {
@@ -844,24 +880,20 @@ export default function DesktopShell({ surface }: Props) {
         >
           {current ? `⌂ ${current.name}` : "⌂ workstations"}
         </button>
-        <select
+        <Select
           value={theme}
-          onChange={(e) => {
-            applyTheme(e.target.value);
-            setTheme(e.target.value);
+          options={THEMES.map((t) => ({ value: t.id, label: t.label }))}
+          onChange={(id) => {
+            applyTheme(id);
+            setTheme(id);
           }}
-          className="ml-auto border border-term-edge bg-term-bg text-term-fg"
-        >
-          {THEMES.map((t) => (
-            <option key={t.id} value={t.id}>
-              {t.label}
-            </option>
-          ))}
-        </select>
+          label="theme"
+          className="ml-auto w-28"
+        />
         <span className="tabular-nums text-term-dim">{clock}</span>
       </header>
       <div
-        ref={containerRef}
+        ref={attachContainer}
         className="relative min-h-0 flex-1 overflow-hidden"
       >
         {allLeaves.map(({ ws: wsIdx, leaf }) => {

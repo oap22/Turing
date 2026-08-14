@@ -44,6 +44,61 @@ function runLabelOf(relPath: string): string {
   return parts.length > 1 ? parts[0] : relPath;
 }
 
+interface RunMultiSelectProps {
+  runFiles: Entry[];
+  selected: string[];
+  onChange: (selected: string[]) => void;
+}
+
+// Custom multi-select listbox standing in for `<select multiple size={4}>` —
+// same visual vocabulary as Select.tsx (bordered term-panel box, term-raised/
+// term-accent highlighted rows), same `string[]` state and "auto" sentinel.
+// Each row is an independent toggle rather than a single commit-on-Enter
+// cursor, so this doesn't reuse Select.tsx's single-select state machine.
+function RunMultiSelect({ runFiles, selected, onChange }: RunMultiSelectProps) {
+  const options = [
+    { value: "auto", label: "auto (newest)" },
+    ...runFiles.map((f) => ({ value: f.rel_path, label: runLabelOf(f.rel_path) })),
+  ];
+
+  function toggle(value: string) {
+    if (selected.includes(value)) {
+      onChange(selected.filter((v) => v !== value));
+    } else {
+      onChange([...selected, value]);
+    }
+  }
+
+  return (
+    <ul
+      role="listbox"
+      aria-multiselectable="true"
+      aria-label="runs"
+      // Roughly the old size={4}/min-w-[160px] footprint so the pane header
+      // doesn't reflow.
+      className="max-h-[88px] min-w-[160px] overflow-auto border border-term-edge bg-term-panel"
+    >
+      {options.map((opt) => {
+        const isSelected = selected.includes(opt.value);
+        return (
+          <li key={opt.value} role="presentation">
+            <button
+              type="button"
+              role="option"
+              aria-selected={isSelected}
+              onClick={() => toggle(opt.value)}
+              className={`block w-full whitespace-nowrap px-2 py-0.5 text-left text-xs ${
+                isSelected ? "bg-term-raised text-term-accent" : "text-term-fg"
+              }`}
+            >
+              {opt.label}
+            </button>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
 
 export default function MetricsPane() {
   const [runFiles, setRunFiles] = useState<Entry[]>([]);
@@ -207,22 +262,13 @@ export default function MetricsPane() {
     <div className="flex h-full flex-col text-xs">
       <div className="flex items-center gap-2 border-b border-term-edge p-2">
         <span className="text-[10px] uppercase tracking-wider text-term-dim">runs</span>
-        <select
-          multiple
-          size={4}
-          value={selected}
-          onChange={(e) =>
-            setSelected(Array.from(e.target.selectedOptions).map((o) => o.value))
-          }
-          className="min-w-[160px] border border-term-edge bg-term-bg text-term-fg"
-        >
-          <option value="auto">auto (newest)</option>
-          {runFiles.map((f) => (
-            <option key={f.rel_path} value={f.rel_path}>
-              {runLabelOf(f.rel_path)}
-            </option>
-          ))}
-        </select>
+        {/* WKWebView draws its own OS bezel around `<select multiple>` and
+            frequently ignores author `option:checked` backgrounds, so — same
+            reasoning as Select.tsx — this is a hand-rolled multi-select
+            listbox instead of a native control CSS can't fully reach. Same
+            `string[]` contract and "auto" sentinel as before, just built from
+            toggleable rows. */}
+        <RunMultiSelect runFiles={runFiles} selected={selected} onChange={setSelected} />
         {eta && (
           <div className="ml-2 font-mono text-term-dim">
             <span>steps/s: {eta.stepsPerSec?.toFixed(2) ?? "—"}</span>

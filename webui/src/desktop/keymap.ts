@@ -3,6 +3,12 @@
 // omarchy source map are resolved and documented in `Cheatsheet.tsx`:
 // toggleDir moved off ⌘J (which collides with focus-down) to ⌘T; cheatsheet
 // moved off ⌘K (which collides with focus-up) to ⌘/.
+//
+// This map is exclusive: DesktopShell listens on `window` with capture:true
+// and preventDefault/stopPropagation's every chord `actionFor` recognizes, so
+// no pane can shadow one — a capturing window listener always runs before a
+// listener on a descendant (xterm's is on its own hidden textarea). Panes that
+// want a chord of their own must use one `actionFor` returns null for.
 
 export type Dir4 = "left" | "right" | "up" | "down";
 
