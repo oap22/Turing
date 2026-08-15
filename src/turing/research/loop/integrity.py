@@ -548,10 +548,42 @@ class ReconcileState(str, Enum):  # noqa: UP042
     :attr:`INCOMPLETE` is reached *only* by a summary that is not there at
     all. A summary that exists but is unreadable, is not a JSON object, or
     disagrees with the log in any field is :attr:`FAILED`, unchanged — this
-    distinction weakens no check. Nor does it offer an escape hatch: deleting
-    a summary rather than doctoring it moves a run from FAILED to INCOMPLETE,
-    and ``turing.research.loop.verify`` exits non-zero (``2``) on INCOMPLETE
-    as well, so there is no edit that turns a bad run green.
+    distinction weakens no check. Nor does deleting a lone summary buy an
+    escape hatch: that moves a run from FAILED to INCOMPLETE, and
+    ``turing.research.loop.verify`` exits non-zero (``2``) on INCOMPLETE too
+    — a doctored *summary alone*, with an honest chain still sitting beside
+    it, cannot be edited to a green exit.
+
+    That guarantee is about the summary in isolation and does not extend to
+    the trio as a whole — this module's own module-level docstring already
+    concedes a self-consistent forgery (every file a check reads, rewritten
+    together so nothing disagrees with anything else) is undetectable by
+    construction, because nothing here is anchored outside the chain. Two
+    edits from that conceded family reach a green ``verify`` through *this*
+    function specifically, reproduced for real, and neither one computes a
+    digest:
+
+    * Delete ``metrics.jsonl`` and ``metrics.chain.json`` outright and leave
+      a freely-edited ``metrics.json`` (and the plots) behind.
+      ``turing.research.loop.verify.find_runs`` walks for directories
+      containing ``metrics.jsonl`` alone, so with the chain gone this
+      directory is not a run any more — the doctored summary is never read,
+      let alone checked, and the CLI exits ``0`` as long as the results root
+      holds one other honest run.
+    * Truncate ``metrics.jsonl`` to empty, rewrite the sidecar as
+      ``{"lines": 0, "final": <the sidecar's own already-recorded "seed",
+      copied verbatim>}``, and null out ``metrics.json``'s derived fields
+      (``steps_recorded: 0``, ``baseline_score: null``, ``best_score: null``,
+      and so on). An empty log with ``lines: 0`` is on-disk-identical to a
+      writer that has not appended its first line yet, which
+      :func:`verify_metrics_chain` reports ``ok=True`` for by design — and
+      :func:`reconcile_summary` has nothing left to disagree with. Real
+      output: ``OK (0 line(s) checked)``, exit ``0``.
+
+    Neither example sharpens the module docstring's limit; both are inside
+    it. What this enum must not claim is that :class:`ReconcileVerdict`
+    closes that hole for the trio the way it closes it for a lone summary —
+    it does not, and was never built to.
     """
 
     OK = "ok"

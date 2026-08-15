@@ -790,7 +790,40 @@ i.e. the parent of every `loop-<slug>/` directory), as:
 
 `series` names which field the metrics pane treats as primary; it defaults to
 `progress` for the reason given above. `runs` are POSIX-style paths relative
-to the results root, one per attempt directory written that round. To watch a
+to the results root, re-derived from disk on every round rather than kept in
+memory — the runner globs `round-*/attempts/**/metrics.jsonl` under the whole
+`loop-<slug>/` directory, so the list spans **every round written so far**,
+not only the one that just finished. Deriving it from memory instead was a
+real bug: the round runner's own attempt outcomes only ever hold the current
+round's problems, so a list built from them — even merged into whatever
+`.viewer.json` already held — lost every earlier round the moment the process
+restarted between rounds and that in-memory state was gone. Re-deriving from
+the filesystem on every write costs nothing a restart doesn't already pay.
+
+The walk is depth-independent, because `problem.id` is an unvalidated path
+component an operator may reasonably namespace — `"cuda/matmul-speedup"`
+produces `attempts/cuda/matmul-speedup/metrics.jsonl`, two segments below
+`attempts/`, and the list includes it at whatever depth it lands. A rotated
+`prior-N/` directory (see Integrity, below) is excluded by name rather than
+by depth, since depth no longer tells a live chain from a superseded one once
+nested ids are in the mix. Reproduced for real — two rounds, one nested id,
+one re-drive that rotates the first round's `cuda/matmul` attempt aside:
+
+```json
+{
+  "series": "progress",
+  "runs": [
+    "loop-test-loop/round-00/attempts/cuda/matmul",
+    "loop-test-loop/round-00/attempts/s1",
+    "loop-test-loop/round-01/attempts/s2"
+  ],
+  "titles": {"progress": "progress toward target (0 = baseline, 1 = target)"}
+}
+```
+
+Both `round-00` and `round-01` are listed together, `cuda/matmul` is listed at
+its full nested path, and the `prior-1/` directory the re-drive left behind
+under `round-00/attempts/cuda/matmul/` is not in the list at all. To watch a
 different series by hand — the raw `speedup` or `val_loss` for one problem,
 say, instead of the cross-problem `progress` — edit `series` in this file
 directly; there is no CLI for it. The desktop re-reads it on its normal poll,
@@ -898,6 +931,46 @@ automatically explained by "it's just a re-drive" — read on for the one
 reachable, genuinely benign way that happens, and note that this module
 cannot tell it apart from tampering on its own.
 
+**A FAIL has a third non-tampering cause: verifying an attempt that is
+mid-append, right now, in the gap between its two writes.** `MetricsWriter`
+writes the JSONL line first and rewrites `metrics.chain.json` second —
+deliberately, not incidentally: if the sidecar write failed after an honest
+line landed, the *next* verification must see a line-count mismatch and say
+so, rather than a writer whose counters silently drifted from what is on disk
+until someone eventually ran `verify` and got a confusing answer far removed
+from the actual failure. The cost of that ordering is a real window, however
+brief, where `metrics.jsonl` has been extended but the sidecar has not yet
+caught up — and this document now positively invites pointing `verify` at a
+round *while it runs*, so that window is reachable in the way this section
+describes, not merely theoretical. Caught for real: a tight loop appending
+thousands of lines to one attempt while a `python -m turing.research.loop.verify`
+subprocess raced it landed on its very first invocation, verbatim:
+
+```
+$ .venv/bin/python -m turing.research.loop.verify <results-root>
+.../attempts/race: FAIL chain: metrics.jsonl has 1143 line(s), metrics.chain.json reports 1141 (first_bad_index=None); summary: metrics.json is missing (the attempt never reached its summary write) [incomplete, not itself the failure]
+detects alteration; does not prevent it — see OPEN-QUESTIONS R2/Q11
+```
+
+Nothing was wrong with that data — the writer had legitimately gotten two
+appends ahead of the CLI process's own JSON parse-and-hash pass by the time it
+finished reading. The next append (its sidecar write lands microseconds
+later) and every check after it verifies clean; re-running `verify` a moment
+later reports the attempt as `INCOMPLETE` (still running, chain intact) or
+`OK`, never this transient `FAIL`. **This is a real limitation of verifying a
+live attempt, not a bug to route around at the write site**: reordering the
+writes — sidecar first, log second — would trade a visible, correct
+"something doesn't add up" for a writer whose own bookkeeping could silently
+diverge from disk on a failed second write, which is strictly worse and is
+exactly the property the docstring on `MetricsWriter.append` calls out as
+deliberate. An operator scripting `verify` against a round that might still be
+running should treat a `FAIL` naming a **currently-open** attempt (no
+`prior-N` in the path, and a summary reported `INCOMPLETE` alongside the
+chain break, as above) as *possibly* this race rather than an automatic
+tamper alarm, and re-check before escalating it — a `FAIL` against a
+`prior-N/` path or one paired with a **present, disagreeing** summary is not
+this shape and should not be waited out.
+
 **A killed process can produce a rotated-aside FAIL that is not tampering,
 and `verify` cannot tell the difference.** `MetricsWriter.append` is not
 atomic across a process kill: if the process dies mid-write, `metrics.jsonl`
@@ -955,27 +1028,122 @@ that did not finish. **Only the summary's absence is excused this way.** A
 sits beside it — otherwise deleting one file would soften a tamper's exit code
 from `1` to `2`.
 
-**A read-only `attempts/<problem-id>/` directory makes the re-drive itself
-fail loudly, not silently.** `_rotate_stale_metrics` is called at the very
-start of `run_attempt`, before a single line of the new attempt is written,
-and it is **not** wrapped in the try/except that guards the summary and plot
-writers later in the function. Reproduced for real by chmod'ing a completed
-attempt's directory to `555` and driving a second attempt into it:
+**`INCOMPLETE` used to over-fire, on a shape that is not a killed process at
+all: a *contained* attempt crash.** Round containment (see "One attempt's
+failure is contained to that attempt", above) catches an attempt's exception
+inside `run_attempts` and lets the round finish — but the crashed attempt's
+own `metrics.json` was, until this fix, never written, because that file has
+always been written by `run_attempt`'s own normal completion, and containment
+means `run_attempt` never reaches its end. A round that finished, having lost
+one problem to a contained crash, left that problem's directory in exactly
+the "intact chain, no summary" shape `INCOMPLETE` exists to name — permanently,
+since nothing was ever going to re-drive a directory the round considers
+closed — so a pre-writeup gate demanding exit `0` could never pass on a tree
+where nothing was wrong that the round's own verdict had not already
+disclosed. Nothing here was loosened to fix that: `RoundRunner` now writes a
+terminal, log-derived `metrics.json` for a contained crash
+(`runner._close_out_crashed_attempt`) — `best_score: null`, since the attempt
+produced no grade and a floor value would be the same fabricated-regression
+bug the round's cell computation already refuses one level up, and
+`final_state: "crashed_in_harness:<ExcType>"`, deliberately not a value of
+`AttemptState`, so it can never be misread as an outcome the experiment
+measured. Reproduced for real, a colliding `score_scale` tripping mid-attempt
+(after one line was already on disk) inside an otherwise-normal round:
 
 ```
-PermissionError: [Errno 13] Permission denied: '.../attempts/s1/prior-1'
-  ...
-  File ".../loop/runner.py", in _rotate_stale_metrics
-    prior_dir.mkdir(parents=True, exist_ok=True)
+$ .venv/bin/python -m turing.research.loop.verify <results-root>
+.../attempts/bad: OK (2 line(s) checked)
+.../attempts/good: OK (4 line(s) checked)
+detects alteration; does not prevent it — see OPEN-QUESTIONS R2/Q11
+$ echo $?
+0
 ```
 
-The exception propagates straight out of `run_attempt` uncaught — there is no
-silent skip, no silent overwrite, and no attempt at partial rotation. The
-whole re-drive raises before the new writer is even constructed, which is the
-correct failure mode for a directory the loop cannot actually write to: a
-round or noise-floor run driven against read-only results storage stops
-instead of quietly producing a record that looks complete but is missing the
-attempt that failed to start.
+`bad`'s own `metrics.json` there reads `"best_score": null,
+"final_state": "crashed_in_harness:ContractViolationError"` — a finding, not
+a pass, but a *finished* one, and `verify` now agrees. The round record still
+says exactly what happened (`all_attempts_completed: false`, the verdict
+prefix, no delta for the affected cell — see "A round record / trajectory"
+below); only the exit code stopped conflating "this round disclosed a loss"
+with "this attempt has not finished yet."
+
+**Exit `2` still means what it always meant: a killed process, not a
+contained crash.** Nothing above shrinks `INCOMPLETE`'s trigger — an attempt
+that never reaches *either* its normal completion *or* a caught exception in
+`run_attempts` (the process itself died, taking the whole call stack with it)
+still leaves an intact chain with no summary, and still reports `2`.
+Reproduced for real, deleting a completed attempt's own `metrics.json` to
+stand in for a process killed in the gap `run_attempt`'s own docstring names —
+after the last append, before the summary write:
+
+```
+$ .venv/bin/python -m turing.research.loop.verify <results-root>
+.../attempts/killed: INCOMPLETE (4 line(s) checked, chain intact) metrics.json is missing (the attempt never reached its summary write)
+detects alteration; does not prevent it — see OPEN-QUESTIONS R2/Q11
+$ echo $?
+2
+```
+
+The dividing line is not "did something go wrong" — it is "did the round (or
+the noise floor, or the CLI operator watching it) ever get a chance to say
+so." A contained crash always does, through the channels named above; a
+killed process, by definition, cannot.
+
+**A read-only `attempts/<problem-id>/` directory makes the re-drive fail
+loudly, not silently — but "fail" now means two different things for a round
+and for a noise floor, and the two must not be conflated.** `_rotate_stale_metrics`
+is called at the very start of `run_attempt`, before a single line of the new
+attempt is written, and it is **not** wrapped in the try/except that guards
+the summary and plot writers later in that function — so the `OSError` it
+raises (`prior_dir.mkdir(...)` denied) still propagates straight out of
+`run_attempt` itself, uncaught, exactly as before. What changed is what is
+sitting one level up. `run_attempts` now wraps *every* call to `run_attempt`
+in the same per-attempt guard that contains a colliding `score_scale` (see
+"One attempt's failure is contained to that attempt", above), and a rotation
+`OSError` is an ordinary `Exception` to that guard — it does not know or care
+that this exception came from a directory the loop cannot write to rather
+than a bad metrics key.
+
+- **A round completes anyway, minus the one problem.** Reproduced for real,
+  re-driving a directory whose rotation raises `PermissionError`: `run_round`
+  logs `research.attempt.crashed` and `research.round.attempts_lost` at
+  `ERROR`, sets the `all_attempts_completed` gate to `False`, and prefixes the
+  verdict —
+  ```
+  1 of 2 attempt(s) failed and are absent from every cell (bad); speedup/practice: no parent round; a baseline has no marginal gain
+  ```
+  — with `bad`'s *own* `attempts/bad/metrics.json` left exactly as the
+  re-drive found it: rotation raises before touching a single file, so the
+  previous, complete summary is simply never disturbed, not synthesised.
+  `python -m turing.research.loop.verify` on the finished results root exits
+  `0` — `bad`'s untouched old chain and its untouched old summary still
+  reconcile with each other, same as they did before anyone tried to re-drive
+  it. The round is honest about the loss (the gate, the verdict prefix, the
+  refused deltas — see "A round record / trajectory" below), but it is not
+  unfinished, and `verify` must not say it is.
+- **A noise-floor seed refuses instead, on purpose.** The same containment
+  happens inside `run_attempts` — the `PermissionError` does not propagate out
+  of it there either — but `NoiseFloorRunner.run` checks `attempt_failures`
+  immediately afterward and raises rather than accept a partial seed:
+  ```
+  noise-floor seed 1 (run 'noise-floor-seed-1') lost 1 of 2 attempt(s): bad
+  (PermissionError: [Errno 13] Permission denied: '.../attempts/bad/prior-1').
+  The floor is refused rather than reduced from what survived: ...
+  ```
+  `noise-floor.json` is never written. See "The noise-floor caller has a
+  stricter bar than this" in `run_attempts`'s own docstring for why a round
+  tolerates exactly the asymmetry a floor cannot: a floor measured over a
+  problem set that shifted between seeds measures the set, not the agent, and
+  every later round's saturation call depends on it being the same yardstick
+  for all of them.
+
+Neither behavior is the pre-containment one — a bare, uncaught `PermissionError`
+straight out of `run_round` or `NoiseFloorRunner.run`. A round's job is to
+survive one broken problem and disclose the loss everywhere a reader would
+look; a noise floor's job is to be the identical measurement across every
+seed or to refuse to be a floor at all, and containing the exception at the
+same layer a round does would silently hand it a floor computed over fewer
+problems than its sibling seeds.
 
 **Read this before trusting a green result from either check, because it is
 the honesty statement this whole mechanism is built on and it is not
@@ -1051,3 +1219,94 @@ prints a trailing line stating the limitation above in full:
 `detects alteration; does not prevent it — see OPEN-QUESTIONS R2/Q11`. That
 line is not decoration; a tool that printed a bare `OK` would be read as a
 claim of authenticity it cannot back.
+
+### A round record / trajectory: a lost attempt refuses deltas, not cells
+
+A round that loses an attempt to a contained crash (see "One attempt's
+failure is contained to that attempt", above) still reduces every problem
+that *did* finish into its cells — the round is not thrown away — but it must
+not let that partial measurement pose as a full one to whatever compares it
+against its parent. Reproduced for real: round 0 measures `alpha` at `3.0` and
+`beta` at `0.5`, a cell mean of `1.75` over `n=2`; round 1 runs the identical
+corpus, loses `beta` to a contained crash, and measures `alpha` alone at
+`3.0`. The arithmetic that would read as a `+1.25` gain is real — a mean rises
+when its weakest member drops out — and nothing about it would be the agent
+improving.
+
+**The round-wide `SaturationVerdict.REFUSED_ATTEMPT_LOST`** is what stands
+between that arithmetic and the trajectory. `assess_saturation` and
+`compute_deltas` both refuse *every* cell in a round with a non-empty
+`attempt_failures`, not only the cell the lost problem belonged to —
+`cost_per_unit_gain` divides one round-wide wall clock and a token total the
+lost attempt's own spend never entered, so every cell's cost number is
+contaminated by the loss regardless of which cell it fell in. The refusal
+reports no gain at all, not a flagged one: `marginal_gain` stays `None` on
+this verdict specifically (unlike the two floor-refusal verdicts, which still
+report a real, floor-less gain), because a difference of means taken over a
+different problem set on each side is not a measurement, and reporting it
+anyway is exactly how a `+1.25` phantom would reach a verdict line. Real
+`trajectory.json` row for round 1 above:
+
+```json
+"delta": {},
+"delta_in_noise_units": {},
+"cost_per_point": {},
+"saturation": [
+  {
+    "problem_type": "speedup",
+    "split": "practice",
+    "verdict": "refused_attempt_lost",
+    "reason": "speedup/practice: at least one attempt was lost, so this round measured fewer problems than its parent; a difference of means over a shifting problem set measures the set as much as the agent and no delta is reported",
+    "marginal_gain": null,
+    "noise_floor": null,
+    "gain_in_noise_units": null
+  }
+],
+"verdict": "1 of 2 attempt(s) failed and are absent from every cell (beta); speedup/practice: at least one attempt was lost, so this round measured fewer problems than its parent; a difference of means over a shifting problem set measures the set as much as the agent and no delta is reported"
+```
+
+Note what is present alongside that refusal in the same row:
+`"constraints": {"all_attempts_completed": false, "eval_set_stable": true, ...}`
+and `"trajectory_restart": false`. **The round lost an attempt; it did not
+lose its eval set**, and the row says both facts separately rather than
+folding a lost-attempt round into the same bucket as an eval-set change. That
+distinction is deliberate, not incidental, because `trajectory.py` derives
+`trajectory_restart` from `eval_set_stable` alone: an eval-set change genuinely
+restarts the curve (nothing before it is comparable to anything after), while
+a lost attempt does not — the next round still descends from this one, still
+measures the same corpus, and a re-drive of the lost problem alone would make
+this round's own gap fillable in place. Collapsing the two would make a
+transient harness failure look like the eval set itself had to be redefined,
+which is a strictly worse read of what happened.
+
+**Two fields named `comparable_to_parent` answer two different questions, on
+purpose, and they legitimately disagree on exactly this round.**
+`trajectory.json`'s row reports `"comparable_to_parent": true` — it answers
+*"did the parent measure the same eval set?"*, computed from nothing but the
+two eval-set hashes, because that field alone is what `trajectory_restart`
+must derive from and a lost attempt must not trip it. The round's own
+`metrics.json` summary reports `"comparable_to_parent": false` for the same
+round — it answers a different, stricter question a reader of *that* file is
+actually asking: *"may these numbers be compared with the parent's?"* — for
+which a matching eval-set hash is necessary but not sufficient, since this
+round's cells were reduced over a strict subset of the problems the parent's
+were reduced over. Both files are correct simultaneously; a reader who
+expects the same field name to mean the same thing in both has been led
+wrong by the coincidence of the name, not by either file. Real output, same
+round, both files:
+
+```json
+// trajectory.json, round 1's row
+"comparable_to_parent": true
+
+// round-01/metrics.json — the round summary
+"comparable_to_parent": false
+```
+
+The round summary's `cells` array is the machine-readable half of the same
+refusal: a clean round's cells each carry `marginal_gain`, `noise_floor`, and
+`cost_per_unit_gain`; a cell belonging to a round with a non-empty
+`attempt_failures` carries none of the three, so a downstream reader — the
+desktop pane, a pre-writeup gate, the self-edit seam deciding whether to keep
+going — can tell "this round's delta is not a valid comparison" without
+parsing the verdict's English.
