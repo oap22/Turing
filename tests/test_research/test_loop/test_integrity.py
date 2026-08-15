@@ -35,6 +35,7 @@ from turing.research.loop.integrity import (
     CHAIN_FIELD,
     CHAIN_SIDECAR_FILENAME,
     CHAIN_VERSION,
+    ChainState,
     ChainVerdict,
     ReconcileState,
     ReconcileVerdict,
@@ -224,6 +225,79 @@ def _tamper_one_value(directory: Path, *, index: int = 1) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Mid-append fixtures — these ones DO go through results.MetricsWriter
+# --------------------------------------------------------------------------- #
+
+
+def _real_metrics_line(step: int) -> results_module.MetricsLine:
+    """One ``MetricsLine`` for the real writer, in this file's ``_line`` shape."""
+    return results_module.MetricsLine(
+        step=step,
+        total_steps=50,
+        ts=1_700_000_000.0 + step,
+        outcome=results_module.Outcome.RUNNING,
+        correctness_pass=None,
+        tokens_used=1000 * (step + 1),
+        tokens_cap=1_000_000,
+        steps_cap=50,
+        consumed_steps=step,
+        wall_clock_s=10.0 * (step + 1),
+        wall_clock_cap_s=10_800.0,
+        cap_extensions=0,
+        step_wall_clock_s=8.0,
+        verify_wall_clock_s=2.0,
+        step_tokens=1000,
+        made_progress=None,
+        progress=None,
+        metrics={"speedup": 1.0 + 0.1 * step},
+        diagnostics={},
+    )
+
+
+async def _writer_snapshots(directory: Path, *, appends: int) -> list[tuple[str, str]]:
+    """Drive a **real** ``MetricsWriter`` and snapshot the pair after each append.
+
+    Every byte the mid-append tests put on disk comes from here rather than
+    from this file's hand-rolled ``_build_chain``. That matters for exactly
+    this defect: the shape under test is one the *writer* produces, in the gap
+    between its two writes, and a hand-built approximation of it would be
+    testing the fixture's idea of the race instead of the writer's.
+
+    Returns ``[(jsonl_text, sidecar_text)]`` — index ``k`` is the pair as it
+    stood after ``k + 1`` appends. Leaves the directory holding the last
+    (fully consistent) snapshot.
+    """
+    writer = results_module.MetricsWriter(directory / "metrics.jsonl", header=_header())
+    snapshots: list[tuple[str, str]] = []
+    for step in range(appends):
+        await writer.append(_real_metrics_line(step))
+        snapshots.append(
+            (
+                (directory / "metrics.jsonl").read_text(encoding="utf-8"),
+                (directory / CHAIN_SIDECAR_FILENAME).read_text(encoding="utf-8"),
+            )
+        )
+    return snapshots
+
+
+def _writer_snapshots_sync(directory: Path, *, appends: int) -> list[tuple[str, str]]:
+    """:func:`_writer_snapshots` for the plain (non-``async``) CLI tests.
+
+    ``verify.main()`` calls ``asyncio.run()`` itself, so the tests that
+    exercise the real exit code cannot be coroutines — see
+    ``_run_verify_cli_subprocess`` below for the same constraint stated at
+    length. They still need the writer's genuine bytes, so the driving loop
+    is opened here instead.
+    """
+    return asyncio.run(_writer_snapshots(directory, appends=appends))
+
+
+def _put_pair(directory: Path, jsonl_text: str, sidecar_text: str) -> None:
+    (directory / "metrics.jsonl").write_text(jsonl_text, encoding="utf-8")
+    (directory / CHAIN_SIDECAR_FILENAME).write_text(sidecar_text, encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- #
 # canonical_json
 # --------------------------------------------------------------------------- #
 
@@ -335,8 +409,9 @@ class TestVerifyMetricsChainHappyPath:
         verdict = await verify_metrics_chain(tmp_path)
 
         assert verdict == ChainVerdict(
-            ok=True, lines_checked=6, first_bad_index=None, reason=verdict.reason
+            state=ChainState.OK, lines_checked=6, first_bad_index=None, reason=verdict.reason
         )
+        assert verdict.ok is True
 
     async def test_an_empty_jsonl_with_a_sidecar_reporting_zero_lines_is_ok(
         self, tmp_path: Path
@@ -548,6 +623,381 @@ class TestVerifyMetricsChainTampering:
 
         assert verdict.ok is False
         assert verdict.first_bad_index is None
+
+
+# --------------------------------------------------------------------------- #
+# Verifying an attempt that is still being written
+# --------------------------------------------------------------------------- #
+
+
+class TestAWriterMidAppendIsNotAFailure:
+    """The false alarm: ``MetricsWriter`` appends the JSONL line and rewrites
+    the sidecar *after* it, and rewrites that sidecar by truncating it — so a
+    verifier reading during either window sees an honest, untouched attempt in
+    a shape that reads as damage. Measured against a real writer, 1633 of 1640
+    checks reported FAIL on data nobody had touched: 1284 unparseable sidecars
+    (the truncate window), 348 line-count mismatches, and one truncated final
+    line. ``docs/research-agent.md`` invites verifying a round *while it runs*,
+    so an operator met this routinely — the cries-wolf failure this whole layer
+    exists to eliminate, firing at exit ``1``.
+
+    **None of these tests depends on timing.** They reproduce the exact
+    intermediate on-disk state a real writer leaves — built by driving a real
+    ``MetricsWriter``, not by hand — and substitute "the writer lands its next
+    write" for the verifier's pause (:func:`integrity._pause`), which is the
+    only seam at which the real sequence can be replayed deterministically. A
+    test that raced a thread and hoped would flake, and a flaky integrity test
+    gets deleted along with the coverage it was carrying.
+    """
+
+    @staticmethod
+    def _pause_that(monkeypatch: pytest.MonkeyPatch, action: Any) -> list[int]:
+        """Replace the verifier's pause with ``action``; return a call log.
+
+        The list is asserted on directly: this fix is only correct if it is
+        *bounded*, and the pause count is what bounds it.
+        """
+        calls: list[int] = []
+
+        def fake_pause(seconds: float) -> None:
+            calls.append(len(calls))
+            action(len(calls))
+
+        monkeypatch.setattr(integrity_module, "_pause", fake_pause)
+        return calls
+
+    async def test_the_sidecar_landing_during_the_pause_verifies_clean(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reported defect, verbatim: N+1 lines against a sidecar reporting N.
+
+        This is the state a real writer is in between its two writes. The
+        writer completes it microseconds later; the verifier must not have
+        already shouted "chain failure" by then.
+        """
+        snapshots = await _writer_snapshots(tmp_path, appends=5)
+        jsonl_after_5, sidecar_after_5 = snapshots[4]
+        _, sidecar_after_4 = snapshots[3]
+        _put_pair(tmp_path, jsonl_after_5, sidecar_after_4)
+
+        # Confirm the fixture really is the bad shape before the writer catches up.
+        assert json.loads(sidecar_after_4)["lines"] == 4
+        assert jsonl_after_5.count("\n") == 5
+
+        calls = self._pause_that(
+            monkeypatch,
+            lambda _n: (tmp_path / CHAIN_SIDECAR_FILENAME).write_text(
+                sidecar_after_5, encoding="utf-8"
+            ),
+        )
+        verdict = await verify_metrics_chain(tmp_path)
+
+        assert verdict.state is ChainState.OK
+        assert verdict.ok is True
+        assert verdict.lines_checked == 5
+        assert calls == [0], "one re-read is enough; the verifier must not spin"
+
+    async def test_a_sidecar_caught_mid_rewrite_verifies_clean_once_it_lands(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The *dominant* shape in practice, and the one an enumeration of
+        "line count or final digest" would have missed: ``write_text``
+        truncates the sidecar before writing it, so a reader can catch it
+        empty and call it unparseable JSON.
+        """
+        snapshots = await _writer_snapshots(tmp_path, appends=4)
+        jsonl_text, sidecar_text = snapshots[3]
+        _put_pair(tmp_path, jsonl_text, "")
+
+        calls = self._pause_that(
+            monkeypatch,
+            lambda _n: (tmp_path / CHAIN_SIDECAR_FILENAME).write_text(
+                sidecar_text, encoding="utf-8"
+            ),
+        )
+        verdict = await verify_metrics_chain(tmp_path)
+
+        assert verdict.state is ChainState.OK
+        assert verdict.lines_checked == 4
+        assert calls == [0]
+
+    async def test_a_torn_final_line_completed_during_the_pause_verifies_clean(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``Path.read_text`` reads a long log in chunks, so a reader can catch
+        the writer's own append part-way and see a truncated **final** line —
+        2 of 1204 concurrent reads, measured. That failure *is* pinned to a
+        line index, which is why the retry rule is "not pinned to an interior
+        line" rather than "not pinned to a line at all".
+        """
+        snapshots = await _writer_snapshots(tmp_path, appends=4)
+        jsonl_text, sidecar_text = snapshots[3]
+        torn = jsonl_text[: -(len(jsonl_text.rsplit("\n", 2)[1]) // 2)]
+        assert not torn.endswith("\n")
+        _put_pair(tmp_path, torn, sidecar_text)
+
+        calls = self._pause_that(
+            monkeypatch,
+            lambda _n: (tmp_path / "metrics.jsonl").write_text(jsonl_text, encoding="utf-8"),
+        )
+        verdict = await verify_metrics_chain(tmp_path)
+
+        assert verdict.state is ChainState.OK
+        assert verdict.lines_checked == 4
+        assert calls == [0]
+
+    async def test_a_log_under_continuous_append_is_in_flight_not_a_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A file nobody stops writing may never present a consistent snapshot.
+
+        The verifier must not pick either lie available to it: not OK (those
+        numbers are not final), and not FAIL (nothing is wrong with the data).
+        It reports IN_FLIGHT, ``ok`` stays ``False``, and — the point of the
+        bound — it stops after a fixed number of reads instead of spinning.
+        """
+        snapshots = await _writer_snapshots(tmp_path, appends=8)
+        _put_pair(tmp_path, snapshots[3][0], snapshots[2][1])
+
+        calls = self._pause_that(
+            monkeypatch,
+            lambda n: (tmp_path / "metrics.jsonl").write_text(
+                snapshots[3 + n][0], encoding="utf-8"
+            ),
+        )
+        verdict = await verify_metrics_chain(tmp_path)
+
+        assert verdict.state is ChainState.IN_FLIGHT
+        assert verdict.ok is False
+        assert "a writer is appending" in verdict.reason
+        assert "line(s)" in verdict.reason, "the underlying numbers stay in the reason"
+        assert len(calls) == integrity_module._SNAPSHOT_ATTEMPTS - 1
+
+    async def test_an_in_flight_chain_is_reported_incomplete_by_verify_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """IN_FLIGHT reuses the existing three-code contract rather than adding
+        a fourth: ``2`` already means "nothing failed, these numbers are not
+        final", which is exactly what a round still being written is. It
+        composes with the summary check without help — a live attempt has no
+        ``metrics.json`` either, so both halves say "unfinished".
+        """
+        snapshots = await _writer_snapshots(tmp_path, appends=8)
+        _put_pair(tmp_path, snapshots[3][0], snapshots[2][1])
+        self._pause_that(
+            monkeypatch,
+            lambda n: (tmp_path / "metrics.jsonl").write_text(
+                snapshots[3 + n][0], encoding="utf-8"
+            ),
+        )
+
+        run_verdict = await verify.verify_run(tmp_path)
+
+        assert run_verdict.state is verify.RunState.INCOMPLETE
+        assert run_verdict.ok is False
+
+    def test_an_in_flight_chain_exits_2_and_does_not_claim_the_chain_is_intact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        snapshots = _writer_snapshots_sync(tmp_path, appends=8)
+        _put_pair(tmp_path, snapshots[3][0], snapshots[2][1])
+        self._pause_that(
+            monkeypatch,
+            lambda n: (tmp_path / "metrics.jsonl").write_text(
+                snapshots[3 + n][0], encoding="utf-8"
+            ),
+        )
+
+        assert verify.main([str(tmp_path)]) == verify.EXIT_INCOMPLETE
+        out = capsys.readouterr().out
+        assert "INCOMPLETE" in out
+        assert "FAIL" not in out
+        assert "chain still being written" in out
+        assert "chain intact" not in out, "the verifier must not claim what it did not check"
+        assert verify.HONESTY_LINE in out
+
+    def test_the_in_flight_json_record_keeps_ok_false_and_names_the_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        snapshots = _writer_snapshots_sync(tmp_path, appends=8)
+        _put_pair(tmp_path, snapshots[3][0], snapshots[2][1])
+        self._pause_that(
+            monkeypatch,
+            lambda n: (tmp_path / "metrics.jsonl").write_text(
+                snapshots[3 + n][0], encoding="utf-8"
+            ),
+        )
+
+        assert verify.main([str(tmp_path), "--json"]) == verify.EXIT_INCOMPLETE
+        record = json.loads(capsys.readouterr().out.splitlines()[0])
+
+        assert record["ok"] is False
+        assert record["state"] == "incomplete"
+        assert record["chain"]["ok"] is False
+        assert record["chain"]["state"] == "in_flight"
+
+    async def test_a_quiet_clean_run_is_still_verified_in_a_single_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No re-read, no pause, no cost on the overwhelmingly common path."""
+        _build_chain(tmp_path, _header(), [_line(i) for i in range(3)])
+        calls = self._pause_that(monkeypatch, lambda _n: None)
+
+        verdict = await verify_metrics_chain(tmp_path)
+
+        assert verdict.ok is True
+        assert calls == []
+
+
+class TestTheReReadWeakensNoDetection:
+    """Every genuine forgery that failed before the re-read must still fail,
+    with the same reason and the same ``first_bad_index``.
+
+    The discriminator is not a guess about intent: a tamper is *stable*, and
+    two reads of a stable file are byte-identical, so the second look changes
+    nothing about the verdict. A live writer is the only thing that can make
+    the bytes move, and the only softening a moving file can buy is
+    IN_FLIGHT — which is still non-zero, still names the directory, and is
+    still not a pass. See ``_verify_metrics_chain_sync`` on why that widens
+    no evasion.
+    """
+
+    @staticmethod
+    def _count_pauses(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+        calls: list[float] = []
+        monkeypatch.setattr(integrity_module, "_pause", calls.append)
+        return calls
+
+    async def test_a_tampered_interior_line_fails_without_any_re_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An interior line is not reachable by the race — the log is strictly
+        append-only and no append rewrites a byte before the end — so this
+        must not even pause, let alone soften.
+        """
+        _build_chain(tmp_path, _header(), [_line(i) for i in range(5)])
+        _tamper_one_value(tmp_path, index=2)
+        calls = self._count_pauses(monkeypatch)
+
+        verdict = await verify_metrics_chain(tmp_path)
+
+        assert verdict.state is ChainState.FAILED
+        assert verdict.first_bad_index == 2
+        assert calls == [], "a tamper is never re-read"
+
+    async def test_a_truncated_log_still_fails(self, tmp_path: Path) -> None:
+        _build_chain(tmp_path, _header(), [_line(i) for i in range(5)])
+        _write_jsonl_lines(tmp_path, _read_jsonl_lines(tmp_path)[:3])
+
+        verdict = await verify_metrics_chain(tmp_path)
+
+        assert verdict.state is ChainState.FAILED
+        assert verdict.lines_checked == 3
+
+    async def test_a_wrong_final_digest_still_fails(self, tmp_path: Path) -> None:
+        _build_chain(tmp_path, _header(), [_line(i) for i in range(3)])
+        sidecar = _read_sidecar(tmp_path)
+        sidecar["final"] = hashlib.sha256(b"not the final digest").hexdigest()
+        _write_sidecar(tmp_path, sidecar)
+
+        verdict = await verify_metrics_chain(tmp_path)
+
+        assert verdict.state is ChainState.FAILED
+        assert verdict.first_bad_index is None
+        assert "final digest" in verdict.reason
+
+    async def test_a_forged_header_still_fails(self, tmp_path: Path) -> None:
+        _build_chain(tmp_path, _header(), [_line(i) for i in range(3)])
+        sidecar = _read_sidecar(tmp_path)
+        sidecar["header"] = _header(attempt_id="someone-elses-attempt")
+        _write_sidecar(tmp_path, sidecar)
+
+        verdict = await verify_metrics_chain(tmp_path)
+
+        assert verdict.state is ChainState.FAILED
+        assert HEADER_ALTERED_REASON in verdict.reason
+
+    async def test_a_sidecar_count_mismatch_that_never_resolves_still_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The crash-between-the-two-writes shape, which is byte-identical to
+        the race and separable from it only by *time*: nothing lands during
+        the pause, so the second read sees the same bytes and the verdict
+        stands. This is the property the whole fix hangs on — if a stable
+        mismatch could be waited out, the writer's deliberate ordering
+        guarantee would have been thrown away in the verifier instead.
+        """
+        snapshots = await _writer_snapshots(tmp_path, appends=5)
+        _put_pair(tmp_path, snapshots[4][0], snapshots[3][1])
+        calls = self._count_pauses(monkeypatch)
+
+        verdict = await verify_metrics_chain(tmp_path)
+
+        assert verdict.state is ChainState.FAILED
+        assert verdict.first_bad_index is None
+        assert verdict.lines_checked == 5
+        assert "metrics.chain.json reports 4" in verdict.reason
+        assert len(calls) == 1, "one re-read settles it; the verifier must not spin"
+
+    async def test_a_stable_torn_final_line_still_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A process killed mid-write leaves a truncated final line for good.
+        ``docs/research-agent.md`` tells operators that shape reports FAIL on a
+        rotated ``prior-N/`` path, and it still does — the last-line retry
+        buys a *live* writer one look, not a permanently damaged file a pass.
+        """
+        snapshots = await _writer_snapshots(tmp_path, appends=4)
+        jsonl_text, sidecar_text = snapshots[3]
+        _put_pair(tmp_path, jsonl_text[: len(jsonl_text) // 2], sidecar_text)
+        calls = self._count_pauses(monkeypatch)
+
+        verdict = await verify_metrics_chain(tmp_path)
+
+        assert verdict.state is ChainState.FAILED
+        assert verdict.ok is False
+        assert len(calls) == 1
+
+    def test_a_run_whose_chain_fails_is_still_exit_1_even_with_no_summary(
+        self, tmp_path: Path, capsys: Any
+    ) -> None:
+        """The composition guarantee ``_combine`` has always made: an absent
+        summary never softens a broken chain. IN_FLIGHT must not have opened a
+        second door to that.
+        """
+        _build_chain(tmp_path, _header(), [_line(i) for i in range(4)])
+        _tamper_one_value(tmp_path, index=1)
+
+        assert verify.main([str(tmp_path)]) == verify.EXIT_FAILED
+        assert "FAIL" in capsys.readouterr().out
+
+    async def test_a_present_disagreeing_summary_outranks_an_in_flight_chain(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A doctored summary is a finding about the data whatever the log is
+        doing while it is read, so it must not be downgraded to "incomplete"
+        by keeping a writer running.
+        """
+        snapshots = await _writer_snapshots(tmp_path, appends=8)
+        _put_pair(tmp_path, snapshots[3][0], snapshots[2][1])
+        _write_summary(tmp_path, {"steps_recorded": 999, "best_score": 1234.0})
+        advanced = 3
+
+        def keep_appending(_seconds: float) -> None:
+            nonlocal advanced
+            advanced += 1
+            (tmp_path / "metrics.jsonl").write_text(snapshots[advanced][0], encoding="utf-8")
+
+        monkeypatch.setattr(integrity_module, "_pause", keep_appending)
+
+        chain = await verify_metrics_chain(tmp_path)
+        assert chain.state is ChainState.IN_FLIGHT
+
+        _put_pair(tmp_path, snapshots[3][0], snapshots[2][1])
+        advanced = 3
+        run_verdict = await verify.verify_run(tmp_path)
+
+        assert run_verdict.state is verify.RunState.FAILED
 
 
 # --------------------------------------------------------------------------- #

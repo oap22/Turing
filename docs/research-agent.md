@@ -931,45 +931,96 @@ automatically explained by "it's just a re-drive" — read on for the one
 reachable, genuinely benign way that happens, and note that this module
 cannot tell it apart from tampering on its own.
 
-**A FAIL has a third non-tampering cause: verifying an attempt that is
-mid-append, right now, in the gap between its two writes.** `MetricsWriter`
+**Verifying an attempt that is being written right now is `INCOMPLETE`, not
+`FAIL` — this used to be a false alarm and is now a state.** `MetricsWriter`
 writes the JSONL line first and rewrites `metrics.chain.json` second —
 deliberately, not incidentally: if the sidecar write failed after an honest
 line landed, the *next* verification must see a line-count mismatch and say
 so, rather than a writer whose counters silently drifted from what is on disk
 until someone eventually ran `verify` and got a confusing answer far removed
-from the actual failure. The cost of that ordering is a real window, however
-brief, where `metrics.jsonl` has been extended but the sidecar has not yet
-caught up — and this document now positively invites pointing `verify` at a
-round *while it runs*, so that window is reachable in the way this section
-describes, not merely theoretical. Caught for real: a tight loop appending
-thousands of lines to one attempt while a `python -m turing.research.loop.verify`
-subprocess raced it landed on its very first invocation, verbatim:
+from the actual failure. That ordering is not negotiable and has not changed;
+neither has the fact that it leaves a real window in which `metrics.jsonl` has
+been extended but the sidecar has not yet caught up. Two more windows exist
+beside it: the sidecar rewrite is a truncate-then-write, so a reader can catch
+it *empty*, and `Path.read_text` reads a long log in chunks, so a reader can
+catch the writer's own append part-way and see a truncated **final** line.
+
+Since this document positively invites pointing `verify` at a round *while it
+runs*, all three were reachable in ordinary use, and all three used to report
+`FAIL` — exit `1`, the code that means "a real failure, act on it" — on
+completely honest, in-flight data. Measured against a real writer and a real
+verifier, the version of this section you may remember was understating it:
+1633 of 1640 checks failed, 1284 of those on the truncated sidecar rather than
+on the line-count mismatch that was originally reported. On a writer appending
+at a more attempt-like pace (one line every 20 ms), 504 of 6527 checks — 7.7%
+— failed. This is the same "a verifier that cries wolf teaches its operator to
+ignore it" failure the rest of this layer exists to eliminate, so it is fixed,
+in the verifier, without touching the write ordering:
+
+**`verify_metrics_chain` re-reads before it believes a failure a writer could
+have caused.** A failure pinned to an *interior* line is never re-read at all —
+the log is strictly append-only and no append rewrites a byte before the end,
+so that is exactly where a real tamper shows up and it fails immediately, with
+the same reason and the same `first_bad_index` as always. Everything else —
+any failure about the pair as a whole, or one pinned to the last line on disk —
+gets one more look 50 ms later. Three outcomes, all of them honest:
+
+* the writer finished in the meantime → `OK`;
+* the two files are byte-identical to the previous read and still do not
+  verify → nothing is writing them, the damage is real → `FAIL`, exit `1`,
+  unchanged. This is what a crash between the two writes leaves, and it is
+  separable from the race by *time* alone;
+* the files keep changing under the verifier → `INCOMPLETE`, exit `2`.
+
+That last state is what a round under continuous append reports, and it is
+reusing the existing exit contract rather than adding to it: a live attempt has
+no `metrics.json` either, so `2` — "nothing failed, but these numbers are not
+final" — was already the right answer for it. Real output, against an attempt
+being appended to as fast as the writer can go:
 
 ```
 $ .venv/bin/python -m turing.research.loop.verify <results-root>
-.../attempts/race: FAIL chain: metrics.jsonl has 1143 line(s), metrics.chain.json reports 1141 (first_bad_index=None); summary: metrics.json is missing (the attempt never reached its summary write) [incomplete, not itself the failure]
+<results-root>/attempts/race: INCOMPLETE (13124 line(s) read, chain still being written) metrics.jsonl has 13124 line(s), metrics.chain.json reports 13102; the pair changed under all 3 read(s), so a writer is appending and no consistent snapshot was available (not a finding about the data)
 detects alteration; does not prevent it — see OPEN-QUESTIONS R2/Q11
+$ echo $?
+2
 ```
 
-Nothing was wrong with that data — the writer had legitimately gotten two
-appends ahead of the CLI process's own JSON parse-and-hash pass by the time it
-finished reading. The next append (its sidecar write lands microseconds
-later) and every check after it verifies clean; re-running `verify` a moment
-later reports the attempt as `INCOMPLETE` (still running, chain intact) or
-`OK`, never this transient `FAIL`. **This is a real limitation of verifying a
-live attempt, not a bug to route around at the write site**: reordering the
-writes — sidecar first, log second — would trade a visible, correct
-"something doesn't add up" for a writer whose own bookkeeping could silently
-diverge from disk on a failed second write, which is strictly worse and is
-exactly the property the docstring on `MetricsWriter.append` calls out as
-deliberate. An operator scripting `verify` against a round that might still be
-running should treat a `FAIL` naming a **currently-open** attempt (no
-`prior-N` in the path, and a summary reported `INCOMPLETE` alongside the
-chain break, as above) as *possibly* this race rather than an automatic
-tamper alarm, and re-check before escalating it — a `FAIL` against a
-`prior-N/` path or one paired with a **present, disagreeing** summary is not
-this shape and should not be waited out.
+Note what that line does *not* say: not `FAIL`, and not "chain intact" either —
+the chain was never read consistently, and claiming otherwise would be a
+different kind of dishonesty. Stop the writer and re-run against the very same
+directory and it settles into the ordinary unfinished-attempt shape, still
+exit `2`:
+
+```
+<results-root>/attempts/race: INCOMPLETE (43540 line(s) checked, chain intact) metrics.json is missing (the attempt never reached its summary write)
+```
+
+Across the two writer profiles measured above, the fixed verifier reports 0
+failures out of 1202 checks and 0 out of 22 — the attempt-paced one a clean
+`OK` every time, the hammered one `INCOMPLETE` every time.
+
+**Nothing was loosened to get there**, and the re-read opens no new evasion.
+The only new verdict reachable is `INCOMPLETE`, and reaching it requires the
+files to *change* between reads — i.e. a process writing them during
+verification. Such a process cannot produce `OK` by changing bytes, because
+`OK` is decided by recomputing every digest from the header; an attacker who
+can write a self-consistent chain does not need this path at all (that hole is
+conceded above, and it lands on the *first* read). The one move a live writer
+buys is holding the verdict at `INCOMPLETE` for as long as the process runs —
+trading a permanent quiet green for a loud non-zero that names the directory
+and says a writer is active. That is not a gain.
+
+**The residual, stated plainly:** a writer descheduled for longer than the
+50 ms pause *between* its two writes still produces a `FAIL`. That window is a
+couple of syscalls wide against a pause three to four orders of magnitude
+larger, so it is rare rather than closed, and the honest fix for it is an
+atomic sidecar replace at the writer — not more waiting in the verifier. An
+operator who does see a `FAIL` naming a **currently-open** attempt (no
+`prior-N` in the path, `INCOMPLETE` summary alongside) can still re-check
+before escalating; that is now the exception rather than the routine outcome.
+A `FAIL` against a `prior-N/` path, or one paired with a **present,
+disagreeing** summary, is not this shape and should not be waited out.
 
 **A killed process can produce a rotated-aside FAIL that is not tampering,
 and `verify` cannot tell the difference.** `MetricsWriter.append` is not
@@ -1193,7 +1244,11 @@ containing a `metrics.jsonl` and checks each one. Human-readable output is one
 `OK` / `INCOMPLETE` / `FAIL` line per run, with a reason and the failing line
 index (or the mismatch list) on `FAIL`. `--json` prints one JSON object per run
 instead, for scripting; each record carries both `ok` (true only for `OK`) and
-`state` (`"ok"` / `"incomplete"` / `"failed"`).
+`state` (`"ok"` / `"incomplete"` / `"failed"`). The nested `chain` object
+carries the same pair, where its `state` is `"ok"` / `"in_flight"` /
+`"failed"` — `"in_flight"` meaning the chain could not be read consistently
+because a writer is appending to it, which is a distinct fact from a chain
+that failed to recompute.
 
 **Exit code — three values, not two:**
 
@@ -1201,7 +1256,7 @@ instead, for scripting; each record carries both `ok` (true only for `OK`) and
 | --- | --- |
 | `0` | every run in `<path>` is complete and passes both checks |
 | `1` | at least one run **failed**: a broken chain, or a summary that is present and disagrees with its log. Also: no runs found at all |
-| `2` | nothing failed, but at least one run is **incomplete**: an intact chain with no `metrics.json` beside it |
+| `2` | nothing failed, but at least one run is **incomplete**: an intact chain with no `metrics.json` beside it, or a chain a writer is still appending to |
 
 `1` outranks `2` when both are present. An operator wiring this into a
 pre-writeup check needs the exit code to mean something on its own, without
@@ -1214,7 +1269,11 @@ re-drive rotates the killed generation's trio into `prior-N/` exactly as it
 found it — chain, no summary — so a two-value exit code reported the whole
 results root as failing forever, on data nobody touched. `2` says "nothing is
 wrong here, but something is not finished", which is neither a green light nor
-an accusation. Every invocation, clean or tampered, also
+an accusation. It carries one more shape for the same reason: an attempt whose
+log is being appended to *as the verifier reads it* cannot be shown a
+consistent snapshot at all, and reporting that as `1` was the second false
+alarm this tool had to stop emitting — see "Integrity, and its limits" above.
+Every invocation, clean or tampered, also
 prints a trailing line stating the limitation above in full:
 `detects alteration; does not prevent it — see OPEN-QUESTIONS R2/Q11`. That
 line is not decoration; a tool that printed a bare `OK` would be read as a
