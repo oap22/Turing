@@ -25,6 +25,7 @@ dependencies = [
     "httpx>=0.28.1",
     "tokenizers>=0.23.1",
     "numpy>=2.4.6",
+    "matplotlib>=3.10",
     "cryptography>=48.0.0",
     "nats-py>=2.15.0",
     "fastapi>=0.136.3",
