@@ -1939,3 +1939,66 @@ class TestIncompleteAgainstARealRun:
         assert result.returncode == verify.EXIT_FAILED, result.stdout + result.stderr
         assert "FAIL" in result.stdout
         assert verify.HONESTY_LINE in result.stdout
+
+
+class TestReadLogTailIsTheOneReaderOfARawLog:
+    """``reconcile_summary`` no longer owns these derivations alone.
+
+    ``runner.py`` has to make exactly the same ones to write a terminal
+    ``metrics.json`` for an attempt whose exception it contained, and a second
+    hand-written copy of "the last line" / "the last line carrying
+    ``progress``" / "the first emitted score-series value" would drift into
+    raising false mismatches on honest data -- the failure mode this module's
+    ``_CORE_LINE_KEYS`` comment already warns about. These tests pin the
+    shared reader against a real, unmocked attempt rather than a hand-built
+    fixture, because hand-built fixtures hid all six earlier false alarms in
+    this file.
+    """
+
+    async def test_the_tail_matches_the_summary_the_same_attempt_wrote(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        output_dir = store.round_dir(0)
+        await runner.run_attempt(
+            make_problem("s1", scores=(1.0, 2.0)), make_config(), output_dir=output_dir
+        )
+        metrics_dir = output_dir / "attempts" / "s1"
+
+        tail = integrity_module.read_log_tail(metrics_dir)
+        summary = json.loads((metrics_dir / "metrics.json").read_text())
+        lines = [
+            json.loads(raw)
+            for raw in (metrics_dir / "metrics.jsonl").read_text().splitlines()
+            if raw
+        ]
+
+        assert tail.line_count == len(lines) == summary["steps_recorded"]
+        assert tail.last_line == lines[-1]
+        assert tail.baseline_score == summary["baseline_score"]
+        assert summary["best_score"] in tail.score_values
+        # The header is the only place the attempt's identity survives on disk
+        # once the in-memory ``Attempt`` is gone with its exception.
+        assert tail.header is not None
+        assert tail.header["attempt_id"] == summary["attempt_id"]
+        assert tail.header["problem_id"] == "s1"
+
+        # And the whole point: a summary built from this tail reconciles.
+        assert (await reconcile_summary(metrics_dir)).state is ReconcileState.OK
+
+    async def test_a_directory_with_no_log_reads_as_empty_rather_than_raising(
+        self, tmp_path: Path
+    ) -> None:
+        """ "The attempt wrote no lines" is an ordinary state on both call sites.
+
+        An attempt killed before its first append leaves exactly this, and the
+        runner's containment path has to be able to ask about it without
+        catching an exception to find out.
+        """
+        tail = integrity_module.read_log_tail(tmp_path)
+        assert tail.line_count == 0
+        assert tail.last_line is None
+        assert tail.header is None
+        assert tail.score_values == ()
+        assert tail.baseline_score is None
+        assert tail.final_progress is None

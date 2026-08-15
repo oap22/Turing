@@ -109,10 +109,12 @@ __all__ = [
     "CHAIN_SIDECAR_FILENAME",
     "CHAIN_VERSION",
     "ChainVerdict",
+    "LogTail",
     "ReconcileState",
     "ReconcileVerdict",
     "canonical_json",
     "chain_next",
+    "read_log_tail",
     "reconcile_summary",
     "seed_hash",
     "verify_metrics_chain",
@@ -617,6 +619,129 @@ def _check_close(
         mismatches.append(field)
 
 
+@dataclass(frozen=True, slots=True)
+class LogTail:
+    """Everything ``metrics.jsonl`` alone says about an attempt that ended.
+
+    This exists so the two call sites that must agree about what an attempt's
+    raw log says cannot drift apart. :func:`reconcile_summary` re-derives
+    ``metrics.json``'s fields from the log and fails the run when they
+    disagree; ``runner.py`` writes a terminal ``metrics.json`` for an attempt
+    whose exception was contained mid-run, and that summary has to reconcile
+    against this same log or the containment would trade an ``INCOMPLETE``
+    verdict for a ``FAILED`` one — a strictly worse outcome, since ``FAILED``
+    is this tool's word for dishonesty. Two hand-written copies of "the last
+    line", "the last line carrying ``progress``" and "the first emitted
+    score-series value" would be exactly the drift this module warns about
+    around :data:`_CORE_LINE_KEYS`; one reader, two consumers, no drift.
+
+    Values are the **raw** JSON objects read off the file, never coerced.
+    :func:`reconcile_summary` compares them for equality against a summary
+    written by someone else and must see what is actually on disk — coercing
+    an ``int`` to a ``float`` here would quietly decide a comparison this
+    module exists to make honestly. A consumer that needs typed values (the
+    runner does, to hand them to ``write_attempt_summary``) coerces at its
+    own call site and is responsible for what it does when that fails.
+
+    A missing, unreadable or empty ``metrics.jsonl`` yields a tail with
+    ``line_count == 0`` and every field ``None`` rather than an exception:
+    "the attempt wrote no lines" is an ordinary state on both call sites
+    (an attempt killed before its first append), not an error condition.
+    """
+
+    #: The sidecar's ``header`` object, or ``None`` when the sidecar is
+    #: missing or unreadable. The only place an attempt's identity survives
+    #: on disk when the in-memory ``Attempt`` died with its exception.
+    header: Mapping[str, object] | None
+    #: Number of parseable JSON-object lines — ``metrics.json``'s
+    #: ``steps_recorded``. Unparseable lines are skipped, not counted:
+    #: reporting them is :func:`verify_metrics_chain`'s finding to raise, and
+    #: double-reporting the same corruption is what this module avoids.
+    line_count: int
+    #: The last parseable line, or ``None`` when there is none. Every field
+    #: ``reconcile_summary`` defines as "the last line's X" comes from here.
+    last_line: Mapping[str, object] | None
+    #: The value of ``progress`` on the *last* line that carries the key at
+    #: all — ``None`` when no line does, which is not the same fact as a line
+    #: carrying ``progress: null`` and is deliberately not distinguished,
+    #: because ``metrics.json`` cannot record the difference either.
+    final_progress: object | None
+    #: The first emitted score-series value across the whole log, in file
+    #: order — ``metrics.json``'s ``baseline_score``.
+    baseline_score: object | None
+    #: Every emitted score-series value, in file order. ``best_score`` has to
+    #: be one of these when it is not ``None``; see :func:`reconcile_summary`
+    #: for why that check is deliberately weak.
+    score_values: tuple[object, ...]
+
+
+def read_log_tail(directory: Path) -> LogTail:
+    """Read ``directory``'s metrics log and sidecar into a :class:`LogTail`.
+
+    Synchronous and blocking by design: both callers already run it off the
+    event loop (:func:`reconcile_summary` through :func:`asyncio.to_thread`,
+    the runner through the same), and an async wrapper here would only add a
+    second way to call it that one of them would eventually get wrong.
+
+    "Score-series value" means the same thing it means in
+    :func:`reconcile_summary`: any key on a line that is not a core field
+    :meth:`~turing.research.loop.results.MetricsLine.to_json` always emits,
+    not ``diag_``-prefixed, and not :data:`CHAIN_FIELD`. That definition
+    lives in exactly one place — here — for the reason :class:`LogTail`
+    gives.
+    """
+    header: Mapping[str, object] | None = None
+    sidecar_path = directory / CHAIN_SIDECAR_FILENAME
+    try:
+        sidecar_raw = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        sidecar_raw = None
+    if isinstance(sidecar_raw, dict) and isinstance(sidecar_raw.get("header"), dict):
+        header = sidecar_raw["header"]
+
+    lines: list[dict[str, object]] = []
+    try:
+        jsonl_text = (directory / _METRICS_JSONL_FILENAME).read_text(encoding="utf-8")
+    except OSError:
+        jsonl_text = ""
+    for raw_line in jsonl_text.split("\n"):
+        if not raw_line:
+            continue
+        try:
+            parsed = json.loads(raw_line)
+        except json.JSONDecodeError:
+            # A malformed line is verify_metrics_chain's finding to raise,
+            # not this function's — skipped rather than double-reported.
+            continue
+        if isinstance(parsed, dict):
+            lines.append(parsed)
+
+    final_progress: object | None = None
+    for line in reversed(lines):
+        if "progress" in line:
+            final_progress = line["progress"]
+            break
+
+    baseline_score: object | None = None
+    score_values: list[object] = []
+    for line in lines:
+        for key, value in line.items():
+            if key == CHAIN_FIELD or key in _CORE_LINE_KEYS or key.startswith(_DIAG_PREFIX):
+                continue
+            score_values.append(value)
+            if baseline_score is None:
+                baseline_score = value
+
+    return LogTail(
+        header=header,
+        line_count=len(lines),
+        last_line=lines[-1] if lines else None,
+        final_progress=final_progress,
+        baseline_score=baseline_score,
+        score_values=tuple(score_values),
+    )
+
+
 async def reconcile_summary(directory: Path) -> ReconcileVerdict:
     """Re-derive ``metrics.json`` from ``metrics.jsonl`` alone and compare.
 
@@ -691,6 +816,13 @@ def _reconcile_summary_sync(directory: Path) -> ReconcileVerdict:
     ``_CORE_LINE_KEYS`` above for why that set is hand-copied rather than
     imported.
 
+    Every derivation above is delegated to :func:`read_log_tail` rather than
+    inlined here, because ``runner.py`` has to make the *same* derivations to
+    write a terminal summary for an attempt whose exception it contained, and
+    a second copy would drift into raising false mismatches on honest data —
+    see :class:`LogTail`. What stays here is the comparison and the verdict,
+    which is this function's own job and nobody else's.
+
     A missing ``metrics.json`` is :attr:`ReconcileState.INCOMPLETE` — not
     ``ok``, and not a FAIL either — with an empty ``mismatches`` tuple and a
     reason naming the summary as absent. See :class:`ReconcileState` for why
@@ -719,7 +851,6 @@ def _reconcile_summary_sync(directory: Path) -> ReconcileVerdict:
     even for an empty log.
     """
     summary_path = directory / _METRICS_SUMMARY_FILENAME
-    jsonl_path = directory / _METRICS_JSONL_FILENAME
 
     if not summary_path.is_file():
         # The only path to INCOMPLETE. Note it is reported the same way for a
@@ -756,40 +887,12 @@ def _reconcile_summary_sync(directory: Path) -> ReconcileVerdict:
         )
     summary: Mapping[str, object] = summary_raw
 
-    lines: list[dict[str, object]] = []
-    if jsonl_path.is_file():
-        jsonl_text = jsonl_path.read_text(encoding="utf-8")
-        for raw_line in jsonl_text.split("\n"):
-            if not raw_line:
-                continue
-            try:
-                parsed = json.loads(raw_line)
-            except json.JSONDecodeError:
-                # A malformed line is verify_metrics_chain's finding to
-                # raise, not this function's — reconcile_summary skips it
-                # rather than double-reporting the same corruption.
-                continue
-            if isinstance(parsed, dict):
-                lines.append(parsed)
-
-    steps_recorded = len(lines)
-    last = lines[-1] if lines else None
-
-    final_progress: object | None = None
-    for line in reversed(lines):
-        if "progress" in line:
-            final_progress = line["progress"]
-            break
-
-    baseline_score: object | None = None
-    score_values: list[object] = []
-    for line in lines:
-        for key, value in line.items():
-            if key == CHAIN_FIELD or key in _CORE_LINE_KEYS or key.startswith(_DIAG_PREFIX):
-                continue
-            score_values.append(value)
-            if baseline_score is None:
-                baseline_score = value
+    tail = read_log_tail(directory)
+    steps_recorded = tail.line_count
+    last = tail.last_line
+    final_progress = tail.final_progress
+    baseline_score = tail.baseline_score
+    score_values = tail.score_values
 
     mismatches: list[str] = []
     _check_exact(mismatches, "steps_recorded", summary.get("steps_recorded"), steps_recorded)

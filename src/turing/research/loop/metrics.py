@@ -368,6 +368,7 @@ def compute_deltas(
     cost: RoundCost,
     basis: CostBasis = CostBasis.WALL_CLOCK,
     comparable: bool = True,
+    all_attempts_completed: bool = True,
 ) -> tuple[RoundDelta, ...]:
     """Per-cell marginal gain, paired with the floor it is read against.
 
@@ -384,8 +385,40 @@ def compute_deltas(
 
     ``comparable=False`` (rounds measured on different eval sets) suppresses
     every delta: a curve drawn across an eval-set change is fiction.
+
+    ``all_attempts_completed=False`` suppresses every delta for the same
+    reason one step down. The eval set is the corpus a round *intended* to
+    measure; this flag is whether it actually measured all of it. A round that
+    lost an attempt has cells reduced over a strict subset of the problems the
+    parent's cells were reduced over, so the difference of the two means is
+    partly the agent and partly which problems dropped out — and, exactly as
+    with an eval-set change, nothing downstream can separate the two again.
+    The failure mode is not theoretical or symmetric: it is *biased*, because
+    a mean rises when its weakest member goes missing, so a contained harness
+    crash manufactures a marginal gain out of a bug in the runner. This is the
+    argument ``noise_floor.py`` already makes for refusing a seed that lost an
+    attempt rather than reducing a floor from it; a round-over-round delta is
+    the number that floor exists to be read against, and it gets the same
+    answer.
+
+    Suppressing the delta rather than flagging it is deliberate, and matches
+    the no-floor case above. A number that exists will be read; a caveat
+    beside it will not. The absence is machine-readable — the ``deltas`` tuple
+    is empty, :func:`assess_saturation` returns
+    :attr:`SaturationVerdict.REFUSED_ATTEMPT_LOST` naming the cause, and the
+    round record's ``all_attempts_completed`` gate is ``False``.
+
+    Refusal is round-wide, not per cell, even though a cell that lost nothing
+    still has a comparable mean. Two reasons, both structural rather than
+    conservative: ``cost_per_unit_gain`` divides *round* cost — one wall clock
+    over the whole round, and a token total the lost attempt's spend is
+    missing from — so every cell's driving-function-#3 number is contaminated
+    by the loss regardless of which cell it fell in; and ``noise_floor.py``
+    refuses the whole seed rather than the affected cell for the same shape of
+    fault, so per-cell salvage here would leave two neighbouring modules
+    disagreeing about what a lost attempt costs a measurement.
     """
-    if parent is None or not comparable:
+    if parent is None or not comparable or not all_attempts_completed:
         return ()
     previous = scores_by_cell(parent)
     deltas: list[RoundDelta] = []
@@ -416,7 +449,7 @@ def compute_deltas(
 class SaturationVerdict(str, Enum):  # noqa: UP042
     """Whether a cell is still improving — or why that cannot be said.
 
-    The four ``REFUSED_*`` members are not error codes. They are the honest
+    The five ``REFUSED_*`` members are not error codes. They are the honest
     answer when the measurement required to make the call was not made, and
     they are written into ``trajectory.json`` verbatim so a reader cannot
     mistake a missing verdict for a flat one.
@@ -428,6 +461,7 @@ class SaturationVerdict(str, Enum):  # noqa: UP042
     REFUSED_NO_NOISE_FLOOR = "refused_no_noise_floor"
     REFUSED_DEGENERATE_NOISE_FLOOR = "refused_degenerate_noise_floor"
     REFUSED_EVAL_SET_CHANGED = "refused_eval_set_changed"
+    REFUSED_ATTEMPT_LOST = "refused_attempt_lost"
 
 
 @dataclass(frozen=True, slots=True)
@@ -457,17 +491,33 @@ def assess_saturation(
     floors: Mapping[Cell, NoiseFloor],
     *,
     comparable: bool = True,
+    all_attempts_completed: bool = True,
 ) -> tuple[SaturationAssessment, ...]:
     """Per-cell saturation verdicts, refusing wherever the basis is missing.
 
-    Saturation is "marginal gain below the seed-noise floor". Each of the four
+    Saturation is "marginal gain below the seed-noise floor". Each of the five
     ways that sentence can fail to apply gets its own refusal rather than a
     fabricated number:
 
     * round 0 has no parent to be a delta *from*;
     * the eval set changed, so the two rounds are not on the same axes;
+    * an attempt was lost, so the round measured a strict subset of the
+      problems the parent measured and the difference of the two means is
+      partly the agent and partly the missing problem — see
+      :func:`compute_deltas` for why that is refused rather than flagged, and
+      why the refusal is round-wide;
     * no floor was measured for the cell;
     * the measured floor is zero, so "beats the noise" resolves nothing.
+
+    The gain is deliberately **not** carried on the attempt-lost refusal, and
+    that is the difference between this refusal and the two floor ones below
+    it. ``REFUSED_NO_NOISE_FLOOR`` reports ``marginal_gain`` because the gain
+    is a real difference between two comparable means that simply has no floor
+    to be judged against — it is a measurement missing its yardstick. A gain
+    computed across a shifting problem set is not a measurement at all, so
+    there is nothing honest to report; reporting it anyway is precisely how
+    ``"a marginal gain of +1.25"`` reached a verdict line for a round whose
+    only change was that its weakest problem crashed.
     """
     assessments: list[SaturationAssessment] = []
     previous = scores_by_cell(parent) if parent is not None else {}
@@ -493,6 +543,21 @@ def assess_saturation(
                     reason=(
                         f"{label}: eval set changed since the parent round; the "
                         "trajectory restarts and no delta is defined across the change"
+                    ),
+                )
+            )
+            continue
+        if not all_attempts_completed:
+            assessments.append(
+                SaturationAssessment(
+                    problem_type=cell[0],
+                    split=cell[1],
+                    verdict=SaturationVerdict.REFUSED_ATTEMPT_LOST,
+                    reason=(
+                        f"{label}: at least one attempt was lost, so this round measured "
+                        "fewer problems than its parent; a difference of means over a "
+                        "shifting problem set measures the set as much as the agent and "
+                        "no delta is reported"
                     ),
                 )
             )

@@ -31,6 +31,18 @@ still refuse to wave through numbers that are not final. Hence a third code
 that is neither "all good" nor "something is wrong" — see
 :class:`~turing.research.loop.integrity.ReconcileState`.
 
+``2`` means *unfinished*, and only that. A round that finished having lost an
+attempt to a contained harness crash is **not** unfinished, and used to report
+``2`` anyway — permanently, since that attempt's directory would never gain a
+summary — which made a pre-writeup gate demanding ``0`` unsatisfiable on a
+tree where nothing was wrong that the round had not already disclosed. The
+fix is at the emitter, as it was for the false ``1``: ``RoundRunner`` now
+writes a terminal, log-derived ``metrics.json`` for a contained attempt (see
+``runner._close_out_crashed_attempt``), so the state this tool reports is
+decided by whether the round is over, not by which line of the runner raised.
+Nothing here was loosened to achieve that — an intact chain with no summary
+is still ``2``, which is exactly what a killed process leaves behind.
+
 Finding **no** runs at all stays ``1`` rather than ``2``. It is not an
 unfinished run; it is a path that contains no runs — almost always the wrong
 path — and an empty directory reporting anything softer would be exactly

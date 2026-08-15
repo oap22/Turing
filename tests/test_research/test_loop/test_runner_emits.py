@@ -22,10 +22,23 @@ from typing import TYPE_CHECKING
 import pytest
 import structlog
 
-from turing.research.contracts import AttemptState, ContractViolationError, EscalationVerdict
+from turing.research.contracts import (
+    AttemptState,
+    Cap,
+    ContractViolationError,
+    EscalationReason,
+    EscalationVerdict,
+)
 from turing.research.loop import plots as plots_module
 from turing.research.loop import verify as verify_cli
-from turing.research.loop.integrity import CHAIN_FIELD, reconcile_summary, verify_metrics_chain
+from turing.research.loop.integrity import (
+    CHAIN_FIELD,
+    ReconcileState,
+    reconcile_summary,
+    verify_metrics_chain,
+)
+from turing.research.loop.metrics import SaturationVerdict
+from turing.research.loop.protocols import SolverStep
 from turing.research.loop.results import Outcome
 from turing.research.loop.runner import PassCriterion
 
@@ -34,19 +47,22 @@ from .conftest import (
     ExplodingSolver,
     FakeSolver,
     ScriptedEscalationChannel,
+    TempWorkspaceProvider,
     make_config,
     make_problem,
     make_runner,
 )
+from .test_runner import floors_for
 
 if TYPE_CHECKING:
     from pathlib import Path
+    from typing import Any
 
     from turing.research.contracts import Attempt, Problem
     from turing.research.loop.protocols import SolverTask
     from turing.research.loop.trajectory import TrajectoryStore
 
-    from .conftest import FakeClock, TempWorkspaceProvider
+    from .conftest import FakeClock
 
 
 class _TokenCostError(RuntimeError):
@@ -1203,3 +1219,464 @@ class TestARedriveLeavesNoStalePlot:
         await runner.run_attempt(make_problem("s1"), make_config(), output_dir=store.round_dir(0))
         metrics_dir = store.round_dir(0) / "attempts" / "s1"
         assert [p for p in metrics_dir.iterdir() if p.is_dir()] == []
+
+
+# --------------------------------------------------------------------------- #
+# Round-7 regression -- a contained loss must not manufacture a marginal gain
+# --------------------------------------------------------------------------- #
+
+
+class _WorkspacesThatFailForSomeProblems(TempWorkspaceProvider):
+    """Raises out of ``materialise`` for named problem ids.
+
+    A transient the corpus fingerprint cannot see, which is the point: a
+    colliding ``score_scale`` is part of ``fingerprint_corpus``'s material, so
+    a round made to lose an attempt *that* way is also a round measured on a
+    different ``eval_set_hash``, and the existing eval-set refusal would mask
+    the defect under test. A vanished workspace template -- a full disk, a
+    pruned scratch mount, an evicted container volume -- loses exactly one
+    attempt while leaving the corpus, and therefore the eval-set hash,
+    byte-for-byte identical between the two rounds. That is the shape that
+    reaches the round-over-round delta.
+    """
+
+    def __init__(self, root: Path, *, fail: set[str] | None = None) -> None:
+        super().__init__(root)
+        self.fail: set[str] = set(fail or ())
+
+    async def materialise(self, problem: Problem, *, attempt_id: str) -> Path:
+        if problem.id in self.fail:
+            raise OSError(f"workspace template for {problem.id} is gone")
+        return await super().materialise(problem, attempt_id=attempt_id)
+
+
+class TestAContainedLossManufacturesNoGain:
+    """A mean rises when its weakest member goes missing.
+
+    Round 0 measures ``alpha`` at 3.0 and ``beta`` at 0.5, a cell mean of
+    1.75 over ``n=2``. Round 1 runs the *identical* corpus with the
+    *identical* scores and loses ``beta`` to a contained harness failure, so
+    its cell is 3.0 over ``n=1``. The agent did not improve by any amount; the
+    weaker problem dropped out of the average. Before this fix the round
+    reported ``eval_set_stable: True``, ``comparable_to_parent: True`` and a
+    verdict line reading "a marginal gain of +1.25" -- an improvement
+    manufactured entirely by a bug in the harness, which is worse than a
+    harness that crashes.
+
+    ``noise_floor.py`` already makes this argument for a seed that lost an
+    attempt: a spread over a shifting problem set measures the set, and
+    nothing downstream can separate the two again. These tests are that
+    argument applied where it decides whether the program is working.
+    """
+
+    @staticmethod
+    def _corpus() -> list[Problem]:
+        return [make_problem("alpha", scores=(3.0,)), make_problem("beta", scores=(0.5,))]
+
+    async def _rounds(
+        self,
+        store: TrajectoryStore,
+        clock: FakeClock,
+        workspaces: _WorkspacesThatFailForSomeProblems,
+        *,
+        lose: set[str],
+    ) -> tuple[Any, Any]:
+        corpus = self._corpus()
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        first = await runner.run_round(corpus, make_config())
+        workspaces.fail = lose
+        second = await runner.run_round(
+            corpus,
+            make_config(round_index=1, run_id="r01", parent_round_id="r00"),
+            parent=first.record,
+            noise_floor=floors_for(corpus, {1: 1.0, 2: 1.1, 3: 1.2}),
+        )
+        return first, second
+
+    async def test_the_round_that_lost_a_problem_emits_no_delta_at_all(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Refused, not flagged. A number that exists will be read.
+
+        The floor is present and the eval set is unchanged, so every other
+        gate for a delta is satisfied -- this asserts the *only* thing
+        stopping the +1.25 is the lost attempt.
+        """
+        failing = _WorkspacesThatFailForSomeProblems(workspaces.root)
+        first, second = await self._rounds(store, clock, failing, lose={"beta"})
+
+        # The arithmetic that would produce the phantom gain is real: the
+        # parent's mean is over both problems, the child's over one.
+        assert first.record.type_scores[0].mean_score == pytest.approx(1.75)
+        assert first.record.type_scores[0].n == 2
+        assert second.record.type_scores[0].mean_score == pytest.approx(3.0)
+        assert second.record.type_scores[0].n == 1
+
+        assert second.record.deltas == ()
+        assert {a.verdict for a in second.assessments} == {SaturationVerdict.REFUSED_ATTEMPT_LOST}
+        # No gain is reported anywhere in the one line an operator reads, not
+        # even as a refusal's supporting number.
+        assert "marginal gain" not in second.record.verdict
+        assert "1.25" not in second.record.verdict
+        assert all(a.marginal_gain is None for a in second.assessments)
+
+    async def test_every_machine_readable_artifact_says_the_delta_is_not_a_comparison(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Prose in a verdict string is not a disclosure a program can act on.
+
+        A downstream reader -- the desktop pane, a pre-writeup gate, the
+        self-edit seam -- has to be able to tell that this round's delta is
+        not a valid comparison without parsing English.
+        """
+        failing = _WorkspacesThatFailForSomeProblems(workspaces.root)
+        await self._rounds(store, clock, failing, lose={"beta"})
+
+        row = json.loads(store.trajectory_path.read_text())["rounds"][1]
+        assert row["delta"] == {}
+        assert row["delta_in_noise_units"] == {}
+        assert row["cost_per_point"] == {}
+        assert [s["verdict"] for s in row["saturation"]] == ["refused_attempt_lost"]
+        assert row["constraints"]["all_attempts_completed"] is False
+
+        summary = json.loads((store.round_dir(1) / "metrics.json").read_text())
+        assert summary["comparable_to_parent"] is False
+        assert [c for c in summary["cells"] if "marginal_gain" in c] == []
+
+    async def test_the_eval_set_gate_still_reports_only_what_it_measures(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """The two facts stay separate, and the asymmetry is deliberate.
+
+        ``eval_set_stable`` answers "did the parent measure the same corpus?"
+        and the answer here is genuinely yes -- collapsing it into the delta
+        refusal would report an eval-set change that did not happen, and
+        ``trajectory.py`` derives ``trajectory_restart`` from exactly that
+        question. A lost attempt does not restart the trajectory: the next
+        round still descends from this one.
+        """
+        failing = _WorkspacesThatFailForSomeProblems(workspaces.root)
+        _, second = await self._rounds(store, clock, failing, lose={"beta"})
+
+        assert second.record.gates["eval_set_stable"] is True
+        row = json.loads(store.trajectory_path.read_text())["rounds"][1]
+        assert row["trajectory_restart"] is False
+        assert row["comparable_to_parent"] is True
+        assert (
+            row["eval_set_hash"]
+            == json.loads(store.trajectory_path.read_text())["rounds"][0]["eval_set_hash"]
+        )
+
+    async def test_a_round_that_lost_nothing_still_gets_its_delta(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """The negative half: the clean path must be unchanged.
+
+        Same corpus, same floor, same lineage -- nothing crashes. The delta,
+        the saturation call and ``comparable_to_parent`` must all be exactly
+        what they were before the refusal existed, or the refusal has bought
+        honesty by breaking the measurement it was protecting.
+        """
+        failing = _WorkspacesThatFailForSomeProblems(workspaces.root)
+        _, second = await self._rounds(store, clock, failing, lose=set())
+
+        assert second.failures == ()
+        assert second.record.gates["all_attempts_completed"] is True
+        assert len(second.record.deltas) == 1
+        assert second.record.deltas[0].marginal_gain == pytest.approx(0.0)
+        assert {a.verdict for a in second.assessments} == {SaturationVerdict.SATURATED}
+        summary = json.loads((store.round_dir(1) / "metrics.json").read_text())
+        assert summary["comparable_to_parent"] is True
+        assert all("marginal_gain" in c for c in summary["cells"])
+
+
+# --------------------------------------------------------------------------- #
+# Round-7 regression -- a namespaced problem id must not vanish from the viewer
+# --------------------------------------------------------------------------- #
+
+
+class TestNestedProblemIdsStayInTheViewerList:
+    """``problem.id`` is an unvalidated path component (RES-16).
+
+    An operator namespacing a corpus -- ``"cuda/matmul-speedup"`` -- gets an
+    attempt directory two segments below ``attempts/``, and the single-segment
+    glob that replaced ``.viewer.json``'s f-string construction matched
+    exactly one. The run executed, chained and verified perfectly; it simply
+    stopped being listed, with no log line and no warning. ``verify``'s walk
+    has always been recursive, so the two tools disagreed about which runs
+    existed on disk -- and the silent one was the one the desktop reads.
+    """
+
+    async def test_a_namespaced_id_is_listed_and_matches_what_verify_finds(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        await runner.run_round(
+            [
+                make_problem("cuda/matmul-speedup", scores=(2.0,)),
+                make_problem("flat", scores=(1.0,)),
+            ],
+            make_config(),
+        )
+        results_root = store.loop_dir.parent
+        viewer = json.loads((results_root / ".viewer.json").read_text())
+
+        assert "loop-test-loop/round-00/attempts/cuda/matmul-speedup" in viewer["runs"]
+        assert "loop-test-loop/round-00/attempts/flat" in viewer["runs"]
+        # The two tools must agree about what is on disk. ``find_runs`` is the
+        # depth-independent walk that always found this run.
+        assert sorted(viewer["runs"]) == sorted(
+            p.relative_to(results_root).as_posix() for p in verify_cli.find_runs(results_root)
+        )
+
+    async def test_a_rotated_prior_chain_under_a_nested_id_is_still_excluded(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Depth no longer separates a live run from a superseded one.
+
+        Rotation puts ``prior-N/`` one segment below the attempt directory,
+        which under a flat id was two segments below ``attempts/`` -- exactly
+        where a nested id's live run also lives. The exclusion therefore moved
+        from depth to directory name, and this is the test that the move did
+        not quietly re-admit a superseded chain to the viewer while a nested
+        live one is listed.
+        """
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        config = make_config()
+        await runner.run_round([make_problem("cuda/matmul", scores=(1.0,))], config)
+        # A second round-0 drive over the same directory rotates the first.
+        await runner.run_attempt(
+            make_problem("cuda/matmul", scores=(2.0,)), config, output_dir=store.round_dir(0)
+        )
+        await runner.run_round(
+            [make_problem("cuda/matmul", scores=(2.0,))],
+            make_config(round_index=1, run_id="r01", parent_round_id="r00"),
+        )
+
+        metrics_dir = store.round_dir(0) / "attempts" / "cuda" / "matmul"
+        assert (metrics_dir / "prior-1" / "metrics.jsonl").is_file()
+        viewer = json.loads((store.loop_dir.parent / ".viewer.json").read_text())
+        assert viewer["runs"] == [
+            "loop-test-loop/round-00/attempts/cuda/matmul",
+            "loop-test-loop/round-01/attempts/cuda/matmul",
+        ]
+
+    async def test_a_flat_id_is_listed_exactly_as_before(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """The un-nested path is the one that already worked; widening the walk
+        must not have changed it.
+        """
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        await runner.run_round([make_problem("s1"), make_problem("s2")], make_config())
+        viewer = json.loads((store.loop_dir.parent / ".viewer.json").read_text())
+        assert viewer["runs"] == [
+            "loop-test-loop/round-00/attempts/s1",
+            "loop-test-loop/round-00/attempts/s2",
+        ]
+
+
+# --------------------------------------------------------------------------- #
+# Round-7 regression -- a finished round must not report "still running"
+# --------------------------------------------------------------------------- #
+
+
+#: Three steps, escalating on the second. With ``verify_every_step=False`` the
+#: first two steps append plain metrics lines (no raw-score key, so a
+#: colliding ``score_scale`` cannot bite yet) and the third trips the cap,
+#: which forces the one verification -- and *that* append carries the score
+#: and raises. The attempt therefore dies with lines already on disk, having
+#: interrupted its operator once on the way.
+_ESCALATING_SCRIPT = (
+    SolverStep(tokens=10, note="work"),
+    SolverStep(tokens=10, note="stuck", escalate=EscalationReason.HARNESS_FAILURE),
+    SolverStep(tokens=10, note="work"),
+)
+
+
+class TestAFinishedRoundThatLostAnAttemptExitsZero:
+    """``INCOMPLETE`` must mean unfinished, not "finished badly".
+
+    A contained crash *after* the first metrics append left an intact chain
+    with no ``metrics.json`` beside it -- ``verify``'s definition of
+    ``INCOMPLETE`` -- on a round that was over. The whole results root then
+    exited ``2`` permanently: a pre-writeup gate demanding ``0`` could never
+    pass on that tree, and an operator taught "``2`` means still running"
+    would read ``2`` where nothing would ever finish. That is a new
+    cry-wolf, which is the failure class this contract exists to remove.
+
+    A contained crash *before* the first append -- the ``score_scale``
+    collision the containment fix was built around -- left no ``metrics.jsonl``
+    at all, so the directory was not a run and the root exited ``0``. Same
+    event class, two different codes, decided by which line of ``run_attempt``
+    raised. The exit-code contract is unchanged; what changed is that a
+    finished round now finishes its own records.
+    """
+
+    @staticmethod
+    def _colliding(problem_id: str, scale: str) -> Problem:
+        problem = make_problem(problem_id)
+        return dataclasses.replace(
+            problem, verifier=dataclasses.replace(problem.verifier, score_scale=scale)
+        )
+
+    async def _round_losing_one_attempt_after_its_first_line(
+        self,
+        store: TrajectoryStore,
+        workspaces: TempWorkspaceProvider,
+        clock: FakeClock,
+        *,
+        solver: object | None = None,
+        bad_first: bool = False,
+    ) -> Path:
+        runner = make_runner(
+            solver=solver or FakeSolver(),
+            store=store,
+            workspaces=workspaces,
+            clock=clock,
+            escalations=ScriptedEscalationChannel([EscalationVerdict.CONTINUE]),
+        )
+        # ``FakeSolver`` walks one script across the whole round, so a test
+        # that needs the *lost* problem to escalate has to run it first.
+        good = make_problem("good", scores=(2.0,))
+        bad = self._colliding("bad", "tokens_used")
+        await runner.run_round(
+            [bad, good] if bad_first else [good, bad],
+            make_config(
+                verify_every_step=False,
+                cap=Cap(max_steps=3, max_tokens=10_000, max_wall_clock_seconds=600.0),
+            ),
+        )
+        return store.round_dir(0) / "attempts" / "bad"
+
+    async def test_a_crash_after_the_first_line_leaves_a_terminal_summary_and_exits_zero(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        metrics_dir = await self._round_losing_one_attempt_after_its_first_line(
+            store, workspaces, clock
+        )
+        # The precondition the defect needed: lines on disk, chain intact.
+        assert len(_read_lines(metrics_dir / "metrics.jsonl")) >= 1
+        assert (await verify_metrics_chain(metrics_dir)).ok is True
+
+        summary = json.loads((metrics_dir / "metrics.json").read_text())
+        assert summary["best_score"] is None
+        assert summary["best_passed_correctness"] is None
+        assert summary["final_state"].startswith("crashed_in_harness:")
+        assert "ContractViolationError" in summary["final_state"]
+        # Not an AttemptState value: a harness crash is not an outcome the
+        # experiment measured, and must not be readable as one.
+        assert summary["final_state"] not in {s.value for s in AttemptState}
+
+        assert await _verify_exit_code(store.loop_dir.parent) == verify_cli.EXIT_OK
+
+    async def test_the_terminal_summary_reconciles_with_the_log_it_was_derived_from(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Trading ``INCOMPLETE`` for ``FAILED`` would be strictly worse.
+
+        ``FAILED`` is this tool's word for a doctored record. A summary
+        written on the error path from anything other than the log's own last
+        line would earn exactly that verdict on an attempt whose only sin was
+        crashing, so every field is re-derived from the log by the same reader
+        ``reconcile_summary`` uses.
+        """
+        metrics_dir = await self._round_losing_one_attempt_after_its_first_line(
+            store, workspaces, clock
+        )
+        verdict = await reconcile_summary(metrics_dir)
+        assert verdict.state is ReconcileState.OK, verdict.reason
+        assert verdict.mismatches == ()
+
+        lines = _read_lines(metrics_dir / "metrics.jsonl")
+        summary = json.loads((metrics_dir / "metrics.json").read_text())
+        assert summary["steps_recorded"] == len(lines)
+        assert summary["outcome"] == lines[-1]["outcome_code"]
+        assert summary["consumed_steps"] == lines[-1]["consumed_steps"]
+        assert summary["consumed_tokens"] == lines[-1]["tokens_used"]
+        assert summary["cap_extensions"] == lines[-1]["cap_extensions"]
+
+    async def test_escalations_the_lost_attempt_raised_are_counted_not_zeroed(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """The in-memory request list died with the attempt; the files did not.
+
+        Writing ``0`` here would put a fabricated number in a file whose whole
+        purpose is to be citable -- and it would understate driving function
+        #4, human-gate load, which is the number the self-improvement claim
+        lives or dies on. The requests were written to disk before the loop
+        suspended on each one, so the real count is recoverable.
+        """
+        metrics_dir = await self._round_losing_one_attempt_after_its_first_line(
+            store, workspaces, clock, solver=FakeSolver(_ESCALATING_SCRIPT), bad_first=True
+        )
+        escalations = sorted((store.round_dir(0) / "escalations").glob("*.json"))
+        raised_by_bad = [
+            path
+            for path in escalations
+            if json.loads(path.read_text())["request"]["problem_id"] == "bad"
+        ]
+        assert raised_by_bad, "the scripted solver did not actually escalate"
+        summary = json.loads((metrics_dir / "metrics.json").read_text())
+        assert summary["escalation_count"] == len(raised_by_bad)
+
+    async def test_a_crash_before_the_first_line_still_exits_zero(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """The other half of the same event class, and it must agree.
+
+        With per-step verification the colliding scale raises at the *first*
+        append, so nothing is written and the directory is not a run at all.
+        Nothing is fabricated to make it one -- writing a summary for a run
+        that does not exist would create a finding rather than clear one.
+        """
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        await runner.run_round(
+            [make_problem("good", scores=(2.0,)), self._colliding("bad", "progress")],
+            make_config(),
+        )
+        assert not (store.round_dir(0) / "attempts" / "bad" / "metrics.jsonl").exists()
+        assert await _verify_exit_code(store.loop_dir.parent) == verify_cli.EXIT_OK
+
+    async def test_a_genuinely_unfinished_run_still_exits_two(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """The negative half, and the reason the exit-code contract is unchanged.
+
+        ``2`` still has to fire for the case it was introduced for: an attempt
+        killed mid-run -- a closed subscription window, a killed process --
+        which reaches no containment path at all because the whole process is
+        gone. Its intact chain with no summary is what ``INCOMPLETE`` means,
+        and this fix must not have made that state unreachable.
+        """
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        await runner.run_round([make_problem("s1", scores=(2.0,))], make_config())
+        (store.round_dir(0) / "attempts" / "s1" / "metrics.json").unlink()
+
+        assert await _verify_exit_code(store.loop_dir.parent) == verify_cli.EXIT_INCOMPLETE
+
+    async def test_a_summary_already_on_disk_is_never_overwritten(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """A crash *after* the summary landed leaves the honest record alone.
+
+        The terminal write is a floor under the reporting contract, not a
+        replacement for it: the real summary carries the attempt's score and
+        state, and clobbering it with the cruder crashed-in-harness record
+        would lose information the run genuinely produced.
+        """
+        output_dir = store.round_dir(0)
+        metrics_dir = output_dir / "attempts" / "s1"
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        await runner.run_attempt(
+            make_problem("s1", scores=(2.0,)), make_config(), output_dir=output_dir
+        )
+        honest = (metrics_dir / "metrics.json").read_bytes()
+
+        await runner._close_out_crashed_attempt(
+            problem=make_problem("s1", scores=(2.0,)),
+            config=make_config(),
+            output_dir=output_dir,
+            exc_type="RuntimeError",
+        )
+        assert (metrics_dir / "metrics.json").read_bytes() == honest
