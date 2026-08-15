@@ -925,6 +925,36 @@ either way. This is a real limitation, not a reassurance: **a FAIL on a
 rotated-aside generation is not automatically benign just because it is
 rotated aside.**
 
+**A process killed *between* writes produces a different shape, and that one
+`verify` does name: `INCOMPLETE`.** `metrics.json` is written once, when an
+attempt terminates; `metrics.jsonl` and its sidecar are extended after every
+step. Kill an attempt in the gap between two appends — a closed subscription
+window, this program's own stated normal — and what is left is an intact,
+fully verifiable chain with no summary beside it. Rotation moves only the
+files that exist, so the operator's honest re-drive leaves a `prior-N/`
+holding a good chain and no `metrics.json` **for as long as the results root
+survives**. That is not a failure and never becomes one, so reporting it as
+`FAIL` made the whole root exit `1` forever on untouched data. It is its own
+state, with its own exit code (`2`). Reproduced for real, after cancelling an
+attempt mid-flight and then re-driving it to completion:
+
+```
+$ .venv/bin/python -m turing.research.loop.verify <results-root>
+.../attempts/s1: OK (4 line(s) checked)
+.../attempts/s1/prior-1: INCOMPLETE (1 line(s) checked, chain intact) metrics.json is missing (the attempt never reached its summary write)
+detects alteration; does not prevent it — see OPEN-QUESTIONS R2/Q11
+$ echo $?
+2
+```
+
+The two killed-process shapes are therefore reported differently and must be
+read differently: a truncated chain is damage `verify` cannot tell from a
+tamper (above), while a missing summary over an intact chain is simply a run
+that did not finish. **Only the summary's absence is excused this way.** A
+`prior-N/` whose chain does not recompute is `FAIL` whether or not a summary
+sits beside it — otherwise deleting one file would soften a tamper's exit code
+from `1` to `2`.
+
 **A read-only `attempts/<problem-id>/` directory makes the re-drive itself
 fail loudly, not silently.** `_rotate_stale_metrics` is called at the very
 start of `run_attempt`, before a single line of the new attempt is written,
@@ -992,12 +1022,31 @@ the same account that could alter the record also produced it.
 `<path>` can be one attempt directory, one round, one `loop-<slug>/`
 directory, or the whole results root — the CLI walks it for every directory
 containing a `metrics.jsonl` and checks each one. Human-readable output is one
-`OK` / `FAIL` line per run, with a reason and the failing line index (or the
-mismatch list) on `FAIL`. `--json` prints one JSON object per run instead, for
-scripting. **Exit code is `0` only when every run in `<path>` passes both the
-chain check and the summary reconciliation, `1` otherwise** — an operator
-wiring this into a pre-writeup check needs the exit code to mean something on
-its own, without reading the text. Every invocation, clean or tampered, also
+`OK` / `INCOMPLETE` / `FAIL` line per run, with a reason and the failing line
+index (or the mismatch list) on `FAIL`. `--json` prints one JSON object per run
+instead, for scripting; each record carries both `ok` (true only for `OK`) and
+`state` (`"ok"` / `"incomplete"` / `"failed"`).
+
+**Exit code — three values, not two:**
+
+| code | meaning |
+| --- | --- |
+| `0` | every run in `<path>` is complete and passes both checks |
+| `1` | at least one run **failed**: a broken chain, or a summary that is present and disagrees with its log. Also: no runs found at all |
+| `2` | nothing failed, but at least one run is **incomplete**: an intact chain with no `metrics.json` beside it |
+
+`1` outranks `2` when both are present. An operator wiring this into a
+pre-writeup check needs the exit code to mean something on its own, without
+reading the text — and it needs three values, because `metrics.json` is
+written once when an attempt ends while the chain grows after every step.
+Verifying a round *while it runs*, or a root holding an attempt that a closed
+subscription window killed, finds intact chains with no summary beside them
+through nobody's fault. Worse, that shape is **permanent**: the honest
+re-drive rotates the killed generation's trio into `prior-N/` exactly as it
+found it — chain, no summary — so a two-value exit code reported the whole
+results root as failing forever, on data nobody touched. `2` says "nothing is
+wrong here, but something is not finished", which is neither a green light nor
+an accusation. Every invocation, clean or tampered, also
 prints a trailing line stating the limitation above in full:
 `detects alteration; does not prevent it — see OPEN-QUESTIONS R2/Q11`. That
 line is not decoration; a tool that printed a bare `OK` would be read as a

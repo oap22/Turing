@@ -36,6 +36,7 @@ from turing.research.loop.integrity import (
     CHAIN_SIDECAR_FILENAME,
     CHAIN_VERSION,
     ChainVerdict,
+    ReconcileState,
     ReconcileVerdict,
     canonical_json,
     chain_next,
@@ -43,6 +44,7 @@ from turing.research.loop.integrity import (
     seed_hash,
     verify_metrics_chain,
 )
+from turing.research.loop.protocols import SolverStep
 
 from .conftest import FakeSolver, make_config, make_problem, make_runner
 
@@ -196,6 +198,18 @@ def _clean_verifiable_run(directory: Path, *, n: int = 3) -> None:
         "best_score": score_values[-1],
     }
     _write_summary(directory, summary)
+
+
+def _unfinished_verifiable_run(directory: Path, *, n: int = 3) -> None:
+    """A run whose chain is intact and whose ``metrics.json`` was never written.
+
+    Deliberately *builds* that shape rather than writing a summary and
+    deleting it: this is what an attempt looks like on disk between its first
+    metrics append and its single end-of-attempt summary write, and a fixture
+    that reached it by deletion would model a different (and less honest)
+    story than the one the INCOMPLETE state exists for.
+    """
+    _build_chain(directory, _header(), [_line(i) for i in range(n)])
 
 
 def _tamper_one_value(directory: Path, *, index: int = 1) -> None:
@@ -984,7 +998,10 @@ class TestReconcileSummary:
 
         verdict = await reconcile_summary(tmp_path)
 
-        assert verdict == ReconcileVerdict(ok=True, mismatches=(), reason=verdict.reason)
+        assert verdict == ReconcileVerdict(
+            state=ReconcileState.OK, mismatches=(), reason=verdict.reason
+        )
+        assert verdict.ok is True
 
     async def test_an_altered_token_count_is_named_and_nothing_unrelated_is(
         self, tmp_path: Path
@@ -1234,17 +1251,69 @@ class TestReconcileSummary:
         assert verdict.ok is False
         assert "best_score" in verdict.mismatches
 
-    async def test_missing_metrics_json_is_ok_false_with_empty_mismatches(
+    async def test_missing_metrics_json_is_incomplete_not_ok_and_not_failed(
         self, tmp_path: Path
     ) -> None:
+        """Absence is its own state. ``metrics.json`` is written once, when an
+        attempt ends, so "log present, summary absent" is what an unfinished
+        run looks like — not a finding about the data. It is still not a pass:
+        ``ok`` stays ``False``, because callers read ``ok`` as "this run is
+        good" and an unfinished run's numbers are not final.
+        """
         lines, _ = _matched_lines_and_summary()
         _write_raw_jsonl(tmp_path, lines)
 
         verdict = await reconcile_summary(tmp_path)
 
+        assert verdict.state is ReconcileState.INCOMPLETE
         assert verdict.ok is False
         assert verdict.mismatches == ()
         assert "missing" in verdict.reason.lower()
+
+    async def test_a_present_but_unparseable_summary_is_failed_not_incomplete(
+        self, tmp_path: Path
+    ) -> None:
+        """Only *absence* is INCOMPLETE. The writer emits ``metrics.json``
+        whole, so a file that is there but does not parse is damage, and
+        damage read as "not finished yet" would be exactly the softening this
+        state must not become.
+        """
+        lines, _ = _matched_lines_and_summary()
+        _write_raw_jsonl(tmp_path, lines)
+        (tmp_path / "metrics.json").write_text("{not json at all", encoding="utf-8")
+
+        verdict = await reconcile_summary(tmp_path)
+
+        assert verdict.state is ReconcileState.FAILED
+        assert verdict.ok is False
+
+    async def test_a_present_summary_that_is_not_an_object_is_failed_not_incomplete(
+        self, tmp_path: Path
+    ) -> None:
+        lines, _ = _matched_lines_and_summary()
+        _write_raw_jsonl(tmp_path, lines)
+        (tmp_path / "metrics.json").write_text("[1, 2, 3]", encoding="utf-8")
+
+        verdict = await reconcile_summary(tmp_path)
+
+        assert verdict.state is ReconcileState.FAILED
+        assert verdict.ok is False
+
+    async def test_a_doctored_summary_still_fails_exactly_as_before(self, tmp_path: Path) -> None:
+        """The guard on the whole change: introducing INCOMPLETE must not have
+        softened the case this module exists for. A summary that is present
+        and disagrees is FAILED, with the disagreeing field still named.
+        """
+        lines, summary = _matched_lines_and_summary()
+        summary["best_score"] = 1_000.0
+        _write_raw_jsonl(tmp_path, lines)
+        _write_summary(tmp_path, summary)
+
+        verdict = await reconcile_summary(tmp_path)
+
+        assert verdict.state is ReconcileState.FAILED
+        assert verdict.ok is False
+        assert verdict.mismatches == ("best_score",)
 
 
 # --------------------------------------------------------------------------- #
@@ -1529,4 +1598,344 @@ class TestVerifyCliAgainstARealRun:
 
         assert result.returncode == 0, result.stdout + result.stderr
         assert "OK" in result.stdout
+        assert verify.HONESTY_LINE in result.stdout
+
+
+# --------------------------------------------------------------------------- #
+# INCOMPLETE — the seventh false alarm, and the one that never cleared
+#
+# `metrics.json` is written once, when an attempt ends; the chain is extended
+# after every step. "Intact chain, no summary" is therefore the ordinary shape
+# of a run that is still going or was killed — and, once the operator's honest
+# re-drive rotates that trio into `prior-N/`, a *permanent* shape. Reporting it
+# as FAIL made the whole results root exit 1 forever on data nobody touched.
+# Reporting it as OK would be worse. It is its own state, with its own exit
+# code, and the tests below pin all three states against both hand-built
+# fixtures (for exact exit codes) and a real, unmocked RoundRunner (for the
+# scenario itself — hand-built fixtures hid every earlier false alarm here).
+# --------------------------------------------------------------------------- #
+
+
+class TestVerifyExitCodeContract:
+    """One test per exit code, plus the precedence rule between two of them.
+
+    These use ``verify.main()`` in-process (as :class:`TestVerifyCli` does)
+    rather than a subprocess: the exit-code *contract* is what is under test,
+    and ``main``'s return value is that contract. The real subprocess exit
+    status is exercised against real runner output in
+    :class:`TestIncompleteAgainstARealRun` below.
+    """
+
+    def test_exit_0_when_every_run_is_complete_and_clean(self, tmp_path: Path, capsys: Any) -> None:
+        _clean_verifiable_run(tmp_path)
+
+        exit_code = verify.main([str(tmp_path)])
+        out = capsys.readouterr().out
+
+        assert exit_code == verify.EXIT_OK == 0
+        assert "OK" in out
+        assert verify.HONESTY_LINE in out
+
+    def test_exit_1_when_a_run_actually_failed(self, tmp_path: Path, capsys: Any) -> None:
+        _clean_verifiable_run(tmp_path)
+        _tamper_one_value(tmp_path)
+
+        exit_code = verify.main([str(tmp_path)])
+        out = capsys.readouterr().out
+
+        assert exit_code == verify.EXIT_FAILED == 1
+        assert "FAIL" in out
+        assert verify.HONESTY_LINE in out
+
+    def test_exit_2_when_a_run_is_incomplete_and_nothing_failed(
+        self, tmp_path: Path, capsys: Any
+    ) -> None:
+        """The state this whole change exists for: an intact chain with no
+        summary beside it. Not 0 — a pre-writeup gate must still refuse to
+        wave through numbers that are not final — and not 1, because nothing
+        is wrong with what is on disk.
+        """
+        _unfinished_verifiable_run(tmp_path)
+
+        exit_code = verify.main([str(tmp_path)])
+        out = capsys.readouterr().out
+
+        assert exit_code == verify.EXIT_INCOMPLETE == 2
+        assert "INCOMPLETE" in out
+        assert "FAIL" not in out
+        assert verify.HONESTY_LINE in out
+
+    def test_a_real_failure_outranks_an_incomplete_run(self, tmp_path: Path, capsys: Any) -> None:
+        """Both present in one tree: the exit code must name the failure. An
+        operator who only reads the integer must be steered to the broken
+        chain, not to the attempt that simply has not finished.
+        """
+        _unfinished_verifiable_run(tmp_path / "still-running")
+        _clean_verifiable_run(tmp_path / "tampered")
+        _tamper_one_value(tmp_path / "tampered")
+
+        exit_code = verify.main([str(tmp_path)])
+        out = capsys.readouterr().out
+
+        assert exit_code == verify.EXIT_FAILED
+        # Both are still *named* in the output — only the single integer has
+        # to choose between them.
+        assert "INCOMPLETE" in out
+        assert "FAIL" in out
+
+    def test_a_broken_chain_with_no_summary_is_a_failure_not_an_incomplete_run(
+        self, tmp_path: Path, capsys: Any
+    ) -> None:
+        """The composition is asymmetric on purpose. "Unfinished" explains a
+        missing *summary*; it never explains a chain that does not recompute.
+        If it did, deleting one file would soften a tamper from 1 to 2.
+        """
+        _unfinished_verifiable_run(tmp_path)
+        _tamper_one_value(tmp_path)
+
+        exit_code = verify.main([str(tmp_path)])
+        out = capsys.readouterr().out
+
+        assert exit_code == verify.EXIT_FAILED
+        assert "FAIL" in out
+        assert verify.HONESTY_LINE in out
+
+    def test_no_runs_found_is_a_failure_not_an_incomplete_run(
+        self, tmp_path: Path, capsys: Any
+    ) -> None:
+        """A path with nothing in it is not half-done, it is the wrong path —
+        so it keeps the harder code rather than the gentler new one.
+        """
+        exit_code = verify.main([str(tmp_path)])
+        capsys.readouterr()
+
+        assert exit_code == verify.EXIT_FAILED
+        assert exit_code != verify.EXIT_INCOMPLETE
+
+    def test_incomplete_is_distinct_in_json_and_ok_stays_false(
+        self, tmp_path: Path, capsys: Any
+    ) -> None:
+        """A machine consumer must be able to tell the three apart, and must
+        not start reading "unfinished" as "good": ``ok`` — the field every
+        pre-existing script keys on — stays ``False``, and ``state`` is what
+        carries the distinction.
+        """
+        _unfinished_verifiable_run(tmp_path)
+
+        exit_code = verify.main([str(tmp_path), "--json"])
+        out = capsys.readouterr().out
+
+        assert exit_code == verify.EXIT_INCOMPLETE
+        record = json.loads(out.splitlines()[0])
+        assert record["ok"] is False
+        assert record["state"] == "incomplete"
+        assert record["chain"]["ok"] is True
+        assert record["reconcile"]["state"] == "incomplete"
+        assert record["reconcile"]["mismatches"] == []
+        assert record["note"] == verify.HONESTY_LINE
+        assert verify.HONESTY_LINE in out
+
+    def test_the_qualifier_still_prints_verbatim_on_an_incomplete_run(
+        self, tmp_path: Path, capsys: Any
+    ) -> None:
+        """HONESTY_LINE is unconditional. A third state is exactly the kind of
+        new branch through ``main`` that could quietly skip it.
+        """
+        _unfinished_verifiable_run(tmp_path)
+
+        verify.main([str(tmp_path)])
+        human_out = capsys.readouterr().out
+        verify.main([str(tmp_path), "--json"])
+        json_out = capsys.readouterr().out
+
+        assert human_out.splitlines()[-1] == verify.HONESTY_LINE
+        assert json_out.splitlines()[-1] == verify.HONESTY_LINE
+
+
+class _StallsAfterOneStepSolver:
+    """Completes one real step, then blocks forever on the next.
+
+    Stands in for a solver that was still working when the process went away.
+    The attempt is torn down by cancelling the task driving ``run_attempt`` —
+    a genuine ``asyncio`` cancellation, not a hand-built file layout — which
+    unwinds out of the runner before it reaches ``write_attempt_summary``,
+    leaving exactly what a closed subscription window leaves behind: a
+    ``metrics.jsonl`` and sidecar with real appended lines, and no summary.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.stalled = asyncio.Event()
+
+    async def step(self, task: Any, attempt: Any) -> SolverStep:
+        self.calls += 1
+        if self.calls > 1:
+            self.stalled.set()
+            await asyncio.Event().wait()  # never returns; the caller cancels us
+        return SolverStep(tokens=10, note="work")
+
+
+def _drive_a_real_attempt_until_it_is_killed(
+    *,
+    store: TrajectoryStore,
+    workspaces: TempWorkspaceProvider,
+    clock: FakeClock,
+    problem: Any,
+    output_dir: Path,
+) -> None:
+    """Start a real ``run_attempt`` and cancel it mid-flight.
+
+    The attempt is cancelled only once the solver has been asked for a
+    *second* step, which guarantees the first step's metrics line — and the
+    sidecar rewritten alongside it — are already durably on disk. That
+    ordering is the whole point: the resulting directory must hold a chain
+    worth verifying, not an empty one.
+    """
+    solver = _StallsAfterOneStepSolver()
+    runner = make_runner(solver=solver, store=store, workspaces=workspaces, clock=clock)
+    config = make_config()
+
+    async def _drive() -> None:
+        task = asyncio.create_task(runner.run_attempt(problem, config, output_dir=output_dir))
+        await solver.stalled.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_drive())
+
+
+class TestIncompleteAgainstARealRun:
+    """The two reproductions, driven through the real runner and the real CLI.
+
+    Hand-built fixtures hid all six earlier false alarms in this file, so the
+    scenario itself is reproduced against an unmocked ``RoundRunner``: a real
+    attempt, really cancelled mid-flight, really re-driven afterwards, really
+    verified through ``python -m turing.research.loop.verify``.
+
+    Not ``async def``, for the reason :class:`TestVerifyCliAgainstARealRun`
+    documents: ``verify.main()`` calls ``asyncio.run()`` internally and this
+    project runs tests in ``asyncio_mode = "auto"``, so the fixture is built
+    under an explicit ``asyncio.run()`` in a sync test and the CLI is invoked
+    as a subprocess.
+    """
+
+    def test_an_attempt_killed_mid_run_reports_incomplete_not_fail(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Scenario 1: verifying a round while it is in progress, or right
+        after a kill. The chain is intact, the summary was never written, and
+        the operator is told the run is unfinished rather than accused.
+        """
+        _drive_a_real_attempt_until_it_is_killed(
+            store=store,
+            workspaces=workspaces,
+            clock=clock,
+            problem=make_problem("s1"),
+            output_dir=store.round_dir(0),
+        )
+
+        metrics_dir = store.round_dir(0) / "attempts" / "s1"
+        # Fixture assumptions, stated rather than assumed: a real chain with
+        # at least one real line, and genuinely no summary.
+        assert (metrics_dir / "metrics.jsonl").stat().st_size > 0
+        assert not (metrics_dir / "metrics.json").exists()
+
+        result = _run_verify_cli_subprocess(str(metrics_dir))
+
+        assert result.returncode == verify.EXIT_INCOMPLETE, result.stdout + result.stderr
+        assert "INCOMPLETE" in result.stdout
+        assert "FAIL" not in result.stdout
+        assert verify.HONESTY_LINE in result.stdout
+
+    def test_a_killed_attempt_rotated_into_prior_n_does_not_fail_the_root_forever(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Scenario 2, the permanent one — kill, then re-drive.
+
+        ``_rotate_stale_metrics`` moves only the files that exist, so the
+        killed attempt's ``prior-N/`` directory holds an intact chain and no
+        ``metrics.json`` for as long as the results root survives. Under the
+        old two-state verdict the whole root exited 1 forever, on completely
+        honest data, with the honest repair run sitting green right next to
+        it. Both generations are checked here in one CLI invocation over the
+        whole results root, exactly as an operator runs it.
+        """
+        problem = make_problem("s1")
+        output_dir = store.round_dir(0)
+
+        _drive_a_real_attempt_until_it_is_killed(
+            store=store,
+            workspaces=workspaces,
+            clock=clock,
+            problem=problem,
+            output_dir=output_dir,
+        )
+        # The operator re-drives; this one runs to completion and writes its
+        # summary. The runner rotates the killed generation aside first.
+        redriven = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        outcome = asyncio.run(redriven.run_attempt(problem, make_config(), output_dir=output_dir))
+        assert outcome.attempt.state.name == "FAILED_WITHIN_CAP"
+
+        metrics_dir = output_dir / "attempts" / "s1"
+        prior_dirs = sorted(p for p in metrics_dir.iterdir() if p.is_dir())
+        assert len(prior_dirs) == 1, f"expected one rotated-aside dir, got {prior_dirs}"
+        prior_dir = prior_dirs[0]
+        # The shape the defect report named: chain rotated, summary never
+        # existed to rotate.
+        assert (prior_dir / "metrics.jsonl").is_file()
+        assert (prior_dir / "metrics.chain.json").is_file()
+        assert not (prior_dir / "metrics.json").exists()
+        assert (metrics_dir / "metrics.json").is_file()
+
+        result = _run_verify_cli_subprocess(str(store.loop_dir.parent))
+
+        assert result.returncode == verify.EXIT_INCOMPLETE, result.stdout + result.stderr
+        assert "FAIL" not in result.stdout
+        prior_line = next(
+            line for line in result.stdout.splitlines() if line.startswith(str(prior_dir) + ":")
+        )
+        current_line = next(
+            line for line in result.stdout.splitlines() if line.startswith(str(metrics_dir) + ":")
+        )
+        assert "INCOMPLETE" in prior_line
+        assert "chain intact" in prior_line
+        assert current_line.split(": ", 1)[1].startswith("OK")
+        assert verify.HONESTY_LINE in result.stdout
+
+    def test_a_rotated_killed_attempt_whose_chain_is_damaged_still_fails(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """The check this must not have weakened, on the same real fixture.
+
+        ``docs/research-agent.md`` records that a process killed *mid-write*
+        leaves a truncated final line, which rotation carries into
+        ``prior-N/`` unchanged. That is a broken chain, and a broken chain is
+        a failure whether or not a summary is missing beside it — INCOMPLETE
+        must never become a way for real damage to travel as "unfinished".
+        """
+        problem = make_problem("s1")
+        output_dir = store.round_dir(0)
+
+        _drive_a_real_attempt_until_it_is_killed(
+            store=store,
+            workspaces=workspaces,
+            clock=clock,
+            problem=problem,
+            output_dir=output_dir,
+        )
+        metrics_dir = output_dir / "attempts" / "s1"
+        jsonl = metrics_dir / "metrics.jsonl"
+        # A kill that landed mid-append, not between appends: the last line
+        # is truncated where the write stopped.
+        text = jsonl.read_text(encoding="utf-8")
+        jsonl.write_text(text[: -(len(text) // 3)], encoding="utf-8")
+
+        redriven = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        asyncio.run(redriven.run_attempt(problem, make_config(), output_dir=output_dir))
+
+        result = _run_verify_cli_subprocess(str(store.loop_dir.parent))
+
+        assert result.returncode == verify.EXIT_FAILED, result.stdout + result.stderr
+        assert "FAIL" in result.stdout
         assert verify.HONESTY_LINE in result.stdout

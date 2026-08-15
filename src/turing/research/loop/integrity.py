@@ -54,6 +54,22 @@ closes a different, easier hole: an honest log with a doctored ``metrics.json``
 summary written over it. It re-derives every summary field from the raw
 lines and never trusts the summary's own arithmetic.
 
+**Reconciliation has three outcomes, not two** (:class:`ReconcileState`).
+``metrics.json`` is written once, at the very end of an attempt, while the
+chain is extended after every step — so "chain present, summary absent" is
+the ordinary on-disk shape of a run that is still going, or of one that was
+killed before it finished, and this program's own brief says subscription
+windows close unpredictably. Reporting that as a *failure* was a false
+alarm that never cleared: a killed attempt's trio is rotated into
+``prior-N/`` on the operator's honest re-drive, and a rotated directory
+holding an intact chain and no summary would have reported FAIL for the life
+of the results root, on data nobody touched. Absence is therefore
+:attr:`ReconcileState.INCOMPLETE` — its own state, never ``ok``. A summary
+that is *present* and disagrees, or is unreadable, is still
+:attr:`ReconcileState.FAILED` exactly as before; deleting a summary to dodge
+a mismatch buys nothing, because ``verify``'s exit code is non-zero for
+INCOMPLETE too.
+
 A FAIL is not automatically tampering, either: an honest re-run of an
 attempt over an already-used ``output_dir`` is refused by
 ``results.MetricsWriter`` before it can splice a second header into an
@@ -78,6 +94,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING
 
 from turing.research.contracts import ContractViolationError
@@ -92,6 +109,7 @@ __all__ = [
     "CHAIN_SIDECAR_FILENAME",
     "CHAIN_VERSION",
     "ChainVerdict",
+    "ReconcileState",
     "ReconcileVerdict",
     "canonical_json",
     "chain_next",
@@ -504,17 +522,68 @@ def _verify_metrics_chain_sync(directory: Path) -> ChainVerdict:
 # --------------------------------------------------------------------------- #
 
 
+class ReconcileState(str, Enum):  # noqa: UP042
+    """Whether a summary agreed with its log, disagreed with it, or is absent.
+
+    Three states rather than a bool because "this run's summary is wrong" and
+    "this run has no summary yet" are different facts about a run, and only
+    the first is a finding about the *data*. ``metrics.json`` is written once,
+    after an attempt terminates; ``metrics.jsonl`` and its sidecar are
+    extended after every step. An attempt observed between those two moments —
+    in flight, or killed by a closed subscription window — has an intact chain
+    and no summary through no fault of anyone's, and that shape is
+    *permanent* once the operator re-drives: ``runner._rotate_stale_metrics``
+    moves aside whichever of the trio exist, so the ``prior-N/`` directory
+    keeps its chain and its missing summary forever.
+
+    Collapsing that into ``ok=False`` made the verifier report FAIL, forever,
+    on untouched honest data — the exact "cries wolf" failure this layer
+    exists to avoid. Collapsing it into ``ok=True`` would be worse: callers
+    read ``ok`` as "this run is good", and an unfinished run is not a good
+    run, it is one whose numbers are not final. Hence a distinct state, and
+    :attr:`ReconcileVerdict.ok` deliberately stays ``False`` for it.
+
+    :attr:`INCOMPLETE` is reached *only* by a summary that is not there at
+    all. A summary that exists but is unreadable, is not a JSON object, or
+    disagrees with the log in any field is :attr:`FAILED`, unchanged — this
+    distinction weakens no check. Nor does it offer an escape hatch: deleting
+    a summary rather than doctoring it moves a run from FAILED to INCOMPLETE,
+    and ``turing.research.loop.verify`` exits non-zero (``2``) on INCOMPLETE
+    as well, so there is no edit that turns a bad run green.
+    """
+
+    OK = "ok"
+    INCOMPLETE = "incomplete"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True, slots=True)
 class ReconcileVerdict:
     """The result of re-deriving ``metrics.json`` from ``metrics.jsonl``.
 
     ``mismatches`` names the exact fields that disagree, so a doctored
-    summary is not merely flagged but pointed at.
+    summary is not merely flagged but pointed at. It is empty for both
+    :attr:`ReconcileState.OK` and :attr:`ReconcileState.INCOMPLETE`, and for
+    the FAILED cases where the summary could not be read far enough to
+    compare any field at all — so ``mismatches`` alone never distinguishes
+    the states. Read :attr:`state`.
+
+    ``ok`` is a derived property, not a field, so it cannot drift from
+    ``state``: it is ``True`` for exactly one of the three states. Existing
+    callers that treat it as "this run is good" keep working unchanged, and
+    a caller that needs to tell an unfinished run from a broken one must ask
+    for :attr:`state` explicitly rather than getting the two silently
+    conflated.
     """
 
-    ok: bool
+    state: ReconcileState
     mismatches: tuple[str, ...]
     reason: str
+
+    @property
+    def ok(self) -> bool:
+        """``True`` only for :attr:`ReconcileState.OK` — never for INCOMPLETE."""
+        return self.state is ReconcileState.OK
 
 
 def _numbers_close(a: object, b: object, *, rel_tol: float = 1e-9, abs_tol: float = 1e-9) -> bool:
@@ -622,9 +691,24 @@ def _reconcile_summary_sync(directory: Path) -> ReconcileVerdict:
     ``_CORE_LINE_KEYS`` above for why that set is hand-copied rather than
     imported.
 
-    A missing ``metrics.json`` is ``ok=False`` with an empty ``mismatches``
-    tuple and a reason naming the summary as absent — absence is not treated
-    as a pass.
+    A missing ``metrics.json`` is :attr:`ReconcileState.INCOMPLETE` — not
+    ``ok``, and not a FAIL either — with an empty ``mismatches`` tuple and a
+    reason naming the summary as absent. See :class:`ReconcileState` for why
+    that is its own state: absence is what an unfinished or killed attempt
+    looks like on disk, permanently so once its trio is rotated into
+    ``prior-N/``, and calling it a failure was a false alarm that never
+    cleared. Absence is still not a pass; ``verify`` exits non-zero on it.
+
+    This function deliberately does **not** consult the chain before deciding
+    that. Re-reading and re-hashing ``metrics.jsonl`` here would duplicate
+    :func:`verify_metrics_chain`'s entire job for one branch, and two copies
+    of that logic is precisely the drift this module warns about elsewhere.
+    The composition — "intact chain **and** absent summary means unfinished;
+    *broken* chain means failure whatever the summary does" — belongs to the
+    caller holding both verdicts, which is
+    :func:`turing.research.loop.verify.verify_run`. A caller that ignores the
+    chain verdict and reads INCOMPLETE as benign on its own is reading this
+    verdict out of context.
 
     When ``metrics.jsonl`` has zero valid lines, the fields above that are
     defined only in terms of "the last line" (``consumed_steps``,
@@ -638,20 +722,35 @@ def _reconcile_summary_sync(directory: Path) -> ReconcileVerdict:
     jsonl_path = directory / _METRICS_JSONL_FILENAME
 
     if not summary_path.is_file():
+        # The only path to INCOMPLETE. Note it is reported the same way for a
+        # zero-line log as for a long one: a run that recorded nothing and
+        # never wrote a summary is, if anything, more obviously unfinished
+        # than one that recorded fifty steps, and inventing a fourth state
+        # for it would buy the operator nothing it could act on differently.
+        # The chain check still reports the line count either way, so an
+        # empty log is visible in the output rather than hidden by this.
         return ReconcileVerdict(
-            ok=False, mismatches=(), reason=f"{_METRICS_SUMMARY_FILENAME} is missing"
+            state=ReconcileState.INCOMPLETE,
+            mismatches=(),
+            reason=(
+                f"{_METRICS_SUMMARY_FILENAME} is missing "
+                "(the attempt never reached its summary write)"
+            ),
         )
     try:
         summary_raw = json.loads(summary_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
+        # Present but unreadable is a failure, not an incompletion: the
+        # writer emits this file whole, so a half-written or unparseable one
+        # is damage, and treating damage as "not finished yet" would hide it.
         return ReconcileVerdict(
-            ok=False,
+            state=ReconcileState.FAILED,
             mismatches=(),
             reason=f"{_METRICS_SUMMARY_FILENAME} is not valid JSON: {exc}",
         )
     if not isinstance(summary_raw, dict):
         return ReconcileVerdict(
-            ok=False,
+            state=ReconcileState.FAILED,
             mismatches=(),
             reason=f"{_METRICS_SUMMARY_FILENAME} does not contain a JSON object",
         )
@@ -733,6 +832,10 @@ def _reconcile_summary_sync(directory: Path) -> ReconcileVerdict:
     ):
         mismatches.append("best_score")
 
-    ok = not mismatches
-    reason = "ok" if ok else f"{len(mismatches)} field(s) disagree with the raw log"
-    return ReconcileVerdict(ok=ok, mismatches=tuple(mismatches), reason=reason)
+    state = ReconcileState.OK if not mismatches else ReconcileState.FAILED
+    reason = (
+        "ok"
+        if state is ReconcileState.OK
+        else f"{len(mismatches)} field(s) disagree with the raw log"
+    )
+    return ReconcileVerdict(state=state, mismatches=tuple(mismatches), reason=reason)

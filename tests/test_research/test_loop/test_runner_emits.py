@@ -15,13 +15,14 @@ re-tested here; only the reporting call sites are.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from typing import TYPE_CHECKING
 
 import pytest
 import structlog
 
-from turing.research.contracts import AttemptState, EscalationVerdict
+from turing.research.contracts import AttemptState, ContractViolationError, EscalationVerdict
 from turing.research.loop import plots as plots_module
 from turing.research.loop import verify as verify_cli
 from turing.research.loop.integrity import CHAIN_FIELD, reconcile_summary, verify_metrics_chain
@@ -41,7 +42,7 @@ from .conftest import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from turing.research.contracts import Attempt
+    from turing.research.contracts import Attempt, Problem
     from turing.research.loop.protocols import SolverTask
     from turing.research.loop.trajectory import TrajectoryStore
 
@@ -74,6 +75,38 @@ class _RaisingSolverWithAccountedTokens:
     async def step(self, task: SolverTask, attempt: Attempt) -> object:
         self.calls += 1
         raise _TokenCostError(self._tokens)
+
+
+class _CancellingSolver:
+    """Raises :class:`asyncio.CancelledError` — a ``BaseException``, not an
+    ``Exception``. Stands in for the round being cancelled mid-attempt, which
+    ``run_attempts``' per-attempt guard must let through untouched rather than
+    re-label as this problem's harness failure and carry on with the corpus.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def step(self, task: SolverTask, attempt: Attempt) -> object:
+        self.calls += 1
+        raise asyncio.CancelledError
+
+
+def _problem_with_scale(problem_id: str, scale: str) -> Problem:
+    """A problem whose verifier reports a colliding ``score_scale``.
+
+    ``score_scale`` is free-form by design (``contracts.py``: "Free-form by
+    design — each problem scores on its own scale"), and the runner names the
+    metrics key holding the raw score after it. ``conftest.make_problem``
+    derives the scale from the problem *type*, so it can only ever produce the
+    two conventional spellings; this rebuilds the same problem around a scale
+    an operator could plausibly and legitimately choose, and that
+    ``results._validate_scored_metric`` then refuses.
+    """
+    problem = make_problem(problem_id)
+    return dataclasses.replace(
+        problem, verifier=dataclasses.replace(problem.verifier, score_scale=scale)
+    )
 
 
 def _read_lines(path: Path) -> list[dict[str, object]]:
@@ -428,6 +461,19 @@ class TestRoundEmission:
         clock: FakeClock,
         monkeypatch: object,
     ) -> None:
+        """Regression: a plot failure used to take ``.viewer.json`` down with it.
+
+        ``render_round_plot`` sat between ``write_round_summary`` and
+        ``write_viewer_config`` in one shared ``try``, so a raise here (its
+        real failure mode is ``float(cell["mean_score"])`` with no guard)
+        skipped the viewer config write entirely -- an unrelated matplotlib
+        problem cost the desktop pane its run list. The fix reorders the two
+        JSON writes ahead of the plot and isolates the plot's own failure, so
+        this must now log a *distinct* event from a genuine JSON-write
+        failure (asserted in the summary-writer-raises test below) rather
+        than both collapsing into the same ``round_emit_failed`` line.
+        """
+
         async def _boom(*args: object, **kwargs: object) -> Path | None:
             raise RuntimeError("matplotlib blew up")
 
@@ -436,9 +482,86 @@ class TestRoundEmission:
         with structlog.testing.capture_logs() as cap:
             outcome = await runner.run_round([make_problem("s1")], make_config())
         assert outcome.record is not None
-        assert any(e.get("event") == "research.results.round_emit_failed" for e in cap)
+
+        plot_failures = [e for e in cap if e.get("event") == "research.results.round_plot_failed"]
+        assert len(plot_failures) == 1
+        assert plot_failures[0]["log_level"] == "error"
+        # Not the generic JSON-write failure event -- the two must stay
+        # distinguishable in an overnight log.
+        assert not any(e.get("event") == "research.results.round_emit_failed" for e in cap)
+
         # The trajectory row -- the thing that actually matters -- still landed.
         assert store.trajectory_path.exists()
+        # And so, now, does the viewer config: this is the actual bug fix.
+        # It used to be silently dropped by exactly this failure.
+        viewer_path = store.loop_dir.parent / ".viewer.json"
+        assert viewer_path.is_file()
+        viewer = json.loads(viewer_path.read_text())
+        assert any(run.endswith("attempts/s1") for run in viewer["runs"])
+        # scores.svg is the one artifact this failure is honestly allowed to
+        # cost the round.
+        assert not (store.round_dir(0) / "scores.svg").exists()
+
+    async def test_a_raising_round_summary_writer_still_logs_round_emit_failed(
+        self,
+        store: TrajectoryStore,
+        workspaces: TempWorkspaceProvider,
+        clock: FakeClock,
+        monkeypatch: object,
+    ) -> None:
+        """The other half of keeping the two failures distinguishable: a
+        genuine structural-JSON failure (not the plot) must still surface as
+        ``round_emit_failed``, and must not be misreported as the plot's
+        ``round_plot_failed`` event.
+        """
+
+        async def _boom(*args: object, **kwargs: object) -> Path:
+            raise OSError("disk full")
+
+        monkeypatch.setattr("turing.research.loop.runner.write_round_summary", _boom, raising=True)
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        with structlog.testing.capture_logs() as cap:
+            outcome = await runner.run_round([make_problem("s1")], make_config())
+        assert outcome.record is not None
+        emit_failures = [e for e in cap if e.get("event") == "research.results.round_emit_failed"]
+        assert len(emit_failures) == 1
+        assert emit_failures[0]["log_level"] == "error"
+        assert not any(e.get("event") == "research.results.round_plot_failed" for e in cap)
+        # Neither the viewer config nor the plot ran -- the summary write is
+        # upstream of both now, so a failure there honestly costs both.
+        assert not (store.loop_dir.parent / ".viewer.json").exists()
+        assert store.trajectory_path.exists()
+
+    async def test_viewer_config_lists_runs_from_every_round_not_just_the_latest(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Regression: ``.viewer.json`` used to be overwritten every round with
+        only that round's outcomes, so round 1's write silently dropped round
+        0's attempts from the desktop pane's run list even though their files
+        were still on disk. The fix derives the list from disk rather than
+        the current round's in-memory ``outcomes``, so both rounds' attempt
+        directories must be present after round 1 -- including the ones round
+        1 did not itself touch.
+        """
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        round0 = await runner.run_round(
+            [make_problem("r0-a", scores=(2.0,))], make_config(round_index=0, run_id="r00")
+        )
+
+        round1 = await runner.run_round(
+            [make_problem("r1-a", scores=(3.0,))],
+            make_config(round_index=1, run_id="r01", parent_round_id="r00"),
+            parent=round0.record,
+        )
+        assert round1.record is not None
+
+        viewer_path = store.loop_dir.parent / ".viewer.json"
+        viewer = json.loads(viewer_path.read_text())
+        runs = viewer["runs"]
+        assert any(run.endswith("round-00/attempts/r0-a") for run in runs)
+        assert any(run.endswith("round-01/attempts/r1-a") for run in runs)
+        # Sorted and deduplicated, not merely "both present in some order".
+        assert runs == sorted(set(runs))
 
 
 # --------------------------------------------------------------------------- #
@@ -786,3 +909,297 @@ class TestNonFiniteTargetAttempts:
         # And the operator's actual command: one exit code over the whole
         # results root, covering both generations at once.
         assert await _verify_exit_code(store.loop_dir.parent) == 0
+
+
+# --------------------------------------------------------------------------- #
+# Round-6 regression — one bad attempt must not abort the whole round
+# --------------------------------------------------------------------------- #
+
+
+class TestOneBadAttemptDoesNotAbortTheRound:
+    """A round is ~11 problems run sequentially over hours of subscription time.
+
+    Before the fix, ``run_attempts`` called ``run_attempt`` with no per-attempt
+    guard, so the first problem to raise discarded every attempt the round had
+    already completed: no round record, no trajectory row, no cells, and the
+    machine time already spent on the earlier problems unrecoverable. The
+    reachable trigger needs no adversarial input — ``score_scale`` is free-form
+    by design, it becomes the metrics key naming the raw score, and
+    ``progress`` / ``step`` / ``ts`` / ``tokens_used`` / ``consumed_steps`` /
+    ``wall_clock_s`` (and ~10 more) are all rejected by
+    ``results._validate_scored_metric`` at that problem's *first* verification.
+
+    The validation is right and stays strict: a scale that silently clobbered
+    a core field would corrupt every chart drawn off the file. What changed is
+    the blast radius. These tests drive a real, unmocked ``RoundRunner``
+    against a real colliding scale.
+    """
+
+    async def test_a_colliding_score_scale_fails_only_its_own_problem(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        corpus = [
+            make_problem("good-1", scores=(2.0,)),
+            _problem_with_scale("bad", "progress"),
+            make_problem("good-2", scores=(3.0,)),
+        ]
+        with structlog.testing.capture_logs() as cap:
+            outcome = await runner.run_round(corpus, make_config())
+
+        # The round finished and was recorded at all -- this is the whole fix.
+        assert store.trajectory_path.is_file()
+        assert outcome.trajectory_row is not None
+
+        # ``good-2`` comes *after* the failure in corpus order, so its metrics
+        # directory existing is the proof the loop kept going rather than
+        # unwinding at the first raise.
+        assert (store.round_dir(0) / "attempts" / "good-2" / "metrics.jsonl").is_file()
+
+        assert [o.problem.id for o in outcome.attempts] == ["good-1", "good-2"]
+        assert [f.problem_id for f in outcome.failures] == ["bad"]
+        assert "ContractViolationError" in outcome.failures[0].error
+
+        crashed = [e for e in cap if e.get("event") == "research.attempt.crashed"]
+        assert len(crashed) == 1
+        assert crashed[0]["log_level"] == "error"
+        assert crashed[0]["problem_id"] == "bad"
+        lost = [e for e in cap if e.get("event") == "research.round.attempts_lost"]
+        assert len(lost) == 1
+        assert lost[0]["log_level"] == "error"
+        assert lost[0]["lost"] == ["bad"]
+
+    async def test_the_lost_problem_is_absent_from_the_cells_never_floored_into_them(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """The containment must not buy round completion with a fake datum.
+
+        Synthesising an outcome with ``best_result=None`` for the crashed
+        attempt is exactly the shape of an honest attempt that ran its cap and
+        never scored, so it would enter the cell at the scale floor and average
+        an instrument failure in as a capability reading -- turning a bug in
+        ``runner.py`` into a regression against the parent round. The cell here
+        must therefore read as a two-problem cell with the two real scores,
+        identical to what the same corpus minus the bad problem would produce.
+        """
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        corpus = [
+            make_problem("good-1", scores=(2.0,)),
+            _problem_with_scale("bad", "tokens_used"),
+            make_problem("good-2", scores=(3.0,)),
+        ]
+        outcome = await runner.run_round(corpus, make_config())
+
+        assert [s.problem_id for s in outcome.scored] == ["good-1", "good-2"]
+        assert len(outcome.record.type_scores) == 1
+        cell = outcome.record.type_scores[0]
+        assert set(cell.scores) == {"good-1", "good-2"}
+        assert cell.mean_score == pytest.approx(2.5)
+        # Not merely "not floored": the floor for this scale is 0.0, so a
+        # floored third entry would drag the mean to ~1.67 and n to 3.
+        assert cell.n == 2
+
+        # Cost is computed over the same set the cells are, so #3's numerator
+        # and denominator cannot be taken over different problems.
+        assert outcome.record.cost.attempts == 2
+
+    async def test_the_round_record_and_trajectory_row_both_say_an_attempt_was_lost(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Absent must not mean silent.
+
+        Every other number in the record is computed over the attempts that
+        survived, so without an explicit signal a round of two measured
+        problems and a round of three are indistinguishable on disk. The gate
+        carries it into both the round record and ``trajectory.json``'s
+        per-round ``constraints``; the verdict carries it into the one line an
+        operator actually reads off a trajectory row.
+        """
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        corpus = [make_problem("good-1", scores=(2.0,)), _problem_with_scale("bad", "step")]
+        outcome = await runner.run_round(corpus, make_config())
+
+        assert outcome.record.gates["all_attempts_completed"] is False
+        assert "bad" in outcome.record.verdict
+        assert outcome.record.verdict.startswith("1 of 2 attempt(s) failed")
+
+        row = json.loads(store.trajectory_path.read_text())["rounds"][0]
+        assert row["constraints"]["all_attempts_completed"] is False
+        assert row["verdict"] == outcome.record.verdict
+
+    async def test_a_clean_round_still_reports_the_gate_as_true(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """The negative half: the new gate and verdict prefix must not appear on
+        a round where nothing went wrong, or they stop meaning anything.
+        """
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        outcome = await runner.run_round(
+            [make_problem("s1", scores=(2.0,)), make_problem("s2", scores=(3.0,))], make_config()
+        )
+        assert outcome.record.gates["all_attempts_completed"] is True
+        assert outcome.failures == ()
+        assert "failed and are absent" not in outcome.record.verdict
+        assert outcome.record.cost.attempts == 2
+
+    async def test_a_round_whose_every_attempt_fails_is_refused_not_recorded(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Containment is not "record whatever survived, even if that is nothing".
+
+        A round record with zero cells is a baseline that measured nothing, and
+        the next round would compute its deltas against that absence. Refusing
+        is the honest outcome, and the losses are still readable off the runner
+        afterwards.
+        """
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        corpus = [_problem_with_scale("bad-1", "progress"), _problem_with_scale("bad-2", "ts")]
+        with pytest.raises(ContractViolationError, match="every one of the 2 attempt"):
+            await runner.run_round(corpus, make_config())
+
+        assert [f.problem_id for f in runner.attempt_failures] == ["bad-1", "bad-2"]
+        # Nothing was recorded: no round row claiming a baseline that is not one.
+        assert (await store.load_trajectory())["rounds"] == []
+
+    async def test_a_cancelled_attempt_stops_the_round_instead_of_being_contained(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """``except Exception``, not ``except BaseException``, and it matters.
+
+        ``asyncio.CancelledError`` is a ``BaseException``: catching it would
+        turn "this round was cancelled" into "problem s1 had a harness
+        failure" and then keep spending subscription time on the rest of the
+        corpus, which is precisely what a cancellation is asking not to happen.
+        """
+        solver = _CancellingSolver()
+        runner = make_runner(solver=solver, store=store, workspaces=workspaces, clock=clock)
+        corpus = [make_problem("s1"), make_problem("s2")]
+        with pytest.raises(asyncio.CancelledError):
+            await runner.run_attempts(corpus, make_config(), output_dir=store.round_dir(0))
+
+        assert solver.calls == 1  # stopped at the first problem, did not go on to s2
+        assert not (store.round_dir(0) / "attempts" / "s2").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Round-6 regression — a stale progress.svg must not outlive a re-drive
+# --------------------------------------------------------------------------- #
+
+
+class TestARedriveLeavesNoStalePlot:
+    """Rotation used to move only the chained trio.
+
+    Its docstring justified that by claiming everything else under the attempt
+    directory "is a wholesale overwrite that self-heals on a re-drive". True of
+    the checkpoints and the attempt log; **false of the plots**.
+    ``render_attempt_plots`` *skips* -- writes nothing -- when the series a
+    plot needs is absent from every point, so a re-driven attempt that dies
+    before its first usable verification rewrites ``cap.svg`` (``tokens_used``
+    is on every line, terminal one included) and leaves the previous attempt's
+    ``progress.svg`` untouched beside it. The desktop's images pane then draws
+    attempt 1's progress curve next to attempt 2's cap chart with nothing
+    marking either as stale -- the same "one chart drawn out of two attempts"
+    failure rotation was built to prevent, displaced from the JSONL to the SVG.
+    """
+
+    async def test_a_redrive_that_never_verifies_leaves_no_plot_from_the_prior_attempt(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        output_dir = store.round_dir(0)
+        metrics_dir = output_dir / "attempts" / "s1"
+
+        first_runner = make_runner(
+            solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock
+        )
+        first = await first_runner.run_attempt(
+            make_problem("s1", scores=(1.0, 5.0)),
+            make_config(pass_criteria={"s1": PassCriterion(min_score=2.0)}),
+            output_dir=output_dir,
+        )
+        assert first.attempt.state is AttemptState.PASSED
+        first_plots = {
+            name: (metrics_dir / name).read_bytes() for name in plots_module.PLOT_FILENAMES
+        }
+
+        # The re-drive: a verifier that raises, escalates, and is abandoned --
+        # so the attempt reaches its terminal state having never produced a
+        # score, and therefore never a ``progress`` point.
+        second_runner = make_runner(
+            solver=FakeSolver(),
+            store=store,
+            workspaces=workspaces,
+            clock=clock,
+            escalations=ScriptedEscalationChannel([EscalationVerdict.ABANDON]),
+        )
+        second = await second_runner.run_attempt(
+            make_problem("s1", raises=True),
+            make_config(pass_criteria={"s1": PassCriterion(min_score=2.0)}),
+            output_dir=output_dir,
+        )
+        assert second.attempt.state is AttemptState.ABANDONED
+        assert second.attempt.attempt_id != first.attempt.attempt_id
+
+        # cap.svg is the current attempt's (tokens_used is on every line);
+        # progress.svg is simply absent, which is the honest reading of "this
+        # attempt never produced a progress series". The old bug is the
+        # inverse: progress.svg present and belonging to somebody else.
+        rendered = sorted(p.name for p in metrics_dir.glob("*.svg"))
+        assert rendered == ["cap.svg"]
+        assert (metrics_dir / "cap.svg").read_bytes() != first_plots["cap.svg"]
+
+    async def test_the_prior_attempts_plots_are_preserved_beside_their_own_metrics(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Preserved, not deleted -- matching the trio's rotation philosophy.
+
+        A stale chart is only misleading where the *current* attempt's chart
+        belongs. Under ``prior-N/``, beside the exact metrics it was drawn
+        from, it is the superseded generation's evidence and its path says so.
+        The rotated directory must also stay verifiable: ``verify``'s walk
+        keys on ``metrics.jsonl`` alone, so the SVGs joining it change nothing
+        about what that walk finds or reports.
+        """
+        output_dir = store.round_dir(0)
+        metrics_dir = output_dir / "attempts" / "s1"
+        config = make_config(pass_criteria={"s1": PassCriterion(min_score=2.0)})
+
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        first = await runner.run_attempt(
+            make_problem("s1", scores=(1.0, 5.0)), config, output_dir=output_dir
+        )
+        first_plots = {
+            name: (metrics_dir / name).read_bytes() for name in plots_module.PLOT_FILENAMES
+        }
+
+        second = await runner.run_attempt(
+            make_problem("s1", scores=(1.0, 5.0)), config, output_dir=output_dir
+        )
+        assert second.attempt.attempt_id != first.attempt.attempt_id
+
+        rotated_dirs = sorted(p for p in metrics_dir.iterdir() if p.is_dir())
+        assert len(rotated_dirs) == 1, f"expected one rotated-aside dir, got {rotated_dirs}"
+        prior_dir = rotated_dirs[0]
+        for name, data in first_plots.items():
+            assert (prior_dir / name).read_bytes() == data, f"{name} is not the first attempt's"
+
+        # The rotated generation is still a complete, independently checkable
+        # run -- the SVGs did not displace or shadow the trio.
+        for name in ("metrics.jsonl", "metrics.chain.json", "metrics.json"):
+            assert (prior_dir / name).is_file()
+        assert (await verify_metrics_chain(prior_dir)).ok is True
+        assert (await reconcile_summary(prior_dir)).ok is True
+        assert sorted(p.name for p in verify_cli.find_runs(metrics_dir)) == ["prior-1", "s1"]
+
+    async def test_a_first_attempt_into_a_clean_directory_rotates_nothing(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """The trigger is unchanged: no prior chain, no rotation, no ``prior-N``.
+
+        Widening rotation from three names to five must not make it fire where
+        it did not before -- a first attempt would otherwise sweep an empty
+        directory aside on every run.
+        """
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        await runner.run_attempt(make_problem("s1"), make_config(), output_dir=store.round_dir(0))
+        metrics_dir = store.round_dir(0) / "attempts" / "s1"
+        assert [p for p in metrics_dir.iterdir() if p.is_dir()] == []

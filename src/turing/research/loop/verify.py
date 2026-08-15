@@ -4,11 +4,37 @@ Walks a path for every directory holding a ``metrics.jsonl`` — one attempt,
 one round, one loop, or an entire results root — and runs both
 :func:`~turing.research.loop.integrity.verify_metrics_chain` and
 :func:`~turing.research.loop.integrity.reconcile_summary` against each one.
-Exit code ``0`` means every run it found passed both checks; anything else,
-including finding **no** runs at all, is ``1``. An operator wiring this into a
-pre-writeup check needs the exit code to mean something, and an empty
-directory reporting success would be exactly backwards: it is not "verified",
-it is "nothing was checked".
+
+**Exit codes — three, not two:**
+
+* ``0`` — every run found is complete and clean.
+* ``1`` — at least one run **failed**: a broken chain, or a summary that is
+  present and disagrees with its log. Also the code for finding **no** runs
+  at all.
+* ``2`` — nothing failed, but at least one run is **incomplete**: an intact
+  chain with no ``metrics.json`` beside it.
+
+``1`` wins over ``2`` when both are present — a real failure is the thing an
+operator has to act on, and it must not be masked by an unfinished run
+elsewhere in the tree.
+
+``2`` exists because ``metrics.json`` is written once, when an attempt ends,
+while the chain grows after every step. Verifying a round *while it runs*, or
+verifying a results root containing an attempt that a closed subscription
+window killed, therefore finds intact chains with no summary beside them —
+through nobody's fault, and **permanently**, because the operator's honest
+re-drive rotates that trio into ``prior-N/`` exactly as it found it. Reporting
+those as ``1`` was a false alarm that never cleared, and this tool's whole
+premise is that a verifier which cries wolf teaches its operator to ignore it.
+Reporting them as ``0`` would be the opposite mistake: a pre-writeup gate must
+still refuse to wave through numbers that are not final. Hence a third code
+that is neither "all good" nor "something is wrong" — see
+:class:`~turing.research.loop.integrity.ReconcileState`.
+
+Finding **no** runs at all stays ``1`` rather than ``2``. It is not an
+unfinished run; it is a path that contains no runs — almost always the wrong
+path — and an empty directory reporting anything softer would be exactly
+backwards: it is not "verified", it is "nothing was checked".
 
 **What a clean result here does and does not mean.** This tool can only tell
 you the metrics log was not casually altered after the fact, and that its
@@ -29,39 +55,96 @@ import asyncio
 import dataclasses
 import json
 import sys
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from turing.research.loop.integrity import reconcile_summary, verify_metrics_chain
+from turing.research.loop.integrity import (
+    ReconcileState,
+    reconcile_summary,
+    verify_metrics_chain,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from turing.research.loop.integrity import ChainVerdict, ReconcileVerdict
 
-__all__ = ["HONESTY_LINE", "RunVerdict", "build_parser", "find_runs", "main", "verify_run"]
+__all__ = [
+    "EXIT_FAILED",
+    "EXIT_INCOMPLETE",
+    "EXIT_OK",
+    "HONESTY_LINE",
+    "RunState",
+    "RunVerdict",
+    "build_parser",
+    "find_runs",
+    "main",
+    "verify_run",
+]
 
 #: Printed verbatim on every invocation, human or ``--json``. Not decoration —
 #: see the module docstring for why a bare ``OK`` would overclaim.
 HONESTY_LINE = "detects alteration; does not prevent it — see OPEN-QUESTIONS R2/Q11"
+
+#: The process exit codes, named so a caller (a shell gate, a test) never has
+#: to restate the contract as bare integers. See the module docstring.
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_INCOMPLETE = 2
+
+
+class RunState(str, Enum):  # noqa: UP042
+    """One run directory's combined verdict across both checks.
+
+    Mirrors :class:`~turing.research.loop.integrity.ReconcileState` at the
+    run level, because the two checks compose into the same three answers:
+    the record is good, the record is wrong, or the record is not finished.
+    """
+
+    OK = "ok"
+    INCOMPLETE = "incomplete"
+    FAILED = "failed"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class RunVerdict:
     """Both checks' results for one run directory, plus the combined verdict.
 
-    ``ok`` is ``chain.ok and reconcile.ok`` — a run with an intact chain but a
-    doctored summary, or vice versa, is not a passing run. ``chain`` and
-    ``reconcile`` are ``None`` only for the synthetic "no runs found at all"
-    record :func:`main` emits when a search turns up nothing; a real run
-    directory always has both.
+    ``state`` is the composition of the two checks, and the composition is
+    asymmetric on purpose:
+
+    * a broken chain is :attr:`RunState.FAILED` no matter what the summary
+      says — including when the summary is merely absent. "Unfinished" is an
+      explanation for a *missing* summary, never for a chain that does not
+      recompute, and letting an absent summary downgrade a chain break would
+      hand a tamperer a one-file delete that softens the verdict;
+    * an intact chain with a present-but-disagreeing summary stays
+      :attr:`RunState.FAILED`, exactly as before this state existed;
+    * only an intact chain with **no** summary is
+      :attr:`RunState.INCOMPLETE` — the shape of a run still going, or one
+      killed before its single end-of-attempt summary write.
+
+    ``ok`` is a derived property rather than a field so it cannot disagree
+    with ``state``; it is ``True`` for :attr:`RunState.OK` alone, so a caller
+    that only ever looks at ``ok`` treats an unfinished run as not-passing,
+    which is the safe reading.
+
+    ``chain`` and ``reconcile`` are ``None`` only for the synthetic "no runs
+    found at all" record :func:`main` emits when a search turns up nothing; a
+    real run directory always has both.
     """
 
     path: str
-    ok: bool
+    state: RunState
     chain: ChainVerdict | None
     reconcile: ReconcileVerdict | None
     reason: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        """``True`` only for :attr:`RunState.OK` — never for INCOMPLETE."""
+        return self.state is RunState.OK
 
 
 def find_runs(root: Path) -> list[Path]:
@@ -76,6 +159,24 @@ def find_runs(root: Path) -> list[Path]:
     return sorted({path.parent for path in root.rglob("metrics.jsonl")})
 
 
+def _combine(chain: ChainVerdict, reconcile: ReconcileVerdict) -> RunState:
+    """Fold the two checks into one run state — see :class:`RunVerdict`.
+
+    Order matters. The chain is asked first, so a chain that does not
+    recompute is FAILED even when the summary is the thing that is missing:
+    only the *summary's* absence is explained by "the attempt did not
+    finish", and a killed process leaves a truncated line in a chain that
+    then fails on its own terms, which is a real finding worth an operator's
+    attention. Checking reconcile first would let a deleted ``metrics.json``
+    quietly soften a broken chain from ``1`` to ``2``.
+    """
+    if not chain.ok:
+        return RunState.FAILED
+    if reconcile.state is ReconcileState.INCOMPLETE:
+        return RunState.INCOMPLETE
+    return RunState.OK if reconcile.ok else RunState.FAILED
+
+
 async def verify_run(directory: Path) -> RunVerdict:
     """Run both checks against one directory and combine them into one verdict."""
     chain, reconcile = await asyncio.gather(
@@ -83,7 +184,7 @@ async def verify_run(directory: Path) -> RunVerdict:
     )
     return RunVerdict(
         path=str(directory),
-        ok=chain.ok and reconcile.ok,
+        state=_combine(chain, reconcile),
         chain=chain,
         reconcile=reconcile,
     )
@@ -92,10 +193,14 @@ async def verify_run(directory: Path) -> RunVerdict:
 async def _verify_all(root: Path) -> list[RunVerdict]:
     run_dirs = find_runs(root)
     if not run_dirs:
+        # FAILED, not INCOMPLETE: nothing here is half-done, there is simply
+        # nothing here — nearly always the wrong path. An operator who
+        # mistyped a root must not get the gentler code reserved for "a real
+        # run is still in flight".
         return [
             RunVerdict(
                 path=str(root),
-                ok=False,
+                state=RunState.FAILED,
                 chain=None,
                 reconcile=None,
                 reason=f"no metrics.jsonl found under {root}",
@@ -105,9 +210,22 @@ async def _verify_all(root: Path) -> list[RunVerdict]:
 
 
 def _format_human(verdict: RunVerdict) -> str:
-    if verdict.ok:
+    if verdict.state is RunState.OK:
         lines_checked = verdict.chain.lines_checked if verdict.chain is not None else 0
         return f"{verdict.path}: OK ({lines_checked} line(s) checked)"
+
+    if verdict.state is RunState.INCOMPLETE:
+        # The word INCOMPLETE leads, and the line says the chain is intact in
+        # the same breath — an operator scanning a wall of output has to be
+        # able to tell at a glance that this path is not an accusation. The
+        # line count is kept in the same position as the OK line's so the two
+        # read as the same shape of report.
+        assert verdict.chain is not None
+        assert verdict.reconcile is not None
+        return (
+            f"{verdict.path}: INCOMPLETE ({verdict.chain.lines_checked} line(s) checked, "
+            f"chain intact) {verdict.reconcile.reason}"
+        )
 
     if verdict.chain is None and verdict.reconcile is None:
         return f"{verdict.path}: FAIL {verdict.reason}"
@@ -119,14 +237,34 @@ def _format_human(verdict: RunVerdict) -> str:
         parts.append(
             f"chain: {verdict.chain.reason} (first_bad_index={verdict.chain.first_bad_index})"
         )
-    if not verdict.reconcile.ok:
+    if verdict.reconcile.state is ReconcileState.INCOMPLETE:
+        # Reached only alongside a chain failure (an intact chain plus an
+        # absent summary is INCOMPLETE, handled above). Say so inline rather
+        # than listing the absent summary as if it were a second finding:
+        # the chain break is what the operator has to act on.
+        parts.append(f"summary: {verdict.reconcile.reason} [incomplete, not itself the failure]")
+    elif not verdict.reconcile.ok:
         mismatches = list(verdict.reconcile.mismatches)
         parts.append(f"summary: {verdict.reconcile.reason} (mismatches={mismatches})")
     return f"{verdict.path}: FAIL " + "; ".join(parts)
 
 
 def _to_json_record(verdict: RunVerdict) -> dict[str, object]:
-    record: dict[str, object] = {"path": verdict.path, "ok": verdict.ok, "note": HONESTY_LINE}
+    """One JSON object per run, for a machine consumer.
+
+    ``ok`` is kept alongside the new ``state`` rather than replaced by it, and
+    stays ``False`` for an incomplete run: a script written against the
+    two-state output keys on ``ok`` and must not start reading "unfinished"
+    as "good" the day this field arrives. ``state`` is what distinguishes
+    ``"incomplete"`` from ``"failed"``, and it is present on every record —
+    including the synthetic no-runs-found one, which is ``"failed"``.
+    """
+    record: dict[str, object] = {
+        "path": verdict.path,
+        "ok": verdict.ok,
+        "state": verdict.state.value,
+        "note": HONESTY_LINE,
+    }
     if verdict.chain is None and verdict.reconcile is None:
         record["reason"] = verdict.reason
         return record
@@ -140,6 +278,7 @@ def _to_json_record(verdict: RunVerdict) -> dict[str, object]:
     }
     record["reconcile"] = {
         "ok": verdict.reconcile.ok,
+        "state": verdict.reconcile.state.value,
         "mismatches": list(verdict.reconcile.mismatches),
         "reason": verdict.reconcile.reason,
     }
@@ -149,12 +288,24 @@ def _to_json_record(verdict: RunVerdict) -> dict[str, object]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="turing-research-verify",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "Verify the metrics hash chain and summary reconciliation for every "
             "research-loop run found under a path (one attempt, one round, one "
             "loop, or an entire results root)."
         ),
-        epilog=f"Every invocation prints the qualifier verbatim: {HONESTY_LINE!r}.",
+        epilog=(
+            "exit codes:\n"
+            f"  {EXIT_OK}  every run found is complete and clean\n"
+            f"  {EXIT_FAILED}  at least one run FAILED: a broken chain, or a summary that is\n"
+            "     present and disagrees with its log. Also: no runs found at all.\n"
+            f"  {EXIT_INCOMPLETE}  nothing failed, but at least one run is INCOMPLETE: an intact\n"
+            "     chain with no metrics.json beside it, i.e. an attempt still\n"
+            "     running or killed before it finished. A real failure outranks\n"
+            f"     an incomplete run, so {EXIT_FAILED} wins when both are present.\n"
+            "\n"
+            f"Every invocation prints the qualifier verbatim: {HONESTY_LINE!r}."
+        ),
     )
     parser.add_argument(
         "path",
@@ -177,11 +328,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not root.exists():
         sys.stderr.write(f"{root}: no such file or directory\n")
         sys.stdout.write(HONESTY_LINE + "\n")
-        return 1
+        return EXIT_FAILED
     if not root.is_dir():
         sys.stderr.write(f"{root}: not a directory\n")
         sys.stdout.write(HONESTY_LINE + "\n")
-        return 1
+        return EXIT_FAILED
 
     verdicts = asyncio.run(_verify_all(root))
 
@@ -194,7 +345,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     sys.stdout.write(HONESTY_LINE + "\n")
 
-    return 0 if all(verdict.ok for verdict in verdicts) else 1
+    # A real failure outranks an incomplete run: an operator who fixes only
+    # what the exit code told them about must never be steered to the
+    # unfinished attempt while a broken chain sits unmentioned in the same
+    # tree. Both are still named in the printed output above; only the single
+    # integer has to choose.
+    if any(verdict.state is RunState.FAILED for verdict in verdicts):
+        return EXIT_FAILED
+    if any(verdict.state is RunState.INCOMPLETE for verdict in verdicts):
+        return EXIT_INCOMPLETE
+    return EXIT_OK
 
 
 if __name__ == "__main__":  # pragma: no cover
