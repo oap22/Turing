@@ -507,11 +507,20 @@ describe("chainDigestOfLastLine", () => {
     expect(chainDigestOfLastLine('{"step":1,"_chain":"0:"}')).toBeNull();
   });
 
-  it("skips a trailing partial line rather than losing the last complete one", () => {
-    // `fs_tail` hands back whatever bytes exist, which for a writer mid-append
-    // can end mid-line. The digest of the last *complete* line is still the
-    // right answer about what this pane has parsed.
-    expect(chainDigestOfLastLine(`${line(0, HEAD)}\n{"step":2,"_ch`)).toBe(HEAD);
+  it("ignores trailing blank lines, which the writer's own `\\n` produces", () => {
+    expect(chainDigestOfLastLine(`${line(0, "aa")}\n${line(1, HEAD)}\n`)).toBe(HEAD);
+    expect(chainDigestOfLastLine(`${line(1, HEAD)}\n\n  \n`)).toBe(HEAD);
+  });
+
+  it("is null — not the last good line's digest — when the last line does not parse", () => {
+    // `verify` on disk fails a log whose last line is garbage; skipping back
+    // to the last good line would keep the badge green over exactly the bytes
+    // the verifier rejects. `fs_tail` holds a mid-write fragment back, so an
+    // unparseable last line here is a real one, not a writer mid-append.
+    expect(chainDigestOfLastLine(`${line(0, HEAD)}\ngarbage\n`)).toBeNull();
+    expect(chainDigestOfLastLine(`${line(0, HEAD)}\n{"step":2,"loss":1}\n`)).toBeNull();
+    expect(chainDigestOfLastLine(`${line(0, HEAD)}\n[1,2]\n`)).toBeNull();
+    expect(chainDigestOfLastLine(`${line(0, HEAD)}\n{"step":2,"_ch`)).toBeNull();
   });
 });
 

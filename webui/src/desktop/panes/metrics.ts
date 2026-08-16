@@ -257,11 +257,11 @@ export interface ViewerFile {
 // half alone was not enough:
 //
 //   * *Bound to the bytes.* A line count is a property two different logs can
-//     share. `runner._rotate_stale_metrics` moves a finished attempt's whole
-//     trio into `prior-N/` and a fresh, unrelated chain takes its place at the
-//     same path; a badge turning on "the loop checked 4 lines and I parsed 4"
-//     would go green over bytes nobody checked. The digest is the only field
-//     that cannot be re-earned by coincidence.
+//     share. A re-drive moves a finished attempt's metrics trio and its
+//     verdict together into `prior-N/` and a fresh, unrelated chain takes
+//     their place at the same path; a badge turning on "the loop checked 4
+//     lines and I parsed 4" would go green over bytes nobody checked. The
+//     digest is the only field that cannot be re-earned by coincidence.
 //   * *Currently beside the run.* Bytes bind the badge to a log, not to a
 //     verdict that has since been rotated away. So the pane re-reads the
 //     verdict on every change to the run file too — see `MetricsPane`'s
@@ -316,31 +316,40 @@ const CHAIN_FIELD = "_chain";
  * alone, and comparing a `"<seq>:"` prefix as well would make the two sides
  * disagree over a field neither is claiming anything about.
  *
- * A line that will not parse is skipped rather than fatal — `fs_tail` hands
- * back whatever bytes exist, and for a writer mid-append that can end
- * mid-line. The digest of the last *complete* line is still the honest answer
- * to "what has this pane parsed".
+ * Only the LAST non-blank line is consulted, and if that line is not an object
+ * carrying a `"<seq>:<digest>"` `_chain`, the answer is `null` — not the
+ * digest of some earlier line that does. `verify` on disk would fail a log
+ * whose last line is garbage; a pane that skipped back to the last *good* line
+ * would keep the badge green over exactly the bytes the verifier rejects.
+ * `null` reads as `stale` in `badgeStateOf` (`failed` is reserved for what the
+ * loop itself recorded), which is the honest state: the verdict does not
+ * describe the pane's last line.
+ *
+ * `fs_tail` never hands this function a partial line — `fsroots.rs::tail_impl`
+ * holds a trailing fragment back and returns whole lines only — so an
+ * unparseable last line here is a real one, not a writer caught mid-append.
  */
 export function chainDigestOfLastLine(text: string): string | null {
-  let digest: string | null = null;
-  for (const line of text.split("\n")) {
-    const t = line.trim();
-    if (t === "") continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(t);
-    } catch {
-      continue;
-    }
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) continue;
-    const raw = (parsed as Record<string, unknown>)[CHAIN_FIELD];
-    if (typeof raw !== "string") continue;
-    const cut = raw.indexOf(":");
-    if (cut < 0) continue;
-    const tail = raw.slice(cut + 1);
-    digest = tail === "" ? null : tail;
+  const lines = text.split("\n");
+  let t = "";
+  for (let i = lines.length - 1; i >= 0; i--) {
+    t = lines[i].trim();
+    if (t !== "") break;
   }
-  return digest;
+  if (t === "") return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(t);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const raw = (parsed as Record<string, unknown>)[CHAIN_FIELD];
+  if (typeof raw !== "string") return null;
+  const cut = raw.indexOf(":");
+  if (cut < 0) return null;
+  const tail = raw.slice(cut + 1);
+  return tail === "" ? null : tail;
 }
 
 /** `verify.RunState` — the three answers the Python verifier can give. */

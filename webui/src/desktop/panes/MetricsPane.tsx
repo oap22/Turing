@@ -10,13 +10,18 @@
 // coding agent can point the pane at a specific series/run set — see
 // desktop/README.md's "Agent-driven viewing" section for the file format.
 //
-// **The verdict badge's contract.** `verified` means the verdict file's
-// `chain_head` equals the `_chain` digest of the LAST line the pane has parsed
-// for that run — the verdict is bound to the bytes, not to a line count — and
-// every state the badge shows is derived from files that are currently beside
-// the run, re-read whenever the run's own file changes. See `metrics.ts` for
-// why each half is load-bearing; `tailRun` and the `fs-change` handler below
-// are where this pane keeps its end of it.
+// **The contract this pane keeps.** A run's chart is built only from bytes of
+// ONE file generation, applied in order: `fs_tail` reports the chunk's start
+// offset and the file's identity; the pane applies a chunk only if its start
+// equals the offset it holds AND the identity matches — a changed identity or
+// a shorter file resets the run to that chunk alone; a chunk with any other
+// start is discarded, never appended. A trailing partial line is not consumed.
+// `verified` means the verdict's `chain_head` equals the `_chain` digest of the
+// last non-blank line the pane holds, and any last non-blank line it cannot
+// parse makes the run `stale`. See `metrics.ts` for why the digest binding is
+// load-bearing; `tailRun` below is where the byte side of this is kept, and
+// the `fs-change` handler is where the verdict is re-read beside every change
+// to the run.
 
 import { Fragment, useEffect, useId, useMemo, useRef, useState } from "react";
 import { inv, subscribe } from "../tauri";
@@ -50,16 +55,58 @@ interface Entry {
   mtime_ms: number;
 }
 
+/** What `fsroots.rs::fs_tail` returns — see `TailChunk` there for the contract
+ * behind each field. Every offset is a byte offset computed on the Rust side;
+ * nothing here does arithmetic on `data`. */
+interface TailChunk {
+  /** Whole lines only: bytes `[start, offset)`, cut at the last `\n`. */
+  data: string;
+  /** Where the next read begins — just past the last `\n` this read consumed. */
+  offset: number;
+  /** Where this read actually began: the caller's offset, or 0 if `restarted`. */
+  start: number;
+  /** File identity (unix `dev`/`ino`); `null` where the platform has none. */
+  dev: number | null;
+  ino: number | null;
+  /** The file was shorter than the caller's offset, so the read began at 0. */
+  restarted: boolean;
+}
+
 interface RunState {
   path: string;
   label: string;
+  /** The byte offset the next `fs_tail` for this run is issued at, and the
+   * only offset a returned chunk may start at to be appended. */
   offset: number;
+  /** `"<dev>:<ino>"` of the file the held bytes came from; `null` until the
+   * first chunk lands, or where the platform reports no identity. */
+  ident: string | null;
   points: Point[];
   arrivals: number[];
-  /** The `_chain` digest of the last line this run has parsed, or `null`.
-   * This is what binds the verdict badge to bytes rather than to a count —
-   * see `chainDigestOfLastLine` in metrics.ts. */
+  /** The `_chain` digest of the last non-blank line this run holds, or
+   * `null` — including when that line does not parse. This is what binds the
+   * verdict badge to bytes rather than to a count — see
+   * `chainDigestOfLastLine` in metrics.ts. */
   lastDigest: string | null;
+  /** At most one `fs_tail` is outstanding per run. A request made while one
+   * is in flight sets `pending`, and the in-flight one issues a single
+   * follow-up read when it lands — the same bytes are never in two responses
+   * that both get applied. */
+  tailing: boolean;
+  pending: boolean;
+}
+
+function identOf(chunk: TailChunk): string | null {
+  return chunk.dev === null || chunk.ino === null ? null : `${chunk.dev}:${chunk.ino}`;
+}
+
+/** Forget everything a run holds, so the next chunk is read from byte 0. */
+function forgetRun(run: RunState) {
+  run.offset = 0;
+  run.ident = null;
+  run.points = [];
+  run.arrivals = [];
+  run.lastDigest = null;
 }
 
 const RESULTS_ROOT = "results";
@@ -207,17 +254,84 @@ export default function MetricsPane() {
     };
   }, []);
 
+  /**
+   * Read whatever the run file has past what this pane holds, and apply it.
+   *
+   * Serialized per run: at most one `fs_tail` is outstanding for a path, and a
+   * request that arrives while one is in flight coalesces into exactly one
+   * follow-up read once it lands. Without this, the ordinary end of an
+   * attempt — the last append's event and the verdict's event a few
+   * milliseconds apart — issued two reads at the same offset, both came back
+   * with the same bytes, and the second was applied on top of the first: seen
+   * from the offset the first had just advanced to, it looked like a restart,
+   * wiped the points down to that one chunk, and pinned the badge `stale`.
+   */
   async function tailRun(path: string) {
     let run = runsRef.current.get(path);
     if (!run) {
-      run = { path, label: runIdOf(path), offset: 0, points: [], arrivals: [], lastDigest: null };
+      run = {
+        path,
+        label: runIdOf(path),
+        offset: 0,
+        ident: null,
+        points: [],
+        arrivals: [],
+        lastDigest: null,
+        tailing: false,
+        pending: false,
+      };
       runsRef.current.set(path, run);
     }
-    let chunk: { data: string; offset: number };
+    if (run.tailing) {
+      run.pending = true;
+      return;
+    }
+    run.tailing = true;
     try {
-      chunk = await inv<{ data: string; offset: number }>("fs_tail", {
+      do {
+        run.pending = false;
+        await tailOnce(run);
+      } while (run.pending);
+    } finally {
+      run.tailing = false;
+    }
+  }
+
+  /**
+   * One `fs_tail` round trip and the rule for applying its chunk.
+   *
+   * The rule, exactly (`chunk` is `fsroots.rs`'s `TailChunk`; `run.offset`
+   * and `run.ident` are what the pane holds):
+   *
+   *   generation changed  := run.ident !== null && chunk ident !== null
+   *                          && they differ
+   *   RESET   if chunk.start === 0 && run.offset > 0
+   *              && (generation changed || chunk.restarted)
+   *           → the run becomes this chunk alone.
+   *   APPEND  else if !generation changed && chunk.start === run.offset
+   *           → the chunk is the run's next bytes.
+   *   RE-READ else if generation changed
+   *           → nothing in this chunk is ours (it was read from an offset
+   *             that only meant something in the old file, and a chunk
+   *             starting at 0 with nothing held is an append anyway):
+   *             forget the run and read the new file from byte 0.
+   *   DISCARD otherwise
+   *           → a duplicate or stale response; not applied, not appended.
+   *
+   * Why identity and not only `restarted`: a re-drive moves the trio and the
+   * verdict together into `prior-N/` and the loop opens a fresh `metrics.jsonl`
+   * — a new inode. If the new file is at least as long as the offset the pane
+   * held (same-length first line; a create and two appends coalesced under
+   * the watcher's debounce), a length check sees nothing and the old points
+   * get the new lines stapled on, with a `verified` badge over the seam. A
+   * truncate in place (same inode, shorter) is the case `restarted` covers.
+   */
+  async function tailOnce(run: RunState) {
+    let chunk: TailChunk;
+    try {
+      chunk = await inv<TailChunk>("fs_tail", {
         root: RESULTS_ROOT,
-        rel: path,
+        rel: run.path,
         offset: run.offset,
       });
     } catch {
@@ -230,37 +344,44 @@ export default function MetricsPane() {
       // is what turns the badge honest.
       return;
     }
-    // `fsroots.rs::tail_impl` restarts at byte 0 when the caller's offset is
-    // past the end of the file (`let start = if offset > len { 0 } else
-    // { offset }`), which is exactly what a re-drive produces: the old chain is
-    // rotated away and a shorter, unrelated one takes its place at the same
-    // path. So a chunk that begins before where this run had read to is a
-    // different generation of the file, and appending it would staple a new
-    // attempt onto a rotated-away one — one continuous curve drawn out of two
-    // runs, with the old attempt's series still offered as tabs.
-    //
-    // `chunk.offset` is a byte offset (`start + buf.len()`), so the chunk's
-    // start is recovered with the data's UTF-8 byte length, not its JS string
-    // length — the two agree for the ASCII `json.dumps` writes, but the offset
-    // arithmetic must not silently assume that.
-    const chunkStart = chunk.offset - new TextEncoder().encode(chunk.data).length;
-    const restarted = chunkStart < run.offset;
-    if (!restarted && chunk.offset === run.offset) return;
+    const ident = identOf(chunk);
+    const generationChanged = run.ident !== null && ident !== null && ident !== run.ident;
+    const reset = chunk.start === 0 && run.offset > 0 && (generationChanged || chunk.restarted);
+    const append = !reset && !generationChanged && chunk.start === run.offset;
+    if (!reset && !append) {
+      if (generationChanged) {
+        // A different file, read from an offset that only meant something in
+        // the old one. Start over from its first byte; the loop in `tailRun`
+        // issues that read.
+        forgetRun(run);
+        run.pending = true;
+        forceRender((n) => n + 1);
+      }
+      return;
+    }
+    if (ident !== null) run.ident = ident;
+    // Nothing new past what the pane holds: same offset, same file. This is
+    // the common answer to a verdict-event re-tail and must not re-render.
+    if (append && chunk.offset === run.offset) return;
     run.offset = chunk.offset;
     const newPoints = parseMetricsText(chunk.data);
-    if (restarted) {
+    if (reset) {
       run.points = newPoints;
       run.arrivals = newPoints.length > 0 ? [Date.now()] : [];
     } else if (newPoints.length > 0) {
       run.points = [...run.points, ...newPoints];
       run.arrivals = [...run.arrivals, Date.now()];
     }
-    // The digest of the last line this run has now parsed — what the badge is
-    // bound to. A chunk carrying no `_chain` at all leaves the previous digest
-    // standing on an append (nothing new was chained) but clears it on a
-    // restart (the previous digest belonged to a file that is no longer here).
+    // The digest of the last non-blank line this run now holds — what the
+    // badge is bound to. `fs_tail` returns whole lines only, so if the chunk
+    // has a non-blank line at all, its last one IS the run's last line, and
+    // its digest (or `null`, if it will not parse — which reads `stale`)
+    // replaces the previous one. A chunk of only blank lines leaves the
+    // previous digest standing on an append; a reset starts from the chunk
+    // regardless, since the previous digest belonged to a file that is no
+    // longer here.
     const digest = chainDigestOfLastLine(chunk.data);
-    run.lastDigest = restarted ? digest : (digest ?? run.lastDigest);
+    run.lastDigest = reset || chunk.data.trim() !== "" ? digest : run.lastDigest;
     forceRender((n) => n + 1);
   }
 
@@ -384,11 +505,12 @@ export default function MetricsPane() {
       // is a claim about a verdict and a log *together*, and each file can move
       // without producing an event of its own for the other:
       //
-      //   * The verdict can be rotated away with no event at all. `fsroots.rs`
-      //     skips any path that is not a file by the time the handler runs, and
-      //     a file renamed into `prior-N/` is precisely that — so the only
-      //     event a re-drive produces for this directory is one for the new,
-      //     empty `metrics.jsonl`. Re-reading the verdict on the run's own
+      //   * The verdict can be rotated away with no event at all. A re-drive
+      //     moves the metrics trio and the verdict together into `prior-N/`;
+      //     `fsroots.rs` skips any path that is not a file by the time the
+      //     handler runs, and the verdict's old path is precisely that — so
+      //     the only event a re-drive produces for this directory is one for
+      //     the new `metrics.jsonl`. Re-reading the verdict on the run's own
       //     event is what stops the badge sitting green over a directory the
       //     verdict has left.
       //   * A run append can be dropped: the watcher debounces repeat writes to

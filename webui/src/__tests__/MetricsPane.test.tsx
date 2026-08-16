@@ -43,19 +43,25 @@ const R1 = `${LOOP}/round-01/attempts`;
  * side recomputes them — but they are per-run and per-line distinct, which is
  * the property the badge's byte binding turns on: the digest of the LAST line
  * is the string the loop copies into the verdict's `chain_head`.
+ *
+ * Every line ends in `\n`, as the writer's own `handle.write("\n")` leaves it
+ * — and as the fake `fs_tail` below requires, since (like the real one) it
+ * hands back whole lines only.
  */
 function chain(steps: number, progressStep: number, speedup: number, tag = "seed"): string {
-  return Array.from({ length: steps }, (_, i) =>
-    JSON.stringify({
-      step: i + 1,
-      total_steps: 10,
-      ts: 1786845156 + i,
-      progress: progressStep * (i + 1),
-      speedup_ratio: speedup + i * 0.1,
-      consumed_steps: i + 1,
-      _chain: `${i}:${digestOf(tag, i)}`,
-    }),
-  ).join("\n");
+  return Array.from({ length: steps }, (_, i) => `${chainLine(i, progressStep, speedup, tag)}\n`).join("");
+}
+
+function chainLine(i: number, progressStep: number, speedup: number, tag: string): string {
+  return JSON.stringify({
+    step: i + 1,
+    total_steps: 10,
+    ts: 1786845156 + i,
+    progress: progressStep * (i + 1),
+    speedup_ratio: speedup + i * 0.1,
+    consumed_steps: i + 1,
+    _chain: `${i}:${digestOf(tag, i)}`,
+  });
 }
 
 function digestOf(tag: string, seq: number): string {
@@ -101,6 +107,49 @@ let contents: Map<string, string>;
 // `fs_list` is called with `exts: ["jsonl"]` and never walks them — the pane
 // reads each one by name, beside the run file it is charting.
 const verdictFiles = new Map<string, string>();
+// Inode per run file, assigned lazily on first read. `contents.set` on an
+// existing path is a write to the same file (append, or truncate in place —
+// same inode); `replaceFile` below is what a re-drive does: the old file moves
+// away and a NEW file appears at the path.
+const inodes = new Map<string, number>();
+let nextIno = 100;
+
+function inodeOf(rel: string): number {
+  let ino = inodes.get(rel);
+  if (ino === undefined) {
+    ino = nextIno++;
+    inodes.set(rel, ino);
+  }
+  return ino;
+}
+
+/** A new file at `rel` — new inode — the way the loop opens a fresh
+ * `metrics.jsonl` after moving the old one into `prior-N/`. */
+function replaceFile(rel: string, body: string) {
+  inodes.delete(rel);
+  contents.set(rel, body);
+}
+
+/**
+ * `fsroots.rs::tail_impl`, modelled field for field. Byte offsets are string
+ * offsets here — every byte the tests write is ASCII, so the two agree.
+ *
+ *   restarted := offset > len          start := restarted ? 0 : offset
+ *   data      := bytes [start, len) cut after the LAST `\n` (a trailing
+ *                partial line is held back; no `\n` at all → "")
+ *   offset    := start + data.length
+ *   dev/ino   := the file's identity
+ */
+function fakeTail(rel: string, offset: number) {
+  const data = contents.get(rel);
+  if (data === undefined) throw new Error(`path does not exist: ${rel}`);
+  const restarted = offset > data.length;
+  const start = restarted ? 0 : offset;
+  const raw = data.slice(start);
+  const nl = raw.lastIndexOf("\n");
+  const buf = nl < 0 ? "" : raw.slice(0, nl + 1);
+  return { data: buf, offset: start + buf.length, start, dev: 1, ino: inodeOf(rel), restarted };
+}
 
 function installFs() {
   invMock.mockImplementation(async (cmd: string, args: Record<string, unknown> = {}) => {
@@ -119,21 +168,16 @@ function installFs() {
       if (verdict !== undefined) return verdict;
       throw new Error(`path does not exist: ${String(args.rel)}`);
     }
-    if (cmd === "fs_tail") {
-      // `fsroots.rs::tail_impl`, verbatim — including the branch that matters
-      // here: `let start = if offset > len { 0 } else { offset }`. A fake that
-      // slices at `offset` unconditionally cannot reach the case where a
-      // re-drive replaces a run file with a shorter one.
-      const rel = String(args.rel);
-      const data = contents.get(rel);
-      if (data === undefined) throw new Error(`path does not exist: ${rel}`);
-      const offset = Number(args.offset ?? 0);
-      const start = offset > data.length ? 0 : offset;
-      const buf = data.slice(start);
-      return { data: buf, offset: start + buf.length };
-    }
+    if (cmd === "fs_tail") return fakeTail(String(args.rel), Number(args.offset ?? 0));
     throw new Error(`unexpected command ${cmd}`);
   });
+}
+
+/** The y-axis tick labels of the chart, as numbers — the domain the drawn
+ * curve spans. Points from a rotated-away generation stapled in front of the
+ * live one show up here as a domain that reaches down to the old values. */
+function yTicks(): number[] {
+  return Array.from(document.querySelectorAll('svg text[x="4"]')).map((t) => Number(t.textContent));
 }
 
 function tailedPaths(): string[] {
@@ -156,6 +200,7 @@ beforeEach(() => {
   viewerJson = null;
   contents = new Map(TREE);
   verdictFiles.clear();
+  inodes.clear();
   fsChangeHandlers.length = 0;
   invMock.mockReset();
   installFs();
@@ -495,14 +540,39 @@ describe("MetricsPane — verdict badge (RES-18)", () => {
     release();
     await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
   });
+
+  it("says nothing was ever checked once the read comes back empty, not that it is still reading", async () => {
+    // `undefined` ("not read yet") and `null` ("read, nothing there") share a
+    // colour and not a sentence. The first read has to land even when it lands
+    // on nothing — a `sameVerdict` that called the two equal would leave the
+    // badge saying "reading…" forever on a run with no verdict.
+    viewerJson = JSON.stringify({ runs: [RUN] });
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const base = invMock.getMockImplementation()!;
+    invMock.mockImplementation(async (cmd: string, args: Record<string, unknown> = {}) => {
+      if (cmd === "fs_read_text" && args.rel === RUN_VERDICT) await held;
+      return base(cmd, args);
+    });
+
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(badge()).toBeInTheDocument());
+    expect(badge().getAttribute("title")).toContain("reading the verdict");
+
+    release();
+    await waitFor(() =>
+      expect(badge().getAttribute("title")).toContain("never recorded a check here"),
+    );
+    expect(badge().getAttribute("title")).not.toContain("reading the verdict");
+    expect(badge()).toHaveAttribute("data-state", "unverified");
+  });
 });
 
 describe("MetricsPane — a re-drive rotates the run out from under the badge", () => {
   /**
-   * `runner._rotate_stale_metrics(metrics_dir)` renames every name in
-   * `_ROTATED_NAMES` — the metrics trio, the verdict, the plots — into
-   * `prior-N/`, and `MetricsWriter.__init__` then opens a brand new, empty
-   * `metrics.jsonl` in its place.
+   * A re-drive moves the metrics trio and the verdict together into
+   * `prior-N/`, and the loop then opens a brand new `metrics.jsonl` in their
+   * place — a new file, hence a new inode, at the same path.
    */
   function rotate(nextChain: string) {
     for (const [name, store] of [
@@ -515,7 +585,7 @@ describe("MetricsPane — a re-drive rotates the run out from under the badge", 
         store.delete(`${RUN}/${name}`);
       }
     }
-    contents.set(RUN_FILE, nextChain);
+    replaceFile(RUN_FILE, nextChain);
   }
 
   it("stops claiming chain ok over a directory the verdict has left", async () => {
@@ -545,11 +615,12 @@ describe("MetricsPane — a re-drive rotates the run out from under the badge", 
     expect(screen.getByRole("button", { name: "progress" })).toBeInTheDocument();
 
     // The new attempt's first line lands, and it measures something else —
-    // a different solver on the same problem id. `fs_tail` sees `offset > len`
-    // and restarts at 0, so the chunk is the whole new file; appending it
-    // would chart a rotated-away attempt with a new one stapled to its end,
-    // and would keep offering the old attempt's series as tabs.
-    rotate(JSON.stringify({ step: 1, total_steps: 4, restarted: 1, _chain: "0:redrive" }));
+    // a different solver on the same problem id. The new file is shorter than
+    // the pane's offset (`fs_tail` restarts at 0) AND a different inode;
+    // either alone must reset the run: appending the chunk would chart a
+    // rotated-away attempt with a new one stapled to its end, and would keep
+    // offering the old attempt's series as tabs.
+    rotate(`${JSON.stringify({ step: 1, total_steps: 4, restarted: 1, _chain: "0:redrive" })}\n`);
     emitFsChange(RUN_FILE);
 
     await waitFor(() => expect(screen.getByRole("button", { name: "restarted" })).toBeInTheDocument());
@@ -558,19 +629,235 @@ describe("MetricsPane — a re-drive rotates the run out from under the badge", 
     expect(badge()).toHaveAttribute("data-state", "unverified");
   });
 
-  it("survives a verdict event for a run file that has been deleted", async () => {
-    // The verdict branch re-tails the run; if that tail rejects on a missing
-    // file the failure surfaces as an unhandled rejection, not as a badge.
+  it("resets on a truncate in place too — same inode, shorter file", async () => {
     verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2, RUN_HEAD));
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
     await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+
+    // Not a re-drive: something rewrote the file in place with less in it.
+    // The identity is unchanged, so this is the case `restarted` exists for.
+    contents.set(RUN_FILE, `${JSON.stringify({ step: 1, total_steps: 4, rewritten: 1, _chain: "0:again" })}\n`);
+    emitFsChange(RUN_FILE);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "rewritten" })).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "progress" })).toBeNull();
+    expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 1");
+    // The old verdict is still beside the file, and it is now about bytes
+    // that are no longer there.
+    expect(badge()).toHaveAttribute("data-state", "stale");
+  });
+
+  it("keeps what it holds when a verdict event re-tails a run file that has been deleted", async () => {
+    // The verdict branch re-tails the run; if that tail rejected on a missing
+    // file the failure would surface as an unhandled rejection, not as a
+    // badge — and the pane must neither blank the chart nor stop reading.
+    verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2, RUN_HEAD));
+    viewerJson = JSON.stringify({ runs: [RUN] });
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    const tailsBefore = tailedPaths().filter((p) => p === RUN_FILE).length;
 
     contents.delete(RUN_FILE);
     verdictFiles.set(RUN_VERDICT, verdictJson("failed", 2, RUN_HEAD));
     emitFsChange(RUN_VERDICT);
 
     await waitFor(() => expect(badge()).toHaveAttribute("data-state", "failed"));
+    // The re-tail was issued and rejected; the points survived it.
+    await waitFor(() => expect(tailedPaths().filter((p) => p === RUN_FILE).length).toBe(tailsBefore + 1));
+    expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 2");
+    expect(screen.getByRole("button", { name: "progress" })).toBeInTheDocument();
+  });
+});
+
+describe("MetricsPane — a replacement file at least as long as the held offset", () => {
+  // The old and the new generation are built with the same digit counts, so
+  // the new file's first lines end at exactly the byte offsets the old ones
+  // did: no length check can see the change. Only the identity can.
+  const OLD_SPEEDUP = 2.5; // 2.5, 2.6, 2.7
+  const NEW_SPEEDUP = 7.5; // 7.5, 7.6, 7.7 — same lengths, different numbers
+
+  function redrive(nextChain: string) {
+    for (const [name, store] of [
+      ["metrics.jsonl", contents],
+      ["metrics.verdict.json", verdictFiles],
+    ] as const) {
+      const body = store.get(`${RUN}/${name}`);
+      if (body !== undefined) {
+        store.set(`${RUN}/prior-1/${name}`, body);
+        store.delete(`${RUN}/${name}`);
+      }
+    }
+    replaceFile(RUN_FILE, nextChain);
+  }
+
+  it("A1: a re-drive whose first line is the same length as the old file is a new run, not a continuation", async () => {
+    contents.set(RUN_FILE, chain(1, 0.03, OLD_SPEEDUP, "r0bad"));
+    verdictFiles.set(RUN_VERDICT, verdictJson("ok", 1, headOf("r0bad", 1)));
+    viewerJson = JSON.stringify({ runs: [RUN] });
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    const oldLen = contents.get(RUN_FILE)!.length;
+
+    // Trio and verdict move into `prior-1/`; the new writer's first line lands
+    // and it is byte-for-byte as long as the old file.
+    const gen2 = chain(1, 0.03, NEW_SPEEDUP, "redrive");
+    expect(gen2.length).toBe(oldLen);
+    redrive(gen2);
+    emitFsChange(RUN_FILE);
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "unverified"));
+
+    // Steps 2 and 3 of the new attempt, then the loop's verdict for it.
+    contents.set(RUN_FILE, chain(3, 0.03, NEW_SPEEDUP, "redrive"));
+    emitFsChange(RUN_FILE);
+    verdictFiles.set(RUN_VERDICT, verdictJson("ok", 3, headOf("redrive", 3)));
+    emitFsChange(RUN_VERDICT);
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 3");
+
+    // What is under that green badge must be the new generation ALONE. With
+    // the old line 1 stapled in front, the speedup curve would reach down to
+    // 2.5 and its axis would say so.
+    screen.getByRole("button", { name: "speedup_ratio" }).click();
+    await waitFor(() => expect(document.querySelectorAll("polyline").length).toBe(1));
+    expect(document.querySelector("polyline")!.getAttribute("points")!.split(" ").length).toBe(3);
+    const ticks = yTicks();
+    expect(ticks.length).toBeGreaterThan(0);
+    for (const t of ticks) expect(t).toBeGreaterThan(7);
+  });
+
+  it("A2: the create and the first appends coalesce into one event for a file already longer than the old one", async () => {
+    contents.set(RUN_FILE, chain(2, 0.03, OLD_SPEEDUP, "r0bad"));
+    verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2, headOf("r0bad", 2)));
+    viewerJson = JSON.stringify({ runs: [RUN] });
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    const oldLen = contents.get(RUN_FILE)!.length;
+
+    // The new attempt's line 2 ends exactly where the old file ended, and the
+    // pane hears about the file once, when it is already 3 lines long — the
+    // watcher's 300 ms debounce swallowed the create and the second append.
+    expect(chain(2, 0.03, NEW_SPEEDUP, "redrive").length).toBe(oldLen);
+    redrive(chain(3, 0.03, NEW_SPEEDUP, "redrive"));
+    emitFsChange(RUN_FILE);
+    verdictFiles.set(RUN_VERDICT, verdictJson("ok", 3, headOf("redrive", 3)));
+    emitFsChange(RUN_VERDICT);
+
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() => expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 3"));
+    screen.getByRole("button", { name: "speedup_ratio" }).click();
+    await waitFor(() => expect(document.querySelectorAll("polyline").length).toBe(1));
+    // Three points, all of them the new generation's — not old lines 1–2
+    // with new line 3 stapled on, which would satisfy the line count and the
+    // digest both and still be a chart of two runs.
+    expect(document.querySelector("polyline")!.getAttribute("points")!.split(" ").length).toBe(3);
+    const ticks = yTicks();
+    expect(ticks.length).toBeGreaterThan(0);
+    for (const t of ticks) expect(t).toBeGreaterThan(7);
+  });
+});
+
+describe("MetricsPane — two events for one run a few milliseconds apart", () => {
+  it("A3: the last append's event and the verdict's event do not wipe the run", async () => {
+    // Attempt running: 2 lines charted, no verdict yet.
+    viewerJson = JSON.stringify({ runs: [RUN] });
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "unverified"));
+    expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 2");
+
+    // The solver writes line 3 (its event is emitted — this solver is slower
+    // than 3 Hz), the attempt ends, and the verdict lands a few ms later. Both
+    // events reach the pane before the first `fs_tail` round trip resolves —
+    // the ordinary end of every attempt, not a race anyone contrived.
+    contents.set(RUN_FILE, chain(3, 0.03, 1.1, "r0bad"));
+    emitFsChange(RUN_FILE);
+    verdictFiles.set(RUN_VERDICT, verdictJson("ok", 3, headOf("r0bad", 3)));
+    emitFsChange(RUN_VERDICT);
+
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 3");
+    screen.getByRole("button", { name: "progress" }).click();
+    await waitFor(() => expect(document.querySelectorAll("polyline").length).toBe(1));
+    // All three points, once each: the same bytes were not applied twice, and
+    // the second read did not wipe the first's points down to one.
+    expect(document.querySelector("polyline")!.getAttribute("points")!.split(" ").length).toBe(3);
+  });
+
+  it("issues at most one fs_tail at a time per run, and one follow-up for a burst", async () => {
+    viewerJson = JSON.stringify({ runs: [RUN] });
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "unverified"));
+    const before = tailedPaths().filter((p) => p === RUN_FILE).length;
+
+    // Hold every read open, fire a burst of events, then release.
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const base = invMock.getMockImplementation()!;
+    invMock.mockImplementation(async (cmd: string, args: Record<string, unknown> = {}) => {
+      if (cmd === "fs_tail" && args.rel === RUN_FILE) await held;
+      return base(cmd, args);
+    });
+    contents.set(RUN_FILE, chain(3, 0.03, 1.1, "r0bad"));
+    emitFsChange(RUN_FILE);
+    emitFsChange(RUN_FILE);
+    verdictFiles.set(RUN_VERDICT, verdictJson("ok", 3, headOf("r0bad", 3)));
+    emitFsChange(RUN_VERDICT);
+    emitFsChange(RUN_VERDICT);
+    // Only the first request went out; the rest coalesced behind it.
+    expect(tailedPaths().filter((p) => p === RUN_FILE).length).toBe(before + 1);
+
+    release();
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    // …into exactly one follow-up read once it landed.
+    await waitFor(() => expect(tailedPaths().filter((p) => p === RUN_FILE).length).toBe(before + 2));
+    expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 3");
+  });
+});
+
+describe("MetricsPane — the bytes at the end of the file", () => {
+  it("charts a line split across two reads once, and is not stuck stale after the mid-write read", async () => {
+    viewerJson = JSON.stringify({ runs: [RUN] });
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 2"));
+
+    // The watcher fires while the writer is mid-line: the file ends in half
+    // of line 3. `fs_tail` holds the fragment back, so the pane still holds
+    // exactly two lines and its offset stops before the fragment.
+    const line3 = chainLine(2, 0.03, 1.1, "r0bad");
+    const twoLines = chain(2, 0.03, 1.1, "r0bad");
+    contents.set(RUN_FILE, `${twoLines}${line3.slice(0, 20)}`);
+    emitFsChange(RUN_FILE);
+    await waitFor(() => expect(tailedPaths().filter((p) => p === RUN_FILE).length).toBeGreaterThanOrEqual(2));
+    expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 2");
+
+    // The writer finishes the line and the attempt ends. Line 3 arrives whole
+    // — charted once — and the verdict for three lines binds.
+    contents.set(RUN_FILE, `${twoLines}${line3}\n`);
+    emitFsChange(RUN_FILE);
+    verdictFiles.set(RUN_VERDICT, verdictJson("ok", 3, headOf("r0bad", 3)));
+    emitFsChange(RUN_VERDICT);
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 3");
+    screen.getByRole("button", { name: "progress" }).click();
+    await waitFor(() => expect(document.querySelectorAll("polyline").length).toBe(1));
+    expect(document.querySelector("polyline")!.getAttribute("points")!.split(" ").length).toBe(3);
+  });
+
+  it("reads stale, not chain ok, once an unparseable line follows the checked one", async () => {
+    verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2, RUN_HEAD));
+    viewerJson = JSON.stringify({ runs: [RUN] });
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+
+    // Garbage appended after the verdict. `verify` on disk would say FAILED;
+    // the pane cannot know that, but it must not keep saying chain ok over a
+    // last line it cannot even parse. (`failed` is the loop's word, not the
+    // pane's, so this reads `stale`.)
+    contents.set(RUN_FILE, `${chain(2, 0.03, 1.1, "r0bad")}not json at all\n`);
+    emitFsChange(RUN_FILE);
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "stale"));
+    // The two good lines are still charted; only the claim about them changed.
+    expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 2");
   });
 });
 

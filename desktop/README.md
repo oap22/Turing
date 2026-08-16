@@ -247,25 +247,48 @@ next to `metrics.json`; the badge reads that file. Each chip is a focusable
 sentence that keeps a green chip from reading as "these numbers are real" is
 not reachable by mouse alone.
 
-**The contract.** `verified` means the verdict file's `chain_head` equals the
-`_chain` digest of the **last line the pane has parsed** for that run — the
-verdict is bound to the bytes, not to a line count — and every state the badge
-shows is derived from files that are **currently beside the run**, re-read
-whenever the run's own file changes. Both halves are load-bearing. A line count
-is a property two different logs can share, and a re-drive
-(`_rotate_stale_metrics` moves the metrics trio *and* the verdict into
+**The contract.** A run's chart is built only from bytes of **one file
+generation**, applied in order: `fs_tail` reports the chunk's start offset and
+the file's identity; the pane applies a chunk only if its start equals the
+offset it holds *and* the identity matches — a changed identity or a shorter
+file resets the run to that chunk alone; a chunk with any other start is
+discarded, never appended. A trailing partial line is not consumed. `verified`
+means the verdict's `chain_head` equals the `_chain` digest of the **last
+non-blank line the pane holds**, and any last non-blank line it cannot parse
+makes the run `stale`. Every state the badge shows is derived from files that
+are **currently beside the run**, re-read whenever the run's own file changes.
+
+Each clause is load-bearing. A line count is a property two different logs can
+share, and a re-drive (the metrics trio and the verdict move together into
 `prior-N/`) puts a fresh, unrelated chain at the same path; binding to the
-digest is what stops a chip going green over bytes nobody checked. And because
-a file renamed away produces no watcher event for its old path, the pane
-re-reads the verdict on every change to the run file too — otherwise the badge
-would sit green over a directory the verdict has left. The reverse edge is
-covered symmetrically: a verdict event re-tails the run, so a watcher event
-dropped by the 300 ms debounce cannot pin a clean run amber forever.
+digest is what stops a chip going green over bytes nobody checked. The new
+file is a new inode, and its bytes can be at least as long as the offset the
+pane held (a same-length first line; a create and two appends coalesced under
+the watcher's debounce) — which is why the identity, not only the length,
+decides whether a chunk continues the run or replaces it, and why a chunk that
+starts anywhere but at the held offset is dropped rather than guessed about.
+`fs_tail` is issued at most once at a time per run (a request during a read
+coalesces into one follow-up), so two events a few milliseconds apart — the
+last append and the verdict, the ordinary end of every attempt — cannot
+deliver the same bytes twice. And because a file renamed away produces no
+watcher event for its old path, the pane re-reads the verdict on every change
+to the run file too — otherwise the badge would sit green over a directory the
+verdict has left. The reverse edge is covered symmetrically: a verdict event
+re-tails the run, so a watcher event dropped by the 300 ms debounce cannot pin
+a clean run amber forever.
+
+`fs_tail` (`desktop/src-tauri/src/fsroots.rs`) returns
+`{ data, offset, start, dev, ino, restarted }`: `data` is whole lines only —
+bytes `[start, offset)` cut at the last `\n`, the fragment after it re-read
+complete on the next call; `start` is where the read began (the caller's
+offset, or `0` with `restarted: true` when the file was shorter than it);
+`dev`/`ino` are the file's identity on unix and `null` elsewhere. Every offset
+is computed on the bytes in Rust; the pane does no byte arithmetic of its own.
 
 | Badge | Meaning |
 |---|---|
 | `✓ chain ok` | the loop's check passed, and the line it ended on is the last line this pane has parsed |
-| `≠ chain stale` | the pane's last parsed line does not match the digest the loop last checked — the pane is behind the file, or the directory was re-driven and this verdict describes a generation that is no longer here |
+| `≠ chain stale` | the pane's last non-blank line does not match the digest the loop last checked — the pane is behind the file, the directory was re-driven and this verdict describes a generation that is no longer here, or the last line does not parse at all (which `verify` would fail; `failed` is reserved for what the loop itself recorded) |
 | `? chain incomplete` | intact chain, no summary beside it, or one a writer was still appending to when the loop looked |
 | `✗ chain FAILED` | the log does not recompute, or its summary disagrees with it. Never softened by a later line landing |
 | `· unverified` | no verdict file beside this run — nothing was checked here. Also what a run **still being written** shows, since the verdict is written only once the attempt ends |
