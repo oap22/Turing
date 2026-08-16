@@ -462,6 +462,48 @@ class TestScoreScaleIsRefusedWhereItIsDeclared:
 
 
 # --------------------------------------------------------------------------- #
+# score_floor — a problem's own declared floor (RES-15)
+# --------------------------------------------------------------------------- #
+
+
+class TestScoreFloorIsDeclaredOnTheVerifier:
+    """A problem on a scale ``DEFAULT_SCORE_FLOORS`` doesn't know can still
+    declare its own floor, alongside the scale, on the verifier.
+    """
+
+    def test_undeclared_floor_defaults_to_none(self) -> None:
+        verifier = make_verifier()
+        assert verifier.score_floor is None
+
+    def test_a_declared_floor_is_kept(self) -> None:
+        verifier = make_verifier(score_scale="val_loss", score_floor=1e9)
+        assert verifier.score_floor == pytest.approx(1e9)
+
+    def test_a_declared_floor_of_zero_is_kept_not_treated_as_falsy(self) -> None:
+        verifier = make_verifier(score_scale="val_loss", score_floor=0.0)
+        assert verifier.score_floor == 0.0
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_a_non_finite_floor_is_refused(self, bad: float) -> None:
+        with pytest.raises(ContractViolationError, match="not finite"):
+            make_verifier(score_scale="val_loss", score_floor=bad)
+
+    def test_a_non_numeric_floor_is_refused(self) -> None:
+        with pytest.raises(ContractViolationError, match="not a plain number"):
+            make_verifier(score_scale="val_loss", score_floor="worst")  # type: ignore[arg-type]
+
+    def test_a_bool_floor_is_refused(self) -> None:
+        """``bool`` is a subclass of ``int`` in Python; refused explicitly."""
+        with pytest.raises(ContractViolationError, match="not a plain number"):
+            make_verifier(score_scale="val_loss", score_floor=True)  # type: ignore[arg-type]
+
+    def test_a_scale_cannot_smuggle_a_bad_floor_in_by_replacing_it_later(self) -> None:
+        verifier = make_verifier(score_scale="val_loss", score_floor=1.0)
+        with pytest.raises(ContractViolationError, match="not finite"):
+            dataclasses.replace(verifier, score_floor=float("nan"))
+
+
+# --------------------------------------------------------------------------- #
 # problem.id — a path component, validated as one (RES-16)
 # --------------------------------------------------------------------------- #
 

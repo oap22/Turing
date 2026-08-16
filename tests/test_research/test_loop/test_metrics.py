@@ -218,6 +218,65 @@ class TestUnscoredProblems:
         with pytest.raises(ContractViolationError, match="no declared floor"):
             ScoredProblem.from_result(problem, None, score_floors={})
 
+    def test_an_unrecognised_scale_still_raises_when_the_problem_declares_nothing(
+        self,
+    ) -> None:
+        """A scale outside DEFAULT_SCORE_FLOORS with no verifier-declared floor
+        either must still raise the pre-existing message — declaring a floor
+        is additive, it does not relax the refusal.
+        """
+        problem = make_problem("loss-1", score_scale="val_loss")
+        with pytest.raises(ContractViolationError, match="no declared floor"):
+            ScoredProblem.from_result(problem, None)
+
+    def test_a_problem_declared_floor_is_used_on_harness_failure(self) -> None:
+        """A loss-scale problem can be scored end to end, including when its
+        verification fails, once it declares its own floor.
+        """
+        problem = make_problem("loss-1", score_scale="val_loss", score_floor=1e9)
+        result = VerificationResult(
+            problem_id="loss-1",
+            verifier_id="v-loss-1",
+            score=0.0,
+            passed_correctness=False,
+            score_scale="val_loss",
+            raw_measurements={HARNESS_FAILURE_KEY: 1.0},
+        )
+        item = ScoredProblem.from_result(problem, result)
+        assert item.scored is False
+        assert item.passed_correctness is False
+        assert item.score == pytest.approx(1e9)
+
+    def test_a_problem_declared_floor_is_used_when_the_verifier_never_ran(self) -> None:
+        problem = make_problem("loss-1", score_scale="val_loss", score_floor=1e9)
+        item = ScoredProblem.from_result(problem, None)
+        assert item.scored is False
+        assert item.score == pytest.approx(1e9)
+
+    def test_round_level_override_wins_over_the_problems_declared_floor(self) -> None:
+        """RoundConfig.score_floors is an operator-level override and takes
+        precedence over whatever the problem itself declared.
+        """
+        problem = make_problem("loss-1", score_scale="val_loss", score_floor=1e9)
+        item = ScoredProblem.from_result(problem, None, score_floors={"val_loss": 42.0})
+        assert item.score == pytest.approx(42.0)
+
+    def test_the_happy_path_ignores_the_declared_floor_entirely(self) -> None:
+        """A real, non-harness-failed verification is scored at face value —
+        the declared floor never enters the picture.
+        """
+        problem = make_problem("loss-1", score_scale="val_loss", score_floor=1e9)
+        result = VerificationResult(
+            problem_id="loss-1",
+            verifier_id="v-loss-1",
+            score=0.37,
+            passed_correctness=True,
+            score_scale="val_loss",
+        )
+        item = ScoredProblem.from_result(problem, result)
+        assert item.scored is True
+        assert item.score == pytest.approx(0.37)
+
 
 # --------------------------------------------------------------------------- #
 # Noise floor

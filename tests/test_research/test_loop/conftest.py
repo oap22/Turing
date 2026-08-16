@@ -117,8 +117,10 @@ def make_problem(
     harness_failure: bool = False,
     template: Path | None = None,
     default_cap: Cap | None = None,
+    score_scale: str | None = None,
+    score_floor: float | None = None,
 ) -> Problem:
-    scale = (
+    scale = score_scale or (
         SCORE_SCALE_SPEEDUP
         if problem_type is ProblemType.SPEEDUP
         else SCORE_SCALE_LEADERBOARD_PERCENTILE
@@ -132,6 +134,7 @@ def make_problem(
         correctness=tuple(correctness),
         raises=raises,
         harness_failure=harness_failure,
+        score_floor=score_floor,
     )
     return Problem(
         id=problem_id,
