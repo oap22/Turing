@@ -74,8 +74,21 @@ from turing.research.loop.metrics import (
     floors_by_cell,
     round_verdict,
 )
+from turing.research.loop.plots import render_attempt_plots, render_round_plot
 from turing.research.loop.protocols import SolverTask, SystemClock
-from turing.research.loop.trajectory import AttemptLog, StepLog
+from turing.research.loop.results import (
+    MetricsLine,
+    MetricsWriter,
+    Outcome,
+    ProgressTracker,
+    read_agent_diagnostics,
+    read_metrics_points,
+    usable_target,
+    write_attempt_summary,
+    write_round_summary,
+    write_viewer_config,
+)
+from turing.research.loop.trajectory import AttemptLog, StepLog, cell_key
 from turing.research.problems.adapter import bind_eval_set_hash
 
 if TYPE_CHECKING:
@@ -257,6 +270,55 @@ def _spend_carried_on_error(exc: BaseException) -> CapConsumption:
     return CapConsumption()
 
 
+#: The hash-chained trio :class:`~turing.research.loop.results.MetricsWriter`
+#: refuses to splice onto. Everything else under an attempt's directory
+#: (checkpoints, the attempt log, the plots) is a wholesale overwrite that
+#: self-heals on a re-drive; this trio is not, because it is chained.
+_METRICS_TRIO = ("metrics.jsonl", "metrics.chain.json", "metrics.json")
+
+
+def _rotate_stale_metrics(metrics_dir: Path) -> None:
+    """Move a prior, non-empty ``metrics.jsonl`` (and its companions) aside.
+
+    A re-run of an attempt into an already-used ``output_dir`` is legitimate
+    and reachable — a closed subscription window, a killed process, a
+    re-driven round — and nothing in :meth:`RoundRunner.run_attempt` (or
+    :meth:`RoundRunner.run_round`, or ``NoiseFloorRunner.run``) has skip-if-
+    already-done logic to prevent it. ``results.MetricsWriter.__init__``
+    refuses outright rather than splice a second attempt's lines onto an
+    existing chain (see its docstring), so without this, a legitimate
+    re-drive would crash instead of re-reporting.
+
+    The check mirrors the writer's own refusal condition exactly — a
+    missing or zero-byte ``metrics.jsonl`` is not a chain and is left alone.
+    When a real prior chain is found, the whole trio is moved, un-renamed,
+    into a numbered ``prior-N/`` subdirectory: not deleted (the earlier
+    attempt's data survives), not resumed (the new writer starts a fresh
+    chain from its own header), and — because the filenames inside that
+    subdirectory are still the canonical ``metrics.jsonl`` /
+    ``metrics.chain.json`` / ``metrics.json`` — still independently
+    checkable by :func:`~turing.research.loop.integrity.verify_metrics_chain`
+    and :func:`~turing.research.loop.integrity.reconcile_summary`, and still
+    found by ``python -m turing.research.loop.verify``'s directory walk,
+    which matches ``metrics.jsonl`` at every depth under a root.
+    """
+    jsonl_path = metrics_dir / "metrics.jsonl"
+    if not (jsonl_path.exists() and jsonl_path.stat().st_size > 0):
+        return
+    suffix = 1
+    while (metrics_dir / f"prior-{suffix}").exists():
+        suffix += 1
+    prior_dir = metrics_dir / f"prior-{suffix}"
+    prior_dir.mkdir(parents=True, exist_ok=True)
+    for name in _METRICS_TRIO:
+        src = metrics_dir / name
+        if not src.exists():
+            continue
+        dest = prior_dir / name
+        src.rename(dest)
+        logger.info("research.results.metrics_rotated", src=str(src), dest=str(dest))
+
+
 class RoundRunner:
     """Runs one round of the corpus. Unattended except for escalations."""
 
@@ -312,6 +374,30 @@ class RoundRunner:
         decisions: list[EscalationDecision] = []
         best: VerificationResult | None = None
         criterion = config.criterion_for(problem.id)
+
+        # -- reporting: the seam that makes this attempt visible while it
+        # runs, not only after trajectory.json is appended to at round end.
+        # See turing.research.loop.results for the file contract.
+        metrics_dir = output_dir / "attempts" / problem.id
+        _rotate_stale_metrics(metrics_dir)
+        metrics_writer = MetricsWriter(
+            metrics_dir / "metrics.jsonl",
+            header={
+                "attempt_id": attempt.attempt_id,
+                "problem_id": problem.id,
+                "round_id": attempt.round_id,
+                "seed": attempt.seed,
+                "score_scale": problem.verifier.score_scale,
+                "started_at_ms": attempt.started_at_ms,
+            },
+            clock=self._clock,
+        )
+        progress_tracker = ProgressTracker(
+            target=None if criterion is None else criterion.min_score
+        )
+        score_series = problem.verifier.score_scale
+        baseline_score: float | None = None
+        final_progress: float | None = None
 
         while True:
             attempt, cap_action = await self._enforce_cap(
@@ -432,6 +518,35 @@ class RoundRunner:
             )
             await self._trajectory.write_attempt_checkpoint(attempt, output_dir=output_dir)
 
+            observed = None if result is None else progress_tracker.observe(result.score)
+            if observed is not None:
+                final_progress = observed
+            if baseline_score is None:
+                baseline_score = progress_tracker.baseline
+            await metrics_writer.append(
+                MetricsLine(
+                    step=attempt.step_index,
+                    total_steps=attempt.cap.max_steps,
+                    ts=now / 1000.0,
+                    outcome=Outcome.from_attempt_state(attempt.state),
+                    correctness_pass=None if result is None else result.passed_correctness,
+                    tokens_used=attempt.consumed.tokens,
+                    tokens_cap=attempt.cap.max_tokens,
+                    steps_cap=attempt.cap.max_steps,
+                    consumed_steps=attempt.consumed.steps,
+                    wall_clock_s=attempt.consumed.wall_clock_seconds,
+                    wall_clock_cap_s=attempt.cap.max_wall_clock_seconds,
+                    cap_extensions=attempt.cap.extension_count,
+                    step_wall_clock_s=step_elapsed,
+                    verify_wall_clock_s=verify_elapsed,
+                    step_tokens=step.tokens,
+                    made_progress=step.made_progress,
+                    progress=observed,
+                    metrics={} if result is None else {score_series: result.score},
+                    diagnostics=await read_agent_diagnostics(attempt.workspace_path),
+                )
+            )
+
             if verifier_error is not None:
                 attempt, _ = await self._escalate_or_fail(
                     problem=problem,
@@ -511,6 +626,50 @@ class RoundRunner:
                     break
 
         await self._trajectory.write_attempt_checkpoint(attempt, output_dir=output_dir)
+
+        # Edit D, terminal line (spec's "Terminal-line rule", added
+        # 2026-08-14). Every line appended above was written from *inside*
+        # the loop, so each one necessarily carries the attempt's
+        # pre-termination state — nothing recorded the state the attempt
+        # actually ended in. metrics.json's outcome is the terminal Outcome,
+        # so without this the log's last line and the summary disagree on
+        # every honest run and reconcile_summary reports a false mismatch
+        # (this is the bug the gate caught). Resource fields are read from
+        # ``attempt``/``best`` directly rather than copied from the last
+        # in-loop line, so this still reconciles even on the
+        # solver-exception termination path, where no metrics line is
+        # written for the charge that ended the attempt. Deliberately *not*
+        # wrapped in the try/except below: it is a chain-extending write
+        # with the same integrity contract as the per-step appends above
+        # (also unwrapped) — a swallowed failure here would silently break
+        # the hash chain on the file's own last line. It runs after the
+        # attempt's real work and its checkpoint are already durably
+        # recorded, so raising here cannot turn a solved attempt into a
+        # lost one.
+        await metrics_writer.append(
+            MetricsLine(
+                step=attempt.step_index,
+                total_steps=attempt.cap.max_steps,
+                ts=self._clock.now_ms() / 1000.0,
+                outcome=Outcome.from_attempt_state(attempt.state),
+                correctness_pass=None if best is None else best.passed_correctness,
+                tokens_used=attempt.consumed.tokens,
+                tokens_cap=attempt.cap.max_tokens,
+                steps_cap=attempt.cap.max_steps,
+                consumed_steps=attempt.consumed.steps,
+                wall_clock_s=attempt.consumed.wall_clock_seconds,
+                wall_clock_cap_s=attempt.cap.max_wall_clock_seconds,
+                cap_extensions=attempt.cap.extension_count,
+                step_wall_clock_s=0.0,
+                verify_wall_clock_s=0.0,
+                step_tokens=0,
+                made_progress=None,
+                progress=final_progress,
+                metrics={},
+                diagnostics={},
+            )
+        )
+
         log = AttemptLog(
             problem_id=problem.id,
             attempt_id=attempt.attempt_id,
@@ -531,6 +690,67 @@ class RoundRunner:
             workspace_path=str(attempt.workspace_path),
         )
         path = await self._trajectory.write_attempt_log(log, output_dir=output_dir)
+
+        # Reporting failures must not fail an attempt that otherwise solved
+        # its problem — this is the one sanctioned swallowed error in this
+        # module. The metrics.jsonl append above is *not* inside this guard:
+        # a chain-breaking write failure there is a contract bug that must
+        # surface immediately, not an observability hiccup.
+        try:
+            await write_attempt_summary(
+                metrics_dir,
+                problem_id=problem.id,
+                attempt_id=attempt.attempt_id,
+                round_id=attempt.round_id,
+                seed=attempt.seed,
+                problem_type=problem.problem_type.value,
+                split=problem.split.value,
+                score_scale=problem.verifier.score_scale,
+                outcome=Outcome.from_attempt_state(attempt.state),
+                final_state=attempt.state.value,
+                best_score=None if best is None else best.score,
+                best_passed_correctness=None if best is None else best.passed_correctness,
+                baseline_score=baseline_score,
+                target_score=None if criterion is None else criterion.min_score,
+                final_progress=final_progress,
+                consumed_steps=attempt.consumed.steps,
+                consumed_tokens=attempt.consumed.tokens,
+                consumed_wall_clock_seconds=attempt.consumed.wall_clock_seconds,
+                cap_extensions=attempt.cap.extension_count,
+                escalation_count=len(escalations),
+                # Lines, not steps: the terminal line above makes the two
+                # legitimately differ by one (spec's terminal-line rule).
+                steps_recorded=metrics_writer.line_count,
+            )
+            points = await read_metrics_points(metrics_writer.path)
+            await render_attempt_plots(
+                metrics_dir,
+                points,
+                # Corrected 2026-08-14: was the literal "score", which the
+                # emitter never writes (the raw series is named after
+                # score_series, bound above from problem.verifier.score_scale).
+                # That mismatch skipped progress.svg on every attempt. See
+                # AC23 and the spec's per-file note on this call site.
+                forcing_series=score_series,
+                # ``usable_target`` rather than the raw ``min_score``: with a
+                # non-finite target matplotlib draws no reference line but
+                # still adds "target" to the legend, so the plot would claim a
+                # bar it never drew while metrics.json (which normalises the
+                # same value) says ``target_score: null``. One predicate, so
+                # the tracker, the summary and the plot cannot disagree.
+                target=usable_target(None if criterion is None else criterion.min_score),
+            )
+        except Exception:
+            logger.exception(
+                "research.results.emit_failed",
+                problem_id=problem.id,
+                attempt_id=attempt.attempt_id,
+                # The directory whose files did not land. ``verify`` reports a
+                # missing summary by path, and without this the ERROR that
+                # explains why cannot be matched to it in an overnight log.
+                directory=str(metrics_dir),
+            )
+
         return AttemptOutcome(
             problem=problem,
             attempt=attempt,
@@ -970,6 +1190,67 @@ class RoundRunner:
             operator_wait_seconds=self._operator_wait_seconds,
             verdict=record.verdict,
         )
+
+        # Reporting failures must not lose a round record that is otherwise
+        # valid — the same one-sanctioned-swallowed-error reasoning as
+        # run_attempt's summary/plot emission.
+        try:
+            deltas_by_cell = {(d.problem_type, d.split): d for d in record.deltas}
+            cells: list[dict[str, object]] = []
+            for ts in type_scores:
+                cell: dict[str, object] = {
+                    "cell": cell_key((ts.problem_type, ts.split)),
+                    "problem_type": ts.problem_type.value,
+                    "split": ts.split.value,
+                    "mean_score": ts.mean_score,
+                    "n": ts.n,
+                    "correctness_passes": ts.correctness_passes,
+                }
+                delta = deltas_by_cell.get((ts.problem_type, ts.split))
+                if delta is not None:
+                    cell["marginal_gain"] = delta.marginal_gain
+                    cell["noise_floor"] = delta.noise_floor
+                    cell["cost_per_unit_gain"] = delta.cost_per_unit_gain
+                cells.append(cell)
+
+            await write_round_summary(
+                output_dir,
+                round_index=config.round_index,
+                run_id=config.run_id,
+                parent_round_id=config.parent_round_id,
+                eval_set_hash=eval_set_hash,
+                seed=config.seed,
+                # Fix 4: match trajectory.json's append_round semantics.
+                # "Comparable to parent" is not a yes/no fact about a round
+                # with no parent -- it's not applicable, and trajectory.json
+                # already encodes exactly that (`comparable` stays None
+                # there when there is no previous row). `comparable` here
+                # defaults to True even when `parent is None`, which made
+                # the round summary claim comparability to a parent that
+                # does not exist while the trajectory row for the same
+                # round recorded null. trajectory.py owns that null and is
+                # do-not-touch, so the summary is what changes to match it.
+                comparable_to_parent=None if parent is None else comparable,
+                cells=cells,
+                wall_clock_seconds=elapsed,
+                tokens=cost.tokens,
+                attempts=cost.attempts,
+                escalations=escalation_count,
+                verdict=record.verdict,
+            )
+            await render_round_plot(output_dir, cells)
+            runs = sorted(
+                f"{self._trajectory.loop_dir.name}/{output_dir.name}/attempts/{o.problem.id}"
+                for o in outcomes
+            )
+            await write_viewer_config(self._trajectory.loop_dir.parent, runs=runs)
+        except Exception:
+            logger.exception(
+                "research.results.round_emit_failed",
+                round_index=config.round_index,
+                run_id=config.run_id,
+            )
+
         return RoundOutcome(
             record=record,
             attempts=outcomes,

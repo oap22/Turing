@@ -602,3 +602,403 @@ From the 2026-08-12 headroom profiling, so they are not discovered as surprises:
   hardcoding constants instead of exporting them counts as a solve. It is a
   reward-hacking decision and it must be settled *before* the corpus is locked,
   because a verifier cannot be amended afterwards.
+
+---
+
+## Where results land, and what the desktop reads
+
+Everything above this section describes loop 1 as it stood before RES-12: the
+contracts and the solver computed the four numbers in memory, and nothing
+wrote them to a file the desktop could read. **This section is the exception
+to the rest of this document's honesty banner — the files and commands named
+below are wired and tested, not aspirational.** A round still cannot be
+started end-to-end (§ Running a round above still applies), but once one is,
+every attempt now streams its own progress to disk as it runs, not only at
+the end.
+
+### Directory layout
+
+```
+~/research-results/
+  .viewer.json                            points the desktop's metrics pane at "progress"
+  loop-<slug>/
+    trajectory.json                       (already existed)
+    round-00/
+      metrics.json                        round summary — per-cell, never pooled
+      scores.svg                          grouped bar chart, one bar per cell
+      attempts/
+        <problem-id>.json                 (already existed — the attempt log)
+        <problem-id>/
+          metrics.jsonl                   one line per solver step
+          metrics.json                    attempt summary
+          metrics.chain.json              hash-chain sidecar (see Integrity, below)
+          progress.svg
+          cap.svg
+      checkpoints/                        (already existed)
+      escalations/                        (already existed)
+```
+
+`attempts/<problem-id>.json` (a file, written by `TrajectoryStore`) and
+`attempts/<problem-id>/` (a directory, written by this contract) are
+different names on disk and coexist without collision.
+
+### The `metrics.jsonl` line contract
+
+One JSON object per line, appended — never rewritten — as the attempt runs.
+The desktop's images and metrics panes tail this file by byte offset, so a
+line, once written, is final. Two real lines, verbatim:
+
+```json
+{"step":1,"total_steps":50,"ts":1755180000,"outcome_code":0,"correctness_pass":0,"tokens_used":18400,"tokens_cap":1500000,"steps_cap":50,"consumed_steps":1,"wall_clock_s":96,"wall_clock_cap_s":10800,"cap_extensions":0,"step_wall_clock_s":88.2,"verify_wall_clock_s":7.8,"step_tokens":18400,"made_progress":1,"progress":0.0,"speedup":1.0,"diag_peak_rss_mb":412.0,"_chain":"0:daba…"}
+{"step":7,"total_steps":50,"ts":1755182140,"outcome_code":1,"correctness_pass":1,"tokens_used":203900,"tokens_cap":1500000,"steps_cap":50,"consumed_steps":7,"wall_clock_s":2236,"wall_clock_cap_s":10800,"cap_extensions":0,"step_wall_clock_s":141.0,"verify_wall_clock_s":24.5,"step_tokens":31200,"made_progress":1,"progress":0.99,"speedup":1.99,"diag_peak_rss_mb":389.0,"_chain":"6:18ab…"}
+```
+
+`speedup` is the series name in these two lines **because that is this
+problem's `score_scale`** — a loss-driven problem's line would carry
+`val_loss` instead, and every problem type names its own raw score
+differently. `progress` is the one series comparable across all of them; see
+below.
+
+**`consumed_steps` is not `step`, and the two are not interchangeable.**
+`step` is the solver's step index — the chart's x-axis, and the field every
+other quantity on the line is plotted against. `consumed_steps` is cap
+accounting: how many steps the attempt's budget has actually been charged
+for. On the happy path shown above they coincide (`step=7`,
+`consumed_steps=7`), which is exactly what makes conflating them dangerous —
+they legitimately diverge. The runner's `_charge_failed_step` calls
+`record_consumption(...)`, which bumps `consumed.steps` **without** bumping
+`step_index`; that is the whole purpose of `_spend_carried_on_error`, whose
+docstring says a proposal call that happened still costs a step even when
+parse/apply then failed. On that path a run can legitimately report
+`step=0` alongside `consumed_steps=2`. Deriving one from the other — instead
+of emitting both — was a real bug: it made the reconciliation verifier flag
+perfectly honest runs as tampered.
+
+`consumed_steps` earns its place on the chart independently, too: a run
+where `consumed_steps` climbs while `step` stays flat is burning budget
+without making progress, a signal that was previously invisible and is now
+its own series.
+
+**Reserved fields.** `step`, `total_steps`, and `ts` are reserved — the
+desktop's chart series (`webui/src/desktop/panes/metrics.ts`,
+`EXCLUDED_SERIES_KEYS`) always excludes them, because it uses them as the
+chart's x-axis and metadata, not as data. A problem-supplied metric that
+reused one of those three names would be silently swallowed by the pane, so
+the writer refuses it loudly instead: any attempt to put a reserved name, or a
+name already used by a core field, into the scored `metrics` payload raises
+`ContractViolationError` and stops the attempt. **A field the desktop cannot
+chart is a field that does not exist**, and it is better to find that out at
+the first emitted line than to discover a silently-missing series after the
+run finished.
+
+The same logic explains why `outcome` is not a string on this line. The pane
+also drops any non-numeric field, and a string outcome would satisfy "the
+attempt's state is recorded" on paper while being invisible on the chart. The
+line instead carries `outcome_code`, an integer:
+
+| `outcome_code` | Meaning | Covers `AttemptState` |
+|---|---|---|
+| `0` | `RUNNING` | `PENDING`, `RUNNING`, `VERIFYING` |
+| `1` | `SOLVED` | `PASSED` |
+| `2` | `FAILED_WITHIN_CAP` | `FAILED_WITHIN_CAP` |
+| `3` | `ESCALATED` | `ESCALATED` |
+| `4` | `ABANDONED` | `ABANDONED` |
+| `5` | `PAUSED` | `PAUSED` |
+
+`PAUSED` gets its own code rather than folding into `RUNNING` because it is
+the state an attempt enters when a subscription window closes, and — per
+§ Interruptions above — resumability is load-bearing in this program. An
+operator scanning the chart needs to see "working" and "waiting to be
+resumed" as visibly different things, not the same flat line.
+
+The four fields `step_wall_clock_s`, `verify_wall_clock_s`, `step_tokens`, and
+`made_progress` exist to diagnose *why* the score line looks the way it does,
+on the same chart: a run burning tokens with `made_progress` at `0`, or a
+`verify_wall_clock_s` that dwarfs `step_wall_clock_s`, is visible without
+opening a log file. `cap_extensions` rides on every line because a cap can
+grow mid-attempt on an operator's `extend_cap` decision (§ Escalations
+above) — a run that reached its target after three extensions is not the
+same result as one that reached it inside the original budget, and this field
+is what makes the two visually distinguishable on the chart rather than
+silently identical.
+
+### The `progress` field
+
+`progress` is a 0 → 1 reading of how far an attempt has come from its own
+untouched starting point toward the problem's own passing bar, regardless of
+what the underlying metric is called or which direction it moves in. It is
+the field `.viewer.json` names as the primary series, specifically so that a
+speedup problem, a Kaggle leaderboard problem, and a loss-driven problem are
+all readable on one axis without averaging their raw scores together — which
+this program never does (§ The four numbers, above).
+
+- The **baseline** is the first score observed in the attempt — the first
+  verification run against the untouched workspace, which *is* the
+  unmodified starting point. There is no baseline field anywhere in the
+  contracts; one was deliberately not added.
+- `progress` is present once a target (`PassCriterion.min_score`) exists for
+  the problem and a score has been observed against it.
+- `progress` is **absent** — not zero, not null-but-charted, simply not a key
+  on the line — when the problem has no target at all.
+- `progress` is also **absent when the target is at or below the baseline**,
+  because the bar was already met before any work happened. Reporting `1.0`
+  in that case would draw a solved-looking curve for an attempt that did
+  nothing, which is the same fake-curve failure `metrics.py` refuses
+  elsewhere in this codebase. This is a refusal, not a bug: it happens
+  exactly **once per attempt**, logged at `WARNING` as
+  `research.results.degenerate_target`, and every following step goes back
+  to a line with no `progress` key rather than a `WARNING` per step.
+
+### The `diag_` namespace
+
+An agent may write its own intermediate numbers — validation-split scores,
+memory usage, anything it wants to watch — to `.turing/metrics.json` inside
+its own workspace. Every key from that file lands on the next emitted line
+prefixed `diag_`. This is the brief's *"the agent invents; the operator holds
+the ruler"* rule expressed as a data format rather than a promise: a
+`diag_`-prefixed key structurally cannot be mistaken for the score the run is
+graded on, because the prefix is applied by the writer, not chosen by the
+agent.
+
+The sidecar reader is deliberately permissive, on purpose and asymmetrically
+so — see "Integrity, and its limits" below for why the scored `metrics`
+payload is strict where this is lenient:
+
+- The file is optional. Missing, unreadable, not valid JSON, valid JSON that
+  isn't an object — every failure mode is treated the same way, and the
+  attempt is never affected by a broken notebook. A missing file is logged at
+  `DEBUG`, because it's the common case and a `WARNING` on every step would
+  drown the log.
+- Non-numeric, boolean, and non-finite values are dropped silently.
+- Capped at **50 keys**, taken in sorted order for determinism. An agent
+  writing thousands of series would otherwise make every line enormous and
+  the pane unusable; going over the cap is logged once per attempt at
+  `WARNING` (`research.results.diagnostics_truncated`), not once per step.
+- A file over **256 KiB** is rejected without being parsed at all, logged
+  once at `WARNING` (`research.results.diagnostics_too_large`). The agent
+  writes this file unattended, so an unbounded read is a denial-of-service an
+  operator could otherwise hand to their own overnight loop.
+
+### `.viewer.json`
+
+Written once per round at the results root (`~/research-results/.viewer.json`,
+i.e. the parent of every `loop-<slug>/` directory), as:
+
+```json
+{"series": "progress", "runs": ["loop-<slug>/round-00/attempts/<problem-id>", "..."], "titles": {"progress": "progress toward target (0 = baseline, 1 = target)"}}
+```
+
+`series` names which field the metrics pane treats as primary; it defaults to
+`progress` for the reason given above. `runs` are POSIX-style paths relative
+to the results root, one per attempt directory written that round. To watch a
+different series by hand — the raw `speedup` or `val_loss` for one problem,
+say, instead of the cross-problem `progress` — edit `series` in this file
+directly; there is no CLI for it. The desktop re-reads it on its normal poll,
+no restart required.
+
+### Integrity, and its limits
+
+Every line also carries `_chain`, a `"<seq>:<sha256 digest>"` string, and a
+sidecar file `metrics.chain.json` sits beside `metrics.jsonl` recording the
+run's header, its seed hash, and the current chain head. Together they let
+`verify_metrics_chain` detect a mutated value, a deleted line, a reordering,
+or a fabricated line spliced into the log, and name the exact line index that
+broke.
+
+The header is bound into that same chain rather than sitting next to it as
+free-floating metadata: `verify_metrics_chain` re-derives `seed_hash(header)`
+from the header as read off disk and compares it against the sidecar's
+recorded `seed`, instead of trusting that recorded value as the chain head.
+**A header edited in place — any of `attempt_id`, `problem_id`, `round_id`,
+`seed`, `score_scale`, or `started_at_ms`, with `metrics.jsonl` left
+byte-for-byte untouched — is therefore its own FAIL cause**, distinct from
+the line-scoped ones above: `reason="metrics.chain.json 'seed' does not
+match the recorded header (header altered)"`, with `first_bad_index=None`
+because the break is not scoped to any one line — it is the run's identity,
+not one of its recorded steps, that no longer matches. A companion check,
+`reconcile_summary`, re-derives `metrics.json` from the raw log and
+separately catches an honest log with a doctored summary written over it —
+but it never inspects the header, so a relabelled chain reconciles perfectly
+clean on its own; the header re-hash above is the only one of the two checks
+that catches a relabelling.
+
+**A FAIL has one more cause that is not tampering: a re-run.** Re-driving an
+attempt reuses the same `attempts/<problem-id>/` directory — a closed
+subscription window, a killed process, or an operator re-driving a round are
+all reachable, ordinary reasons this happens, and nothing in `run_attempt`,
+`run_round`, or the noise-floor runner checks "is this already done" first.
+An honest re-run that simply appended onto whatever `metrics.jsonl` was
+already sitting there would splice two attempts' hash chains into one file —
+two headers, two `_chain` sequences each restarting at `0`, in the same log.
+That is byte-for-byte the shape `verify_metrics_chain` reports for real
+tampering, so an operator reading a bare FAIL would have no way to tell a
+re-drive from an alteration. `MetricsWriter` closes this at the source rather
+than leaving it for the reader to puzzle out: its constructor refuses
+outright — raising `ContractViolationError` — if `metrics.jsonl` already
+exists and is non-empty, before a single line of the new attempt is written.
+The call site rotates the **whole trio** — `metrics.jsonl`,
+`metrics.chain.json`, and `metrics.json` — aside together, into a
+`prior-<N>/` subdirectory of `attempts/<problem-id>/`, before constructing
+the new writer. `N` starts at `1` and increments by finding the first integer
+not already in use: a second attempt into the same directory produces
+`prior-1/`, a third produces `prior-2/`, and so on — nothing is ever
+overwritten or deleted, so a directory that has been re-driven three times
+holds three generations on disk at once. Driven for real (fake solver, three
+attempts of the same problem into one directory):
+
+```
+attempts/s1/
+  metrics.jsonl          ← current (3rd) attempt
+  metrics.chain.json
+  metrics.json
+  progress.svg
+  cap.svg
+  prior-1/                ← 1st attempt, rotated aside before the 2nd started
+    metrics.jsonl
+    metrics.chain.json
+    metrics.json
+  prior-2/                ← 2nd attempt, rotated aside before the 3rd started
+    metrics.jsonl
+    metrics.chain.json
+    metrics.json
+```
+
+Each `prior-N/` directory is a complete, independently verifiable trio in its
+own right — its header carries the superseded attempt's own `attempt_id`, not
+the current one's — because the whole trio rotates together rather than just
+the JSONL. A rotation that preserved an orphaned chain sidecar with no
+summary next to it would only be half a fix.
+
+**Telling a re-drive apart from an alteration.** `verify`'s directory walk
+finds *every* directory anywhere under `<path>` containing a file literally
+named `metrics.jsonl`, at any depth — which means it walks into `prior-N/`
+subdirectories too and prints a separate `OK`/`FAIL` line for each one. **A
+rotated-aside file is not invisible to `verify` and can itself report a
+FAIL** — the discriminator an operator actually has is *which path* the FAIL
+line names, not whether one exists at all. Run for real against a directory
+holding a current attempt plus two rotated-aside ones:
+
+```
+$ .venv/bin/python -m turing.research.loop.verify <results-root>
+.../attempts/s1: OK (4 line(s) checked)
+.../attempts/s1/prior-1: OK (4 line(s) checked)
+.../attempts/s1/prior-2: OK (4 line(s) checked)
+detects alteration; does not prevent it — see OPEN-QUESTIONS R2/Q11
+```
+
+The presence of one or more `prior-N/` siblings next to the current
+`metrics.jsonl` is the on-disk signature of a re-drive; every honest
+generation there, current or rotated, verifies clean independently. A FAIL
+against the **current** attempt's own `metrics.jsonl` — the path `verify`
+prints with no `prior-N` component — means the record you are relying on
+*right now* is corrupt or altered, exactly as the rest of this section says.
+A FAIL against a `prior-N/` path means that one **superseded** generation is
+corrupt; it does not implicate the current attempt, but it is also not
+automatically explained by "it's just a re-drive" — read on for the one
+reachable, genuinely benign way that happens, and note that this module
+cannot tell it apart from tampering on its own.
+
+**A killed process can produce a rotated-aside FAIL that is not tampering,
+and `verify` cannot tell the difference.** `MetricsWriter.append` is not
+atomic across a process kill: if the process dies mid-write, `metrics.jsonl`
+is left with a truncated, malformed final line. Rotation does not validate
+what it moves — `_rotate_stale_metrics` checks only that the file exists and
+is non-empty, never that it parses — so that malformed line survives the move
+into `prior-N/` unchanged, and the *next* attempt (which never touches the
+malformed file) is unaffected and verifies clean on its own. Reproduced for
+real: after truncating a completed attempt's `metrics.jsonl` mid-line to
+simulate a kill, then driving a second attempt into the same directory:
+
+```
+$ .venv/bin/python -m turing.research.loop.verify <results-root>
+.../attempts/s1: OK (4 line(s) checked)
+.../attempts/s1/prior-1: FAIL chain: line 2 is not valid JSON (first_bad_index=2); summary: 5 field(s) disagree with the raw log (mismatches=['steps_recorded', 'consumed_steps', 'consumed_tokens', 'consumed_wall_clock_seconds', 'outcome'])
+detects alteration; does not prevent it — see OPEN-QUESTIONS R2/Q11
+```
+
+Nothing in this mechanism distinguishes that shape from an actual tamper of
+the rotated file — both look identical on disk and to `verify_metrics_chain`.
+An operator seeing a FAIL on a `prior-N/` path has to reach for context this
+module does not have (was that attempt running when a subscription window
+closed or a process was killed?) rather than reading the FAIL alone as proof
+either way. This is a real limitation, not a reassurance: **a FAIL on a
+rotated-aside generation is not automatically benign just because it is
+rotated aside.**
+
+**A read-only `attempts/<problem-id>/` directory makes the re-drive itself
+fail loudly, not silently.** `_rotate_stale_metrics` is called at the very
+start of `run_attempt`, before a single line of the new attempt is written,
+and it is **not** wrapped in the try/except that guards the summary and plot
+writers later in the function. Reproduced for real by chmod'ing a completed
+attempt's directory to `555` and driving a second attempt into it:
+
+```
+PermissionError: [Errno 13] Permission denied: '.../attempts/s1/prior-1'
+  ...
+  File ".../loop/runner.py", in _rotate_stale_metrics
+    prior_dir.mkdir(parents=True, exist_ok=True)
+```
+
+The exception propagates straight out of `run_attempt` uncaught — there is no
+silent skip, no silent overwrite, and no attempt at partial rotation. The
+whole re-drive raises before the new writer is even constructed, which is the
+correct failure mode for a directory the loop cannot actually write to: a
+round or noise-floor run driven against read-only results storage stops
+instead of quietly producing a record that looks complete but is missing the
+attempt that failed to start.
+
+**Read this before trusting a green result from either check, because it is
+the honesty statement this whole mechanism is built on and it is not
+softened anywhere else in this codebase either:**
+
+> This module makes tampering **detectable**. It does not make it **impossible**,
+> and no docstring, log line, or CLI output in this codebase may claim that it
+> does. `OPEN-QUESTIONS.md` **R2** records that the `turing` sandbox user is
+> provisioned and never used — `research_workspace_root` defaults to the
+> *operator's* home and nothing drops privileges — so agent-authored code runs
+> as the operator today. `verify_metrics_chain` re-derives the header's hash and
+> compares it against the recorded seed, so editing the header alone —
+> `attempt_id`, `problem_id`, `round_id`, `seed`, `score_scale`, or
+> `started_at_ms`, with every digest and every byte of `metrics.jsonl` left as
+> it was — is now a nameable FAIL, not a silent pass. What still verifies clean
+> is the *full* recomputation: a process that can write anywhere the operator
+> can write can rewrite this entire chain from a forged header down —
+> recomputing every digest from it and rewriting the sidecar to match — and
+> produce a file that verifies clean. Nothing in this module can tell that
+> apart from a genuine run, because the header is bound *into* the chain and
+> never anchored to anything outside it, so a self-consistent forgery is
+> indistinguishable from a real one by construction. Prevention needs R2
+> (privilege separation, results root not
+> writable by the agent) and **Q11** (harness physically unreachable). Until
+> those land, a green verdict from this module means "not casually altered", not
+> "provably genuine".
+>
+> Second, narrower point that must not be blurred: a valid chain proves a number
+> was not changed **after it was recorded**. It says nothing about whether the
+> number is **meaningful**. A wrong verifier produces wrong numbers that chain
+> perfectly.
+
+A reader who takes a green `verify` result as proof that a number is real has
+been misled by this document. It is not proof. It is a tripwire against
+casual, accidental, or unsophisticated alteration, running on a machine where
+the same account that could alter the record also produced it.
+
+**Running the check:**
+
+```bash
+.venv/bin/python -m turing.research.loop.verify <path> [--json]
+```
+
+`<path>` can be one attempt directory, one round, one `loop-<slug>/`
+directory, or the whole results root — the CLI walks it for every directory
+containing a `metrics.jsonl` and checks each one. Human-readable output is one
+`OK` / `FAIL` line per run, with a reason and the failing line index (or the
+mismatch list) on `FAIL`. `--json` prints one JSON object per run instead, for
+scripting. **Exit code is `0` only when every run in `<path>` passes both the
+chain check and the summary reconciliation, `1` otherwise** — an operator
+wiring this into a pre-writeup check needs the exit code to mean something on
+its own, without reading the text. Every invocation, clean or tampered, also
+prints a trailing line stating the limitation above in full:
+`detects alteration; does not prevent it — see OPEN-QUESTIONS R2/Q11`. That
+line is not decoration; a tool that printed a bare `OK` would be read as a
+claim of authenticity it cannot back.
