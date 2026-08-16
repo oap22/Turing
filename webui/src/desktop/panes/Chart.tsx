@@ -18,9 +18,33 @@
 import { useEffect, useRef, useState } from "react";
 
 interface Series {
+  /**
+   * Stable identity, independent of what the series is *called*. Optional so a
+   * caller with genuinely unique labels needn't invent one; see `seriesKey`
+   * for why relying on the label instead is not safe.
+   */
+  id?: string;
   label: string;
   points: Array<[number, number]>;
   color?: string;
+}
+
+// A React key has to be unique and stable. `label` is neither by construction:
+// it is a display string, and MetricsPane composes it as `<run>/<series
+// title>`, so two runs charting the same series produce the *same* key. That
+// is not theoretical — with every run mislabelled by the loop name, a real
+// session logged "Encountered two children with the same key" 442 times and
+// React left the duplicate-keyed nodes mounted. Switching series with two runs
+// pinned then accumulated 3 → 4 → 5 → 6 polylines, and the stale ones were
+// rescaled onto the new axis: old `consumed_steps` and `speedup_ratio` data
+// drawn as entirely plausible-looking `progress` curves. Fabricated data that
+// reads as real is the worst failure this pane has, so the key must not depend
+// on a display string even after the labels are fixed upstream.
+//
+// The two branches are namespaced apart so a caller that supplies `id` for
+// some series and not others cannot collide an id of "0" with index 0.
+function seriesKey(s: Series, index: number): string {
+  return s.id !== undefined ? `id:${s.id}` : `idx:${index}`;
 }
 
 interface Props {
@@ -115,7 +139,7 @@ export default function Chart({ series, height = 120 }: Props) {
         {series.map((s, i) => {
           const latest = s.points.length > 0 ? s.points[s.points.length - 1][1] : null;
           return (
-            <span key={s.label} style={{ color: s.color ?? colorFor(i) }}>
+            <span key={seriesKey(s, i)} style={{ color: s.color ?? colorFor(i) }}>
               {s.label}
               {latest !== null ? `: ${formatSig(latest)}` : ""}
             </span>
@@ -153,8 +177,10 @@ export default function Chart({ series, height = 120 }: Props) {
             const points = s.points.map(([x, y]) => `${toSvgX(x)},${toSvgY(y)}`).join(" ");
             return (
               <polyline
-                key={s.label}
-                data-testid={`chart-line-${s.label}`}
+                key={seriesKey(s, i)}
+                // Keyed by the same rule as the React key, so the testid is
+                // unique for the same reason the key is.
+                data-testid={`chart-line-${seriesKey(s, i)}`}
                 points={points}
                 fill="none"
                 stroke={s.color ?? colorFor(i)}

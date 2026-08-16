@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   type ImageEntry,
   ageLabel,
+  describeImage,
   mimeFor,
   newerCount,
   nextSelection,
@@ -136,5 +137,90 @@ describe("presentation helpers", () => {
     expect(ageLabel(now - 7_200_000, now)).toBe("2h");
     // Clock skew on a mirrored file must not render "-3s".
     expect(ageLabel(now + 3_000, now)).toBe("0s");
+  });
+});
+
+describe("describeImage", () => {
+  it("distinguishes two same-named plots from different attempts (defect D)", () => {
+    // The reported bug: 18 rows all reading "cap.svg" / "progress.svg" with
+    // nothing in the visible label to tell one attempt's chart from
+    // another's.
+    const a = describeImage(
+      img("loop-probe/round-00/attempts/flat-baseline/cap.svg", 100),
+    );
+    const b = describeImage(
+      img(
+        "loop-probe/round-00/attempts/cuda/matmul-speedup/cap.svg",
+        100,
+      ),
+    );
+    expect(a.label).not.toBe(b.label);
+    expect(a.label).toContain("flat-baseline");
+    expect(b.label).toContain("cap");
+  });
+
+  it("renders a nested problem id legibly, not flattened or truncated", () => {
+    const { label } = describeImage(
+      img(
+        "loop-probe/round-00/attempts/cuda/matmul-speedup/progress.svg",
+        100,
+      ),
+    );
+    expect(label).toContain("cuda/matmul-speedup");
+    expect(label).toContain("round-00");
+    expect(label).toContain("progress");
+  });
+
+  it("labels a round-level plot (no attempt) with its round and chart", () => {
+    const { label } = describeImage(img("loop-probe/round-01/scores.svg", 100));
+    expect(label).toBe("round-01 · scores");
+  });
+
+  it("marks a prior-N/ plot as superseded", () => {
+    const { label, superseded } = describeImage(
+      img(
+        "loop-probe/round-00/attempts/cuda/matmul-speedup/prior-1/cap.svg",
+        100,
+      ),
+    );
+    expect(superseded).toBe(true);
+    expect(label).toContain("prior #1");
+    // Still identifies the round and attempt — marked, not stripped of
+    // context, since the whole point is telling it apart from the live one.
+    expect(label).toContain("round-00");
+    expect(label).toContain("cuda/matmul-speedup");
+  });
+
+  it("does not mark a problem id that merely contains the text prior-N", () => {
+    // _PRIOR_DIR_PATTERN in runner.py is matched with .fullmatch() against a
+    // whole path segment, not searched for as a substring. A problem id
+    // like "prior-benchmark-1" (or nested under one) must not be flagged.
+    const { label, superseded } = describeImage(
+      img(
+        "loop-probe/round-00/attempts/cuda/prior-benchmark-1/cap.svg",
+        100,
+      ),
+    );
+    expect(superseded).toBe(false);
+    expect(label).not.toContain("prior #");
+    expect(label).toContain("cuda/prior-benchmark-1");
+  });
+
+  it("carries the full root/rel_path in title for the hover fallback", () => {
+    const { title } = describeImage(
+      img("loop-probe/round-00/attempts/flat-baseline/cap.svg", 100, "results"),
+    );
+    expect(title).toBe(
+      "results/loop-probe/round-00/attempts/flat-baseline/cap.svg",
+    );
+  });
+
+  it("falls back to a directory hint for a path outside the round/attempts shape", () => {
+    // Vault images (or anything under `results` that isn't a research run)
+    // have no round/attempts structure to parse.
+    const { label } = describeImage(
+      img("Personal/NVIDIA GTC/AI/diagram.png", 100, "vault"),
+    );
+    expect(label).toBe("Personal/NVIDIA GTC/AI/diagram");
   });
 });

@@ -29,6 +29,104 @@ export function relTail(relPath: string): string {
   return parts[parts.length - 1] ?? relPath;
 }
 
+//: A round directory, as `RoundRunner`/`trajectory.py` names it
+//: (`round-{index:02d}`). Anchored so a problem id segment that merely
+//: starts with the text (`round-robin/...`) is not mistaken for one.
+const ROUND_DIR = /^round-(\d+)$/;
+
+//: Mirrors `_PRIOR_DIR_PATTERN` in `research/loop/runner.py` exactly —
+//: `re.compile(r"prior-\d+")`, matched there with `.fullmatch()` against a
+//: single path segment. Testing the *whole* segment (via `^`/`$`, same as
+//: `fullmatch`) rather than searching the full rel_path is what keeps a
+//: problem id that merely contains the text — `cuda/prior-benchmark`, say —
+//: from being flagged as a rotated generation it isn't.
+const PRIOR_DIR = /^prior-(\d+)$/;
+
+export interface ImageLabel {
+  /** Short, disambiguating text for the narrow list row. */
+  label: string;
+  /** Full `root/rel_path` for a `title` attribute — the cheap hover fallback
+   * for whatever the visible label had to abbreviate. */
+  title: string;
+  /** True when this plot was rotated aside by `_rotate_stale_metrics` — a
+   * superseded generation of a re-driven attempt, not the current one. */
+  superseded: boolean;
+}
+
+/**
+ * Turn a raw `root`/`rel_path` into a label that identifies a plot instead
+ * of just naming its file.
+ *
+ * The pane used to show `relTail()` alone, so 18 rows read as `cap.svg` /
+ * `progress.svg` / `scores.svg` on repeat — indistinguishable, because the
+ * round, the attempt, and (for `prior-N/`) the generation all live in the
+ * *directory* part of the path that `relTail` throws away. This walks the
+ * same directory structure `RoundRunner` writes
+ * (`round-N/attempts/<problem.id>/[prior-N/]<chart>.svg`, or
+ * `round-N/<chart>.svg` for a round-level plot like `scores.svg`) and
+ * reassembles round, attempt, and chart into one readable label.
+ *
+ * `problem.id` is an unvalidated path component (RES-16) that operators may
+ * namespace, e.g. `cuda/matmul-speedup` — see `_viewer_runs`'s docstring in
+ * `runner.py`. Everything between `attempts/` and the chart file (skipping a
+ * `prior-N/` segment, if present) is joined back into that id rather than
+ * assumed to be one segment, so a nested id renders as `cuda/matmul-speedup`
+ * instead of being flattened or truncated to just `matmul-speedup`.
+ *
+ * A path that doesn't match this shape (anything under the `vault` root, or
+ * a `results` file outside the round/attempts tree) still gets a directory
+ * hint instead of falling back to the bare filename — the ambiguity this
+ * function exists to fix isn't specific to research runs.
+ */
+export function describeImage(entry: ImageEntry): ImageLabel {
+  const segments = entry.rel_path.split("/");
+  const fileName = segments[segments.length - 1] ?? entry.rel_path;
+  const chart = fileName.replace(/\.[^.]+$/, "");
+  const title = `${entry.root}/${entry.rel_path}`;
+
+  let round: string | null = null;
+  let attemptSegs: string[] = [];
+  let priorGen: number | null = null;
+  let inAttempts = false;
+
+  for (const seg of segments.slice(0, -1)) {
+    const roundMatch = ROUND_DIR.exec(seg);
+    if (roundMatch) {
+      round = seg;
+      inAttempts = false;
+      attemptSegs = [];
+      continue;
+    }
+    if (seg === "attempts") {
+      inAttempts = true;
+      continue;
+    }
+    const priorMatch = PRIOR_DIR.exec(seg);
+    if (priorMatch) {
+      priorGen = Number(priorMatch[1]);
+      continue;
+    }
+    if (inAttempts) attemptSegs.push(seg);
+  }
+
+  const superseded = priorGen !== null;
+  let label: string;
+  if (round || attemptSegs.length > 0) {
+    const parts = [round, attemptSegs.join("/") || null, chart].filter(
+      (p): p is string => !!p,
+    );
+    label = parts.join(" · ");
+  } else {
+    // Not a recognized research-run layout (a vault image, most likely).
+    // The parent directory is still cheap disambiguation over the bare name.
+    const dir = segments.slice(0, -1).join("/");
+    label = dir ? `${dir}/${chart}` : chart;
+  }
+  if (superseded) label += ` · prior #${priorGen}`;
+
+  return { label, title, superseded };
+}
+
 export function ageLabel(mtimeMs: number, nowMs: number): string {
   const s = Math.max(0, Math.floor((nowMs - mtimeMs) / 1000));
   if (s < 60) return `${s}s`;
