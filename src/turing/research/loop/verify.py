@@ -202,6 +202,12 @@ def find_runs(root: Path) -> list[Path]:
     next attempt into this directory heals on its own. The check is by path
     *segment*, not prefix, so a legitimate ``prior-N/`` — which this walk
     must keep finding — is never caught by it.
+
+    The narrow corollary: if the crash landed on the final rename and the
+    staged run was the *only* run under ``root``, this returns nothing and
+    the CLI reports ``no metrics.jsonl found`` (exit 1) until the next
+    attempt into that directory heals it. That is a "nothing checked" report,
+    not a clean one, and it is honest about which.
     """
     return sorted(
         {
