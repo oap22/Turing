@@ -81,6 +81,7 @@ from turing.research.loop.metrics import (
 from turing.research.loop.plots import PLOT_FILENAMES, render_attempt_plots, render_round_plot
 from turing.research.loop.protocols import SolverTask, SystemClock
 from turing.research.loop.results import (
+    METRICS_VERDICT_FILENAME,
     MetricsLine,
     MetricsWriter,
     Outcome,
@@ -346,7 +347,11 @@ _METRICS_TRIO = ("metrics.jsonl", "metrics.chain.json", "metrics.json")
 #:
 #: Named files rather than a glob over ``*.svg``: rotation must never sweep
 #: aside a file the runner did not write.
-_ROTATED_NAMES: tuple[str, ...] = (*_METRICS_TRIO, *PLOT_FILENAMES)
+#: ``metrics.verdict.json`` joins them for the same displaced-staleness reason:
+#: it reports a line count for the chain it was written beside, so left in
+#: place it would describe the superseded generation's log while sitting next
+#: to the new one, and the desktop's badge would read ``stale`` forever.
+_ROTATED_NAMES: tuple[str, ...] = (*_METRICS_TRIO, METRICS_VERDICT_FILENAME, *PLOT_FILENAMES)
 
 #: Matches the subdirectory names :func:`_rotate_stale_metrics` creates. Used
 #: by :meth:`RoundRunner._viewer_runs` to tell a superseded chain from a live
@@ -371,7 +376,7 @@ _PRIOR_DIR_PATTERN = re.compile(r"prior-\d+")
 #: problem-id path segment (``contracts._reject_unsafe_problem_id`` already
 #: refuses ids that could shadow ``prior-<digits>``; a dot-prefixed name
 #: needs no matching refusal because no problem id may contain one).
-_STAGING_DIR_NAME = ".rotating"
+_STAGING_DIR_NAME = integrity.STAGING_DIR_NAME
 
 
 def _next_free_prior_suffix(metrics_dir: Path) -> int:

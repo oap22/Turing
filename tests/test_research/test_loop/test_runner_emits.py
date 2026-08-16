@@ -40,8 +40,8 @@ from turing.research.loop.integrity import (
 from turing.research.loop.metrics import SaturationVerdict
 from turing.research.loop.noise_floor import NoiseFloorConfig, NoiseFloorRunner
 from turing.research.loop.protocols import SolverStep
+from turing.research.loop.results import METRICS_VERDICT_FILENAME, Outcome
 from turing.research.loop.results import MetricsWriter as results_MetricsWriter
-from turing.research.loop.results import Outcome
 from turing.research.loop.results import _validate_scored_metric as results_validate
 from turing.research.loop.runner import PassCriterion
 
@@ -975,6 +975,78 @@ class TestStagingDirectoryNeverReportsAsARun:
 
         with pytest.raises(ContractViolationError, match=r"\.rotating"):
             _rotate_stale_metrics(metrics_dir)
+
+
+# --------------------------------------------------------------------------- #
+# RES-18 — the verdict the desktop's badge reads
+# --------------------------------------------------------------------------- #
+
+
+class TestTheLoopStampsItsOwnVerdict:
+    """``metrics.verdict.json``, driven against the real emitter.
+
+    The desktop's metrics pane reads files; it cannot run ``verify``. So the
+    loop runs it at the end of every attempt and leaves the answer beside the
+    summary. These tests pin the three things the pane's badge depends on: the
+    file lands, its ``lines_checked`` is the count the pane will compare
+    against its own parse, and the file is invisible to every check it reports
+    on.
+    """
+
+    async def test_a_real_attempt_leaves_an_ok_verdict_matching_its_log(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        await runner.run_attempt(
+            make_problem("s1", scores=(1.0, 5.0)),
+            make_config(pass_criteria={"s1": PassCriterion(min_score=2.0)}),
+            output_dir=store.round_dir(0),
+        )
+
+        metrics_dir = store.round_dir(0) / "attempts" / "s1"
+        payload = json.loads((metrics_dir / METRICS_VERDICT_FILENAME).read_text())
+        assert payload["state"] == "ok"
+        log_lines = (metrics_dir / "metrics.jsonl").read_text().rstrip("\n").split("\n")
+        assert payload["lines_checked"] == len(log_lines)
+        assert payload["checked_by"] == "loop"
+
+        # And it changed nothing about what verify itself sees.
+        assert verify_cli.find_runs(metrics_dir) == [metrics_dir]
+        assert (await verify_cli.verify_run(metrics_dir)).state is verify_cli.RunState.OK
+
+    async def test_a_redrive_rotates_the_verdict_aside_with_its_trio(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """A verdict left behind would describe the superseded generation's log.
+
+        Rotation is what keeps a superseded attempt's evidence together and
+        out of the live directory; a verdict file exempted from it would sit
+        beside the *new* chain claiming a line count from the old one — which
+        the pane would read as ``stale`` forever, on data nobody touched.
+        Driven through the public re-drive path only.
+        """
+        config = make_config(pass_criteria={"s1": PassCriterion(min_score=2.0)})
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        metrics_dir = store.round_dir(0) / "attempts" / "s1"
+
+        await runner.run_attempt(
+            make_problem("s1", scores=(1.0, 5.0)), config, output_dir=store.round_dir(0)
+        )
+        first_verdict = (metrics_dir / METRICS_VERDICT_FILENAME).read_bytes()
+
+        await runner.run_attempt(
+            make_problem("s1", scores=(1.0, 5.0)), config, output_dir=store.round_dir(0)
+        )
+
+        prior = metrics_dir / "prior-1"
+        assert (prior / METRICS_VERDICT_FILENAME).read_bytes() == first_verdict
+        # The live directory has its own, freshly written, not the old one.
+        assert (metrics_dir / METRICS_VERDICT_FILENAME).is_file()
+        assert json.loads((prior / METRICS_VERDICT_FILENAME).read_text())["state"] == "ok"
+        assert json.loads((metrics_dir / METRICS_VERDICT_FILENAME).read_text())["state"] == "ok"
+        # The rotated generation is still exactly one independently checkable
+        # run — the verdict file joining it is not a second one.
+        assert sorted(p.name for p in verify_cli.find_runs(metrics_dir)) == ["prior-1", "s1"]
 
 
 # --------------------------------------------------------------------------- #

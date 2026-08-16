@@ -5,14 +5,22 @@ import { createElement } from "react";
 import { render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  VERDICT_QUALIFIER,
+  badgeLabelOf,
+  badgeRunTailOf,
+  badgeStateOf,
+  badgeTitleOf,
+  chainDigestOfLastLine,
   etaOf,
   isChartRunFile,
   matchesViewerRuns,
   parseMetricsText,
+  parseVerdictFile,
   parseViewerFile,
   pickSeries,
   runIdOf,
   seriesOf,
+  verdictPathOf,
 } from "../desktop/panes/metrics";
 import Chart from "../desktop/panes/Chart";
 
@@ -385,5 +393,316 @@ describe("parseViewerFile", () => {
     expect(parseViewerFile("null")).toBeNull();
     expect(parseViewerFile("42")).toBeNull();
     expect(parseViewerFile('"loss"')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// metrics.verdict.json — what the badge beside the run selector is derived from
+// ---------------------------------------------------------------------------
+
+// The digest the loop recorded, and the digest the pane's last parsed line
+// carries. `results.write_attempt_verdict` copies `chain_head` straight out of
+// the sidecar's `"final"`, and `MetricsWriter._append_sync` writes that same
+// digest into the last line's `_chain` as `"<seq>:<digest>"` — so these two
+// strings are the same string whenever the pane has read the whole log.
+const HEAD = "b7f0".repeat(16);
+const CHECKED_AT_MS = 1786845156000;
+
+/** The shape `results.write_attempt_verdict` emits. */
+function verdictJson(extra: Record<string, unknown> = {}): string {
+  return JSON.stringify(
+    {
+      schema_version: 1,
+      state: "ok",
+      lines_checked: 4,
+      checked_at_ms: CHECKED_AT_MS,
+      checked_by: "loop",
+      chain_head: HEAD,
+      detail: "/results/round-00/attempts/s1: OK (4 line(s) checked)",
+      note: "detects alteration; does not prevent it — see OPEN-QUESTIONS R2/Q11",
+      ...extra,
+    },
+    null,
+    2,
+  );
+}
+
+describe("verdictPathOf", () => {
+  it("names the verdict beside the run file, not beside the results root", () => {
+    expect(verdictPathOf("loop/round-00/attempts/s1/metrics.jsonl")).toBe(
+      "loop/round-00/attempts/s1/metrics.verdict.json",
+    );
+  });
+
+  it("handles a run file sitting directly at the results root", () => {
+    expect(verdictPathOf("metrics.jsonl")).toBe("metrics.verdict.json");
+  });
+});
+
+describe("parseVerdictFile", () => {
+  it("reads the emitted shape", () => {
+    expect(parseVerdictFile(verdictJson())).toEqual({
+      state: "ok",
+      linesChecked: 4,
+      checkedAtMs: CHECKED_AT_MS,
+      checkedBy: "loop",
+      chainHead: HEAD,
+      detail: "/results/round-00/attempts/s1: OK (4 line(s) checked)",
+    });
+  });
+
+  it("reads the two non-ok states", () => {
+    expect(parseVerdictFile(verdictJson({ state: "failed" }))?.state).toBe("failed");
+    expect(parseVerdictFile(verdictJson({ state: "incomplete" }))?.state).toBe("incomplete");
+  });
+
+  it("returns null rather than guessing when the state is unknown or absent", () => {
+    // A file this reader cannot understand must read as "no verdict", never
+    // as a passing one: the badge's whole job is to not overclaim.
+    expect(parseVerdictFile(verdictJson({ state: "probably-fine" }))).toBeNull();
+    expect(parseVerdictFile('{"lines_checked":4}')).toBeNull();
+    expect(parseVerdictFile("not json")).toBeNull();
+    expect(parseVerdictFile("null")).toBeNull();
+    expect(parseVerdictFile("[]")).toBeNull();
+  });
+
+  it("returns null when lines_checked is missing or not a number", () => {
+    // Without it there is nothing to compare the pane's own parse against,
+    // so every badge would be a guess about whether it is current.
+    expect(parseVerdictFile(verdictJson({ lines_checked: "4" }))).toBeNull();
+    expect(parseVerdictFile('{"state":"ok"}')).toBeNull();
+  });
+
+  it("tolerates missing optional fields", () => {
+    expect(parseVerdictFile('{"state":"ok","lines_checked":0}')).toEqual({
+      state: "ok",
+      linesChecked: 0,
+      checkedAtMs: null,
+      checkedBy: null,
+      chainHead: null,
+      detail: null,
+    });
+  });
+});
+
+describe("chainDigestOfLastLine", () => {
+  // `MetricsWriter._append_sync`: `payload["_chain"] = f"{seq}:{digest}"`.
+  function line(seq: number, digest: string): string {
+    return JSON.stringify({ step: seq + 1, loss: 0.5, _chain: `${seq}:${digest}` });
+  }
+
+  it("returns the digest half of the last line's `_chain`", () => {
+    expect(chainDigestOfLastLine([line(0, "aa"), line(1, HEAD)].join("\n"))).toBe(HEAD);
+  });
+
+  it("ignores the sequence number, which is not what `chain_head` records", () => {
+    expect(chainDigestOfLastLine(line(41, HEAD))).toBe(HEAD);
+  });
+
+  it("is null when no line carries a usable `_chain`", () => {
+    expect(chainDigestOfLastLine("")).toBeNull();
+    expect(chainDigestOfLastLine('{"step":1,"loss":0.5}')).toBeNull();
+    expect(chainDigestOfLastLine('{"step":1,"_chain":7}')).toBeNull();
+    expect(chainDigestOfLastLine('{"step":1,"_chain":"nocolon"}')).toBeNull();
+    expect(chainDigestOfLastLine('{"step":1,"_chain":"0:"}')).toBeNull();
+  });
+
+  it("ignores trailing blank lines, which the writer's own `\\n` produces", () => {
+    expect(chainDigestOfLastLine(`${line(0, "aa")}\n${line(1, HEAD)}\n`)).toBe(HEAD);
+    expect(chainDigestOfLastLine(`${line(1, HEAD)}\n\n  \n`)).toBe(HEAD);
+  });
+
+  it("is null — not the last good line's digest — when the last line does not parse", () => {
+    // `verify` on disk fails a log whose last line is garbage; skipping back
+    // to the last good line would keep the badge green over exactly the bytes
+    // the verifier rejects. `fs_tail` holds a mid-write fragment back, so an
+    // unparseable last line here is a real one, not a writer mid-append.
+    expect(chainDigestOfLastLine(`${line(0, HEAD)}\ngarbage\n`)).toBeNull();
+    expect(chainDigestOfLastLine(`${line(0, HEAD)}\n{"step":2,"loss":1}\n`)).toBeNull();
+    expect(chainDigestOfLastLine(`${line(0, HEAD)}\n[1,2]\n`)).toBeNull();
+    expect(chainDigestOfLastLine(`${line(0, HEAD)}\n{"step":2,"_ch`)).toBeNull();
+  });
+});
+
+describe("badgeStateOf", () => {
+  const ok = parseVerdictFile(verdictJson());
+
+  it("is verified only when the verdict's chain head is the pane's own last line", () => {
+    expect(badgeStateOf(ok, 4, HEAD)).toBe("verified");
+  });
+
+  it("is stale when the pane's last line is not the line the loop checked", () => {
+    // The gate is the bytes, not the count: a log that was re-driven to the
+    // same length as the checked one is a different log, and the digest is
+    // what says so.
+    expect(badgeStateOf(ok, 4, "0000".repeat(16))).toBe("stale");
+    expect(badgeStateOf(ok, 4, null)).toBe("stale");
+  });
+
+  it("is stale when the verdict recorded no chain head to bind to", () => {
+    // No head means the sidecar could not be read; there is nothing to bind
+    // the badge to, and a green chip would be asserting a match nobody made.
+    expect(badgeStateOf(parseVerdictFile(verdictJson({ chain_head: null })), 4, HEAD)).toBe(
+      "stale",
+    );
+  });
+
+  it("is stale when the log has grown or shrunk since the loop checked", () => {
+    expect(badgeStateOf(ok, 5, HEAD)).toBe("stale");
+    expect(badgeStateOf(ok, 3, HEAD)).toBe("stale");
+  });
+
+  it("is unverified when there is no verdict file", () => {
+    expect(badgeStateOf(null, 4, HEAD)).toBe("unverified");
+    expect(badgeStateOf(undefined, 0, null)).toBe("unverified");
+  });
+
+  it("reports incomplete and failed verdicts as themselves", () => {
+    expect(badgeStateOf(parseVerdictFile(verdictJson({ state: "incomplete" })), 4, HEAD)).toBe(
+      "incomplete",
+    );
+    expect(badgeStateOf(parseVerdictFile(verdictJson({ state: "failed" })), 4, HEAD)).toBe(
+      "failed",
+    );
+  });
+
+  it("never softens a failed verdict into stale, however the bytes moved", () => {
+    // Otherwise appending one line to a log whose chain does not recompute
+    // would downgrade the badge from an accusation to a shrug.
+    const failed = parseVerdictFile(verdictJson({ state: "failed" }));
+    expect(badgeStateOf(failed, 99, "0000".repeat(16))).toBe("failed");
+    expect(badgeStateOf(failed, 0, null)).toBe("failed");
+  });
+
+  it("reports a moved chain head under an incomplete verdict as stale", () => {
+    // "Unfinished as of line 4" says nothing about line 5; the honest badge
+    // is the one saying the verdict no longer describes this file.
+    const incomplete = parseVerdictFile(verdictJson({ state: "incomplete" }));
+    expect(badgeStateOf(incomplete, 6, "0000".repeat(16))).toBe("stale");
+  });
+});
+
+describe("badgeRunTailOf", () => {
+  it("names the segments that tell two runs of one round apart", () => {
+    expect(badgeRunTailOf("loop-probe/round-00/attempts/bad-instrument")).toBe(
+      "round-00/bad-instrument",
+    );
+    expect(badgeRunTailOf("loop-probe/round-00/attempts/cuda/matmul-speedup")).toBe(
+      "cuda/matmul-speedup",
+    );
+  });
+
+  it("degrades to whatever the run id has", () => {
+    expect(badgeRunTailOf("metrics.jsonl")).toBe("metrics.jsonl");
+    expect(badgeRunTailOf("solo")).toBe("solo");
+  });
+});
+
+describe("badgeLabelOf", () => {
+  it("never reads as a trust boundary on the good path", () => {
+    const label = badgeLabelOf("verified");
+    expect(label).toContain("chain ok");
+    expect(label.toLowerCase()).not.toContain("trusted");
+    expect(label.toLowerCase()).not.toContain("verified");
+    expect(label.toLowerCase()).not.toContain("authentic");
+  });
+
+  it("gives every state its own glyph as well as its own words", () => {
+    const labels = (["verified", "stale", "incomplete", "failed", "unverified"] as const).map(
+      badgeLabelOf,
+    );
+    expect(new Set(labels).size).toBe(labels.length);
+    expect(new Set(labels.map((l) => l[0])).size).toBe(labels.length);
+  });
+});
+
+describe("badgeTitleOf", () => {
+  const dir = "loop/round-00/attempts/s1";
+
+  it("carries the honesty qualifier, with the run's own directory in the command", () => {
+    const title = badgeTitleOf("verified", parseVerdictFile(verdictJson()), dir, "results");
+    expect(title).toContain(VERDICT_QUALIFIER.replace("<dir>", `results/${dir}`));
+    expect(title).toContain("python -m turing.research.loop.verify");
+  });
+
+  it("writes a command the operator can paste, rooted where the pane is reading", () => {
+    expect(badgeTitleOf("verified", null, dir, "results")).toContain(
+      `python -m turing.research.loop.verify results/${dir}`,
+    );
+    // No root to name is said, not silently dropped — a bare relative path
+    // would be a command that fails from the operator's shell.
+    expect(badgeTitleOf("verified", null, dir)).toContain(
+      `python -m turing.research.loop.verify <results-root>/${dir}`,
+    );
+  });
+
+  it("offers the independent check from every state, including the failing ones", () => {
+    for (const state of ["verified", "stale", "incomplete", "failed", "unverified"] as const) {
+      const title = badgeTitleOf(state, null, dir, "results");
+      expect(title, state).toContain(`python -m turing.research.loop.verify results/${dir}`);
+    }
+  });
+
+  it("hedges only the green state, and never the accusation", () => {
+    // The qualifier parses against the *verified* clause and nothing else.
+    // Welded onto FAILED it produced "the loop's check FAILED here … — not
+    // proof the numbers are authentic or meaningful", which reads as though
+    // the failure itself were being walked back.
+    const failed = parseVerdictFile(verdictJson({ state: "failed" }));
+    const title = badgeTitleOf("failed", failed, dir, "results");
+    expect(title).toContain("FAILED here");
+    expect(title).not.toContain("not proof the numbers are authentic or meaningful");
+    expect(badgeTitleOf("verified", parseVerdictFile(verdictJson()), dir, "results")).toContain(
+      "not proof the numbers are authentic or meaningful",
+    );
+    for (const state of ["stale", "incomplete", "unverified"] as const) {
+      expect(badgeTitleOf(state, null, dir, "results"), state).not.toContain(
+        "not proof the numbers are authentic or meaningful",
+      );
+    }
+  });
+
+  it("says when the loop last looked, so 'as last checked' names a time", () => {
+    const title = badgeTitleOf("verified", parseVerdictFile(verdictJson()), dir, "results");
+    expect(title).toContain("as last checked by loop at");
+    expect(title).toContain(new Date(CHECKED_AT_MS).toLocaleString());
+  });
+
+  it("describes stale as a mismatch of digests, not as a run still being written", () => {
+    // A live run has no verdict file at all — it renders `unverified`. Calling
+    // stale "the ordinary state of a run still being written" described a
+    // state that cannot happen, and taught the operator to shrug at the one
+    // badge that means the pane and the loop are looking at different bytes.
+    const title = badgeTitleOf("stale", parseVerdictFile(verdictJson()), dir, "results");
+    expect(title).toContain("4");
+    expect(title).toContain("re-driven");
+    expect(title).not.toContain("still being written");
+  });
+
+  it("does not claim nothing was checked while the read is still in flight", () => {
+    // `undefined` is "not read yet", `null` is "read, nothing there". They
+    // share one visual state on purpose; they must not share one sentence.
+    expect(badgeTitleOf("unverified", undefined, dir, "results")).toContain(
+      "reading the verdict",
+    );
+    expect(badgeTitleOf("unverified", undefined, dir, "results")).not.toContain(
+      "never recorded a check here",
+    );
+    expect(badgeTitleOf("unverified", null, dir, "results")).toContain(
+      "never recorded a check here",
+    );
+  });
+
+  it("quotes the loop's own sentence when it has one", () => {
+    // The badge and the terminal must tell the same story, so the reason
+    // travels verbatim from `verify`'s own formatter rather than being
+    // re-worded here.
+    const detail = "/results/…/s1: FAIL chain: line 0 digest does not match the recomputed chain";
+    const title = badgeTitleOf(
+      "failed",
+      parseVerdictFile(verdictJson({ state: "failed", detail })),
+      dir,
+    );
+    expect(title).toContain(detail);
   });
 });

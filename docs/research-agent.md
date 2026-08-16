@@ -1478,6 +1478,67 @@ prints a trailing line stating the limitation above in full:
 line is not decoration; a tool that printed a bare `OK` would be read as a
 claim of authenticity it cannot back.
 
+**The verdict badge — the same check, where the numbers are actually read.**
+An operator reading a curve in the desktop's metrics pane is not running this
+CLI, and the pane cannot run it (this is Python; that is a WebView). So the
+loop runs it *itself*: `results.write_attempt_verdict` calls the same
+`verify_run` at the end of every attempt, immediately after `metrics.json` is
+written, and records the answer beside it in `metrics.verdict.json`:
+
+```json
+{
+  "schema_version": 1,
+  "state": "ok",
+  "lines_checked": 41,
+  "checked_at_ms": 1786845156000,
+  "checked_by": "loop",
+  "chain_head": "9f2c…",
+  "detail": "…/attempts/s1: OK (41 line(s) checked)",
+  "note": "detects alteration; does not prevent it — see OPEN-QUESTIONS R2/Q11"
+}
+```
+
+`state` and `detail` come from `verify_run` and `format_run_verdict` — the
+same two functions this CLI calls — so the badge and the terminal can never
+tell an operator two different stories about one run. The file is a *report
+about* the run, never part of it: the chain does not cover it, `find_runs`
+does not see it (that walk keys on `metrics.jsonl`), reconciliation does not
+read it, and re-running `verify` after it lands returns exactly what it
+returned before. A re-drive rotates it into `prior-N/` with the trio, since a
+verdict left in place would describe the superseded generation's log. A
+directory with no `metrics.jsonl` gets no verdict at all — it is not a run, and
+stamping `failed` on it would manufacture a finding — and any verdict already
+sitting in such a directory is *removed*, because a verdict that outlives its
+log describes bytes that are not there.
+
+**What the badge's green state actually asserts.** `chain_head` is the
+sidecar's recorded final digest, and `MetricsWriter._append_sync` writes that
+same digest into the last line's `_chain` as `"<seq>:<digest>"`. So the pane
+compares the verdict's `chain_head` against the digest carried by the last line
+*it* has parsed: equal means the loop's check ended on exactly the bytes on
+screen. That is the binding — not `lines_checked`, which is shown but is only a
+secondary cross-check, because a line count is a property two different logs
+can share and a re-drive can land on the same one by coincidence. See
+`desktop/README.md`'s "The `metrics` pane's verdict badge" for the five states
+and their precedence (failed > stale > incomplete > verified, with `unverified`
+outside the ladder).
+
+`stale` therefore means *the pane's last parsed line is not the line the loop
+checked* — the pane is behind the file, or the directory was re-driven and the
+verdict describes a generation that is no longer here. It is not the state of a
+run in progress: a live attempt has no verdict beside it (this file is written
+after the summary, once nothing is appending), so it reads `unverified`.
+
+The green badge reads `chain ok`, never "verified", and carries this qualifier
+in its tooltip and in its accessible description: *chain internally consistent
+as last checked by the loop — not proof the numbers are authentic or
+meaningful; run `python -m turing.research.loop.verify <dir>` for an
+independent check*. Everything this section says about what a green `verify`
+does and does not mean applies unchanged to a green badge, which is why the
+badge says so itself. The other four states close on their own words instead:
+welding the qualifier onto `✗ chain FAILED` produced a sentence that read as
+though the failure were being walked back.
+
 ### A round record / trajectory: a lost attempt refuses deltas, not cells
 
 A round that loses an attempt to a contained crash (see "One attempt's

@@ -91,12 +91,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from turing.research.loop.integrity import (
+    STAGING_DIR_NAME as _STAGING_DIR_NAME,
+)
+from turing.research.loop.integrity import (
     ChainState,
     ReconcileState,
     reconcile_summary,
     verify_metrics_chain,
 )
-from turing.research.loop.runner import _STAGING_DIR_NAME
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -112,6 +114,7 @@ __all__ = [
     "RunVerdict",
     "build_parser",
     "find_runs",
+    "format_run_verdict",
     "main",
     "verify_run",
 ]
@@ -279,6 +282,21 @@ async def _verify_all(root: Path) -> list[RunVerdict]:
             )
         ]
     return list(await asyncio.gather(*(verify_run(directory) for directory in run_dirs)))
+
+
+def format_run_verdict(verdict: RunVerdict) -> str:
+    """One human-readable line for one run — exactly what this CLI prints.
+
+    Public because it is not only this CLI's output any more: the loop stamps
+    a machine-readable verdict beside every attempt's summary
+    (:func:`turing.research.loop.results.write_attempt_verdict`) so the
+    desktop's metrics pane can show whether the curve it is drawing verifies,
+    and the human sentence in that file has to be *this* sentence. A second
+    formatter would drift, and the two would eventually describe the same
+    verdict differently — the operator reading the badge and the operator
+    reading the terminal must not be told different stories.
+    """
+    return _format_human(verdict)
 
 
 def _format_human(verdict: RunVerdict) -> str:

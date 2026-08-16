@@ -236,6 +236,103 @@ via tabs, ETA strip naming the run it describes),
 Claude Code / Codex CLI session list + transcript tail), `agentfeed`
 (cross-session tool/assistant activity feed).
 
+### The `metrics` pane's verdict badge
+
+Beside the run selector, one small badge per charted run, carrying that run's
+own distinguishing path tail and saying whether the log under its curve
+verifies. The pane cannot run the verifier — that is Python — so the loop runs
+it at the end of every attempt and writes the answer to `metrics.verdict.json`
+next to `metrics.json`; the badge reads that file. Each chip is a focusable
+`<button>` with the qualifier attached as its accessible description, so the
+sentence that keeps a green chip from reading as "these numbers are real" is
+not reachable by mouse alone.
+
+**The contract.** A run's chart is built only from bytes of **one file
+generation**, applied in order: `fs_tail` reports the chunk's start offset and
+the file's identity; the pane applies a chunk only if its start equals the
+offset it holds *and* the identity matches — a changed identity or a shorter
+file resets the run to that chunk alone; a chunk with any other start is
+discarded, never appended. A trailing partial line is not consumed. `verified`
+means the verdict's `chain_head` equals the `_chain` digest of the **last
+non-blank line the pane holds**, and any last non-blank line it cannot parse
+makes the run `stale` — as does an appended chunk that holds only blank lines,
+which the writer never emits and `integrity.py` treats as a malformed record.
+Every state the badge shows is derived from files that are **currently beside
+the run**, re-read whenever the run's own file changes.
+
+Two limits on "one file generation", stated honestly. (a) Where the platform
+reports no file identity (`dev`/`ino` are `null` — anything but unix),
+identity-based reset is unavailable and detection is length-only: a re-drive
+whose new file is at least as long as the held offset is not seen as a new
+generation there. (b) An in-place rewrite of the **same** inode that ends
+longer than the pane's offset (`cp other.jsonl metrics.jsonl`) is invisible to
+both identity and length; it is caught only by the **seam check** — because a
+held offset always sits just after a `\n`, the first non-blank line of an
+appended chunk must parse as a JSON object, and if it does not the run is
+forgotten and re-read from byte 0. That is a heuristic, not identity: a rewrite
+whose lines happen to end at the same byte offsets as the old ones passes it,
+and the badge then answers for the rewrite's last line over a chart that still
+begins with the old file's points.
+
+Each clause is load-bearing. A line count is a property two different logs can
+share, and a re-drive (the metrics trio and the verdict move together into
+`prior-N/`) puts a fresh, unrelated chain at the same path; binding to the
+digest is what stops a chip going green over bytes nobody checked. The new
+file is a new inode, and its bytes can be at least as long as the offset the
+pane held (a same-length first line; a create and two appends coalesced under
+the watcher's debounce) — which is why the identity, not only the length,
+decides whether a chunk continues the run or replaces it, and why a chunk that
+starts anywhere but at the held offset is dropped rather than guessed about.
+`fs_tail` is issued at most once at a time per run (a request during a read
+coalesces into one follow-up), so two events a few milliseconds apart — the
+last append and the verdict, the ordinary end of every attempt — cannot
+deliver the same bytes twice. And because a file renamed away produces no
+watcher event for its old path, the pane re-reads the verdict on every change
+to the run file too — otherwise the badge would sit green over a directory the
+verdict has left. The reverse edge is covered symmetrically: a verdict event
+re-tails the run, so a watcher event dropped by the 300 ms debounce cannot pin
+a clean run amber forever.
+
+`fs_tail` (`desktop/src-tauri/src/fsroots.rs`) returns
+`{ data, offset, start, dev, ino, restarted }`: `data` is whole lines only —
+bytes `[start, offset)` cut at the last `\n`, the fragment after it re-read
+complete on the next call; `start` is where the read began (the caller's
+offset, or `0` with `restarted: true` when the file was shorter than it);
+`dev`/`ino` are the file's identity on unix and `null` elsewhere. Length and
+identity are read by `fstat` on the handle the bytes are then read from — one
+open, not a stat followed by an open — so a rotation between the two cannot
+label a new file's bytes with the old file's identity. Every offset is computed
+on the bytes in Rust; the pane does no byte arithmetic of its own.
+
+| Badge | Meaning |
+|---|---|
+| `✓ chain ok` | the loop's check passed, and the line it ended on is the last line this pane has parsed |
+| `≠ chain stale` | the pane's last non-blank line does not match the digest the loop last checked — the pane is behind the file, the directory was re-driven and this verdict describes a generation that is no longer here, or the last line does not parse at all (which `verify` would fail; `failed` is reserved for what the loop itself recorded) |
+| `? chain incomplete` | intact chain, no summary beside it, or one a writer was still appending to when the loop looked |
+| `✗ chain FAILED` | the log does not recompute, or its summary disagrees with it. Never softened by a later line landing |
+| `· unverified` | no verdict file beside this run — nothing was checked here. Also what a run **still being written** shows, since the verdict is written only once the attempt ends |
+
+Precedence, when more than one rule could apply: **failed > stale > incomplete
+> verified**, with `unverified` standing outside the ladder for "there is no
+verdict file to read at all". A failure is never softened into `stale` by a
+later line landing, and `verified` is only ever reached by falling all the way
+through.
+
+Note what is *not* a badge state: "the run is still being written". A live
+attempt has no verdict beside it, so it reads `unverified` — never `stale`.
+`stale` always means the pane and the loop are looking at different bytes.
+
+**A green badge is not a trust boundary, and its wording is deliberate.** It
+says `chain ok`, never "verified" or "trusted", and its tooltip carries the
+qualifier in full: *chain internally consistent as last checked by the loop —
+not proof the numbers are authentic or meaningful; run `python -m
+turing.research.loop.verify <dir>` for an independent check*. The chain is
+written by the same account that could rewrite it, a self-consistent forgery
+is undetectable by construction, and a wrong verifier's wrong numbers chain
+perfectly — see `docs/research-agent.md`'s "Integrity, and its limits". The
+badge exists so an operator reading a curve knows whether anyone checked, not
+so a green chip can stand in for having checked.
+
 ### The `flywheel` pane's round timeline
 
 Each round renders as index, the cells it scored, a status glyph, and the
