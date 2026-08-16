@@ -37,6 +37,7 @@ from turing.research.loop.results import (
     read_metrics_points,
     usable_target,
     write_attempt_summary,
+    write_attempt_verdict,
     write_round_summary,
     write_viewer_config,
 )
@@ -1014,6 +1015,28 @@ class TestAttemptVerdict:
         """
         await write_attempt_summary(tmp_path, **_attempt_summary_kwargs())
         assert not (tmp_path / METRICS_VERDICT_FILENAME).exists()
+
+    async def test_a_missing_log_deletes_a_verdict_left_over_from_an_earlier_generation(
+        self, tmp_path: Path
+    ) -> None:
+        """A verdict must never outlive the log it describes.
+
+        The "no ``metrics.jsonl``, no verdict" rule above is about not
+        *manufacturing* a finding, and returning early satisfies that — but
+        only for a directory that was empty to begin with. If a previous
+        generation's verdict is sitting there when the log goes away, leaving
+        it in place hands the pane a green badge over a directory whose chain
+        nobody has checked, which is the same overclaim from the other
+        direction. So the early return removes it first.
+        """
+        stale = tmp_path / METRICS_VERDICT_FILENAME
+        stale.write_text(
+            json.dumps({"schema_version": 1, "state": "ok", "lines_checked": 40}),
+            encoding="utf-8",
+        )
+
+        assert await write_attempt_verdict(tmp_path) is None
+        assert not stale.exists()
 
     async def test_the_verdict_file_is_neither_a_run_nor_tamper_evidence(
         self, tmp_path: Path

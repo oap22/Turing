@@ -238,18 +238,47 @@ Claude Code / Codex CLI session list + transcript tail), `agentfeed`
 
 ### The `metrics` pane's verdict badge
 
-Beside the run selector, one small badge per charted run, saying whether the
-log under that curve verifies. The pane cannot run the verifier — that is
-Python — so the loop runs it at the end of every attempt and writes the answer
-to `metrics.verdict.json` next to `metrics.json`; the badge reads that file.
+Beside the run selector, one small badge per charted run, carrying that run's
+own distinguishing path tail and saying whether the log under its curve
+verifies. The pane cannot run the verifier — that is Python — so the loop runs
+it at the end of every attempt and writes the answer to `metrics.verdict.json`
+next to `metrics.json`; the badge reads that file. Each chip is a focusable
+`<button>` with the qualifier attached as its accessible description, so the
+sentence that keeps a green chip from reading as "these numbers are real" is
+not reachable by mouse alone.
+
+**The contract.** `verified` means the verdict file's `chain_head` equals the
+`_chain` digest of the **last line the pane has parsed** for that run — the
+verdict is bound to the bytes, not to a line count — and every state the badge
+shows is derived from files that are **currently beside the run**, re-read
+whenever the run's own file changes. Both halves are load-bearing. A line count
+is a property two different logs can share, and a re-drive
+(`_rotate_stale_metrics` moves the metrics trio *and* the verdict into
+`prior-N/`) puts a fresh, unrelated chain at the same path; binding to the
+digest is what stops a chip going green over bytes nobody checked. And because
+a file renamed away produces no watcher event for its old path, the pane
+re-reads the verdict on every change to the run file too — otherwise the badge
+would sit green over a directory the verdict has left. The reverse edge is
+covered symmetrically: a verdict event re-tails the run, so a watcher event
+dropped by the 300 ms debounce cannot pin a clean run amber forever.
 
 | Badge | Meaning |
 |---|---|
-| `✓ chain ok` | the loop's check passed, and it covered exactly the number of lines this pane has parsed |
-| `≠ chain stale` | a verdict exists but describes a different line count — the log grew or shrank since. Also the ordinary state of a run **still being written**, since the verdict is written once the attempt ends |
+| `✓ chain ok` | the loop's check passed, and the line it ended on is the last line this pane has parsed |
+| `≠ chain stale` | the pane's last parsed line does not match the digest the loop last checked — the pane is behind the file, or the directory was re-driven and this verdict describes a generation that is no longer here |
 | `? chain incomplete` | intact chain, no summary beside it, or one a writer was still appending to when the loop looked |
 | `✗ chain FAILED` | the log does not recompute, or its summary disagrees with it. Never softened by a later line landing |
-| `· unverified` | no verdict file beside this run — nothing was checked here |
+| `· unverified` | no verdict file beside this run — nothing was checked here. Also what a run **still being written** shows, since the verdict is written only once the attempt ends |
+
+Precedence, when more than one rule could apply: **failed > stale > incomplete
+> verified**, with `unverified` standing outside the ladder for "there is no
+verdict file to read at all". A failure is never softened into `stale` by a
+later line landing, and `verified` is only ever reached by falling all the way
+through.
+
+Note what is *not* a badge state: "the run is still being written". A live
+attempt has no verdict beside it, so it reads `unverified` — never `stale`.
+`stale` always means the pane and the loop are looking at different bytes.
 
 **A green badge is not a trust boundary, and its wording is deliberate.** It
 says `chain ok`, never "verified" or "trusted", and its tooltip carries the

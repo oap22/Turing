@@ -9,14 +9,24 @@
 // must not be built from a display label). Watches `.viewer.json` too, so a
 // coding agent can point the pane at a specific series/run set — see
 // desktop/README.md's "Agent-driven viewing" section for the file format.
+//
+// **The verdict badge's contract.** `verified` means the verdict file's
+// `chain_head` equals the `_chain` digest of the LAST line the pane has parsed
+// for that run — the verdict is bound to the bytes, not to a line count — and
+// every state the badge shows is derived from files that are currently beside
+// the run, re-read whenever the run's own file changes. See `metrics.ts` for
+// why each half is load-bearing; `tailRun` and the `fs-change` handler below
+// are where this pane keeps its end of it.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useId, useMemo, useRef, useState } from "react";
 import { inv, subscribe } from "../tauri";
 import Chart from "./Chart";
 import {
   badgeLabelOf,
+  badgeRunTailOf,
   badgeStateOf,
   badgeTitleOf,
+  chainDigestOfLastLine,
   etaOf,
   isChartRunFile,
   matchesViewerRuns,
@@ -46,6 +56,10 @@ interface RunState {
   offset: number;
   points: Point[];
   arrivals: number[];
+  /** The `_chain` digest of the last line this run has parsed, or `null`.
+   * This is what binds the verdict badge to bytes rather than to a count —
+   * see `chainDigestOfLastLine` in metrics.ts. */
+  lastDigest: string | null;
 }
 
 const RESULTS_ROOT = "results";
@@ -64,6 +78,26 @@ const BADGE_CLASSES: Record<BadgeState, string> = {
   failed: "border-rose-400/40 text-rose-400",
   unverified: "border-term-edge text-term-dim",
 };
+
+/**
+ * Whether two reads of one run's verdict say the same thing.
+ *
+ * `undefined` ("not read yet") is never equal to anything, including `null`:
+ * they share a badge colour but not a sentence, so the first read has to land
+ * even when it lands on nothing.
+ */
+function sameVerdict(a: RunVerdict | null | undefined, b: RunVerdict | null): boolean {
+  if (a === undefined) return false;
+  if (a === null || b === null) return a === b;
+  return (
+    a.state === b.state &&
+    a.linesChecked === b.linesChecked &&
+    a.checkedAtMs === b.checkedAtMs &&
+    a.checkedBy === b.checkedBy &&
+    a.chainHead === b.chainHead &&
+    a.detail === b.detail
+  );
+}
 
 interface RunMultiSelectProps {
   runFiles: Entry[];
@@ -126,6 +160,9 @@ function RunMultiSelect({ runFiles, selected, onChange }: RunMultiSelectProps) {
 }
 
 export default function MetricsPane() {
+  // Prefix for the badges' `aria-describedby` targets, so two panes mounted at
+  // once cannot claim the same ids.
+  const paneId = useId();
   const [runFiles, setRunFiles] = useState<Entry[]>([]);
   const [selected, setSelected] = useState<string[]>(["auto"]);
   const runsRef = useRef<Map<string, RunState>>(new Map());
@@ -173,21 +210,57 @@ export default function MetricsPane() {
   async function tailRun(path: string) {
     let run = runsRef.current.get(path);
     if (!run) {
-      run = { path, label: runIdOf(path), offset: 0, points: [], arrivals: [] };
+      run = { path, label: runIdOf(path), offset: 0, points: [], arrivals: [], lastDigest: null };
       runsRef.current.set(path, run);
     }
-    const chunk = await inv<{ data: string; offset: number }>("fs_tail", {
-      root: RESULTS_ROOT,
-      rel: path,
-      offset: run.offset,
-    });
-    if (chunk.offset === run.offset) return;
+    let chunk: { data: string; offset: number };
+    try {
+      chunk = await inv<{ data: string; offset: number }>("fs_tail", {
+        root: RESULTS_ROOT,
+        rel: path,
+        offset: run.offset,
+      });
+    } catch {
+      // The run file is gone — a re-drive rotated it into `prior-N/` between
+      // the event and this read, or the directory was removed outright. Same
+      // reasoning as `loadVerdict`'s catch: an absent file is a state, not an
+      // error, and letting it reject here would surface as an unhandled
+      // rejection rather than as anything the operator can see. The pane keeps
+      // what it has already parsed; the verdict read running beside this one
+      // is what turns the badge honest.
+      return;
+    }
+    // `fsroots.rs::tail_impl` restarts at byte 0 when the caller's offset is
+    // past the end of the file (`let start = if offset > len { 0 } else
+    // { offset }`), which is exactly what a re-drive produces: the old chain is
+    // rotated away and a shorter, unrelated one takes its place at the same
+    // path. So a chunk that begins before where this run had read to is a
+    // different generation of the file, and appending it would staple a new
+    // attempt onto a rotated-away one — one continuous curve drawn out of two
+    // runs, with the old attempt's series still offered as tabs.
+    //
+    // `chunk.offset` is a byte offset (`start + buf.len()`), so the chunk's
+    // start is recovered with the data's UTF-8 byte length, not its JS string
+    // length — the two agree for the ASCII `json.dumps` writes, but the offset
+    // arithmetic must not silently assume that.
+    const chunkStart = chunk.offset - new TextEncoder().encode(chunk.data).length;
+    const restarted = chunkStart < run.offset;
+    if (!restarted && chunk.offset === run.offset) return;
     run.offset = chunk.offset;
     const newPoints = parseMetricsText(chunk.data);
-    if (newPoints.length > 0) {
+    if (restarted) {
+      run.points = newPoints;
+      run.arrivals = newPoints.length > 0 ? [Date.now()] : [];
+    } else if (newPoints.length > 0) {
       run.points = [...run.points, ...newPoints];
       run.arrivals = [...run.arrivals, Date.now()];
     }
+    // The digest of the last line this run has now parsed — what the badge is
+    // bound to. A chunk carrying no `_chain` at all leaves the previous digest
+    // standing on an append (nothing new was chained) but clears it on a
+    // restart (the previous digest belonged to a file that is no longer here).
+    const digest = chainDigestOfLastLine(chunk.data);
+    run.lastDigest = restarted ? digest : (digest ?? run.lastDigest);
     forceRender((n) => n + 1);
   }
 
@@ -195,7 +268,9 @@ export default function MetricsPane() {
   // `metrics.verdict.json` (`results.write_attempt_verdict`). Keyed by run
   // file path. `undefined` means "not read yet", `null` means "read and there
   // is nothing there" — both render as `unverified`, which is the honest
-  // reading of "this pane has no evidence either way".
+  // reading of "this pane has no evidence either way", but they do not read
+  // as the same sentence (see `clauseOf` in metrics.ts: only one of them is a
+  // fact about the run).
   const [verdicts, setVerdicts] = useState<Record<string, RunVerdict | null>>({});
 
   async function loadVerdict(path: string) {
@@ -211,7 +286,11 @@ export default function MetricsPane() {
       // of every run written before this file existed. Not an error.
       parsed = null;
     }
-    setVerdicts((prev) => ({ ...prev, [path]: parsed }));
+    // Every change to a run file now re-reads its verdict too, so this runs on
+    // every append of a live run whose directory has no verdict in it. Keeping
+    // the same object when nothing changed keeps that from being a re-render
+    // per solver step for a value that reads `null` either way.
+    setVerdicts((prev) => (sameVerdict(prev[path], parsed) ? prev : { ...prev, [path]: parsed }));
   }
 
   const activePaths = useMemo(() => {
@@ -301,8 +380,26 @@ export default function MetricsPane() {
         void loadViewerFile();
         return;
       }
+      // Either half of a run's pair of files changing re-reads BOTH. The badge
+      // is a claim about a verdict and a log *together*, and each file can move
+      // without producing an event of its own for the other:
+      //
+      //   * The verdict can be rotated away with no event at all. `fsroots.rs`
+      //     skips any path that is not a file by the time the handler runs, and
+      //     a file renamed into `prior-N/` is precisely that — so the only
+      //     event a re-drive produces for this directory is one for the new,
+      //     empty `metrics.jsonl`. Re-reading the verdict on the run's own
+      //     event is what stops the badge sitting green over a directory the
+      //     verdict has left.
+      //   * A run append can be dropped: the watcher debounces repeat writes to
+      //     one path inside 300 ms, which a solver stepping faster than ~3 Hz
+      //     hits routinely. If the dropped write was the last one, the verdict
+      //     event that follows it is the pane's only remaining chance to catch
+      //     up — without the re-tail the badge stays amber forever on a run
+      //     that is perfectly clean.
       if (runsRef.current.has(payload.rel_path)) {
         void tailRun(payload.rel_path);
+        void loadVerdict(payload.rel_path);
         return;
       }
       // The loop writes `metrics.verdict.json` once the attempt ends, i.e.
@@ -311,6 +408,7 @@ export default function MetricsPane() {
       for (const runPath of runsRef.current.keys()) {
         if (payload.rel_path === verdictPathOf(runPath)) {
           void loadVerdict(runPath);
+          void tailRun(runPath);
           return;
         }
       }
@@ -380,21 +478,47 @@ export default function MetricsPane() {
             to prevent. See metrics.ts for what these states mean and for why
             the good one reads "chain ok" rather than anything stronger. */}
         {activeRuns.length > 0 && (
-          <div className="flex shrink-0 flex-col gap-px">
+          // Capped and scrollable, matching the run listbox beside it: there is
+          // one chip per charted run and `.viewer.json` can name any number of
+          // them, so an uncapped column grows the header until it pushes the
+          // chart it annotates off the bottom of the pane.
+          <div className="flex max-h-[88px] shrink-0 flex-col gap-px overflow-auto">
             {activeRuns.map((run) => {
               const verdict = verdicts[run.path];
-              const state = badgeStateOf(verdict, run.points.length);
+              const state = badgeStateOf(verdict, run.points.length, run.lastDigest);
+              const title = badgeTitleOf(state, verdict, run.label, RESULTS_ROOT);
+              const describedById = `${paneId}-verdict-${run.path}`;
               return (
-                <span
-                  key={run.path}
-                  data-testid="metrics-verdict"
-                  data-run={run.label}
-                  data-state={state}
-                  title={`${run.label}\n${badgeTitleOf(state, verdict, run.label)}`}
-                  className={`whitespace-nowrap border px-1 text-[10px] ${BADGE_CLASSES[state]}`}
-                >
-                  {badgeLabelOf(state)}
-                </span>
+                // Fragment rather than a wrapper element: the chips are the
+                // column's own children, so the column is what scrolls.
+                <Fragment key={run.path}>
+                  {/* A `<button>` rather than a `<span title=…>`. The title is
+                      reachable by mouse and by nothing else, and the qualifier
+                      — the sentence that keeps a green chip from reading as
+                      "these numbers are real" — is the part of this badge that
+                      must not be mouse-only. The button does not act: it is
+                      focusable so the description can be announced, which is
+                      the whole job. */}
+                  <button
+                    type="button"
+                    data-testid="metrics-verdict"
+                    data-run={run.label}
+                    data-state={state}
+                    title={`${run.label}\n${title}`}
+                    aria-describedby={describedById}
+                    className={`whitespace-nowrap border px-1 text-left text-[10px] ${BADGE_CLASSES[state]}`}
+                  >
+                    {/* The run's distinguishing tail, in the chip's own visible
+                        text. Five identically-worded chips told apart only by
+                        an attribute are unreadable in exactly the case this
+                        badge exists for: one red chip in a stack, and no way to
+                        say which run failed without a mouse. */}
+                    {badgeLabelOf(state)} <span className="opacity-70">{badgeRunTailOf(run.label)}</span>
+                  </button>
+                  <span id={describedById} className="sr-only">
+                    {title}
+                  </span>
+                </Fragment>
               );
             })}
           </div>

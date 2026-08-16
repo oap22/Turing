@@ -247,6 +247,28 @@ export interface ViewerFile {
 // `metrics.verdict.json` — whether the run being charted verifies
 // ---------------------------------------------------------------------------
 //
+// **The contract this badge keeps.** `verified` means the verdict file's
+// `chain_head` equals the `_chain` digest of the LAST line the pane has parsed
+// for that run — the verdict is bound to the bytes, not to a line count — and
+// every state the badge shows is derived from files that are currently beside
+// the run, re-read whenever the run's own file changes.
+//
+// Both halves of that are load-bearing, and each one exists because the other
+// half alone was not enough:
+//
+//   * *Bound to the bytes.* A line count is a property two different logs can
+//     share. `runner._rotate_stale_metrics` moves a finished attempt's whole
+//     trio into `prior-N/` and a fresh, unrelated chain takes its place at the
+//     same path; a badge turning on "the loop checked 4 lines and I parsed 4"
+//     would go green over bytes nobody checked. The digest is the only field
+//     that cannot be re-earned by coincidence.
+//   * *Currently beside the run.* Bytes bind the badge to a log, not to a
+//     verdict that has since been rotated away. So the pane re-reads the
+//     verdict on every change to the run file too — see `MetricsPane`'s
+//     `fs-change` handler — rather than only when the verdict path itself
+//     changes, which for a *renamed-away* file is an event the watcher never
+//     sends (`fsroots.rs` skips paths that are not files at handler time).
+//
 // The chain (`_chain` per line, `metrics.chain.json` beside it) and the
 // verifier that recomputes it are Python, and this pane is not. So the loop
 // runs `verify_run` itself at the end of every attempt and writes the answer
@@ -267,6 +289,58 @@ const VERDICT_BASENAME = "metrics.verdict.json";
 export function verdictPathOf(runFilePath: string): string {
   const cut = runFilePath.lastIndexOf("/");
   return cut < 0 ? VERDICT_BASENAME : `${runFilePath.slice(0, cut + 1)}${VERDICT_BASENAME}`;
+}
+
+//: `integrity.CHAIN_FIELD` — the field `MetricsWriter._append_sync` adds last.
+const CHAIN_FIELD = "_chain";
+
+/**
+ * The digest half of the last line's `_chain`, or `null` if there isn't one.
+ *
+ * This is the pane's side of the byte binding. The Python that writes both
+ * ends of it:
+ *
+ * ```python
+ * digest = integrity.chain_next(self._chain_head, payload)
+ * payload[integrity.CHAIN_FIELD] = f"{self._seq}:{digest}"      # the line
+ * sidecar = {..., "final": digest, "lines": new_lines}          # the sidecar
+ * ```
+ *
+ * and `results.write_attempt_verdict` copies `chain_head` straight out of that
+ * sidecar's `"final"` (`_read_chain_head`). So for a log the pane has read to
+ * the end, `chain_head` and this function's return value are the *same string*
+ * — which is why comparing them is a statement about bytes rather than about
+ * how many lines each side happened to count.
+ *
+ * The sequence number is deliberately dropped: `chain_head` records the digest
+ * alone, and comparing a `"<seq>:"` prefix as well would make the two sides
+ * disagree over a field neither is claiming anything about.
+ *
+ * A line that will not parse is skipped rather than fatal — `fs_tail` hands
+ * back whatever bytes exist, and for a writer mid-append that can end
+ * mid-line. The digest of the last *complete* line is still the honest answer
+ * to "what has this pane parsed".
+ */
+export function chainDigestOfLastLine(text: string): string | null {
+  let digest: string | null = null;
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (t === "") continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(t);
+    } catch {
+      continue;
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) continue;
+    const raw = (parsed as Record<string, unknown>)[CHAIN_FIELD];
+    if (typeof raw !== "string") continue;
+    const cut = raw.indexOf(":");
+    if (cut < 0) continue;
+    const tail = raw.slice(cut + 1);
+    digest = tail === "" ? null : tail;
+  }
+  return digest;
 }
 
 /** `verify.RunState` — the three answers the Python verifier can give. */
@@ -323,34 +397,74 @@ export function parseVerdictFile(text: string): RunVerdict | null {
 export type BadgeState = "verified" | "stale" | "incomplete" | "failed" | "unverified";
 
 /**
- * Fold a verdict and the pane's own line count into one badge state.
+ * Fold a verdict, the pane's last parsed digest, and its line count into one
+ * badge state.
  *
- * The order of the rules is the whole design:
+ * The precedence is `failed` > `stale` > `incomplete` > `verified`, with
+ * `unverified` standing outside it for "there is no verdict file". The order
+ * is the whole design:
  *
  * 1. **No verdict → `unverified`.** Never "probably fine".
- * 2. **`failed` → `failed`, whatever the line count is doing.** A failure is
- *    never softened into `stale`; otherwise appending a single line to a log
- *    whose chain does not recompute would downgrade an accusation to a shrug,
- *    which is a one-line evasion nobody should be handed.
- * 3. **Line counts disagree → `stale`.** The loop checked N lines and the pane
- *    parsed M; a verdict about N says nothing about line N+1. This is also the
- *    ordinary state of a run that is still going — the verdict is written once
- *    the attempt ends, so a live chain outruns it — which is exactly why the
- *    badge must not read as either "good" or "broken" here.
- * 4. **`incomplete` → `incomplete`**: an intact chain with no summary, or one
+ * 2. **`failed` → `failed`, whatever the bytes are doing.** A failure is never
+ *    softened into `stale`; otherwise appending a single line to a log whose
+ *    chain does not recompute would downgrade an accusation to a shrug, which
+ *    is a one-line evasion nobody should be handed.
+ * 3. **The bytes do not match → `stale`.** `lastLineDigest` is the `_chain`
+ *    digest of the last line *this pane* parsed; `chainHead` is the digest the
+ *    loop's own check ended on. Unequal — or either one missing — means the
+ *    verdict is not about the bytes on screen. This is the gate: a verdict
+ *    with no recorded head cannot bind to anything, and a green badge there
+ *    would be asserting a match nobody made.
+ * 4. **Line counts disagree → `stale`.** Kept as a secondary check. The digest
+ *    already catches every re-drive and every appended line, but a count is
+ *    the field an operator can check by eye against the chart, and the two
+ *    disagreeing is worth showing as "not current" rather than resolving in
+ *    favour of the one that is easier to satisfy.
+ * 5. **`incomplete` → `incomplete`**: an intact chain with no summary, or one
  *    a writer was still appending to when the loop looked.
- * 5. Otherwise `verified` — and see `badgeLabelOf` for why that word never
+ * 6. Otherwise `verified` — and see `badgeLabelOf` for why that word never
  *    reaches the operator's eyes on its own.
+ *
+ * Note what is *not* in this list: "the run is still being written". A live
+ * attempt has no verdict file beside it at all — `write_attempt_verdict` runs
+ * after the summary, once nothing is appending — so a run in progress reads
+ * `unverified`, never `stale`.
  */
 export function badgeStateOf(
   verdict: RunVerdict | null | undefined,
   parsedLineCount: number,
+  lastLineDigest: string | null,
 ): BadgeState {
   if (!verdict) return "unverified";
   if (verdict.state === "failed") return "failed";
+  if (verdict.chainHead === null || verdict.chainHead !== lastLineDigest) return "stale";
   if (verdict.linesChecked !== parsedLineCount) return "stale";
   if (verdict.state === "incomplete") return "incomplete";
   return "verified";
+}
+
+//: Path segments that name the results layout rather than the run. Keeping
+//: `attempts` in a two-segment tail would spend half of it on a word every
+//: run shares.
+const LAYOUT_SEGMENTS = new Set(["attempts"]);
+
+/**
+ * The shortest tail of a run id that still tells it from its siblings.
+ *
+ * Chips stack in a column a few characters wide, so they cannot carry the full
+ * `loop/round-NN/attempts/<problem-id>` the listbox and the ETA strip show.
+ * They still have to carry *something*: a stack of identically-worded chips
+ * distinguished only by an attribute is unreadable in exactly the case the
+ * badge exists for — one red chip among several green ones, and no way to say
+ * which run failed without a mouse.
+ *
+ * Two segments is what a nested problem id (`cuda/matmul-speedup`) needs, and
+ * what a flat one spends on its round instead (`round-00/bad-instrument`).
+ */
+export function badgeRunTailOf(runId: string): string {
+  const segments = runId.split("/").filter((s) => s !== "" && !LAYOUT_SEGMENTS.has(s));
+  const tail = segments.slice(-2).join("/");
+  return tail === "" ? runId : tail;
 }
 
 const BADGE_LABELS: Record<BadgeState, string> = {
@@ -389,36 +503,99 @@ const [VERIFIED_CLAUSE, QUALIFIER_TAIL] = [
   VERDICT_QUALIFIER.slice(VERDICT_QUALIFIER.indexOf(QUALIFIER_SPLIT)),
 ];
 
+/**
+ * The command that checks this run independently, as the operator would type
+ * it. `verify.main` takes a path from the shell's cwd, not from the pane's
+ * results root, so a bare run id is a command that fails; the pane passes the
+ * root it is actually reading, and when there is none to name the placeholder
+ * is said out loud rather than quietly dropped.
+ */
+function verifyCommandPathOf(runDir: string, resultsRoot: string | null | undefined): string {
+  return `${resultsRoot ?? "<results-root>"}/${runDir}`;
+}
+
 /** What each state actually claims, in place of the verified clause. */
 function clauseOf(state: BadgeState, verdict: RunVerdict | null | undefined): string {
   switch (state) {
     case "verified":
       return VERIFIED_CLAUSE;
     case "stale":
+      // NOT "the ordinary state of a run still being written", which is what
+      // this used to say and is a state that cannot occur: the verdict file is
+      // written after the attempt ends, so a live run has none beside it and
+      // renders `unverified`. Describing an impossible benign case taught the
+      // operator to shrug at the one badge meaning the pane and the loop are
+      // looking at different bytes.
       return (
-        `the loop last checked ${verdict?.linesChecked ?? 0} line(s); this pane has parsed a ` +
-        "different number, so the verdict does not describe what you are reading (the ordinary " +
-        "state of a run still being written)"
+        "this pane's last parsed line is not the line the loop's check ended on " +
+        `(it checked ${verdict?.linesChecked ?? 0} line(s)) — either this pane is behind the ` +
+        "file, or the directory was re-driven and this verdict describes a generation that is " +
+        "no longer here"
       );
     case "incomplete":
       return "the loop's check found this run unfinished: an intact chain with no summary, or one a writer was still appending to";
     case "failed":
       return "the loop's check FAILED here: the log does not recompute, or its summary disagrees with it";
     case "unverified":
-      return "no verdict file beside this run — the loop never recorded a check here";
+      // `undefined` is "the read has not come back", `null` is "the read came
+      // back and there is nothing there". One visual state, because the pane
+      // has no evidence either way in both — but not one sentence, because
+      // only one of them is a fact about the run.
+      return verdict === undefined
+        ? "reading the verdict beside this run…"
+        : "no verdict file beside this run — the loop never recorded a check here";
   }
 }
 
-/** The badge's `title`: what this state claims, the qualifier, and the loop's
- * own sentence when it left one. */
+/**
+ * How each state closes.
+ *
+ * Only `verified` gets the honesty tail. Welded onto the others it produced a
+ * double-em-dash run-on whose hedge attached to the wrong clause: "the loop's
+ * check FAILED here … — not proof the numbers are authentic or meaningful"
+ * reads as though the *failure* were being walked back, which is the one
+ * reading this badge must never allow. Every state still offers the
+ * independent check, because "go look yourself" is useful from all five.
+ */
+function closerOf(state: BadgeState, commandPath: string): string {
+  const check = `run \`python -m turing.research.loop.verify ${commandPath}\``;
+  switch (state) {
+    case "verified":
+      return QUALIFIER_TAIL.replace("<dir>", commandPath);
+    case "stale":
+      return `This is a fact about this pane's reading, not a finding about the run; ${check} for a check of the bytes on disk now.`;
+    case "incomplete":
+      return `Not an accusation: a run that stopped early looks exactly like this; ${check} for a current check.`;
+    case "failed":
+      return `This is the loop's own finding, quoted, not a guess by this pane; ${check} to reproduce it.`;
+    case "unverified":
+      return `Nothing is claimed here in either direction; ${check} to check it yourself.`;
+  }
+}
+
+/** The badge's `title`: what this state claims, how it closes, when the loop
+ * last looked, and the loop's own sentence when it left one. */
 export function badgeTitleOf(
   state: BadgeState,
   verdict: RunVerdict | null | undefined,
   runDir: string,
+  resultsRoot?: string | null,
 ): string {
-  const parts = [`${clauseOf(state, verdict)} ${QUALIFIER_TAIL.replace("<dir>", runDir)}`];
+  const commandPath = verifyCommandPathOf(runDir, resultsRoot);
+  const parts = [`${clauseOf(state, verdict)} ${closerOf(state, commandPath)}`];
+  // "As last checked by the loop" is a claim about a moment, and the file
+  // records which one. Without it the operator cannot tell a check from ten
+  // seconds ago from one from last week's run of the same directory.
+  if (verdict?.checkedAtMs !== null && verdict?.checkedAtMs !== undefined) {
+    parts.push(
+      `as last checked by ${verdict.checkedBy ?? "the loop"} at ` +
+        new Date(verdict.checkedAtMs).toLocaleString(),
+    );
+  }
   // Verbatim from `verify.format_run_verdict`, so the badge and the terminal
-  // cannot tell an operator two different stories about one run.
+  // cannot tell an operator two different stories about one run. It is a
+  // secondary line, and stays last: it names an absolute path on whatever host
+  // ran the loop, which is not the path the tooltip's first line is about.
   if (verdict?.detail) parts.push(`loop: ${verdict.detail}`);
   return parts.join("\n");
 }

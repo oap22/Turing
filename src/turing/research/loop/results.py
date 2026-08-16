@@ -1019,12 +1019,19 @@ async def write_attempt_verdict(directory: Path, *, checked_by: str = "loop") ->
     believe.
 
     **A directory with no ``metrics.jsonl`` gets no verdict at all** and this
-    returns ``None``. ``verify.find_runs`` keys on that file, so such a
-    directory is not a run; stamping ``failed`` ("metrics.chain.json is
-    missing") on it would manufacture a finding about a run that does not
-    exist — the cries-wolf failure
+    returns ``None``, *removing* any verdict already sitting there. That the
+    directory is not a run is why no verdict is written: ``verify.find_runs``
+    keys on that file, and stamping ``failed`` ("metrics.chain.json is
+    missing") on a non-run would manufacture a finding about a run that does
+    not exist — the cries-wolf failure
     :mod:`turing.research.loop.integrity` exists to avoid, arriving by a new
-    route.
+    route. But *returning* without touching the directory only avoids that for
+    a directory that was empty to begin with. A verdict left over from an
+    earlier generation of the same path — the log rotated aside, or removed,
+    without the verdict going with it — would go on describing a log that is
+    not there, and the pane would show a green badge over bytes nobody checked:
+    the same overclaim arriving from the other direction. A verdict must never
+    outlive the log it describes, so the early return deletes it.
 
     ``lines_checked`` is the field the badge turns on: the pane compares it
     against the number of lines it parsed itself, and shows ``stale`` when
@@ -1039,10 +1046,13 @@ async def write_attempt_verdict(directory: Path, *, checked_by: str = "loop") ->
     provide.
 
     The verdict file is **not** part of anything it reports on — see
-    :data:`METRICS_VERDICT_FILENAME`. It is rewritten wholesale on every call,
-    so a re-emitted summary never leaves an older verdict beside a newer log.
+    :data:`METRICS_VERDICT_FILENAME`. It is rewritten wholesale on every call
+    that has a log to describe, and removed on every call that does not, so no
+    call ever leaves an older verdict standing beside a newer log — or beside
+    no log at all.
     """
     if not (directory / "metrics.jsonl").exists():
+        await asyncio.to_thread((directory / METRICS_VERDICT_FILENAME).unlink, missing_ok=True)
         return None
 
     verdict = await verify_run(directory)
