@@ -243,6 +243,186 @@ export interface ViewerFile {
   titles?: Record<string, string>;
 }
 
+// ---------------------------------------------------------------------------
+// `metrics.verdict.json` — whether the run being charted verifies
+// ---------------------------------------------------------------------------
+//
+// The chain (`_chain` per line, `metrics.chain.json` beside it) and the
+// verifier that recomputes it are Python, and this pane is not. So the loop
+// runs `verify_run` itself at the end of every attempt and writes the answer
+// beside the summary (`results.write_attempt_verdict`); this reads it back.
+//
+// What that buys, exactly: the operator reading a curve can see whether the
+// log under it recomputes. What it does NOT buy — and what the badge's own
+// text has to keep saying — is that the numbers are genuine. The chain is
+// self-referential (`integrity.py`'s module docstring concedes a
+// self-consistent forgery is undetectable by construction), it is written by
+// the same account that could alter it, and a wrong verifier's wrong numbers
+// chain perfectly. A green badge here means "not casually altered, as of the
+// loop's own last check", nothing more.
+
+const VERDICT_BASENAME = "metrics.verdict.json";
+
+/** The verdict file that belongs to one `metrics.jsonl` run file. */
+export function verdictPathOf(runFilePath: string): string {
+  const cut = runFilePath.lastIndexOf("/");
+  return cut < 0 ? VERDICT_BASENAME : `${runFilePath.slice(0, cut + 1)}${VERDICT_BASENAME}`;
+}
+
+/** `verify.RunState` — the three answers the Python verifier can give. */
+export type VerdictState = "ok" | "incomplete" | "failed";
+
+/** One parsed `metrics.verdict.json`. Field names are camelCased; the file's
+ * are snake_case, matching `results.write_attempt_verdict`'s payload. */
+export interface RunVerdict {
+  state: VerdictState;
+  /** `chain.lines_checked` — how many log lines the loop's check covered. */
+  linesChecked: number;
+  checkedAtMs: number | null;
+  checkedBy: string | null;
+  chainHead: string | null;
+  /** `verify.format_run_verdict`'s sentence, verbatim. */
+  detail: string | null;
+}
+
+const VERDICT_STATES = new Set<string>(["ok", "incomplete", "failed"]);
+
+/**
+ * Parse a `metrics.verdict.json` body, or return `null`.
+ *
+ * Stricter than `parseViewerFile`, and deliberately so: that file is a
+ * *request* the pane can honour partially, this one is a *claim about
+ * evidence*. A body missing `state` or `lines_checked`, or carrying a state
+ * this reader does not know, is treated as no verdict at all — which the badge
+ * shows as `unverified`. The failure mode of guessing here would be a badge
+ * that reassures on a file it did not understand.
+ */
+export function parseVerdictFile(text: string): RunVerdict | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const o = parsed as Record<string, unknown>;
+  if (typeof o.state !== "string" || !VERDICT_STATES.has(o.state)) return null;
+  if (typeof o.lines_checked !== "number" || !Number.isFinite(o.lines_checked)) return null;
+  return {
+    state: o.state as VerdictState,
+    linesChecked: o.lines_checked,
+    checkedAtMs: typeof o.checked_at_ms === "number" ? o.checked_at_ms : null,
+    checkedBy: typeof o.checked_by === "string" ? o.checked_by : null,
+    chainHead: typeof o.chain_head === "string" ? o.chain_head : null,
+    detail: typeof o.detail === "string" ? o.detail : null,
+  };
+}
+
+/** What the badge shows. Five states, not three: two of them are facts about
+ * the *pane's* relationship to the verdict rather than about the run. */
+export type BadgeState = "verified" | "stale" | "incomplete" | "failed" | "unverified";
+
+/**
+ * Fold a verdict and the pane's own line count into one badge state.
+ *
+ * The order of the rules is the whole design:
+ *
+ * 1. **No verdict → `unverified`.** Never "probably fine".
+ * 2. **`failed` → `failed`, whatever the line count is doing.** A failure is
+ *    never softened into `stale`; otherwise appending a single line to a log
+ *    whose chain does not recompute would downgrade an accusation to a shrug,
+ *    which is a one-line evasion nobody should be handed.
+ * 3. **Line counts disagree → `stale`.** The loop checked N lines and the pane
+ *    parsed M; a verdict about N says nothing about line N+1. This is also the
+ *    ordinary state of a run that is still going — the verdict is written once
+ *    the attempt ends, so a live chain outruns it — which is exactly why the
+ *    badge must not read as either "good" or "broken" here.
+ * 4. **`incomplete` → `incomplete`**: an intact chain with no summary, or one
+ *    a writer was still appending to when the loop looked.
+ * 5. Otherwise `verified` — and see `badgeLabelOf` for why that word never
+ *    reaches the operator's eyes on its own.
+ */
+export function badgeStateOf(
+  verdict: RunVerdict | null | undefined,
+  parsedLineCount: number,
+): BadgeState {
+  if (!verdict) return "unverified";
+  if (verdict.state === "failed") return "failed";
+  if (verdict.linesChecked !== parsedLineCount) return "stale";
+  if (verdict.state === "incomplete") return "incomplete";
+  return "verified";
+}
+
+const BADGE_LABELS: Record<BadgeState, string> = {
+  // "chain ok", never "verified" or "trusted": the claim is about the hash
+  // chain recomputing, not about the numbers being real, and a chip that
+  // said the latter would be the one lie this whole feature exists to avoid.
+  verified: "✓ chain ok",
+  stale: "≠ chain stale",
+  incomplete: "? chain incomplete",
+  failed: "✗ chain FAILED",
+  unverified: "· unverified",
+};
+
+/** The badge's visible text. Glyph *and* word per state, matching the
+ * flywheel pane's rule that colour is never the only carrier of a status. */
+export function badgeLabelOf(state: BadgeState): string {
+  return BADGE_LABELS[state];
+}
+
+/**
+ * The qualifier every badge carries, verbatim, with `<dir>` for the run.
+ *
+ * This is the same refusal-to-overclaim `verify`'s own `HONESTY_LINE` makes on
+ * every invocation of the CLI. It is not decoration: a bare green chip beside
+ * a chart is read as "these numbers are real", and nothing in this program can
+ * establish that.
+ */
+export const VERDICT_QUALIFIER =
+  "chain internally consistent as last checked by the loop — not proof the numbers are " +
+  "authentic or meaningful; run `python -m turing.research.loop.verify <dir>` for an " +
+  "independent check";
+
+const QUALIFIER_SPLIT = "— not proof";
+const [VERIFIED_CLAUSE, QUALIFIER_TAIL] = [
+  VERDICT_QUALIFIER.slice(0, VERDICT_QUALIFIER.indexOf(QUALIFIER_SPLIT)).trim(),
+  VERDICT_QUALIFIER.slice(VERDICT_QUALIFIER.indexOf(QUALIFIER_SPLIT)),
+];
+
+/** What each state actually claims, in place of the verified clause. */
+function clauseOf(state: BadgeState, verdict: RunVerdict | null | undefined): string {
+  switch (state) {
+    case "verified":
+      return VERIFIED_CLAUSE;
+    case "stale":
+      return (
+        `the loop last checked ${verdict?.linesChecked ?? 0} line(s); this pane has parsed a ` +
+        "different number, so the verdict does not describe what you are reading (the ordinary " +
+        "state of a run still being written)"
+      );
+    case "incomplete":
+      return "the loop's check found this run unfinished: an intact chain with no summary, or one a writer was still appending to";
+    case "failed":
+      return "the loop's check FAILED here: the log does not recompute, or its summary disagrees with it";
+    case "unverified":
+      return "no verdict file beside this run — the loop never recorded a check here";
+  }
+}
+
+/** The badge's `title`: what this state claims, the qualifier, and the loop's
+ * own sentence when it left one. */
+export function badgeTitleOf(
+  state: BadgeState,
+  verdict: RunVerdict | null | undefined,
+  runDir: string,
+): string {
+  const parts = [`${clauseOf(state, verdict)} ${QUALIFIER_TAIL.replace("<dir>", runDir)}`];
+  // Verbatim from `verify.format_run_verdict`, so the badge and the terminal
+  // cannot tell an operator two different stories about one run.
+  if (verdict?.detail) parts.push(`loop: ${verdict.detail}`);
+  return parts.join("\n");
+}
+
 export function parseViewerFile(text: string): ViewerFile | null {
   try {
     const parsed: unknown = JSON.parse(text);

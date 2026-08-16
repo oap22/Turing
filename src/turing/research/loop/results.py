@@ -49,6 +49,11 @@ from turing.research.contracts import (
 )
 from turing.research.loop import integrity
 from turing.research.loop.protocols import SystemClock
+from turing.research.loop.verify import (
+    HONESTY_LINE,
+    format_run_verdict,
+    verify_run,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -59,6 +64,7 @@ logger = structlog.get_logger(__name__)
 
 __all__ = [
     "AGENT_DIAGNOSTICS_RELPATH",
+    "METRICS_VERDICT_FILENAME",
     "RESERVED_FIELDS",
     "MetricsLine",
     "MetricsWriter",
@@ -68,9 +74,20 @@ __all__ = [
     "read_metrics_points",
     "usable_target",
     "write_attempt_summary",
+    "write_attempt_verdict",
     "write_round_summary",
     "write_viewer_config",
 ]
+
+#: Where :func:`write_attempt_verdict` records what ``verify`` said about this
+#: directory, for a reader that cannot run ``verify`` itself — the desktop's
+#: metrics pane. Deliberately **not** ``metrics.json``-adjacent in meaning: it
+#: is not part of the hash chain, not reconciled against the log, and not a
+#: run in its own right (``verify.find_runs`` keys on ``metrics.jsonl``). It is
+#: a *report about* the other files, which is why nothing that checks them
+#: reads it, and why re-running ``verify`` after it lands returns exactly what
+#: it returned before.
+METRICS_VERDICT_FILENAME = "metrics.verdict.json"
 
 
 #: Keys the desktop's chart series builder treats as axis/meta rather than a
@@ -965,7 +982,102 @@ async def write_attempt_summary(
     }
     path = directory / "metrics.json"
     await asyncio.to_thread(_write_summary_json, path, payload)
+
+    # After the summary, never before: `verify_run` reconciles `metrics.json`
+    # against the log, so a check run one line earlier would report every
+    # honest attempt as INCOMPLETE ("summary is missing") forever.
+    #
+    # Guarded, because this is reporting *about* reporting. The summary is
+    # already on disk and the caller's plots still have to be drawn; a verdict
+    # that could not be produced must degrade to "no verdict file", which the
+    # pane shows as `unverified`, rather than take the emission block down
+    # with it.
+    try:
+        await write_attempt_verdict(directory)
+    except Exception:
+        logger.exception("research.results.verdict_failed", directory=str(directory))
+
     return path
+
+
+async def write_attempt_verdict(directory: Path, *, checked_by: str = "loop") -> Path | None:
+    """Record what ``verify`` says about ``directory``, for a reader that cannot run it.
+
+    The desktop's metrics pane reads files out of the results root; it has no
+    Python, so it cannot recompute a hash chain and has never had any way to
+    tell an operator whether the curve on screen verifies. This writes the
+    answer down at the one moment it is cheap and unambiguous — the attempt is
+    over, nothing is appending — and the pane reads it (see
+    ``webui/src/desktop/panes/metrics.ts``, ``parseVerdictFile``).
+
+    **Not a second verifier.** Every field comes from
+    :func:`~turing.research.loop.verify.verify_run` and
+    :func:`~turing.research.loop.verify.format_run_verdict`, the same two
+    functions ``python -m turing.research.loop.verify`` calls. A reimplemented
+    check here would eventually disagree with the CLI, and an operator holding
+    a green badge and a red terminal would have no way to decide which to
+    believe.
+
+    **A directory with no ``metrics.jsonl`` gets no verdict at all** and this
+    returns ``None``. ``verify.find_runs`` keys on that file, so such a
+    directory is not a run; stamping ``failed`` ("metrics.chain.json is
+    missing") on it would manufacture a finding about a run that does not
+    exist — the cries-wolf failure
+    :mod:`turing.research.loop.integrity` exists to avoid, arriving by a new
+    route.
+
+    ``lines_checked`` is the field the badge turns on: the pane compares it
+    against the number of lines it parsed itself, and shows ``stale`` when
+    they differ, because a verdict about 40 lines says nothing about the 41st.
+    ``chain_head`` is the sidecar's recorded final digest, copied through for
+    an operator correlating two reports of the same run; it is absent when the
+    sidecar cannot be read, which is itself one of the states ``verify``
+    reports. ``note`` carries
+    :data:`~turing.research.loop.verify.HONESTY_LINE` verbatim, for the same
+    reason the CLI prints it on every invocation: a bare ``"state": "ok"``
+    would be read as proof of authenticity that no chain in this program can
+    provide.
+
+    The verdict file is **not** part of anything it reports on — see
+    :data:`METRICS_VERDICT_FILENAME`. It is rewritten wholesale on every call,
+    so a re-emitted summary never leaves an older verdict beside a newer log.
+    """
+    if not (directory / "metrics.jsonl").exists():
+        return None
+
+    verdict = await verify_run(directory)
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "state": verdict.state.value,
+        "lines_checked": 0 if verdict.chain is None else verdict.chain.lines_checked,
+        "checked_at_ms": SystemClock().now_ms(),
+        "checked_by": checked_by,
+        "chain_head": await asyncio.to_thread(_read_chain_head, directory),
+        "detail": format_run_verdict(verdict),
+        "note": HONESTY_LINE,
+    }
+    path = directory / METRICS_VERDICT_FILENAME
+    await asyncio.to_thread(_write_summary_json, path, payload)
+    return path
+
+
+def _read_chain_head(directory: Path) -> str | None:
+    """The sidecar's recorded final digest, or ``None`` if it cannot be read.
+
+    Read rather than recomputed on purpose: this is a *label* for correlating
+    two reports about the same run, not evidence. Whether the recorded head is
+    the one the log actually produces is exactly the question
+    :func:`~turing.research.loop.integrity.verify_metrics_chain` already
+    answered above, and its answer is the ``state`` field.
+    """
+    try:
+        raw = json.loads((directory / integrity.CHAIN_SIDECAR_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(raw, dict) and isinstance(raw.get("final"), str):
+        final: str = raw["final"]
+        return final
+    return None
 
 
 async def write_round_summary(

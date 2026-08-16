@@ -236,6 +236,32 @@ via tabs, ETA strip naming the run it describes),
 Claude Code / Codex CLI session list + transcript tail), `agentfeed`
 (cross-session tool/assistant activity feed).
 
+### The `metrics` pane's verdict badge
+
+Beside the run selector, one small badge per charted run, saying whether the
+log under that curve verifies. The pane cannot run the verifier — that is
+Python — so the loop runs it at the end of every attempt and writes the answer
+to `metrics.verdict.json` next to `metrics.json`; the badge reads that file.
+
+| Badge | Meaning |
+|---|---|
+| `✓ chain ok` | the loop's check passed, and it covered exactly the number of lines this pane has parsed |
+| `≠ chain stale` | a verdict exists but describes a different line count — the log grew or shrank since. Also the ordinary state of a run **still being written**, since the verdict is written once the attempt ends |
+| `? chain incomplete` | intact chain, no summary beside it, or one a writer was still appending to when the loop looked |
+| `✗ chain FAILED` | the log does not recompute, or its summary disagrees with it. Never softened by a later line landing |
+| `· unverified` | no verdict file beside this run — nothing was checked here |
+
+**A green badge is not a trust boundary, and its wording is deliberate.** It
+says `chain ok`, never "verified" or "trusted", and its tooltip carries the
+qualifier in full: *chain internally consistent as last checked by the loop —
+not proof the numbers are authentic or meaningful; run `python -m
+turing.research.loop.verify <dir>` for an independent check*. The chain is
+written by the same account that could rewrite it, a self-consistent forgery
+is undetectable by construction, and a wrong verifier's wrong numbers chain
+perfectly — see `docs/research-agent.md`'s "Integrity, and its limits". The
+badge exists so an operator reading a curve knows whether anyone checked, not
+so a green chip can stand in for having checked.
+
 ### The `flywheel` pane's round timeline
 
 Each round renders as index, the cells it scored, a status glyph, and the

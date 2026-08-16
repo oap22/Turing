@@ -11,14 +11,22 @@ import { createElement } from "react";
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { invMock } = vi.hoisted(() => ({ invMock: vi.fn() }));
+const { invMock, fsChangeHandlers } = vi.hoisted(() => ({
+  invMock: vi.fn(),
+  // Every `fs-change` callback the pane has subscribed. Most tests assert on
+  // the initial load and never touch these; the verdict-badge tests below
+  // deliver a change through them, which is how the real watcher reaches the
+  // pane (`fsroots.rs` emits one event per created/modified file).
+  fsChangeHandlers: [] as Array<(payload: { root: string; rel_path: string }) => void>,
+}));
 
 vi.mock("../desktop/tauri", () => ({
   isTauri: () => true,
   inv: (cmd: string, args?: Record<string, unknown>) => invMock(cmd, args),
-  // The pane only uses the bus to hear about later file changes; every test
-  // here asserts on the initial load, so an inert subscription is enough.
-  subscribe: () => ({ unsubscribe: () => {}, ready: Promise.resolve() }),
+  subscribe: (_event: string, handler: (payload: { root: string; rel_path: string }) => void) => {
+    fsChangeHandlers.push(handler);
+    return { unsubscribe: () => {}, ready: Promise.resolve() };
+  },
 }));
 
 import MetricsPane from "../desktop/panes/MetricsPane";
@@ -66,6 +74,10 @@ const RUN_FILES = TREE.map(([p]) => p).filter((p) => p.endsWith("metrics.jsonl")
 const SUMMARY_FILES = TREE.map(([p]) => p).filter((p) => p.endsWith("metrics.json"));
 
 let viewerJson: string | null = null;
+// `metrics.verdict.json` bodies by relative path. Not part of `TREE` because
+// `fs_list` is called with `exts: ["jsonl"]` and never walks them — the pane
+// reads each one by name, beside the run file it is charting.
+const verdictFiles = new Map<string, string>();
 
 function installFs() {
   const contents = new Map(TREE);
@@ -81,6 +93,8 @@ function installFs() {
     }
     if (cmd === "fs_read_text") {
       if (args.rel === ".viewer.json" && viewerJson !== null) return viewerJson;
+      const verdict = verdictFiles.get(String(args.rel));
+      if (verdict !== undefined) return verdict;
       throw new Error(`path does not exist: ${String(args.rel)}`);
     }
     if (cmd === "fs_tail") {
@@ -110,10 +124,35 @@ function selectedRunLabels(): string[] {
 
 beforeEach(() => {
   viewerJson = null;
+  verdictFiles.clear();
+  fsChangeHandlers.length = 0;
   invMock.mockReset();
   installFs();
   localStorage.clear();
 });
+
+/** Deliver one watcher event, exactly as `fsroots.rs` emits it. */
+function emitFsChange(relPath: string) {
+  for (const handler of fsChangeHandlers) handler({ root: "results", rel_path: relPath });
+}
+
+/** The body `results.write_attempt_verdict` writes. */
+function verdictJson(state: string, linesChecked: number): string {
+  return JSON.stringify({
+    schema_version: 1,
+    state,
+    lines_checked: linesChecked,
+    checked_at_ms: 1786845156000,
+    checked_by: "loop",
+    chain_head: "b7f0".repeat(16),
+    detail: `<dir>: ${state.toUpperCase()} (${linesChecked} line(s) checked)`,
+    note: "detects alteration; does not prevent it — see OPEN-QUESTIONS R2/Q11",
+  });
+}
+
+function badge(): HTMLElement {
+  return screen.getByTestId("metrics-verdict");
+}
 
 afterEach(() => {
   cleanup();
@@ -251,5 +290,88 @@ describe("MetricsPane — ETA strip (defect C)", () => {
     // distinguishes "the selected run" from "runFiles[0]".
     await waitFor(() => expect(strip).toHaveTextContent("last step: 5"));
     expect(strip).toHaveTextContent(`${R0}/cuda/matmul-speedup`);
+  });
+});
+
+// `bad-instrument`'s chain is 2 lines long, so a verdict claiming 2 describes
+// exactly what the pane parses and one claiming anything else does not.
+const RUN = `${R0}/bad-instrument`;
+const RUN_VERDICT = `${RUN}/metrics.verdict.json`;
+
+describe("MetricsPane — verdict badge (RES-18)", () => {
+  it("says chain ok, without claiming the numbers are trustworthy", async () => {
+    verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2));
+    viewerJson = JSON.stringify({ runs: [RUN] });
+    render(createElement(MetricsPane));
+
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    expect(badge()).toHaveTextContent("chain ok");
+    // The qualifier is the point of the badge: a green chip that stopped
+    // there would be read as "these numbers are real".
+    const title = badge().getAttribute("title") ?? "";
+    expect(title).toContain("not proof the numbers are authentic or meaningful");
+    expect(title).toContain(`python -m turing.research.loop.verify ${RUN}`);
+  });
+
+  it("reads unverified when the loop left no verdict beside the run", async () => {
+    viewerJson = JSON.stringify({ runs: [RUN] });
+    render(createElement(MetricsPane));
+
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "unverified"));
+  });
+
+  it("reads stale when the verdict describes a different number of lines", async () => {
+    verdictFiles.set(RUN_VERDICT, verdictJson("ok", 1));
+    viewerJson = JSON.stringify({ runs: [RUN] });
+    render(createElement(MetricsPane));
+
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "stale"));
+  });
+
+  it("reads failed when the loop's own check failed", async () => {
+    verdictFiles.set(RUN_VERDICT, verdictJson("failed", 2));
+    viewerJson = JSON.stringify({ runs: [RUN] });
+    render(createElement(MetricsPane));
+
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "failed"));
+  });
+
+  it("picks the verdict up when the loop writes it mid-session", async () => {
+    viewerJson = JSON.stringify({ runs: [RUN] });
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "unverified"));
+
+    // The attempt ends: `write_attempt_verdict` lands the file and the
+    // watcher reports it. The operator must not have to reopen the pane.
+    verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2));
+    emitFsChange(RUN_VERDICT);
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+  });
+
+  it("re-reads the verdict when it is rewritten", async () => {
+    verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2));
+    viewerJson = JSON.stringify({ runs: [RUN] });
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+
+    verdictFiles.set(RUN_VERDICT, verdictJson("failed", 2));
+    emitFsChange(RUN_VERDICT);
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "failed"));
+  });
+
+  it("gives each pinned run its own badge, named", async () => {
+    // One badge for two runs would attribute one run's verdict to the other —
+    // the same lie the ETA strip's run label exists to prevent.
+    verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2));
+    verdictFiles.set(`${R1}/flat-baseline/metrics.verdict.json`, verdictJson("failed", 3));
+    viewerJson = JSON.stringify({ runs: [RUN, `${R1}/flat-baseline`] });
+    render(createElement(MetricsPane));
+
+    await waitFor(() => expect(screen.getAllByTestId("metrics-verdict").length).toBe(2));
+    const states = screen
+      .getAllByTestId("metrics-verdict")
+      .map((b) => [b.getAttribute("data-run"), b.getAttribute("data-state")]);
+    expect(states).toContainEqual([RUN, "verified"]);
+    expect(states).toContainEqual([`${R1}/flat-baseline`, "failed"]);
   });
 });

@@ -14,15 +14,22 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { inv, subscribe } from "../tauri";
 import Chart from "./Chart";
 import {
+  badgeLabelOf,
+  badgeStateOf,
+  badgeTitleOf,
   etaOf,
   isChartRunFile,
   matchesViewerRuns,
   parseMetricsText,
+  parseVerdictFile,
   parseViewerFile,
   pickSeries,
   runIdOf,
   seriesOf,
+  verdictPathOf,
+  type BadgeState,
   type Point,
+  type RunVerdict,
   type ViewerFile,
 } from "./metrics";
 
@@ -44,6 +51,19 @@ interface RunState {
 const RESULTS_ROOT = "results";
 const SERIES_STORAGE_KEY = "turing.metrics.series";
 const VIEWER_FILE_REL = ".viewer.json";
+
+// Colour *and* glyph per badge state (the glyph is in `badgeLabelOf`), for the
+// same reason the flywheel pane's round statuses carry both: colour alone is
+// not a status an operator can read reliably. `stale` and `incomplete` share
+// an amber — neither is an accusation, both mean "this is not a verdict about
+// what you are looking at" — and are told apart by their glyph and words.
+const BADGE_CLASSES: Record<BadgeState, string> = {
+  verified: "border-emerald-400/40 text-emerald-400",
+  stale: "border-amber-400/40 text-amber-400",
+  incomplete: "border-amber-400/40 text-amber-400",
+  failed: "border-rose-400/40 text-rose-400",
+  unverified: "border-term-edge text-term-dim",
+};
 
 interface RunMultiSelectProps {
   runFiles: Entry[];
@@ -171,6 +191,29 @@ export default function MetricsPane() {
     forceRender((n) => n + 1);
   }
 
+  // What `verify` said about each run, as recorded by the loop itself in
+  // `metrics.verdict.json` (`results.write_attempt_verdict`). Keyed by run
+  // file path. `undefined` means "not read yet", `null` means "read and there
+  // is nothing there" — both render as `unverified`, which is the honest
+  // reading of "this pane has no evidence either way".
+  const [verdicts, setVerdicts] = useState<Record<string, RunVerdict | null>>({});
+
+  async function loadVerdict(path: string) {
+    let parsed: RunVerdict | null = null;
+    try {
+      const text = await inv<string>("fs_read_text", {
+        root: RESULTS_ROOT,
+        rel: verdictPathOf(path),
+      });
+      parsed = parseVerdictFile(text);
+    } catch {
+      // No verdict file — the ordinary state of an attempt still running, and
+      // of every run written before this file existed. Not an error.
+      parsed = null;
+    }
+    setVerdicts((prev) => ({ ...prev, [path]: parsed }));
+  }
+
   const activePaths = useMemo(() => {
     const newest = runFiles[0]?.rel_path;
     const pinned = selected.filter((s) => s !== "auto");
@@ -182,6 +225,7 @@ export default function MetricsPane() {
   useEffect(() => {
     for (const path of activePaths) {
       void tailRun(path);
+      void loadVerdict(path);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activePaths.join("|")]);
@@ -259,6 +303,16 @@ export default function MetricsPane() {
       }
       if (runsRef.current.has(payload.rel_path)) {
         void tailRun(payload.rel_path);
+        return;
+      }
+      // The loop writes `metrics.verdict.json` once the attempt ends, i.e.
+      // while this pane is already open on the run — so the badge has to
+      // arrive on a watcher event, not only on mount.
+      for (const runPath of runsRef.current.keys()) {
+        if (payload.rel_path === verdictPathOf(runPath)) {
+          void loadVerdict(runPath);
+          return;
+        }
       }
     });
     return () => {
@@ -320,6 +374,31 @@ export default function MetricsPane() {
             `string[]` contract and "auto" sentinel as before, just built from
             toggleable rows. */}
         <RunMultiSelect runFiles={runFiles} selected={selected} onChange={setSelected} />
+        {/* One badge per charted run, each naming its own run in the tooltip.
+            A single badge over a multi-run overlay would attribute one run's
+            verdict to another — the same lie the ETA strip's run label exists
+            to prevent. See metrics.ts for what these states mean and for why
+            the good one reads "chain ok" rather than anything stronger. */}
+        {activeRuns.length > 0 && (
+          <div className="flex shrink-0 flex-col gap-px">
+            {activeRuns.map((run) => {
+              const verdict = verdicts[run.path];
+              const state = badgeStateOf(verdict, run.points.length);
+              return (
+                <span
+                  key={run.path}
+                  data-testid="metrics-verdict"
+                  data-run={run.label}
+                  data-state={state}
+                  title={`${run.label}\n${badgeTitleOf(state, verdict, run.label)}`}
+                  className={`whitespace-nowrap border px-1 text-[10px] ${BADGE_CLASSES[state]}`}
+                >
+                  {badgeLabelOf(state)}
+                </span>
+              );
+            })}
+          </div>
+        )}
         {eta && etaRun && (
           <div data-testid="metrics-eta" className="ml-2 truncate font-mono text-term-dim">
             <span title={etaRun.label}>{etaRun.label}</span>

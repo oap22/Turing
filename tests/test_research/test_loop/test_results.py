@@ -27,6 +27,7 @@ from turing.research.loop import results
 from turing.research.loop.integrity import verify_metrics_chain
 from turing.research.loop.results import (
     AGENT_DIAGNOSTICS_RELPATH,
+    METRICS_VERDICT_FILENAME,
     RESERVED_FIELDS,
     MetricsLine,
     MetricsWriter,
@@ -39,6 +40,7 @@ from turing.research.loop.results import (
     write_round_summary,
     write_viewer_config,
 )
+from turing.research.loop.verify import HONESTY_LINE, RunState, find_runs, verify_run
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -932,6 +934,119 @@ class TestNonFiniteTargetScore:
             )
         assert json.loads(path.read_text())["target_score"] is None
         assert not [e for e in cap if e.get("event") == "research.results.target_score_dropped"]
+
+
+class TestAttemptVerdict:
+    """The verdict the loop stamps beside its own summary (RES-18).
+
+    The desktop's metrics pane cannot run Python, so it cannot verify the
+    chain it is charting. The loop can — at the one moment the attempt is over
+    and the log has stopped moving — and it records the answer in a file the
+    pane can read. Nothing here is a second verifier: every field comes from
+    :func:`turing.research.loop.verify.verify_run`.
+    """
+
+    async def _honest_chain(self, directory: Path, *, lines: int) -> MetricsWriter:
+        writer = MetricsWriter(directory / "metrics.jsonl", header=_header())
+        for index in range(lines):
+            await writer.append(_line(step=index + 1))
+        return writer
+
+    def _reconciling_kwargs(self, lines: int) -> dict[str, object]:
+        """Summary fields that agree with ``_header()`` and ``_line()``.
+
+        A summary that disagreed would fail reconciliation and mask whichever
+        chain state the test is actually about.
+        """
+        return _attempt_summary_kwargs(
+            problem_id="problem-1",
+            attempt_id="attempt-1",
+            round_id="round-00",
+            seed=7,
+            outcome=Outcome.RUNNING,
+            best_score=None,
+            baseline_score=None,
+            final_progress=None,
+            consumed_steps=1,
+            consumed_tokens=100,
+            consumed_wall_clock_seconds=10.0,
+            cap_extensions=0,
+            steps_recorded=lines,
+        )
+
+    async def test_an_honest_attempt_gets_an_ok_verdict_beside_its_summary(
+        self, tmp_path: Path
+    ) -> None:
+        await self._honest_chain(tmp_path, lines=3)
+        await write_attempt_summary(tmp_path, **self._reconciling_kwargs(3))
+
+        payload = json.loads((tmp_path / METRICS_VERDICT_FILENAME).read_text())
+        assert payload["state"] == "ok"
+        # The pane compares this against the number of lines it parsed itself;
+        # a count meaning anything else would make its badge lie.
+        assert payload["lines_checked"] == 3
+        assert payload["checked_by"] == "loop"
+        assert isinstance(payload["checked_at_ms"], int)
+        sidecar = json.loads((tmp_path / "metrics.chain.json").read_text())
+        assert payload["chain_head"] == sidecar["final"]
+        assert "OK (3 line(s) checked)" in payload["detail"]
+        # The qualifier travels with the verdict, so a reader of the file
+        # alone cannot mistake it for proof of authenticity.
+        assert payload["note"] == HONESTY_LINE
+
+    async def test_a_tampered_log_yields_state_failed(self, tmp_path: Path) -> None:
+        await self._honest_chain(tmp_path, lines=3)
+        jsonl = tmp_path / "metrics.jsonl"
+        raw = jsonl.read_text().split("\n")
+        raw[0] = raw[0].replace('"tokens_used":100', '"tokens_used":999')
+        jsonl.write_text("\n".join(raw), encoding="utf-8")
+
+        await write_attempt_summary(tmp_path, **self._reconciling_kwargs(3))
+
+        payload = json.loads((tmp_path / METRICS_VERDICT_FILENAME).read_text())
+        assert payload["state"] == "failed"
+        assert "line 0 digest does not match" in payload["detail"]
+
+    async def test_a_directory_with_no_chain_gets_no_verdict_at_all(self, tmp_path: Path) -> None:
+        """``find_runs`` keys on ``metrics.jsonl``, so a directory without one
+        is not a run. Stamping a FAILED verdict on it would manufacture a
+        finding about a run that does not exist.
+        """
+        await write_attempt_summary(tmp_path, **_attempt_summary_kwargs())
+        assert not (tmp_path / METRICS_VERDICT_FILENAME).exists()
+
+    async def test_the_verdict_file_is_neither_a_run_nor_tamper_evidence(
+        self, tmp_path: Path
+    ) -> None:
+        """It sits *outside* everything it reports on.
+
+        The chain covers ``metrics.jsonl``'s lines and reconciliation covers
+        ``metrics.json``; a file that changed either verdict by existing would
+        make a second run of ``verify`` disagree with the first.
+        """
+        await self._honest_chain(tmp_path, lines=2)
+        await write_attempt_summary(tmp_path, **self._reconciling_kwargs(2))
+        assert (tmp_path / METRICS_VERDICT_FILENAME).is_file()
+
+        assert find_runs(tmp_path) == [tmp_path]
+        assert (await verify_run(tmp_path)).state is RunState.OK
+
+    async def test_a_re_emitted_summary_re_checks_the_log(self, tmp_path: Path) -> None:
+        """A verdict describes the log as it stood at *its* summary write.
+
+        Leaving the first one in place after the log grew is precisely the
+        mismatch the pane's ``stale`` badge exists to notice; the writer must
+        not create that state by itself.
+        """
+        writer = await self._honest_chain(tmp_path, lines=2)
+        await write_attempt_summary(tmp_path, **self._reconciling_kwargs(2))
+        assert json.loads((tmp_path / METRICS_VERDICT_FILENAME).read_text())["lines_checked"] == 2
+
+        await writer.append(_line(step=3))
+        await write_attempt_summary(tmp_path, **self._reconciling_kwargs(3))
+        payload = json.loads((tmp_path / METRICS_VERDICT_FILENAME).read_text())
+        assert payload["state"] == "ok"
+        assert payload["lines_checked"] == 3
 
 
 class TestWriteRoundSummary:
