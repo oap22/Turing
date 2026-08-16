@@ -404,6 +404,28 @@ def _rotate_stale_metrics(metrics_dir: Path) -> None:
 _CRASHED_FINAL_STATE_PREFIX = "crashed_in_harness"
 
 
+def _mint_attempt_id(config: RoundConfig, problem: Problem) -> str:
+    """The identity one attempt is known by, minted once per attempt.
+
+    Lifted out of :meth:`RoundRunner.run_attempt` so the *caller* can mint it
+    and keep it. That is the whole fix for the round-4 defect: the id is the
+    only field in the chain header that distinguishes two generations of the
+    same attempt, and it used to be created inside ``run_attempt`` — where it
+    died with any exception, leaving :meth:`RoundRunner._close_out_crashed_attempt`
+    nothing to compare a found chain against. Minted here and passed down, it
+    survives the exception in the caller's frame, so the close-out can always
+    answer "is this directory's chain the one *this* attempt wrote?" exactly.
+
+    The ``uuid4`` suffix is what makes it a generation discriminator rather
+    than a restatement of ``run_id``/``problem_id``: a re-drive under a
+    byte-identical ``RoundConfig`` — the built-in shape of the noise floor's
+    "fix the cause and re-run from seed 1" workflow, whose per-seed ``run_id``
+    is derived deterministically as ``<run_id>-seed-<n>`` — still gets a fresh
+    id here, where every other identity field repeats.
+    """
+    return f"{config.run_id}-{problem.id}-{uuid.uuid4().hex[:8]}"
+
+
 class _ForeignChainError(Exception):
     """The chain in an attempt directory is not the chain of the attempt that crashed.
 
@@ -462,6 +484,7 @@ def _read_crashed_attempt_record(
     metrics_dir: Path,
     escalations_dir: Path,
     *,
+    expected_attempt_id: str,
     expected_problem_id: str,
     expected_round_id: str,
     expected_seed: int,
@@ -474,33 +497,70 @@ def _read_crashed_attempt_record(
 
     **The header must name this attempt, or nothing is derived.** The chain
     header is the only place an attempt's identity survives on disk, and it is
-    checked field by field — ``problem_id``, ``round_id``, ``seed`` — against
-    the attempt that actually crashed, raising :class:`_ForeignChainError`
-    when any of them disagrees or is missing. This is not defensive
-    programming; the directory genuinely can hold a *previous generation's*
-    chain at this moment. ``run_attempt`` materialises the workspace (I/O
-    against a template that can be pruned, evicted or fill a disk) **before**
-    it calls ``_rotate_stale_metrics``, so an exception in that window leaves
-    the earlier generation's trio untouched and un-rotated: an intact chain
-    with no summary — the honest "killed before its summary write" shape that
-    ``verify`` reports ``INCOMPLETE`` and that rotation exists to preserve.
-    Without this check the close-out adopted that chain, wrote a summary
-    asserting the *current* round's ``round_id`` and ``seed`` and an exception
-    type that never touched it, and ``verify`` blessed the result ``OK``,
-    because every field it reconciles was re-derived from the very log the
-    summary had just been misattributed to. Two harms, either sufficient: a
-    fabricated claim about a run that did not make it, and the destruction of
-    the one honest state — ``INCOMPLETE`` — that said the earlier generation
-    was killed unfinished.
+    checked field by field — ``attempt_id``, ``problem_id``, ``round_id``,
+    ``seed`` — against the attempt that actually crashed, raising
+    :class:`_ForeignChainError` when any of them disagrees or is missing. This
+    is not defensive programming; the directory genuinely can hold a *previous
+    generation's* chain at this moment. ``run_attempt`` materialises the
+    workspace (I/O against a template that can be pruned, evicted or fill a
+    disk) **before** it calls ``_rotate_stale_metrics``, so an exception in
+    that window leaves the earlier generation's trio untouched and un-rotated:
+    an intact chain with no summary — the honest "killed before its summary
+    write" shape that ``verify`` reports ``INCOMPLETE`` and that rotation
+    exists to preserve. Without this check the close-out adopted that chain,
+    wrote a summary asserting the *current* round's ``round_id`` and ``seed``
+    and an exception type that never touched it, and ``verify`` blessed the
+    result ``OK``, because every field it reconciles was re-derived from the
+    very log the summary had just been misattributed to. Two harms, either
+    sufficient: a fabricated claim about a run that did not make it, and the
+    destruction of the one honest state — ``INCOMPLETE`` — that said the
+    earlier generation was killed unfinished.
 
-    ``attempt_id`` is deliberately *not* in the comparison: it is minted
-    inside ``run_attempt`` and dies with the exception, so there is nothing to
-    compare against here. The trio that is checked is what the summary would
-    otherwise claim from the current config, and it pins the generation
-    whenever a re-drive changes the round or the seed. A re-drive under the
-    *same* ``run_id`` and seed is not distinguishable by any surviving
-    evidence, and is left as the documented limit of this guard rather than
-    guessed at.
+    **``attempt_id`` is the field that actually decides it, and the other
+    three are kept for the message.** Round 3 left ``attempt_id`` out on the
+    grounds that it was minted inside ``run_attempt`` and died with the
+    exception; that made ``problem_id``/``round_id``/``seed`` the whole guard,
+    and those three are *equal across generations by construction* in the only
+    re-run workflow this package ships. ``NoiseFloorConfig.round_config_for``
+    derives each seed's ``run_id`` deterministically as
+    ``<run_id>-seed-<n>``, and the refusal an incomplete seed raises tells the
+    operator to "fix the cause and re-run the noise floor from seed 1" — so
+    the sanctioned recovery reuses the identical ``run_id`` *and* seed, into
+    the identical ``noise_floor_seed_dir``. A gen-2 attempt crashing in
+    ``materialise`` therefore matched all three, adopted gen 1's chain, and
+    overwrote a killed attempt's honest ``INCOMPLETE`` with
+    ``crashed_in_harness:OSError`` — flipping the directory to ``OK`` under
+    ``verify``, the pre-writeup gate. :func:`_mint_attempt_id` is now called by
+    ``run_attempts`` *before* ``run_attempt``, so the crashed attempt's own id
+    survives in the caller's frame and reaches here; its ``uuid4`` suffix
+    differs between generations even when every other field repeats. The other
+    three stay in the comparison because they cost nothing and they are what
+    makes the refusal *readable* — "round_id='gen1' (expected 'gen2')" tells
+    an operator which generation is sitting in the directory, where a bare
+    id mismatch would not.
+
+    This is a different comparison from
+    :data:`~turing.research.loop.integrity._IDENTITY_FIELDS`, which
+    ``reconcile_summary`` uses, and the two must not be conflated.
+    That one compares a ``metrics.json`` against the header *beside it* and
+    excludes ``started_at_ms`` because that field never reaches a summary —
+    a statement about which fields the two **documents** have in common. This
+    one compares the header against the **live attempt** that just crashed,
+    where the available evidence is whatever survived the exception in the
+    caller's frame. Different sides, different evidence, so neither list is
+    the other's.
+
+    ``started_at_ms`` cannot serve here, which is why the id is minted
+    upstream instead. ``run_attempt`` awaits ``materialise`` *before* it reads
+    the clock and builds the :class:`~turing.research.contracts.Attempt`, so
+    at the canonical crash point no start time has been taken at all; the
+    nearest substitute — a watermark stamped by the caller before the call and
+    compared with ``>=`` — would rest on wall-clock monotonicity *across
+    processes*, which ``SystemClock.now_ms`` (``time.time()``) does not
+    provide. An NTP step, a container clock reset, or simply a re-run inside
+    the same millisecond would make a previous generation's header look
+    current, and the guard would adopt exactly the chain it exists to refuse.
+    A ``uuid4`` needs no clock and no ordering assumption.
 
     ``escalation_count`` is counted from the round's ``escalations/``
     directory rather than defaulted to ``0``. The in-memory request list died
@@ -526,6 +586,7 @@ def _read_crashed_attempt_record(
     foreign = [
         f"{field}={header.get(field)!r} (expected {expected!r})"
         for field, expected in (
+            ("attempt_id", expected_attempt_id),
             ("problem_id", expected_problem_id),
             ("round_id", expected_round_id),
             ("seed", expected_seed),
@@ -659,9 +720,18 @@ class RoundRunner:
         config: RoundConfig,
         *,
         output_dir: Path,
+        attempt_id: str | None = None,
     ) -> AttemptOutcome:
-        """Work one problem until it passes, the cap trips, or it is abandoned."""
-        attempt_id = f"{config.run_id}-{problem.id}-{uuid.uuid4().hex[:8]}"
+        """Work one problem until it passes, the cap trips, or it is abandoned.
+
+        ``attempt_id`` is minted here when the caller does not supply one, so a
+        direct call still works. :meth:`run_attempts` *does* supply one, and
+        must: the id is the only evidence that distinguishes two generations of
+        the same attempt, and minting it inside this method meant it died with
+        any exception raised out of it — see :func:`_mint_attempt_id` and
+        :meth:`_close_out_crashed_attempt`.
+        """
+        attempt_id = attempt_id or _mint_attempt_id(config, problem)
         workspace = await self._workspaces.materialise(problem, attempt_id=attempt_id)
         now = self._clock.now_ms()
         attempt = Attempt(
@@ -1409,8 +1479,17 @@ class RoundRunner:
         failures: list[AttemptFailure] = []
         self._attempt_failures = ()
         for problem in corpus:
+            # Minted here, not inside ``run_attempt``, so it outlives an
+            # exception raised out of it and the close-out below can tell this
+            # attempt's chain from a previous generation's — the one field
+            # that can, when a re-drive repeats run_id, problem_id and seed.
+            attempt_id = _mint_attempt_id(config, problem)
             try:
-                outcomes.append(await self.run_attempt(problem, config, output_dir=output_dir))
+                outcomes.append(
+                    await self.run_attempt(
+                        problem, config, output_dir=output_dir, attempt_id=attempt_id
+                    )
+                )
             except Exception as exc:
                 logger.exception(
                     "research.attempt.crashed",
@@ -1432,6 +1511,7 @@ class RoundRunner:
                     config=config,
                     output_dir=output_dir,
                     exc_type=type(exc).__name__,
+                    attempt_id=attempt_id,
                 )
         # Set before the refusal below so a caller inspecting the runner after
         # a total-loss raise can still see which problems were lost.
@@ -1451,6 +1531,7 @@ class RoundRunner:
         config: RoundConfig,
         output_dir: Path,
         exc_type: str,
+        attempt_id: str,
     ) -> None:
         """Give a contained attempt a terminal ``metrics.json``, or leave it alone.
 
@@ -1513,21 +1594,32 @@ class RoundRunner:
           summary landed, so the honest terminal record is already there and
           overwriting it with a cruder one would lose information.
         * a chain header that names a different attempt — a different
-          ``problem_id``, ``round_id`` or ``seed``, or one of those missing.
-          Then this directory's chain belongs to an earlier generation and a
-          summary written over it would be a claim about someone else's log.
-          (A header that cannot be read *at all* is left alone too, by the
-          generic guard below rather than by this check: with no header there
-          is nothing to attribute a summary to, and it takes the same "write
-          nothing" path.) This is reachable, not hypothetical:
+          ``attempt_id``, ``problem_id``, ``round_id`` or ``seed``, or one of
+          those missing. Then this directory's chain belongs to an earlier
+          generation and a summary written over it would be a claim about
+          someone else's log. (A header that cannot be read *at all* is left
+          alone too, by the generic guard below rather than by this check: with
+          no header there is nothing to attribute a summary to, and it takes
+          the same "write nothing" path.) This is reachable, not hypothetical:
           ``run_attempt`` materialises the workspace before it rotates the
           stale trio aside, so a crash in that window finds the previous
           generation's chain still in place, intact and summary-less — the
           honest ``INCOMPLETE`` shape a killed attempt leaves and rotation
           promises to preserve. :func:`_read_crashed_attempt_record` enforces
-          the check (see its docstring for the full driven example and for why
-          ``attempt_id`` is not part of it); the refusal is logged under its
-          own event name so it cannot be mistaken for reporting failing.
+          the check (see its docstring for the full driven example, and for why
+          ``attempt_id`` is the field that decides it); the refusal is logged
+          under its own event name so it cannot be mistaken for reporting
+          failing.
+
+        ``attempt_id`` is a parameter rather than something read back off disk
+        precisely so it can be *compared* with what is on disk. The caller
+        mints it before calling :meth:`run_attempt` (:func:`_mint_attempt_id`)
+        so it outlives the exception; reading it out of the header instead
+        would make the guard compare the found chain against itself, which is
+        what round 3's version effectively did and why a re-drive repeating
+        ``run_id``, ``problem_id`` and ``seed`` — the noise floor's documented
+        "re-run from seed 1" recovery, by construction — walked straight
+        through it.
 
         Because the header must match the current attempt before anything is
         written, ``target_score`` — taken from *this* config's criterion — is
@@ -1544,6 +1636,7 @@ class RoundRunner:
                 _read_crashed_attempt_record,
                 metrics_dir,
                 output_dir / "escalations",
+                expected_attempt_id=attempt_id,
                 expected_problem_id=problem.id,
                 expected_round_id=config.run_id,
                 expected_seed=config.seed,

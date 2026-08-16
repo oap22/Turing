@@ -38,12 +38,14 @@ from turing.research.loop.integrity import (
     verify_metrics_chain,
 )
 from turing.research.loop.metrics import SaturationVerdict
+from turing.research.loop.noise_floor import NoiseFloorConfig, NoiseFloorRunner
 from turing.research.loop.protocols import SolverStep
 from turing.research.loop.results import Outcome
 from turing.research.loop.runner import PassCriterion
 
 from .conftest import (
     DEFAULT_CAP,
+    ENGINE,
     ExplodingSolver,
     FakeSolver,
     ScriptedEscalationChannel,
@@ -1882,6 +1884,12 @@ class TestAFinishedRoundThatLostAnAttemptExitsZero:
             config=make_config(),
             output_dir=output_dir,
             exc_type="RuntimeError",
+            # This attempt's own id, so the summary-present early return is
+            # the *only* thing that can be stopping the write here -- the
+            # identity guard would otherwise mask what this test asserts.
+            attempt_id=json.loads((metrics_dir / "metrics.chain.json").read_text())["header"][
+                "attempt_id"
+            ],
         )
         assert (metrics_dir / "metrics.json").read_bytes() == honest
 
@@ -2054,3 +2062,179 @@ class TestACloseOutNeverWritesOverAnotherGenerationsChain:
         assert (metrics_dir / "prior-1" / "metrics.json").read_bytes() == first_generation
         assert (await reconcile_summary(metrics_dir / "prior-1")).state is ReconcileState.OK
         assert await _verify_exit_code(store.loop_dir.parent) == verify_cli.EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
+# Round-4 regression -- the guard must survive a re-drive that repeats the
+# round id and the seed, because that is the only re-run workflow this package
+# ships instructions for
+# --------------------------------------------------------------------------- #
+
+
+class _NoiseFloorWorkspacesThatFailOneSeedProblem(TempWorkspaceProvider):
+    """Raises out of ``materialise`` for one (seed, problem) pair.
+
+    The attempt id is ``<run_id>-<problem_id>-<hex>`` and the noise floor's
+    per-seed run id is ``<run_id>-seed-<n>``, so a prefix match picks out
+    exactly one seed's attempt at one problem -- the transient (pruned
+    template, evicted volume, full disk) that the corpus fingerprint cannot
+    see, aimed at the pre-rotation window.
+    """
+
+    def __init__(self, root: Path, *, seed_run_id: str, problem_id: str) -> None:
+        super().__init__(root)
+        self._prefix = f"{seed_run_id}-{problem_id}-"
+        self.refusals = 0
+
+    async def materialise(self, problem: Problem, *, attempt_id: str) -> Path:
+        if attempt_id.startswith(self._prefix):
+            self.refusals += 1
+            raise OSError(f"workspace template for {problem.id} is gone")
+        return await super().materialise(problem, attempt_id=attempt_id)
+
+
+class TestARedrivenNoiseFloorSeedNeverAdoptsTheKilledGenerationsChain:
+    """The round-3 guard's conceded limit was the shipped recovery workflow.
+
+    Round 3 pinned the close-out's adoption on ``problem_id``, ``round_id``
+    and ``seed``, and conceded that a re-drive repeating all three was
+    indistinguishable -- framing it as exotic. It is the opposite of exotic:
+    ``NoiseFloorConfig.round_config_for`` derives each seed's ``run_id``
+    deterministically as ``<run_id>-seed-<n>``, and the refusal an incomplete
+    seed raises tells the operator, in those words, to *"fix the cause and
+    re-run the noise floor from seed 1"*. The sanctioned recovery therefore
+    reuses the identical ``run_id`` and the identical ``seed``, into the
+    identical ``noise_floor_seed_dir`` -- all three fields equal by
+    construction, every time.
+
+    Driven end to end: seed 1's ``speed-1`` attempt is killed in the gap
+    between its last append and its summary write, leaving the intact-chain-
+    no-summary shape ``verify`` calls ``INCOMPLETE``. The operator re-runs the
+    floor from seed 1; that seed's ``speed-1`` crashes in ``materialise``, in
+    the window before rotation. All three of round 3's fields matched, the
+    guard passed, and the close-out wrote ``crashed_in_harness:OSError`` over
+    generation 1's log -- a cause of death generation 1 never experienced --
+    flipping the directory to ``OK`` and the results root to exit ``0``. The
+    honest "killed, unfinished" record was destroyed and ``verify``, the
+    pre-writeup gate, blessed the result.
+    """
+
+    @staticmethod
+    def _corpus() -> list[Problem]:
+        return [make_problem("speed-1", scores=(2.0,)), make_problem("speed-2", scores=(3.0,))]
+
+    @staticmethod
+    def _config() -> NoiseFloorConfig:
+        return NoiseFloorConfig(
+            run_id="nf",
+            eval_set_hash="",
+            engine=ENGINE,
+            seeds=(1, 2, 3),
+            default_cap=DEFAULT_CAP,
+        )
+
+    async def _seed_one_killed_before_its_summary(
+        self, store: TrajectoryStore, tmp_path: Path, clock: FakeClock
+    ) -> Path:
+        """A real seed-1 run, killed in the gap ``run_attempt``'s docstring names.
+
+        Driven through ``run_attempts`` with the noise floor's own per-seed
+        config and output directory -- not a hand-built fixture -- so the
+        directory, the run id and the chain are exactly what the floor
+        produces. The summary is removed afterwards because that is what a
+        killed process leaves behind: every append landed, and ``metrics.json``
+        is missing because the process died before the single end-of-attempt
+        write.
+        """
+        runner = make_runner(
+            solver=FakeSolver(),
+            store=store,
+            workspaces=TempWorkspaceProvider(tmp_path / "workspaces-gen1"),
+            clock=clock,
+        )
+        seed_dir = store.noise_floor_seed_dir(1)
+        await runner.run_attempts(
+            self._corpus(), self._config().round_config_for(1), output_dir=seed_dir
+        )
+        metrics_dir = seed_dir / "attempts" / "speed-1"
+        (metrics_dir / "metrics.json").unlink()
+        assert (await verify_cli.verify_run(metrics_dir)).state is verify_cli.RunState.INCOMPLETE
+        return metrics_dir
+
+    async def _redrive_from_seed_one(
+        self, store: TrajectoryStore, tmp_path: Path, clock: FakeClock
+    ) -> None:
+        """The re-run the refusal message instructs, crashing before rotation."""
+        workspaces = _NoiseFloorWorkspacesThatFailOneSeedProblem(
+            tmp_path / "workspaces-gen2", seed_run_id="nf-seed-1", problem_id="speed-1"
+        )
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        with pytest.raises(ContractViolationError):
+            await NoiseFloorRunner(runner, store).run(self._corpus(), self._config())
+        assert workspaces.refusals == 1, "the re-drive did not actually crash in materialise"
+
+    async def test_the_redrive_leaves_the_killed_generations_chain_byte_for_byte(
+        self, store: TrajectoryStore, tmp_path: Path, clock: FakeClock
+    ) -> None:
+        metrics_dir = await self._seed_one_killed_before_its_summary(store, tmp_path, clock)
+        chain_before = (metrics_dir / "metrics.jsonl").read_bytes()
+        header_before = json.loads((metrics_dir / "metrics.chain.json").read_text())["header"]
+
+        await self._redrive_from_seed_one(store, tmp_path, clock)
+
+        assert not (metrics_dir / "metrics.json").exists()
+        assert (metrics_dir / "metrics.jsonl").read_bytes() == chain_before
+        assert (
+            json.loads((metrics_dir / "metrics.chain.json").read_text())["header"] == header_before
+        )
+        assert (await verify_metrics_chain(metrics_dir)).ok is True
+
+    async def test_verify_still_reports_the_killed_attempt_unfinished(
+        self, store: TrajectoryStore, tmp_path: Path, clock: FakeClock
+    ) -> None:
+        """The pre-writeup gate must not be able to pass on this tree.
+
+        ``INCOMPLETE`` is the true statement: that attempt was killed and will
+        never gain a summary. An ``OK`` bought with a fabricated one is not a
+        milder finding, it is a false negative that also erased the evidence
+        for the real one.
+        """
+        metrics_dir = await self._seed_one_killed_before_its_summary(store, tmp_path, clock)
+        await self._redrive_from_seed_one(store, tmp_path, clock)
+
+        assert (await verify_cli.verify_run(metrics_dir)).state is verify_cli.RunState.INCOMPLETE
+        assert await _verify_exit_code(store.loop_dir.parent) == verify_cli.EXIT_INCOMPLETE
+
+    async def test_the_refusal_fires_on_the_attempt_id_with_every_other_field_equal(
+        self, store: TrajectoryStore, tmp_path: Path, clock: FakeClock
+    ) -> None:
+        """Names the field that carried the guard, and proves the others could not.
+
+        ``problem_id``, ``round_id`` and ``seed`` are all *equal* here -- that
+        is the entire point of the scenario -- so this asserts the refusal
+        reason cites ``attempt_id`` and nothing else. If a later change drops
+        ``attempt_id`` back out of the comparison, the reason list goes empty,
+        the guard passes, and this test fails on the assertion rather than on
+        some downstream symptom.
+        """
+        metrics_dir = await self._seed_one_killed_before_its_summary(store, tmp_path, clock)
+        header = json.loads((metrics_dir / "metrics.chain.json").read_text())["header"]
+
+        with structlog.testing.capture_logs() as cap:
+            await self._redrive_from_seed_one(store, tmp_path, clock)
+
+        refusals = [
+            e for e in cap if e.get("event") == "research.results.crashed_attempt_summary_refused"
+        ]
+        assert len(refusals) == 1
+        assert refusals[0]["log_level"] == "error"
+        reason = refusals[0]["reason"]
+        assert f"attempt_id={header['attempt_id']!r}" in reason
+        # The three fields round 3 relied on agree, so they contribute nothing.
+        assert "problem_id=" not in reason
+        assert "round_id=" not in reason
+        assert "seed=" not in reason
+        # A deliberate, correct refusal is not the reporting layer breaking.
+        assert not any(
+            e.get("event") == "research.results.crashed_attempt_summary_failed" for e in cap
+        )

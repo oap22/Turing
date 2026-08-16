@@ -1136,8 +1136,8 @@ with "this attempt has not finished yet."
 **The close-out refuses to write when the chain in that directory is not this
 attempt's** — a guard its docstring promised from the start and that round 3
 found unimplemented. `_read_crashed_attempt_record` compares the chain
-header's `problem_id`, `round_id` and `seed` against the attempt that
-actually crashed, and refuses (logging
+header's `attempt_id`, `problem_id`, `round_id` and `seed` against the attempt
+that actually crashed, and refuses (logging
 `research.results.crashed_attempt_summary_refused` at `ERROR`, writing
 nothing) when any of them disagrees. This is reachable rather than defensive:
 `run_attempt` materialises the workspace — real I/O against a template that
@@ -1154,13 +1154,64 @@ mismatches, because every field it reconciled had just been re-derived from
 that same log. It also destroyed the honest `INCOMPLETE` state that said
 generation 1 was killed unfinished, which is the one thing rotation promises a
 superseded generation keeps. With the guard, that directory stays untouched
-and keeps reporting `2` until someone looks at it. `attempt_id` is not part of
-the comparison — it is minted inside `run_attempt` and dies with the exception
-— so a re-drive under the *same* `run_id` and seed remains indistinguishable
-by any surviving evidence; that is the documented limit of the guard, not an
-oversight. `reconcile_summary`'s identity check (see "Integrity, and its
-limits") is the independent second guard on the same shape, from the reader's
-side.
+and keeps reporting `2` until someone looks at it. `reconcile_summary`'s
+identity check (see "Integrity, and its limits") is the independent second
+guard on the same shape, from the reader's side.
+
+**`attempt_id` is the field that decides it, and round 3's version left it
+out.** Round 3 pinned the comparison on `problem_id`, `round_id` and `seed`
+alone, on the grounds that `attempt_id` was minted inside `run_attempt` and
+died with the exception, and conceded a re-drive repeating `run_id` *and*
+seed as the guard's documented limit — framed as exotic. It was the shipped
+recovery workflow. `NoiseFloorConfig.round_config_for` derives each seed's
+`run_id` deterministically as `<run_id>-seed-<n>`, and the refusal an
+incomplete seed raises tells the operator, in those words, to *"fix the cause
+and re-run the noise floor from seed 1"* — so the sanctioned recovery reuses
+the identical `run_id`, the identical seed and the identical
+`noise_floor_seed_dir`, every time. Driven end to end: seed 1's `speed-1`
+attempt is killed in the gap between its last append and its summary write
+(`INCOMPLETE`, exit `2`); the operator re-runs the floor as instructed; that
+seed's `speed-1` crashes in `materialise`, before rotation; all three of round
+3's fields match, the guard passes, and the close-out writes
+`crashed_in_harness:OSError` over generation 1's log — a cause of death
+generation 1 never experienced — flipping the directory to `OK` and the whole
+results root to exit `0`. The honest "killed, unfinished" record is destroyed
+and `verify`, the pre-writeup gate, blesses the result.
+
+The fix is to stop the id dying: `run_attempts` mints it (`_mint_attempt_id`)
+*before* calling `run_attempt` and passes it down, so it survives the
+exception in the caller's frame and reaches the close-out. Its `uuid4` suffix
+differs between two generations of the same attempt even when every other
+identity field repeats, so the comparison is now exact rather than a
+best-effort trio; `run_id` determinism is untouched, and nothing that depends
+on a floor being re-runnable under the same ids changed. The other three
+fields stay in the comparison because they are what makes the refusal
+*readable* — `round_id='gen1' (expected 'gen2')` tells an operator which
+generation is sitting in the directory, where a bare id mismatch would not.
+
+`started_at_ms` — also in the header, and different for every generation —
+cannot serve this purpose, which is why the id is minted upstream instead.
+`run_attempt` awaits `materialise` *before* it reads the clock and builds the
+`Attempt`, so at the canonical crash point no start time has been taken at
+all; and the nearest substitute, a watermark stamped by the caller and
+compared with `>=`, would rest on wall-clock monotonicity *across processes*,
+which `SystemClock.now_ms` (`time.time()`) does not provide. An NTP step, a
+container clock reset, or a re-run landing in the same millisecond would make
+a previous generation's header look current and the guard would adopt exactly
+the chain it exists to refuse. A `uuid4` needs no clock and no ordering
+assumption. Note that this is a *different* comparison from
+`reconcile_summary`'s identity check, which excludes `started_at_ms` for an
+unrelated reason — that one compares two **documents** in the same directory
+and the field never reaches a summary, while this one compares the header
+against the **live attempt** that just crashed. Different sides, different
+evidence; neither field list is the other's.
+
+What remains indistinguishable is only what no evidence can separate: a
+`uuid4` collision in the 32-bit suffix (and that fails *closed* — a matching
+id on a foreign chain is the one direction that adopts, at roughly one in four
+billion), and a re-drive against a results tree an attacker can write to,
+which is the R2/Q11 limit the honesty statement at the end of this section
+already states for every check in this module.
 
 **`materialise` was left where it is, before rotation.** Reordering would
 close this window too, but it costs more than it buys: rotation would then
