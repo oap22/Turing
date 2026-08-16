@@ -681,6 +681,98 @@ class TestIntegrityAgainstARealRun:
         rotated_reconcile_verdict = await reconcile_summary(rotated_dir)
         assert rotated_reconcile_verdict.ok is True, rotated_reconcile_verdict.mismatches
 
+    async def test_a_crash_between_rotation_renames_heals_on_the_next_entry(
+        self,
+        store: TrajectoryStore,
+        workspaces: TempWorkspaceProvider,
+        clock: FakeClock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """RES-19: the rotation *set* has to be atomic, not just each rename.
+
+        ``_rotate_stale_metrics`` used to move the trio (and plots) aside with
+        three-plus sequential ``Path.rename`` calls straight into a
+        pre-existing ``prior-N/``. Each individual rename is atomic; a process
+        killed between two of them left ``prior-N/`` holding, say, a log with
+        no chain sidecar (fails verification on its own) while the *live*
+        ``metrics_dir`` kept a stale sidecar with no log — a half-rotated
+        state ``MetricsWriter``'s old refusal (``metrics.jsonl`` only) did not
+        catch, so the next drive wrote a fresh chain beside that orphaned
+        sidecar and **both** generations then failed verification on
+        completely honest data.
+
+        This drives one real attempt to build an honest trio-plus-plots (real
+        ``MetricsWriter``, real ``RoundRunner``, not hand-built), monkeypatches
+        ``Path.rename`` to raise right after the first file lands, and asserts
+        that a *second*, unpatched call to ``_rotate_stale_metrics`` heals the
+        interrupted rotation: nothing from the trio/plots is left directly in
+        ``metrics_dir``, exactly one ``prior-N/`` exists holding every file
+        that was ever present, and that directory still verifies clean.
+        """
+        from pathlib import Path as _Path
+
+        from turing.research.loop.runner import _ROTATED_NAMES, _rotate_stale_metrics
+
+        problem = make_problem("s1", scores=(1.0, 5.0))
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        config = make_config(pass_criteria={"s1": PassCriterion(min_score=2.0)})
+        output_dir = store.round_dir(0)
+        outcome = await runner.run_attempt(problem, config, output_dir=output_dir)
+        assert outcome.attempt.state is AttemptState.PASSED
+
+        metrics_dir = output_dir / "attempts" / "s1"
+        present_before = [name for name in _ROTATED_NAMES if (metrics_dir / name).exists()]
+        # The fixture is only meaningful if there is a real trio *and* both
+        # plots to move -- otherwise this would not exercise a multi-rename
+        # rotation at all.
+        assert set(present_before) == set(_ROTATED_NAMES)
+        contents_before = {name: (metrics_dir / name).read_bytes() for name in present_before}
+
+        real_rename = _Path.rename
+        call_count = {"n": 0}
+
+        def flaky_rename(self: _Path, target: object) -> object:
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise OSError("simulated crash mid-rotation")
+            return real_rename(self, target)
+
+        monkeypatch.setattr(_Path, "rename", flaky_rename)
+
+        with pytest.raises(OSError, match="simulated crash mid-rotation"):
+            _rotate_stale_metrics(metrics_dir)
+
+        # Exactly one rename landed before the injected crash: the trio/plots
+        # are now split between metrics_dir and the (dot-prefixed, hidden)
+        # staging directory rotation left behind.
+        assert call_count["n"] == 2
+
+        # A second call -- unpatched calls still raise on n==2, but that value
+        # is already spent, so every rename this call makes succeeds -- heals
+        # the interrupted rotation.
+        _rotate_stale_metrics(metrics_dir)
+
+        # (a) Nothing from the trio/plots sits directly in metrics_dir.
+        for name in _ROTATED_NAMES:
+            assert not (metrics_dir / name).exists(), f"{name} was left in metrics_dir"
+
+        # (b) Exactly one prior-N/ exists, holding every file that was ever
+        # present, byte for byte.
+        rotated_dirs = sorted(p for p in metrics_dir.iterdir() if p.is_dir())
+        assert len(rotated_dirs) == 1, f"expected one rotated-aside dir, got {rotated_dirs}"
+        prior_dir = rotated_dirs[0]
+        assert prior_dir.name == "prior-1"
+        for name, data in contents_before.items():
+            assert (prior_dir / name).read_bytes() == data, f"{name} is not byte-identical"
+
+        # (c) The healed prior-N/ still verifies clean for the honest chain.
+        chain_verdict = await verify_metrics_chain(prior_dir)
+        assert chain_verdict.ok is True, chain_verdict.reason
+        reconcile_verdict = await reconcile_summary(prior_dir)
+        assert reconcile_verdict.ok is True, reconcile_verdict.mismatches
+        run_verdict = await verify_cli.verify_run(prior_dir)
+        assert run_verdict.state is verify_cli.RunState.OK
+
     async def test_chain_and_reconcile_are_both_ok_when_the_solver_raises_with_accounted_tokens(
         self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
     ) -> None:

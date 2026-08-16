@@ -968,6 +968,31 @@ the current one's — because the whole trio rotates together rather than just
 the JSONL. A rotation that preserved an orphaned chain sidecar with no
 summary next to it would only be half a fix.
 
+**The move into `prior-N/` is atomic as a set, not just file by file.**
+Moving each of the trio and its plots with its own `rename` call is not
+enough on its own: each individual move is atomic, but a process killed
+*between* two of them used to leave `prior-N/` holding, say, a log with no
+chain sidecar — which fails verification on its own — while the *live*
+`attempts/<problem-id>/` directory kept the stale sidecar with no log, a
+half-rotated shape `MetricsWriter`'s refusal (checking only `metrics.jsonl`)
+did not catch. The next drive then wrote a fresh chain beside that orphaned
+sidecar, and **both** generations failed verification on completely honest
+data — the exact "verifier cries wolf" failure this document's INCOMPLETE
+work went four rounds to eliminate, reopened at a different seam.
+`_rotate_stale_metrics` now stages the whole set into a hidden directory
+inside `attempts/<problem-id>/` (same filesystem, so every individual move is
+still a cheap rename) and commits it with **one** final `rename` onto the
+numbered `prior-N/` name — so an observer can only ever see "before" or
+"after" rotation, never a `prior-N/` holding some but not all of the files it
+moved. A crash can still land inside that staging window, so every call
+site — which is to say the start of every attempt — checks for a leftover
+staging directory first and finishes committing it before deciding whether a
+*new* rotation is needed, closing the window on the next entry rather than
+leaving it permanent. `MetricsWriter`'s refusal was widened to match:
+constructing a writer now also refuses over a non-empty `metrics.chain.json`
+with no `metrics.jsonl` beside it, since that shape is exactly what the
+residual staging window can (briefly) leave behind.
+
 **Telling a re-drive apart from an alteration.** `verify`'s directory walk
 finds *every* directory anywhere under `<path>` containing a file literally
 named `metrics.jsonl`, at any depth — which means it walks into `prior-N/`

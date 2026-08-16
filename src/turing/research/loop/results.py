@@ -588,6 +588,26 @@ class MetricsWriter:
     chain and is not refused; those are exactly the states a fresh attempt
     directory is in.
 
+    **The same refusal fires on a non-empty sidecar even with no log.**
+    ``runner._rotate_stale_metrics`` moves the whole trio aside as one atomic
+    set, but the *window* the crash lands in (a hard kill, a full disk,
+    ``SIGKILL`` mid-rotation) can still leave this directory holding a real
+    ``metrics.chain.json`` with no ``metrics.jsonl`` beside it — the residual
+    a startup self-heal has not yet reached. That sidecar carries a real
+    chain head and a real header naming a *different* attempt; a writer that
+    only checked ``metrics.jsonl`` would see "missing" here, treat this as a
+    fresh directory, and start appending — advancing the chain from *this*
+    attempt's seed while the sidecar still claims the previous attempt's
+    header, or getting silently overwritten by this attempt's own first
+    append before anyone could tell the two apart. Either way the evidence
+    that a rotation was left half-done disappears, which is strictly worse
+    than refusing: the caller is expected to finish healing the leftover
+    rotation (see :func:`~turing.research.loop.runner._rotate_stale_metrics`)
+    before constructing a writer here, not to have this class paper over it.
+    A **missing or empty** sidecar is not refused, for the same reason a
+    missing or empty ``metrics.jsonl`` is not: both are exactly the states a
+    fresh attempt directory is in.
+
     This constructor deliberately does **not** resume the prior chain from
     the sidecar. The header carries this attempt's own ``attempt_id`` and
     ``started_at_ms``, distinct from whatever produced the existing file;
@@ -606,15 +626,20 @@ class MetricsWriter:
         header: Mapping[str, object],
         clock: Clock | None = None,
     ) -> None:
-        if path.exists() and path.stat().st_size > 0:
+        sidecar_path = path.parent / integrity.CHAIN_SIDECAR_FILENAME
+        jsonl_present = path.exists() and path.stat().st_size > 0
+        sidecar_present = sidecar_path.exists() and sidecar_path.stat().st_size > 0
+        if jsonl_present or sidecar_present:
+            present = path.name if jsonl_present else sidecar_path.name
             raise ContractViolationError(
-                f"{path} already exists and is not empty; a MetricsWriter must start "
-                "from a fresh chain, not splice new lines onto one seeded by a different "
-                "attempt — rotate the existing metrics.jsonl (and its metrics.chain.json "
-                "sidecar) aside before constructing a new writer over this path"
+                f"{path.parent} already holds a non-empty {present!r}; a MetricsWriter "
+                "must start from a fresh chain, not splice new lines onto one seeded by "
+                "a different attempt, and not write beside a sidecar that names one — "
+                "rotate the existing metrics.jsonl and its metrics.chain.json sidecar "
+                "aside (as a matched pair) before constructing a new writer over this path"
             )
         self._path = path
-        self._sidecar_path = path.parent / integrity.CHAIN_SIDECAR_FILENAME
+        self._sidecar_path = sidecar_path
         self._header = dict(header)
         # Held only so this writer's constructor shape matches its neighbours
         # (``TrajectoryStore``) and so tests can inject a deterministic clock.
