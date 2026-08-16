@@ -10,22 +10,50 @@ is already on disk::
         --loop-slug 2026-08-16-speedup-baseline \\
         --harness-root /Users/Shared/turing/harness \\
         --reference-root /Users/Shared/turing/reference \\
-        --scaffold-repo /Users/Shared/turing/turing-skills
+        --scaffold-repo /Users/Shared/turing/turing-skills \\
+        --yes
 
 Kill it at any point and run the identical command again: completed attempts are
-reused, an interrupted attempt continues from its checkpoint, and an attempt
-suspended on an operator decision re-enters that wait. See the "Resume" section
-of ``docs/research-agent.md`` for the completeness table this rests on, and
+reused, an interrupted attempt continues from its checkpoint, an attempt
+suspended on an operator decision re-enters that wait, and a round that had
+already finished is returned as it was written — a no-op success, not a
+refusal. See the "Resume" section of ``docs/research-agent.md`` for the
+completeness table this rests on, and
 :meth:`~turing.research.loop.trajectory.TrajectoryStore.load_stored_attempt` for
 the rules themselves.
+
+**Two flags gate what an invocation touches.**
+
+* ``--yes`` acknowledges that the run spends subscription compute. Without it
+  a non-``--dry-run`` invocation runs the whole preflight — corpus, scaffold
+  sha, backend client, both configs, the plan — and then refuses with exit
+  ``2`` and one line, having written nothing under the results root. It is
+  the difference between "show me what would run" and "run it", and it is
+  deliberately not the default: the driver is invoked by hand and by
+  schedulers alike, and a scheduler that spends a subscription window should
+  have said so in its command line.
+* ``--dry-run`` does everything ``--yes`` would validate and nothing it would
+  spend. Concretely, a dry run **does** load the corpus and refuse a missing
+  harness script, read the scaffold repo's ``HEAD``, read
+  ``ResearchLoopSettings`` / ``SolverSettings`` / ``BackendSettings`` and
+  construct the Anthropic SDK client (a missing credential refuses here, at
+  zero compute; no request is sent), and construct the
+  :class:`~turing.research.loop.noise_floor.NoiseFloorConfig` and
+  :class:`~turing.research.loop.runner.RoundConfig` the real run would use —
+  so ``--seeds 1 --dry-run`` refuses exactly as ``--seeds 1`` would. It
+  **does not** create the results directory, materialise a workspace, or
+  call a model. Exit ``0`` from a dry run means the identical command with
+  ``--yes`` in place of ``--dry-run`` gets past preflight.
 
 **What this driver deliberately does not do**, each refused loudly rather than
 faked:
 
 * **Rounds greater than 0.** A round *N* > 0 needs its parent's
   :class:`~turing.research.contracts.RoundRecord` to compute a delta against,
-  and nothing decodes ``round-NN/round.json`` back into one — the record is
-  written, never read. It also needs loop 2's self-edit step, which is what
+  and this driver does not load one — ``round-NN/round.json`` can be decoded
+  (:func:`~turing.research.loop.trajectory.decode_round_record`, used only so a
+  restart after a finished round is a no-op), but nothing here selects a
+  parent, loads it and validates its lineage. It also needs loop 2's self-edit step, which is what
   makes round *N* differ from round 0 at all and is explicitly out of scope
   (``docs/research-agent.md`` § What is deliberately NOT built yet). Passing
   ``--round`` a positive number refuses and names both.
@@ -43,8 +71,9 @@ faked:
   ``FAILED_WITHIN_CAP`` holding its best score. That is the brief's solver
   shape, not a missing feature.
 
-Exit codes: ``0`` the phase finished, ``2`` the run was refused (every refusal
-names the missing piece), ``130`` interrupted — which, with resume, is a pause
+Exit codes: ``0`` the phase finished (or, on a restart, was already finished),
+``2`` the run was refused (every refusal names the missing piece; a missing
+``--yes`` is one of them), ``130`` interrupted — which, with resume, is a pause
 rather than a loss.
 """
 
@@ -229,8 +258,30 @@ async def _drive(args: argparse.Namespace) -> int:
     )
 
     store = TrajectoryStore(settings.research_results_root, args.loop_slug)
-    await store.ensure_layout()
     eval_set_hash = fingerprint_corpus(corpus, extra=adapter.eval_set_material())
+
+    # Both configs are built *before* the dry-run return so that a dry run
+    # validates exactly what a real run would: ``--seeds 1`` refuses inside
+    # ``NoiseFloorConfig.__post_init__`` here, on both paths, rather than
+    # passing a dry run it would fail for real.
+    floor_config = NoiseFloorConfig(
+        run_id=f"{args.loop_slug}-noise-floor",
+        eval_set_hash=eval_set_hash,
+        engine=engine,
+        seeds=tuple(args.seeds),
+        default_cap=solver_settings.default_cap(),
+        escalate_on_cap_exhaustion=solver_settings.research_escalate_on_cap_exhausted,
+    )
+    round_config = RoundConfig(
+        round_index=0,
+        run_id=f"{args.loop_slug}-round-00",
+        parent_round_id=None,
+        eval_set_hash=eval_set_hash,
+        engine=engine,
+        seed=args.seeds[0],
+        default_cap=solver_settings.default_cap(),
+        escalate_on_cap_exhaustion=solver_settings.research_escalate_on_cap_exhausted,
+    )
 
     sys.stdout.write(
         f"loop      {store.loop_dir}\n"
@@ -238,12 +289,30 @@ async def _drive(args: argparse.Namespace) -> int:
         f"corpus    {len(corpus)} problem(s), eval_set_hash {eval_set_hash}\n"
         f"engine    {engine.backend} / {engine.orchestrator_model} @ "
         f"{engine.scaffold_git_sha[:12]}\n"
+        f"seeds     {list(floor_config.seeds)} (round 0 seeds with {round_config.seed})\n"
+        f"cap       {round_config.default_cap.max_steps} steps / "
+        f"{round_config.default_cap.max_tokens} tokens / "
+        f"{round_config.default_cap.max_wall_clock_seconds:g} s\n"
         "answer escalations with:\n"
         f"  python -m turing.research.loop.cli --loop-dir <dir> --list\n"
     )
     if args.dry_run:
-        sys.stdout.write("dry run: everything above assembled; nothing was driven\n")
+        sys.stdout.write(
+            "dry run: everything above assembled and validated; nothing was driven and "
+            "nothing was written under the results root\n"
+        )
+        await backend.aclose()
         return EXIT_OK
+    if not args.yes:
+        await backend.aclose()
+        raise ContractViolationError(
+            "this run spends subscription compute; re-run with --yes to acknowledge that, "
+            "or --dry-run to stop here (nothing was written)"
+        )
+
+    # The results tree is created only past both gates above; a dry run and a
+    # refused run leave the results root exactly as they found it.
+    await store.ensure_layout()
 
     # The floor is measured every invocation, and on a restart that costs
     # nothing: ``NoiseFloorRunner.run`` reuses every complete seed and
@@ -262,24 +331,14 @@ async def _drive(args: argparse.Namespace) -> int:
         ),
         store,
     )
-    report = await floor_runner.run(
-        corpus,
-        NoiseFloorConfig(
-            run_id=f"{args.loop_slug}-noise-floor",
-            eval_set_hash=eval_set_hash,
-            engine=engine,
-            seeds=tuple(args.seeds),
-            default_cap=solver_settings.default_cap(),
-            escalate_on_cap_exhaustion=solver_settings.research_escalate_on_cap_exhausted,
-        ),
-        resume=args.resume,
-    )
+    report = await floor_runner.run(corpus, floor_config, resume=args.resume)
     sys.stdout.write(
         f"noise floor: {len(report.floors)} cell(s) over seeds {list(report.seeds)}"
         f" (reused {list(floor_runner.skipped_seeds)})\n"
     )
 
     if args.noise_floor_only:
+        await backend.aclose()
         return EXIT_OK
 
     round_runner = _build_runner(
@@ -290,19 +349,18 @@ async def _drive(args: argparse.Namespace) -> int:
     )
     outcome = await round_runner.run_round(
         corpus,
-        RoundConfig(
-            round_index=0,
-            run_id=f"{args.loop_slug}-round-00",
-            parent_round_id=None,
-            eval_set_hash=eval_set_hash,
-            engine=engine,
-            seed=args.seeds[0],
-            default_cap=solver_settings.default_cap(),
-            escalate_on_cap_exhaustion=solver_settings.research_escalate_on_cap_exhausted,
-        ),
+        round_config,
         noise_floor=report,
         resume=args.resume,
     )
+    if outcome.already_finished:
+        sys.stdout.write(
+            f"round 00: already finished under run_id {outcome.record.run_id!r}; "
+            "nothing driven, nothing written\n"
+            f"verdict: {outcome.record.verdict}\n"
+        )
+        await backend.aclose()
+        return EXIT_OK
     sys.stdout.write(
         f"round 00: {len(outcome.attempts)} attempt(s), "
         f"{len(round_runner.skipped_problems)} reused, "
@@ -323,10 +381,15 @@ def build_parser() -> argparse.ArgumentParser:
             "corpus, resuming from whatever is already on disk."
         ),
         epilog=(
+            "A run spends subscription compute and must say so: pass --yes, or --dry-run "
+            "to assemble and validate everything and stop. Without either, the preflight "
+            "runs and the invocation refuses with exit 2 and nothing written.\n"
+            "Kill a run at any point and re-run the identical command (--yes included) "
+            "to resume; a round that already finished is a no-op success.\n"
             "Rounds greater than 0 are loop 2 and are refused; see the module "
             "docstring for the full list of what is not wired.\n"
             "exit codes:\n"
-            f"  {EXIT_OK}  the phase finished\n"
+            f"  {EXIT_OK}  the phase finished (or was already finished)\n"
             f"  {EXIT_REFUSED}  refused — the message names the missing piece\n"
             f"  {EXIT_INTERRUPTED}  interrupted; re-run the same command to resume\n"
         ),
@@ -383,7 +446,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="assemble every component and print the plan, then exit without driving",
+        help=(
+            "assemble and validate every component (corpus, scaffold sha, backend "
+            "client, both configs) and print the plan, then exit without driving; "
+            "creates nothing under the results root"
+        ),
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "acknowledge that this run spends subscription compute; without it a "
+            "non-dry-run invocation refuses (exit 2) after preflight, having written "
+            "nothing"
+        ),
     )
     return parser
 
@@ -394,9 +470,11 @@ def _refuse_unbuilt_round(round_index: int) -> ContractViolationError:
         "than driving something that would look like a round. Two pieces are missing, "
         "either sufficient:\n"
         "  1. A round > 0 must compute its deltas against its parent's RoundRecord, and "
-        "nothing decodes round-NN/round.json back into one — the record is written and "
-        "never read. Driving without a parent would produce a round with no lineage, "
-        "which RoundConfig refuses anyway.\n"
+        "this driver does not load one: round-NN/round.json can be decoded "
+        "(trajectory.decode_round_record, used only for the restart-after-finish no-op), "
+        "but nothing here selects a parent, loads it and validates its lineage. Driving "
+        "without a parent would produce a round with no lineage, which RoundConfig "
+        "refuses anyway.\n"
         "  2. What makes round N differ from round 0 is loop 2's self-edit step, which "
         "is out of scope for loop 1 (docs/research-agent.md, 'What is deliberately NOT "
         "built yet'). Re-running round 0's scaffold under a new index would produce a "

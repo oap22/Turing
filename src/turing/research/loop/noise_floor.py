@@ -46,7 +46,6 @@ from turing.research.loop.metrics import (
 )
 from turing.research.loop.runner import RoundConfig
 from turing.research.loop.trajectory import (
-    RunIdentity,
     cell_key,
     encode_noise_floor,
     encode_type_score,
@@ -59,7 +58,7 @@ if TYPE_CHECKING:
     from turing.research.contracts import Cap, EngineIdentity, Problem, TypeScore
     from turing.research.loop.metrics import Cell, NoiseFloor
     from turing.research.loop.runner import AttemptFailure, PassCriterion, RoundRunner
-    from turing.research.loop.trajectory import TrajectoryStore
+    from turing.research.loop.trajectory import RunIdentity, TrajectoryStore
 
 logger = structlog.get_logger(__name__)
 
@@ -383,21 +382,27 @@ class NoiseFloorRunner:
         escalations = 0
         eval_set_hash = bind_eval_set_hash(corpus, config.eval_set_hash)
         self._skipped_seeds = ()
-        identities = {
-            seed: RunIdentity(
-                round_id=config.round_config_for(seed).run_id,
-                seed=seed,
-                eval_set_hash=eval_set_hash,
-            )
+        # The per-seed identity is the *bound* seed config's — the same object
+        # ``run_attempts`` stamps onto every checkpoint — so it carries the
+        # ``config_digest`` and, through it, the engine. A floor measured
+        # under scaffold A is not re-derived and stamped with scaffold B: the
+        # seed's checkpoints name A's digest, this run's identity names B's,
+        # and the seed is driven again. Without this the report below would
+        # claim ``config.engine`` for numbers no process measured under it,
+        # and ``run_round``'s "a floor measured on a different scaffold is
+        # not a floor" guard would pass on exactly such a floor.
+        seed_configs = {
+            seed: replace(config.round_config_for(seed), eval_set_hash=eval_set_hash)
             for seed in config.seeds
         }
+        identities = {seed: seed_config.identity() for seed, seed_config in seed_configs.items()}
         already_measured: tuple[int, ...] = ()
         if resume:
             already_measured = await self._trajectory.list_completed_seeds(
                 identities, [problem.id for problem in corpus]
             )
         for seed in config.seeds:
-            seed_config = replace(config.round_config_for(seed), eval_set_hash=eval_set_hash)
+            seed_config = seed_configs[seed]
             output_dir = self._trajectory.noise_floor_seed_dir(seed)
             if seed in already_measured:
                 logger.info(

@@ -393,13 +393,43 @@ class OperatorEscalationChannel:
         self._sleep = sleep or asyncio.sleep
         self._clock = clock or SystemClock()
 
-    async def request_decision(self, request: EscalationRequest) -> EscalationDecision:
+    async def request_decision(
+        self, request: EscalationRequest, *, reopened: bool = False
+    ) -> EscalationDecision:
+        """Publish, page, and poll until the operator answers.
+
+        ``reopened`` (a restart re-entering a wait a previous process died in)
+        changes one thing: the first push is skipped. The operator was paged
+        when the request was raised, and a decision may already be sitting in
+        the inbox — so this polls first, and if nothing has arrived it falls
+        into the ordinary reminder cadence (``repush_interval_seconds`` after
+        the restart, then every interval), rather than paging again on every
+        restart for a question that was asked once. The request file is
+        re-published either way: that is idempotent, and it keeps
+        ``cli --list`` truthful if the earlier process died between publish
+        and push. The cost of the choice, stated: if that earlier process died
+        *before* its push, the operator first hears of the request one repush
+        interval after the restart — and with reminders disabled
+        (``repush_interval_seconds=None``) not at all until the next fresh
+        escalation. Reminders are on by default; that is what they are for.
+        """
         await self._inbox.publish(request)
         pushes = 0
         waited = 0.0
+        if reopened:
+            logger.info(
+                "research.escalation.reopened",
+                request_id=request.request_id,
+                problem_id=request.problem_id,
+                detail=(
+                    "re-entering a wait a previous process died in; polling for the answer "
+                    "before paging again, then keeping the reminder cadence"
+                ),
+            )
         while True:
             if self._notifier is not None and (
-                pushes == 0 or (self._repush is not None and waited >= self._repush)
+                (pushes == 0 and not reopened)
+                or (self._repush is not None and waited >= self._repush)
             ):
                 pushes += 1
                 waited = 0.0

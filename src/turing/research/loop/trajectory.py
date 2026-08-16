@@ -40,10 +40,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import structlog
 
@@ -53,26 +55,29 @@ from turing.research.contracts import (
     Cap,
     CapConsumption,
     ContractViolationError,
+    EngineIdentity,
+    EscalationReason,
+    EscalationRequest,
+    ProblemType,
+    RoundCost,
+    RoundDelta,
+    RoundRecord,
+    Split,
+    TypeScore,
     VerificationResult,
+)
+from turing.research.loop.metrics import (
+    SaturationAssessment,
+    SaturationVerdict,
+    ScoredProblem,
 )
 from turing.research.loop.protocols import SystemClock
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
-    from turing.research.contracts import (
-        EscalationDecision,
-        EscalationRequest,
-        RoundRecord,
-        TypeScore,
-    )
-    from turing.research.loop.metrics import (
-        Cell,
-        CostBasis,
-        NoiseFloor,
-        SaturationAssessment,
-        ScoredProblem,
-    )
+    from turing.research.contracts import EscalationDecision
+    from turing.research.loop.metrics import Cell, CostBasis, NoiseFloor
     from turing.research.loop.protocols import Clock
 
 logger = structlog.get_logger(__name__)
@@ -87,7 +92,11 @@ __all__ = [
     "StoredAttempt",
     "TrajectoryStore",
     "cell_key",
+    "decode_assessments",
     "decode_attempt_checkpoint",
+    "decode_escalation_request",
+    "decode_round_record",
+    "decode_scored_problems",
     "encode_assessment",
     "encode_noise_floor",
     "encode_round_record",
@@ -229,11 +238,27 @@ class RunIdentity:
     id, a re-measured baseline — from silently inheriting the old numbers, and
     it is the same identity comparison
     ``runner._read_crashed_attempt_record`` makes for the metrics chain.
+
+    ``config_digest`` is the fourth coordinate, and it exists because the
+    first three name *which* run without naming *how it measured*. A round
+    killed under a cap of 2 steps and restarted with a cap of 6 has the same
+    ``run_id``, ``seed`` and corpus; without this field it would reuse the
+    cap-2 scores for the finished problems and drive the rest at cap 6, and
+    the resulting :class:`~turing.research.contracts.RoundRecord` would be
+    one number measured two ways. The same holds for the engine — a floor
+    measured under scaffold ``A`` re-derived and stamped with ``B`` would pass
+    ``run_round``'s engine guard on a floor that never saw ``B``. The digest
+    is ``RoundConfig.config_digest()``: a SHA-256 over the canonical JSON of
+    every measurement-affecting field, so any drift in one of them makes the
+    stored attempt a previous generation and re-drives it — the safe
+    direction. Empty means "compare nothing", which only a caller that has no
+    ``RoundConfig`` (a hand-built identity in a test) should rely on.
     """
 
     round_id: str
     seed: int
     eval_set_hash: str = ""
+    config_digest: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,6 +370,147 @@ def _decode_step_log(payload: Mapping[str, Any]) -> StepLog:
         score=payload.get("score"),
         passed_correctness=payload.get("passed_correctness"),
         verifier_error=payload.get("verifier_error"),
+    )
+
+
+def decode_escalation_request(payload: Any, *, attempt_id: str) -> EscalationRequest | None:
+    """One ``escalations/<id>.json`` file back into the request it recorded.
+
+    ``None`` for anything that is not a readable request **for this attempt**:
+    a payload that is not the ``{"request": ..., "decision": ...}`` shape this
+    store writes, a request naming another attempt, or one missing a field the
+    rebuild needs. Shared by ``runner._read_prior_escalations`` (which counts
+    the requests an attempt already raised) and by :meth:`_read_stored_attempt`
+    (which decides whether an ``ESCALATED`` checkpoint can be re-entered), so
+    the two cannot disagree about whether a request file is usable — the case
+    that used to lose a problem outright: the store said *awaiting decision*
+    because the file existed, the runner then failed to decode it and raised.
+
+    ``best_result`` is dropped rather than decoded: the operator-facing
+    encoding keeps four fields of a
+    :class:`~turing.research.contracts.VerificationResult`, and a half-built
+    result would be a fabricated measurement.
+    """
+    request = payload.get("request") if isinstance(payload, dict) else None
+    if not isinstance(request, dict) or request.get("attempt_id") != attempt_id:
+        return None
+    try:
+        return EscalationRequest(
+            request_id=request["request_id"],
+            problem_id=request["problem_id"],
+            attempt_id=request["attempt_id"],
+            round_id=request["round_id"],
+            reason=EscalationReason(request["reason"]),
+            summary=request.get("summary", ""),
+            cap=Cap(
+                max_steps=request["cap"]["max_steps"],
+                max_tokens=request["cap"]["max_tokens"],
+                max_wall_clock_seconds=request["cap"]["max_wall_clock_seconds"],
+                extension_count=request["cap"].get("extension_count", 0),
+            ),
+            consumed=CapConsumption(
+                steps=request["consumed"]["steps"],
+                tokens=request["consumed"]["tokens"],
+                wall_clock_seconds=request["consumed"]["wall_clock_seconds"],
+            ),
+            created_at_ms=int(request["created_at_ms"]),
+            best_result=None,
+        )
+    except (KeyError, TypeError, ValueError, ContractViolationError):
+        return None
+
+
+def _decode_type_score(payload: Mapping[str, Any]) -> TypeScore:
+    return TypeScore(
+        problem_type=ProblemType(payload["problem_type"]),
+        split=Split(payload["split"]),
+        scores={str(k): float(v) for k, v in payload["scores"].items()},
+        correctness_passes=int(payload["correctness_passes"]),
+    )
+
+
+def decode_round_record(payload: Mapping[str, Any]) -> RoundRecord:
+    """``round-NN/round.json`` back into the :class:`RoundRecord` it encodes.
+
+    The inverse of :func:`encode_round_record` for the record itself; the
+    per-problem ``scored`` list and the saturation assessments beside it have
+    their own decoders. Construction goes through the contract dataclasses,
+    so their invariants are re-checked rather than trusted from the file.
+
+    Written for one caller: a ``run_round`` that finds its round already in
+    ``trajectory.json`` and must return what the first process measured
+    without measuring, or writing, anything (RES-17). It is deliberately
+    *not* the "decode the parent round" piece the driver's ``--round N``
+    refusal names — that refusal has a second, sufficient reason (loop 2's
+    self-edit step), and nothing here loads a *parent*.
+    """
+    engine = payload["engine"]
+    cost = payload["cost"]
+    return RoundRecord(
+        round_index=int(payload["round_index"]),
+        run_id=payload["run_id"],
+        parent_round_id=payload.get("parent_round_id"),
+        eval_set_hash=payload["eval_set_hash"],
+        engine=EngineIdentity(
+            backend=engine["backend"],
+            orchestrator_model=engine["orchestrator_model"],
+            substep_model=engine["substep_model"],
+            scaffold_git_sha=engine["scaffold_git_sha"],
+        ),
+        type_scores=tuple(_decode_type_score(ts) for ts in payload.get("type_scores", [])),
+        deltas=tuple(
+            RoundDelta(
+                problem_type=ProblemType(d["problem_type"]),
+                split=Split(d["split"]),
+                marginal_gain=float(d["marginal_gain"]),
+                noise_floor=float(d["noise_floor"]),
+                cost_per_unit_gain=(
+                    None if d.get("cost_per_unit_gain") is None else float(d["cost_per_unit_gain"])
+                ),
+            )
+            for d in payload.get("deltas", [])
+        ),
+        cost=RoundCost(
+            wall_clock_seconds=float(cost["wall_clock_seconds"]),
+            tokens=int(cost["tokens"]),
+            attempts=int(cost["attempts"]),
+        ),
+        escalation_count=int(payload["escalation_count"]),
+        created_at_ms=int(payload["created_at_ms"]),
+        gates={str(k): v for k, v in payload.get("gates", {}).items()},
+        verdict=str(payload.get("verdict", "")),
+    )
+
+
+def decode_scored_problems(payload: Mapping[str, Any]) -> tuple[ScoredProblem, ...]:
+    """The ``problems`` list of ``round.json`` back into cell contributions."""
+    return tuple(
+        ScoredProblem(
+            problem_id=item["problem_id"],
+            problem_type=ProblemType(item["problem_type"]),
+            split=Split(item["split"]),
+            score=float(item["score"]),
+            passed_correctness=bool(item["passed_correctness"]),
+            score_scale=item["score_scale"],
+            scored=bool(item.get("scored", True)),
+        )
+        for item in payload.get("problems", [])
+    )
+
+
+def decode_assessments(payload: Mapping[str, Any]) -> tuple[SaturationAssessment, ...]:
+    """The ``saturation`` list of ``round.json`` back into assessments."""
+    return tuple(
+        SaturationAssessment(
+            problem_type=ProblemType(item["problem_type"]),
+            split=Split(item["split"]),
+            verdict=SaturationVerdict(item["verdict"]),
+            reason=str(item.get("reason", "")),
+            marginal_gain=item.get("marginal_gain"),
+            noise_floor=item.get("noise_floor"),
+            gain_in_noise_units=item.get("gain_in_noise_units"),
+        )
+        for item in payload.get("saturation", [])
     )
 
 
@@ -545,17 +711,33 @@ def encode_trajectory_row(
 
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp")
-    # ``allow_nan=False`` because Python emits bare ``NaN``/``Infinity``, which
-    # is not JSON: every other reader rejects the file outright. The desktop
-    # flywheel pane would blank rather than show one bad number, and a NaN that
-    # reached here would mean a driving function was computed wrong anyway —
-    # better to fail at the write, where the traceback still names the round.
-    tmp.write_text(
-        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    tmp.replace(path)
+    # The scratch name carries the pid and a uuid rather than a fixed
+    # ``<name>.tmp``. Two writers of the same file is not hypothetical here: an
+    # operator who starts a second driver over one results tree (or a
+    # ``--noise-floor-only`` run alongside a full one) has two processes
+    # writing ``checkpoints/<problem>.json``, and with one shared scratch name
+    # they interleave — writer A's partial text, writer B's ``replace``, and a
+    # file that is neither. Unique names make the worst case "the last
+    # ``replace`` wins", which is atomic and yields one whole document.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+    try:
+        # ``allow_nan=False`` because Python emits bare ``NaN``/``Infinity``,
+        # which is not JSON: every other reader rejects the file outright. The
+        # desktop flywheel pane would blank rather than show one bad number,
+        # and a NaN that reached here would mean a driving function was
+        # computed wrong anyway — better to fail at the write, where the
+        # traceback still names the round.
+        tmp.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    finally:
+        # A refused serialisation (the NaN guard above) used to leave its
+        # scratch file behind. With a unique name per call that would
+        # accumulate one corpse per failure instead of one in total, so the
+        # cleanup is no longer optional.
+        tmp.unlink(missing_ok=True)
 
 
 def _read_json(path: Path) -> Any | None:
@@ -646,6 +828,7 @@ class TrajectoryStore:
         *,
         output_dir: Path,
         eval_set_hash: str = "",
+        config_digest: str = "",
     ) -> Path:
         """Persist the latest immutable checkpoint of an attempt.
 
@@ -672,6 +855,10 @@ class TrajectoryStore:
           deterministically as ``<run_id>-seed-<n>``, so a corpus edited
           between two invocations of the same floor repeats both. See
           :class:`RunIdentity`.
+        * ``config_digest``, so a checkpoint cannot be reused by a run
+          measuring under a *different configuration* — a raised cap, a
+          swapped scaffold, a flipped ``verify_every_step``. See
+          :attr:`RunIdentity.config_digest`.
         """
         path = self.attempt_checkpoint_path(attempt.problem_id, output_dir=output_dir)
         payload = {
@@ -680,6 +867,7 @@ class TrajectoryStore:
             "round_id": attempt.round_id,
             "seed": attempt.seed,
             "eval_set_hash": eval_set_hash,
+            "config_digest": config_digest,
             "workspace_path": str(attempt.workspace_path),
             "state": attempt.state.value,
             "step_index": attempt.step_index,
@@ -725,15 +913,22 @@ class TrajectoryStore:
     ) -> StoredAttempt:
         """What is already on disk for one ``(run, problem)``, and what to do with it.
 
+        **The contract**, which every rule below serves and every test of
+        resume is a test of: *resume never adopts a number this run did not
+        measure under this exact configuration, never destroys a measurement,
+        and re-running a finished sweep with the identical command is a no-op
+        success.*
+
         **Complete — reuse the outcome, spend nothing.** All of:
 
         * the checkpoint decodes and names this ``identity``
-          (``round_id`` / ``seed`` / ``eval_set_hash``);
+          (``round_id`` / ``seed`` / ``eval_set_hash`` / ``config_digest``);
         * its state is terminal — ``PASSED``, ``FAILED_WITHIN_CAP`` or
           ``ABANDONED`` (:data:`~turing.research.contracts.TERMINAL_ATTEMPT_STATES`);
-        * the attempt log ``attempts/<problem-id>.json`` is beside it;
+        * the attempt log ``attempts/<problem-id>.json`` is beside it **and
+          names the checkpoint's** ``attempt_id``;
         * the attempt summary ``attempts/<problem-id>/metrics.json`` is beside
-          it.
+          it **and names the checkpoint's** ``attempt_id``.
 
         The last two are not belt-and-braces. ``metrics.json`` is written once,
         at the end of ``run_attempt``, and its absence beside an intact chain
@@ -743,7 +938,11 @@ class TrajectoryStore:
         call *finished* what the pre-writeup gate calls *unfinished*, and the
         two must not disagree about the same directory. So a terminal
         checkpoint with no finished record on disk is re-driven: the honest
-        reading of "we cannot tell what it reported".
+        reading of "we cannot tell what it reported". The ``attempt_id``
+        comparison closes the remaining gap: a log and summary left by a
+        *previous generation* of the same problem (same run, same seed, a
+        different attempt id) are a finished record of some attempt, not of
+        this one, and must not bless a checkpoint they never described.
 
         **The three states that are deliberately not complete:**
 
@@ -751,16 +950,24 @@ class TrajectoryStore:
           :attr:`AttemptDisposition.RESUMABLE`. This is the load-bearing case:
           subscription windows close mid-attempt, and an interruption must
           cost the remainder of the attempt, not the attempt.
-        * ``ESCALATED`` with its request file still on disk →
-          :attr:`AttemptDisposition.AWAITING_DECISION`. ``ESCALATED`` is
-          neither terminal nor resumable — only an operator moves it — so the
-          restart re-enters the wait on that same request. Re-driving would
-          both throw away the work and raise a second escalation for one
-          event, inflating driving function #4.
+        * ``ESCALATED`` with a request file that decodes and names this
+          attempt → :attr:`AttemptDisposition.AWAITING_DECISION`.
+          ``ESCALATED`` is neither terminal nor resumable — only an operator
+          moves it — so the restart re-enters the wait on that same request.
+          Re-driving would both throw away the work and raise a second
+          escalation for one event, inflating driving function #4. The file
+          is *decoded* here, with the same decoder the runner rebuilds it
+          with (:func:`decode_escalation_request`), not merely stat-ed: a
+          request that exists but does not decode, or names another attempt,
+          is ``ABSENT`` — re-driven — rather than an ``AWAITING_DECISION``
+          the runner then cannot honour and loses the problem to.
         * anything unreadable, foreign, or contradictory →
           :attr:`AttemptDisposition.ABSENT`, i.e. drive it. Every refusal
           direction here is towards *spending compute*, never towards
-          adopting a number this run did not measure.
+          adopting a number this run did not measure. That includes a
+          checkpoint whose bytes are not UTF-8 or not JSON: every read
+          failure is a ``ValueError`` or an ``OSError``, and both mean
+          *absent*, never *the round dies here*.
 
         ``ABANDONED`` counts as complete, and that is a deliberate reading of
         the state rather than an oversight: it is reachable only through an
@@ -839,9 +1046,14 @@ class TrajectoryStore:
             )
 
         checkpoint_path = self.attempt_checkpoint_path(problem_id, output_dir=output_dir)
+        # ``ValueError`` rather than ``json.JSONDecodeError``: the decode error
+        # is one subclass, ``UnicodeDecodeError`` (a checkpoint whose bytes are
+        # not UTF-8) is another, and a checkpoint that cannot be read is
+        # *absent* whichever way it failed. This function is a resume probe;
+        # nothing it hits may take the round down.
         try:
             raw = _read_json(checkpoint_path)
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError) as exc:
             return absent(f"{checkpoint_path} could not be read: {exc}")
         if raw is None:
             return absent("no checkpoint on disk")
@@ -856,13 +1068,18 @@ class TrajectoryStore:
             round_id=attempt.round_id,
             seed=attempt.seed,
             eval_set_hash=str(raw.get("eval_set_hash", "")),
+            config_digest=str(raw.get("config_digest", "")),
         )
         if attempt.problem_id != problem_id or stored_identity != identity:
             return absent(
                 f"checkpoint belongs to a different run "
                 f"(problem_id={attempt.problem_id!r}, round_id={stored_identity.round_id!r}, "
                 f"seed={stored_identity.seed!r}, "
-                f"eval_set_hash={stored_identity.eval_set_hash!r})"
+                f"eval_set_hash={stored_identity.eval_set_hash!r}, "
+                f"config_digest={stored_identity.config_digest!r}; "
+                f"this run is round_id={identity.round_id!r}, seed={identity.seed!r}, "
+                f"eval_set_hash={identity.eval_set_hash!r}, "
+                f"config_digest={identity.config_digest!r})"
             )
 
         log_path = output_dir / "attempts" / f"{problem_id}.json"
@@ -871,7 +1088,12 @@ class TrajectoryStore:
         log_raw: Any = None
         try:
             log_raw = _read_json(log_path)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
+            log_raw = None
+        # A log that names another attempt is a previous generation's record
+        # of this problem, not this attempt's; its steps must not be spliced
+        # onto a resumed attempt, and it must not count towards completeness.
+        if isinstance(log_raw, dict) and log_raw.get("attempt_id") != attempt.attempt_id:
             log_raw = None
         if isinstance(log_raw, dict):
             try:
@@ -903,13 +1125,28 @@ class TrajectoryStore:
             if not isinstance(log_raw, dict):
                 return absent(
                     f"terminal checkpoint ({attempt.state.value}) with no readable attempt "
-                    f"log at {log_path}; the attempt did not finish reporting"
+                    f"log for attempt {attempt.attempt_id!r} at {log_path}; the attempt did "
+                    "not finish reporting"
                 )
             summary_path = output_dir / "attempts" / problem_id / "metrics.json"
-            if not summary_path.exists():
+            try:
+                summary_raw = _read_json(summary_path)
+            except (OSError, ValueError):
+                summary_raw = None
+            if summary_raw is None:
                 return absent(
                     f"terminal checkpoint ({attempt.state.value}) with no summary at "
                     f"{summary_path}; verify calls that directory INCOMPLETE and so does this"
+                )
+            if (
+                not isinstance(summary_raw, dict)
+                or summary_raw.get("attempt_id") != attempt.attempt_id
+            ):
+                return absent(
+                    f"terminal checkpoint ({attempt.state.value}) for attempt "
+                    f"{attempt.attempt_id!r} but the summary at {summary_path} names "
+                    f"{summary_raw.get('attempt_id') if isinstance(summary_raw, dict) else None!r}"
+                    "; a finished record of some other attempt does not finish this one"
                 )
             return found(
                 AttemptDisposition.COMPLETE,
@@ -921,10 +1158,25 @@ class TrajectoryStore:
             if not attempt.escalation_id:
                 return absent("ESCALATED checkpoint carries no escalation_id to re-open")
             request_path = output_dir / "escalations" / f"{attempt.escalation_id}.json"
-            if not request_path.exists():
+            try:
+                request_raw = _read_json(request_path)
+            except (OSError, ValueError) as exc:
+                return absent(
+                    f"ESCALATED checkpoint names request {attempt.escalation_id!r} but "
+                    f"{request_path} could not be read: {exc}"
+                )
+            if request_raw is None:
                 return absent(
                     f"ESCALATED checkpoint names request {attempt.escalation_id!r} but "
                     f"{request_path} is missing"
+                )
+            request = decode_escalation_request(request_raw, attempt_id=attempt.attempt_id)
+            if request is None or request.request_id != attempt.escalation_id:
+                return absent(
+                    f"ESCALATED checkpoint names request {attempt.escalation_id!r} but "
+                    f"{request_path} does not decode as a request for attempt "
+                    f"{attempt.attempt_id!r}; there is no question to re-enter, so the "
+                    "attempt is driven again rather than lost"
                 )
             return found(
                 AttemptDisposition.AWAITING_DECISION,
@@ -977,6 +1229,24 @@ class TrajectoryStore:
         )
         await asyncio.to_thread(_write_json, path, payload)
         return path
+
+    async def load_round_record(self, round_index: int) -> dict[str, Any] | None:
+        """The raw ``round-NN/round.json`` document, or ``None`` if none is there.
+
+        Raw rather than decoded, so the caller can read ``run_id`` off a file
+        that may not decode in full; :func:`decode_round_record` is the
+        strict half.
+        """
+        path = self.round_dir(round_index) / "round.json"
+        try:
+            raw = await asyncio.to_thread(_read_json, path)
+        except (OSError, ValueError) as exc:
+            raise ContractViolationError(f"{path} could not be read: {exc}") from exc
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise ContractViolationError(f"{path} is not a round record")
+        return raw
 
     async def load_trajectory(self) -> dict[str, Any]:
         raw = await asyncio.to_thread(_read_json, self.trajectory_path)
