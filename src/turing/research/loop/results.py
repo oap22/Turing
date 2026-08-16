@@ -40,7 +40,13 @@ from typing import TYPE_CHECKING
 
 import structlog
 
-from turing.research.contracts import AttemptState, ContractViolationError
+from turing.research.contracts import (
+    CORE_METRICS_FIELDS,
+    DIAGNOSTIC_KEY_PREFIX,
+    RESERVED_METRICS_FIELDS,
+    AttemptState,
+    ContractViolationError,
+)
 from turing.research.loop import integrity
 from turing.research.loop.protocols import SystemClock
 
@@ -74,7 +80,14 @@ __all__ = [
 #: rejects it loudly instead, at the point the line is built, rather than
 #: leaving a gap in the chart that only an operator staring at the pane would
 #: ever notice.
-RESERVED_FIELDS: frozenset[str] = frozenset({"step", "total_steps", "ts"})
+#:
+#: Defined in ``contracts.py`` and re-exported here under the name this
+#: module has always published. ``contracts`` is the one module both this one
+#: and ``integrity`` can import, and ``contracts`` needs the set itself to
+#: refuse a colliding ``score_scale`` where the scale is *declared* — so the
+#: list lives there and nothing hand-copies it. See
+#: :data:`turing.research.contracts.RESERVED_METRICS_FIELDS`.
+RESERVED_FIELDS: frozenset[str] = RESERVED_METRICS_FIELDS
 
 
 # --------------------------------------------------------------------------- #
@@ -298,30 +311,15 @@ class ProgressTracker:
 
 
 #: The keys :meth:`MetricsLine.to_json` always emits itself (beyond
-#: :data:`RESERVED_FIELDS`), in the order they are written. A caller-supplied
-#: ``metrics`` entry sharing one of these names would silently overwrite a
-#: core field — or, read the other way, a core field would silently clobber
-#: the caller's score — so it is rejected instead.
-_CORE_EMITTED_KEYS: frozenset[str] = frozenset(
-    {
-        "outcome_code",
-        "correctness_pass",
-        "tokens_used",
-        "tokens_cap",
-        "steps_cap",
-        "consumed_steps",
-        "wall_clock_s",
-        "wall_clock_cap_s",
-        "cap_extensions",
-        "step_wall_clock_s",
-        "verify_wall_clock_s",
-        "step_tokens",
-        "made_progress",
-        "progress",
-    }
-)
+#: :data:`RESERVED_FIELDS`). A caller-supplied ``metrics`` entry sharing one
+#: of these names would silently overwrite a core field — or, read the other
+#: way, a core field would silently clobber the caller's score — so it is
+#: rejected instead. Defined in ``contracts.py`` for the reason given on
+#: :data:`RESERVED_FIELDS` above; the emission *order* is the one this
+#: module's :meth:`MetricsLine.to_json` writes, and lives there.
+_CORE_EMITTED_KEYS: frozenset[str] = CORE_METRICS_FIELDS
 
-_DIAG_PREFIX = "diag_"
+_DIAG_PREFIX = DIAGNOSTIC_KEY_PREFIX
 
 
 @dataclass(frozen=True, slots=True)
@@ -411,12 +409,19 @@ class MetricsLine:
         strictly: a reserved-field collision, a core-key collision, an empty
         key, a ``diag_``-prefixed key, or a non-finite / non-numeric / bool
         value all raise :class:`~turing.research.contracts.ContractViolationError`
-        naming the offending key. This is reachable in production, not
-        theoretical: the runner names the metrics key after the problem's own
-        ``score_scale``, which is free-form per ``contracts.py``, so a problem
-        declaring a scale of ``"progress"`` or ``"step"`` must fail loudly at
-        its first emitted line rather than quietly clobbering an axis or a
-        core field.
+        naming the offending key.
+
+        The runner's own metrics key can no longer trip the *key* checks: it
+        names the key after the problem's ``score_scale``, and
+        ``contracts._reject_unusable_score_scale`` refuses a colliding, empty
+        or ``diag_``-prefixed scale where the verifier declares it, so a
+        corpus with a bad scale fails before the round starts rather than
+        losing an attempt at its first verification. These checks stay, and
+        stay strict, for the same reason the key list is now a single shared
+        one: they are the definition of what a metrics key may be, they hold
+        for any caller that assembles ``metrics`` from something other than a
+        verifier's declared scale, and a colliding scale arriving here would
+        mean the two had drifted apart. Keep them in step.
 
         ``diagnostics`` is the agent's own notebook and is validated
         leniently: a bad entry there — non-numeric, ``bool``, non-finite, an

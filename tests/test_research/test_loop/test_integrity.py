@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from turing.research import contracts
 from turing.research.contracts import (
     ContractViolationError,
     EscalationReason,
@@ -1777,44 +1778,70 @@ class TestReconcileSummary:
 
 
 # --------------------------------------------------------------------------- #
-# _CORE_LINE_KEYS — the hand-copied list must not silently drift
+# RESERVED_METRICS_KEYS — the one shared list must match what is really emitted
 # --------------------------------------------------------------------------- #
 
 
 class TestCoreLineKeysStaySynced:
-    def test_core_line_keys_matches_what_metrics_line_to_json_actually_emits(self) -> None:
-        """``integrity._CORE_LINE_KEYS`` is hand-copied from ``results.py``
-        (see the comment directly above its definition in ``integrity.py``
-        for why: ``results.py`` imports ``integrity`` to seed its hash chain,
-        so importing back would be circular). Nothing at runtime keeps the
-        two lists in sync — this test is the only thing that does. A key
-        renamed, added, or removed in ``results.RESERVED_FIELDS`` or
-        ``results._CORE_EMITTED_KEYS`` without a matching edit to the
-        hand-copied set in ``integrity.py`` would silently make
-        ``reconcile_summary`` misclassify a core field as a score-series
-        value (or vice versa) — this asserts that never happens unnoticed.
+    """``integrity`` and ``results`` no longer keep their own copies of this
+    list; both import :data:`turing.research.contracts.RESERVED_METRICS_KEYS`,
+    which ``contracts`` needs anyway to refuse a ``score_scale`` that would
+    collide with one of these keys. There is therefore nothing left for a
+    set-versus-set drift test to compare.
 
-        Importing both ``results`` and ``integrity`` here is fine even though
-        ``results.py`` cannot import ``integrity`` back: the circularity is a
-        constraint on the *modules*, not on a test that imports each of them
-        independently.
-        """
-        emitted_core_keys = results_module.RESERVED_FIELDS | results_module._CORE_EMITTED_KEYS
-        hand_copied_keys = integrity_module._CORE_LINE_KEYS
+    What *can* still drift is the list against the emitter: a field added to
+    ``MetricsLine.to_json`` and not added to ``contracts`` would make
+    ``reconcile_summary`` read a core field as this attempt's score series
+    (and would let a verifier declare that field's name as its scale). So the
+    guard now drives the real emitter and checks the keys it actually writes.
+    """
 
-        missing_from_integrity = emitted_core_keys - hand_copied_keys
-        extra_in_integrity = hand_copied_keys - emitted_core_keys
-
-        assert not missing_from_integrity and not extra_in_integrity, (
-            "turing.research.loop.integrity._CORE_LINE_KEYS has drifted from the "
-            "keys turing.research.loop.results.MetricsLine.to_json actually emits "
-            "(results.RESERVED_FIELDS | results._CORE_EMITTED_KEYS). "
-            f"Missing from integrity._CORE_LINE_KEYS: {sorted(missing_from_integrity)}. "
-            f"Present in integrity._CORE_LINE_KEYS but no longer emitted: "
-            f"{sorted(extra_in_integrity)}. "
-            "Update the hand-copied set at the comment above "
-            "_CORE_LINE_KEYS's definition in integrity.py to match."
+    def test_the_shared_set_matches_what_metrics_line_to_json_actually_emits(self) -> None:
+        line = results_module.MetricsLine(
+            step=3,
+            total_steps=50,
+            ts=1_700_000_000.0,
+            outcome=results_module.Outcome.RUNNING,
+            # Every optional field non-``None``: ``to_json`` omits these when
+            # unset, and an omitted key would make this assertion vacuous.
+            correctness_pass=True,
+            tokens_used=1000,
+            tokens_cap=1_000_000,
+            steps_cap=50,
+            consumed_steps=3,
+            wall_clock_s=10.0,
+            wall_clock_cap_s=10800.0,
+            cap_extensions=0,
+            step_wall_clock_s=8.0,
+            verify_wall_clock_s=2.0,
+            step_tokens=1000,
+            made_progress=True,
+            progress=0.5,
+            metrics={},
+            diagnostics={},
         )
+
+        emitted = set(line.to_json())
+        declared = set(contracts.RESERVED_METRICS_KEYS)
+
+        assert emitted == declared, (
+            "turing.research.contracts.RESERVED_METRICS_KEYS has drifted from the keys "
+            "turing.research.loop.results.MetricsLine.to_json actually emits. "
+            f"Emitted but not declared: {sorted(emitted - declared)}. "
+            f"Declared but no longer emitted: {sorted(declared - emitted)}. "
+            "Both integrity.reconcile_summary and the score_scale refusal in "
+            "contracts read that set; update it to match the emitter."
+        )
+
+    def test_both_readers_use_the_one_definition(self) -> None:
+        """No copy anywhere: a reader that forked its own set would pass the
+        test above while still drifting from the other reader.
+        """
+        assert integrity_module._CORE_LINE_KEYS is contracts.RESERVED_METRICS_KEYS
+        assert results_module.RESERVED_FIELDS is contracts.RESERVED_METRICS_FIELDS
+        assert results_module._CORE_EMITTED_KEYS is contracts.CORE_METRICS_FIELDS
+        assert results_module._DIAG_PREFIX is contracts.DIAGNOSTIC_KEY_PREFIX
+        assert integrity_module._DIAG_PREFIX is contracts.DIAGNOSTIC_KEY_PREFIX
 
 
 # --------------------------------------------------------------------------- #

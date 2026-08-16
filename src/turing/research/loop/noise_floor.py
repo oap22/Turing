@@ -260,7 +260,7 @@ class NoiseFloorRunner:
 
         **Deterministic vs transient failures do not get different
         treatment**, and the distinction is worth stating because it is the
-        obvious place to soften this. A colliding ``score_scale`` is a
+        obvious place to soften this. An unreadable workspace template is a
         property of the *problem* and so is lost by every seed identically:
         the resulting floor is at least internally consistent, just measured
         over a narrower corpus than advertised. A transient loss (I/O, a
