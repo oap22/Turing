@@ -369,6 +369,7 @@ def compute_deltas(
     basis: CostBasis = CostBasis.WALL_CLOCK,
     comparable: bool = True,
     all_attempts_completed: bool = True,
+    parent_attempts_completed: bool | None = True,
 ) -> tuple[RoundDelta, ...]:
     """Per-cell marginal gain, paired with the floor it is read against.
 
@@ -417,8 +418,39 @@ def compute_deltas(
     refuses the whole seed rather than the affected cell for the same shape of
     fault, so per-cell salvage here would leave two neighbouring modules
     disagreeing about what a lost attempt costs a measurement.
+
+    ``parent_attempts_completed`` is the **same refusal read off the other
+    side of the subtraction, and without it the fix above is one-sided.**
+    "Cells reduced over a strict subset of the problems the parent's cells
+    were reduced over" is a statement about a *pair* of rounds: it is equally
+    true when the child measured everything and the parent — the round whose
+    means are the ``before`` in every subtraction here — is the one missing a
+    problem. Driven for real, a round 0 that lost its *strongest* problem
+    recorded a cell mean of 0.5 over ``n=1`` and correctly refused its own
+    deltas; round 1 then measured the identical corpus with the identical
+    agent, reduced 1.75 over ``n=2``, and emitted ``marginal_gain=+1.25``
+    with every gate green. Nothing about that number is the agent: it is
+    "which problems ran in the parent". Losing the *weak* problem in the
+    parent manufactures the mirror-image phantom regression, so the bias
+    argument above applies with its sign flipped, not weakened.
+
+    **``None`` — the parent record carries no ``all_attempts_completed``
+    gate — is refused, not trusted.** Records written before that gate
+    existed are silent about the very fact this argument turns on, and the
+    two readings of that silence are not symmetric: trusting it re-opens
+    exactly the manufactured gain above (emitted with every gate green, which
+    is the property that makes it dangerous), while refusing it costs a delta
+    that can be recovered the moment the parent is re-driven under a runner
+    that writes the gate. Every other unresolved basis in this module — no
+    floor, a degenerate floor, a changed eval set — already resolves the same
+    way: refuse, and say which measurement was missing.
     """
-    if parent is None or not comparable or not all_attempts_completed:
+    if (
+        parent is None
+        or not comparable
+        or not all_attempts_completed
+        or parent_attempts_completed is not True
+    ):
         return ()
     previous = scores_by_cell(parent)
     deltas: list[RoundDelta] = []
@@ -449,10 +481,20 @@ def compute_deltas(
 class SaturationVerdict(str, Enum):  # noqa: UP042
     """Whether a cell is still improving — or why that cannot be said.
 
-    The five ``REFUSED_*`` members are not error codes. They are the honest
+    The six ``REFUSED_*`` members are not error codes. They are the honest
     answer when the measurement required to make the call was not made, and
     they are written into ``trajectory.json`` verbatim so a reader cannot
     mistake a missing verdict for a flat one.
+
+    ``REFUSED_ATTEMPT_LOST`` and ``REFUSED_PARENT_ATTEMPT_LOST`` are the same
+    fault on the two sides of one subtraction, and they are separate members
+    rather than one because the operator action differs: the first says *this*
+    round is short a problem, which a re-drive of that problem fixes; the
+    second says the *baseline* is short one, which no amount of re-driving
+    this round will repair — the parent has to be re-measured (or a later,
+    complete round adopted as the baseline) before any delta from it means
+    anything. One member for both would leave an operator re-running the wrong
+    round and watching the same refusal come back.
     """
 
     IMPROVING = "improving"
@@ -462,6 +504,7 @@ class SaturationVerdict(str, Enum):  # noqa: UP042
     REFUSED_DEGENERATE_NOISE_FLOOR = "refused_degenerate_noise_floor"
     REFUSED_EVAL_SET_CHANGED = "refused_eval_set_changed"
     REFUSED_ATTEMPT_LOST = "refused_attempt_lost"
+    REFUSED_PARENT_ATTEMPT_LOST = "refused_parent_attempt_lost"
 
 
 @dataclass(frozen=True, slots=True)
@@ -492,10 +535,11 @@ def assess_saturation(
     *,
     comparable: bool = True,
     all_attempts_completed: bool = True,
+    parent_attempts_completed: bool | None = True,
 ) -> tuple[SaturationAssessment, ...]:
     """Per-cell saturation verdicts, refusing wherever the basis is missing.
 
-    Saturation is "marginal gain below the seed-noise floor". Each of the five
+    Saturation is "marginal gain below the seed-noise floor". Each of the six
     ways that sentence can fail to apply gets its own refusal rather than a
     fabricated number:
 
@@ -506,6 +550,10 @@ def assess_saturation(
       partly the agent and partly the missing problem — see
       :func:`compute_deltas` for why that is refused rather than flagged, and
       why the refusal is round-wide;
+    * the *parent* lost an attempt (or is silent about whether it did), so the
+      subtraction's ``before`` is the reduced mean and the same contamination
+      arrives from the other side — see :func:`compute_deltas` for the driven
+      example and for why an absent gate refuses rather than trusts;
     * no floor was measured for the cell;
     * the measured floor is zero, so "beats the noise" resolves nothing.
 
@@ -517,7 +565,17 @@ def assess_saturation(
     computed across a shifting problem set is not a measurement at all, so
     there is nothing honest to report; reporting it anyway is precisely how
     ``"a marginal gain of +1.25"`` reached a verdict line for a round whose
-    only change was that its weakest problem crashed.
+    only change was that its weakest problem crashed. The parent-side refusal
+    carries no gain for the identical reason — it is the same shifting problem
+    set, whichever of the two rounds it moved in.
+
+    **When both rounds are lossy the round's own loss is the verdict**, with
+    the parent's named in the same reason string rather than dropped. Naming
+    only the parent would contradict this record's own
+    ``all_attempts_completed`` gate and its verdict prefix, both of which
+    already say this round is short a problem; naming only this round's loss
+    would send an operator to re-drive a round whose delta is refused again
+    the moment it completes.
     """
     assessments: list[SaturationAssessment] = []
     previous = scores_by_cell(parent) if parent is not None else {}
@@ -548,16 +606,43 @@ def assess_saturation(
             )
             continue
         if not all_attempts_completed:
+            reason = (
+                f"{label}: at least one attempt was lost, so this round measured "
+                "fewer problems than its parent; a difference of means over a "
+                "shifting problem set measures the set as much as the agent and "
+                "no delta is reported"
+            )
+            if parent_attempts_completed is not True:
+                reason += (
+                    " (the parent round is also not a full-corpus measurement, so "
+                    "re-driving this round alone will not restore the delta)"
+                )
             assessments.append(
                 SaturationAssessment(
                     problem_type=cell[0],
                     split=cell[1],
                     verdict=SaturationVerdict.REFUSED_ATTEMPT_LOST,
+                    reason=reason,
+                )
+            )
+            continue
+        if parent_attempts_completed is not True:
+            assessments.append(
+                SaturationAssessment(
+                    problem_type=cell[0],
+                    split=cell[1],
+                    verdict=SaturationVerdict.REFUSED_PARENT_ATTEMPT_LOST,
                     reason=(
-                        f"{label}: at least one attempt was lost, so this round measured "
-                        "fewer problems than its parent; a difference of means over a "
-                        "shifting problem set measures the set as much as the agent and "
-                        "no delta is reported"
+                        f"{label}: the parent round "
+                        + (
+                            "lost at least one attempt"
+                            if parent_attempts_completed is False
+                            else "records no all_attempts_completed gate, so whether it "
+                            "measured the full corpus is unknown"
+                        )
+                        + ", so this round's cells cover problems the parent's cells did "
+                        "not; a difference of means over a shifting problem set measures "
+                        "the set as much as the agent and no delta is reported"
                     ),
                 )
             )

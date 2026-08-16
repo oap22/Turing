@@ -60,6 +60,7 @@ if TYPE_CHECKING:
 
     from turing.research.contracts import Attempt, Problem
     from turing.research.loop.protocols import SolverTask
+    from turing.research.loop.runner import RoundRunner
     from turing.research.loop.trajectory import TrajectoryStore
 
     from .conftest import FakeClock
@@ -1391,6 +1392,209 @@ class TestAContainedLossManufacturesNoGain:
 
 
 # --------------------------------------------------------------------------- #
+# Round-8 regression -- the same phantom gain, displaced onto the parent
+# --------------------------------------------------------------------------- #
+
+
+class TestAParentSideLossManufacturesNoGainEither:
+    """The refusal above was one-sided, and the bias simply moved one round.
+
+    Nothing consulted the *parent* record's ``all_attempts_completed`` gate,
+    so a round that lost an attempt correctly refused its own deltas and then
+    served as the baseline for the next round's. Driven end-to-end: round 0
+    loses ``alpha`` (3.0, the strong problem) and records 0.5 over ``n=1``;
+    round 1 runs the identical corpus with the identical agent and identical
+    scores, records 1.75 over ``n=2``, and emitted ``marginal_gain=+1.25``,
+    ``cost_per_unit_gain``, ``IMPROVING`` and ``comparable_to_parent: true``
+    with every gate green. The agent did not change at all -- the entire delta
+    is *which problems ran in the parent*. Losing the weak problem in the
+    parent manufactures the mirror-image phantom regression.
+    """
+
+    @staticmethod
+    def _corpus() -> list[Problem]:
+        return [make_problem("alpha", scores=(3.0,)), make_problem("beta", scores=(0.5,))]
+
+    async def _two_rounds(
+        self,
+        store: TrajectoryStore,
+        clock: FakeClock,
+        workspaces: _WorkspacesThatFailForSomeProblems,
+        *,
+        lose_in_parent: set[str],
+        lose_in_child: set[str] = frozenset(),  # type: ignore[assignment]
+        strip_parent_gate: bool = False,
+    ) -> tuple[Any, Any]:
+        corpus = self._corpus()
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        workspaces.fail = set(lose_in_parent)
+        first = await runner.run_round(corpus, make_config())
+        parent = first.record
+        if strip_parent_gate:
+            # An older record: written before the gate existed, so it is
+            # silent about the one fact the refusal turns on. Derived from a
+            # real driven round rather than hand-built, because everything
+            # else about it -- the cells, the lineage, the eval-set hash --
+            # has to be exactly what a real parent carries.
+            parent = dataclasses.replace(parent, gates={})
+        workspaces.fail = set(lose_in_child)
+        second = await runner.run_round(
+            corpus,
+            make_config(round_index=1, run_id="r01", parent_round_id="r00"),
+            parent=parent,
+            noise_floor=floors_for(corpus, {1: 1.0, 2: 1.1, 3: 1.2}),
+        )
+        return first, second
+
+    async def test_a_complete_round_reports_no_gain_against_a_lossy_parent(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """The delta the fix exists to stop, on the side it did not cover.
+
+        The floor is present, the eval set is unchanged and *this* round lost
+        nothing -- every other gate for a delta is satisfied, so this asserts
+        the only thing standing between the arithmetic and the trajectory is
+        the parent's own lost attempt.
+        """
+        failing = _WorkspacesThatFailForSomeProblems(workspaces.root)
+        first, second = await self._two_rounds(store, clock, failing, lose_in_parent={"alpha"})
+
+        # The arithmetic that would produce the phantom +1.25 is real.
+        assert first.record.type_scores[0].mean_score == pytest.approx(0.5)
+        assert first.record.type_scores[0].n == 1
+        assert second.record.type_scores[0].mean_score == pytest.approx(1.75)
+        assert second.record.type_scores[0].n == 2
+
+        assert second.record.deltas == ()
+        assert {a.verdict for a in second.assessments} == {
+            SaturationVerdict.REFUSED_PARENT_ATTEMPT_LOST
+        }
+        assert all(a.marginal_gain is None for a in second.assessments)
+        assert "1.25" not in second.record.verdict
+        assert "marginal gain" not in second.record.verdict
+        assert "parent round lost at least one attempt" in second.record.verdict
+
+    async def test_the_refusal_names_the_parent_so_the_operator_re_drives_the_right_round(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Two refusals, because two different rounds have to be re-driven.
+
+        ``refused_attempt_lost`` says "re-drive the problem this round lost";
+        ``refused_parent_attempt_lost`` says "this round is fine, the baseline
+        is not". One shared verdict would send an operator to re-run a round
+        that is already complete and watch the same refusal come back.
+        """
+        failing = _WorkspacesThatFailForSomeProblems(workspaces.root)
+        _, second = await self._two_rounds(store, clock, failing, lose_in_parent={"alpha"})
+
+        row = json.loads(store.trajectory_path.read_text())["rounds"][1]
+        assert [s["verdict"] for s in row["saturation"]] == ["refused_parent_attempt_lost"]
+        assert row["delta"] == {}
+        assert row["delta_in_noise_units"] == {}
+        assert row["cost_per_point"] == {}
+        # This round measured everything it set out to, and says so.
+        assert second.record.gates["all_attempts_completed"] is True
+        assert row["constraints"]["all_attempts_completed"] is True
+        # The eval set never changed either: a lossy parent is not a restart.
+        assert row["trajectory_restart"] is False
+        assert second.record.gates["eval_set_stable"] is True
+        # The parent's completeness is not a gate on *this* round's record --
+        # every entry there is a statement about this round, and a false one
+        # whose subject is a different round reads as this round failing.
+        assert set(second.record.gates) == {
+            "eval_set_stable",
+            "lineage_recorded",
+            "noise_floor_available",
+            "all_attempts_completed",
+        }
+
+    async def test_the_round_summary_says_these_numbers_are_not_comparable(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """``comparable_to_parent`` answers "may these be compared with the parent's?"
+
+        A matching eval-set hash is necessary and not sufficient: the parent's
+        cells were reduced over a strict subset of this round's problems, so
+        the honest answer in the file a reader cites is no.
+        """
+        failing = _WorkspacesThatFailForSomeProblems(workspaces.root)
+        await self._two_rounds(store, clock, failing, lose_in_parent={"alpha"})
+
+        summary = json.loads((store.round_dir(1) / "metrics.json").read_text())
+        assert summary["comparable_to_parent"] is False
+        assert [c for c in summary["cells"] if "marginal_gain" in c] == []
+
+    async def test_a_parent_with_no_gate_at_all_is_refused_rather_than_trusted(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Silence is unknown, not fine.
+
+        A record written before the gate existed says nothing about whether it
+        measured its whole corpus. Trusting that silence re-opens exactly the
+        phantom gain above -- emitted with every gate green, which is the
+        property that makes it dangerous -- while refusing it costs a delta
+        that comes back the moment the baseline is re-driven under a runner
+        that writes the gate.
+        """
+        failing = _WorkspacesThatFailForSomeProblems(workspaces.root)
+        _, second = await self._two_rounds(
+            store, clock, failing, lose_in_parent=set(), strip_parent_gate=True
+        )
+
+        assert second.record.deltas == ()
+        assert {a.verdict for a in second.assessments} == {
+            SaturationVerdict.REFUSED_PARENT_ATTEMPT_LOST
+        }
+        assert "records no all_attempts_completed gate" in second.record.verdict
+        summary = json.loads((store.round_dir(1) / "metrics.json").read_text())
+        assert summary["comparable_to_parent"] is False
+
+    async def test_two_lossy_rounds_name_this_round_first_and_the_parent_too(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Both sides short a problem: the verdict has to survive that.
+
+        This round's own loss is the verdict -- its gate and its verdict
+        prefix already say so, and a verdict naming only the parent would
+        contradict them -- but the parent's loss is named in the same reason,
+        so nobody re-drives this round expecting the delta back.
+        """
+        failing = _WorkspacesThatFailForSomeProblems(workspaces.root)
+        _, second = await self._two_rounds(
+            store, clock, failing, lose_in_parent={"alpha"}, lose_in_child={"beta"}
+        )
+
+        assert second.record.deltas == ()
+        assert {a.verdict for a in second.assessments} == {SaturationVerdict.REFUSED_ATTEMPT_LOST}
+        assert second.record.gates["all_attempts_completed"] is False
+        assert second.record.verdict.startswith("1 of 2 attempt(s) failed")
+        assert "the parent round is also not a full-corpus measurement" in second.record.verdict
+
+    async def test_a_complete_parent_still_gets_its_delta(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """The negative half: the clean path is unchanged, byte for byte.
+
+        Same corpus, same floor, same lineage, nothing lost on either side.
+        The delta, the saturation call and both ``comparable_to_parent``
+        fields must be exactly what they were before the parent-side refusal
+        existed, or the refusal has bought honesty by breaking the measurement
+        it protects.
+        """
+        failing = _WorkspacesThatFailForSomeProblems(workspaces.root)
+        _, second = await self._two_rounds(store, clock, failing, lose_in_parent=set())
+
+        assert len(second.record.deltas) == 1
+        assert second.record.deltas[0].marginal_gain == pytest.approx(0.0)
+        assert {a.verdict for a in second.assessments} == {SaturationVerdict.SATURATED}
+        summary = json.loads((store.round_dir(1) / "metrics.json").read_text())
+        assert summary["comparable_to_parent"] is True
+        row = json.loads(store.trajectory_path.read_text())["rounds"][1]
+        assert row["saturation"][0]["verdict"] == "saturated"
+        assert row["delta"] != {}
+
+
+# --------------------------------------------------------------------------- #
 # Round-7 regression -- a namespaced problem id must not vanish from the viewer
 # --------------------------------------------------------------------------- #
 
@@ -1680,3 +1884,173 @@ class TestAFinishedRoundThatLostAnAttemptExitsZero:
             exc_type="RuntimeError",
         )
         assert (metrics_dir / "metrics.json").read_bytes() == honest
+
+
+# --------------------------------------------------------------------------- #
+# Round-8 regression -- a close-out must not speak for a prior generation
+# --------------------------------------------------------------------------- #
+
+
+class TestACloseOutNeverWritesOverAnotherGenerationsChain:
+    """``_close_out_crashed_attempt``'s docstring promised this guard; the code
+    did not implement it.
+
+    ``_read_crashed_attempt_record`` only checked that the header *had* an
+    ``attempt_id``, and the close-out only checked "summary absent, jsonl
+    present" -- so the identity of the chain it adopted was never compared
+    with the attempt that actually crashed. The shape is reachable, not
+    theoretical: ``run_attempt`` materialises the workspace *before* it
+    rotates the stale trio aside, so an exception in that window (a pruned
+    template, an evicted volume, a full disk) leaves the previous
+    generation's chain exactly where it was -- intact, summary-less, the
+    honest "killed before its summary write" state ``verify`` calls
+    ``INCOMPLETE`` and rotation exists to preserve.
+
+    Driven, that produced a ``metrics.json`` asserting generation 1's
+    ``attempt_id`` beside generation 2's ``round_id``, generation 2's ``seed``
+    and ``crashed_in_harness:OSError`` -- an exception that never touched that
+    log -- and ``verify`` reported ``OK`` with zero mismatches, because every
+    field it reconciles had just been re-derived from the very log the summary
+    was misattributed to. Two harms, either sufficient: a fabricated claim
+    about a run that did not make it, and the destruction of the one state
+    that said the earlier attempt was killed unfinished.
+    """
+
+    @staticmethod
+    def _corpus() -> list[Problem]:
+        return [make_problem("alpha", scores=(3.0,)), make_problem("beta", scores=(0.5,))]
+
+    async def _generation_one_killed_before_its_summary(
+        self,
+        store: TrajectoryStore,
+        workspaces: _WorkspacesThatFailForSomeProblems,
+        clock: FakeClock,
+    ) -> tuple[RoundRunner, Path, dict[str, object]]:
+        """A real gen-1 round, with ``beta``'s summary removed after the fact.
+
+        Removing the summary (rather than building the shape by hand) is how
+        a killed process actually leaves the directory: the chain is complete
+        because every append landed, and ``metrics.json`` is missing because
+        the process died in the gap between the last append and the single
+        end-of-attempt write that ``run_attempt``'s own docstring names.
+        """
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        output_dir = store.round_dir(0)
+        await runner.run_attempts(
+            self._corpus(), make_config(run_id="gen1", seed=7), output_dir=output_dir
+        )
+        metrics_dir = output_dir / "attempts" / "beta"
+        header = json.loads((metrics_dir / "metrics.chain.json").read_text())["header"]
+        (metrics_dir / "metrics.json").unlink()
+        assert (await verify_cli.verify_run(metrics_dir)).state is verify_cli.RunState.INCOMPLETE
+        return runner, metrics_dir, header
+
+    async def test_a_redrive_that_crashes_before_rotation_leaves_the_older_chain_alone(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        failing = _WorkspacesThatFailForSomeProblems(workspaces.root)
+        runner, metrics_dir, header = await self._generation_one_killed_before_its_summary(
+            store, failing, clock
+        )
+        chain_before = (metrics_dir / "metrics.jsonl").read_bytes()
+
+        failing.fail = {"beta"}
+        with structlog.testing.capture_logs() as cap:
+            await runner.run_attempts(
+                self._corpus(),
+                make_config(run_id="gen2", seed=99),
+                output_dir=store.round_dir(0),
+            )
+
+        # Nothing was written over generation 1's log, and generation 1's log
+        # is byte-for-byte what it was.
+        assert not (metrics_dir / "metrics.json").exists()
+        assert (metrics_dir / "metrics.jsonl").read_bytes() == chain_before
+        assert json.loads((metrics_dir / "metrics.chain.json").read_text())["header"] == header
+
+        # The refusal is disclosed, and under its own event name: an operator
+        # greps ``..._summary_failed`` when the reporting layer is broken, and
+        # this is the opposite -- reporting working correctly.
+        refusals = [
+            e for e in cap if e.get("event") == "research.results.crashed_attempt_summary_refused"
+        ]
+        assert len(refusals) == 1
+        assert refusals[0]["log_level"] == "error"
+        assert "round_id='gen1' (expected 'gen2')" in refusals[0]["reason"]
+        assert "seed=7 (expected 99)" in refusals[0]["reason"]
+        assert not any(
+            e.get("event") == "research.results.crashed_attempt_summary_failed" for e in cap
+        )
+
+    async def test_the_killed_generations_honest_incomplete_state_survives(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """``INCOMPLETE`` is the true statement about that directory.
+
+        The attempt was killed unfinished and never rotated aside, so "the
+        summary is missing" is exactly what happened. Trading it for an ``OK``
+        earned by a fabricated summary is strictly worse than the ``2`` an
+        operator has to go look at: the ``2`` is a finding, the ``OK`` is a
+        false negative that also erased the evidence.
+        """
+        failing = _WorkspacesThatFailForSomeProblems(workspaces.root)
+        runner, metrics_dir, _ = await self._generation_one_killed_before_its_summary(
+            store, failing, clock
+        )
+        failing.fail = {"beta"}
+        await runner.run_attempts(
+            self._corpus(), make_config(run_id="gen2", seed=99), output_dir=store.round_dir(0)
+        )
+
+        assert (await verify_metrics_chain(metrics_dir)).ok is True
+        verdict = await verify_cli.verify_run(metrics_dir)
+        assert verdict.state is verify_cli.RunState.INCOMPLETE
+        assert await _verify_exit_code(store.loop_dir.parent) == verify_cli.EXIT_INCOMPLETE
+
+    async def test_a_crash_after_rotation_still_gets_its_own_terminal_summary(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """The guard has to be precise, not merely safe.
+
+        Here the re-drive gets far enough to rotate the previous generation
+        aside and start its own chain, and *then* dies (a colliding
+        ``score_scale`` on the first append that carries a score). The header
+        in the directory is now this attempt's, so the close-out writes the
+        terminal summary it exists to write -- and generation 1's complete
+        pair sits untouched in ``prior-1/``. A guard that refused here would
+        have re-introduced the permanent exit ``2`` the close-out removed.
+        """
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        output_dir = store.round_dir(0)
+        config = make_config(
+            run_id="gen1",
+            seed=7,
+            verify_every_step=False,
+            cap=Cap(max_steps=3, max_tokens=10_000, max_wall_clock_seconds=600.0),
+        )
+        await runner.run_attempts(
+            [make_problem("bad", scores=(2.0,))], config, output_dir=output_dir
+        )
+        metrics_dir = output_dir / "attempts" / "bad"
+        first_generation = (metrics_dir / "metrics.json").read_bytes()
+
+        await runner.run_attempts(
+            # A surviving sibling, because a round that loses *every* attempt
+            # is refused outright one level up and never reaches a close-out.
+            [_problem_with_scale("bad", "tokens_used"), make_problem("good", scores=(1.0,))],
+            dataclasses.replace(config, run_id="gen2", seed=99),
+            output_dir=output_dir,
+        )
+
+        summary = json.loads((metrics_dir / "metrics.json").read_text())
+        header = json.loads((metrics_dir / "metrics.chain.json").read_text())["header"]
+        assert summary["round_id"] == header["round_id"] == "gen2"
+        assert summary["seed"] == header["seed"] == 99
+        assert summary["attempt_id"] == header["attempt_id"]
+        assert summary["final_state"].startswith("crashed_in_harness:")
+        assert (await reconcile_summary(metrics_dir)).state is ReconcileState.OK
+
+        # Generation 1 survives, whole, where rotation put it.
+        assert (metrics_dir / "prior-1" / "metrics.json").read_bytes() == first_generation
+        assert (await reconcile_summary(metrics_dir / "prior-1")).state is ReconcileState.OK
+        assert await _verify_exit_code(store.loop_dir.parent) == verify_cli.EXIT_OK

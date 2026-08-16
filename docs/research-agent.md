@@ -850,10 +850,25 @@ match the recorded header (header altered)"`, with `first_bad_index=None`
 because the break is not scoped to any one line — it is the run's identity,
 not one of its recorded steps, that no longer matches. A companion check,
 `reconcile_summary`, re-derives `metrics.json` from the raw log and
-separately catches an honest log with a doctored summary written over it —
-but it never inspects the header, so a relabelled chain reconciles perfectly
-clean on its own; the header re-hash above is the only one of the two checks
-that catches a relabelling.
+separately catches an honest log with a doctored summary written over it. It
+also compares the summary's four identity fields — `attempt_id`,
+`problem_id`, `round_id`, `seed` — against the chain header sitting in the
+same directory, so a `metrics.json` claiming a different attempt, round or
+seed than the log beside it is a named mismatch rather than a clean pass. The
+two checks still catch different relabellings and neither subsumes the other:
+the header re-hash above catches a header edited to name a different run,
+while this catches a *summary* written over a log that was never that run's.
+Everything else `reconcile_summary` compares is re-derived by the same reader
+the writer used, so for a summary written from that reader — which is exactly
+what the contained-crash close-out below writes — agreement is definitional at
+write time and those fields can only ever catch a later edit; the identity
+fields are the only ones that can catch a dishonest write. `score_scale` and
+`started_at_ms` are deliberately excluded: the first is a property of the
+problem's verifier rather than of this attempt's identity (and already
+load-bearing elsewhere in that module), the second never reaches the summary.
+A field absent from either document is skipped rather than flagged — a
+missing sidecar is `verify_metrics_chain`'s finding to report, and a summary
+that makes no claim cannot contradict one.
 
 **A FAIL has one more cause that is not tampering: a re-run.** Re-driving an
 attempt reuses the same `attempts/<problem-id>/` directory — a closed
@@ -1118,6 +1133,43 @@ prefix, no delta for the affected cell — see "A round record / trajectory"
 below); only the exit code stopped conflating "this round disclosed a loss"
 with "this attempt has not finished yet."
 
+**The close-out refuses to write when the chain in that directory is not this
+attempt's** — a guard its docstring promised from the start and that round 3
+found unimplemented. `_read_crashed_attempt_record` compares the chain
+header's `problem_id`, `round_id` and `seed` against the attempt that
+actually crashed, and refuses (logging
+`research.results.crashed_attempt_summary_refused` at `ERROR`, writing
+nothing) when any of them disagrees. This is reachable rather than defensive:
+`run_attempt` materialises the workspace — real I/O against a template that
+can be pruned, evicted, or hit a full disk — **before** it calls
+`_rotate_stale_metrics`, so a crash in that window finds the *previous*
+generation's chain still sitting in place, intact and summary-less. Driven,
+the unguarded close-out adopted it: generation 1 (`run_id=gen1, seed=7`) was
+killed before its summary, generation 2 (`run_id=gen2, seed=99`) crashed in
+`materialise`, and the summary written over generation 1's log read
+`{"attempt_id": "gen1-beta-…", "round_id": "gen2", "seed": 99, "final_state":
+"crashed_in_harness:OSError"}` — asserting that generation 1 died of an
+exception that never touched its log — while `verify` reported `OK` with zero
+mismatches, because every field it reconciled had just been re-derived from
+that same log. It also destroyed the honest `INCOMPLETE` state that said
+generation 1 was killed unfinished, which is the one thing rotation promises a
+superseded generation keeps. With the guard, that directory stays untouched
+and keeps reporting `2` until someone looks at it. `attempt_id` is not part of
+the comparison — it is minted inside `run_attempt` and dies with the exception
+— so a re-drive under the *same* `run_id` and seed remains indistinguishable
+by any surviving evidence; that is the documented limit of the guard, not an
+oversight. `reconcile_summary`'s identity check (see "Integrity, and its
+limits") is the independent second guard on the same shape, from the reader's
+side.
+
+**`materialise` was left where it is, before rotation.** Reordering would
+close this window too, but it costs more than it buys: rotation would then
+fire for an attempt that never starts, minting a fresh `prior-N/` on every
+failed re-drive and moving the live generation's chain, summary and plots out
+of the directory the desktop reads in favour of a generation that produced
+nothing. The identity guard closes the defect without inventing empty
+generations.
+
 **Exit `2` still means what it always meant: a killed process, not a
 contained crash.** Nothing above shrinks `INCOMPLETE`'s trigger — an attempt
 that never reaches *either* its normal completion *or* a caught exception in
@@ -1369,3 +1421,59 @@ refusal: a clean round's cells each carry `marginal_gain`, `noise_floor`, and
 desktop pane, a pre-writeup gate, the self-edit seam deciding whether to keep
 going — can tell "this round's delta is not a valid comparison" without
 parsing the verdict's English.
+
+**The same refusal reads off the parent, and without that half it was
+one-sided.** Nothing consulted the *parent* record's `all_attempts_completed`
+gate, so a round that lost an attempt correctly refused its own deltas and
+then served as the baseline for the next round's. Driven end-to-end: round 0
+loses `alpha` (the *strong* problem) to a contained crash and records a cell
+mean of `0.5` over `n=1`, refusing its own reporting exactly as above; round 1
+then runs the identical corpus with the identical agent and identical scores,
+records `1.75` over `n=2`, and emitted `marginal_gain: +1.25`,
+`cost_per_unit_gain: 0.2959`, `SaturationVerdict.IMPROVING`, a verdict line
+reading `"gain +1.25 = +12.50x the noise floor"` and
+`"comparable_to_parent": true` — **with every gate green**. The agent did not
+change at all; the entire delta is *which problems ran in the parent*. Losing
+the weak problem in the parent manufactures the mirror-image phantom
+regression.
+
+`run_round` now reads the parent record's own `all_attempts_completed` gate
+and passes it to `compute_deltas` and `assess_saturation`, which refuse
+round-wide on the same argument, and the refusal has its **own** verdict —
+`SaturationVerdict.REFUSED_PARENT_ATTEMPT_LOST` (`"refused_parent_attempt_lost"`
+in `trajectory.json`) — rather than sharing `refused_attempt_lost`. The two
+call for different operator actions: `refused_attempt_lost` says re-drive the
+problem *this* round lost, while `refused_parent_attempt_lost` says this round
+is fine and the *baseline* is not, so no amount of re-driving this round will
+bring the delta back — the parent has to be re-measured, or a later complete
+round adopted as the baseline. When both rounds are lossy the round's own loss
+is the verdict (its gate and verdict prefix already say so) with the parent's
+named in the same reason string, so nobody re-drives this round expecting the
+delta to return. `ERROR`-level `research.round.parent_attempts_lost` carries
+the same fact to the log, naming the parent's `run_id`.
+
+**A parent record carrying no `all_attempts_completed` gate at all is refused,
+not trusted.** A record written before that gate existed is silent about the
+one fact the refusal turns on, and the two readings of that silence are not
+symmetric: trusting it re-opens exactly the phantom gain above — emitted with
+every gate green, which is the property that makes it dangerous — while
+refusing it costs a delta that returns the moment the baseline is re-driven
+under a runner that writes the gate. Every other unresolved basis in
+`metrics.py` (no floor, a degenerate floor, a changed eval set) already
+resolves the same way. The refusal reason says which case it is:
+`"the parent round records no all_attempts_completed gate, so whether it
+measured the full corpus is unknown"`.
+
+The parent's completeness is deliberately **not** added to this round's
+`gates` map. Every entry there is a statement about the round it belongs to,
+and `webui/src/desktop/panes/flywheel.ts` reads any `false` gate it does not
+recognise as *this round failed something* — which would paint a complete,
+honest round red for its baseline's fault. The refusal travels in the channel
+built for refusals instead (`saturation[].verdict`, the empty `delta` /
+`delta_in_noise_units` / `cost_per_point` maps, the verdict line, and
+`comparable_to_parent: false` in the round summary), and that pane already
+renders any `refused_*` verdict as "refused" with no change needed. The round
+summary's `comparable_to_parent` is the one place the two losses meet: it
+answers *"may these numbers be compared with the parent's?"*, so it is
+`false` when this round lost an attempt, when the parent did, or when the
+parent is silent about whether it did.

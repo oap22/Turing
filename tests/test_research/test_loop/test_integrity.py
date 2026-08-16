@@ -26,7 +26,11 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from turing.research.contracts import ContractViolationError
+from turing.research.contracts import (
+    ContractViolationError,
+    EscalationReason,
+    EscalationVerdict,
+)
 from turing.research.loop import integrity as integrity_module
 from turing.research.loop import results as results_module
 from turing.research.loop import verify
@@ -47,7 +51,13 @@ from turing.research.loop.integrity import (
 )
 from turing.research.loop.protocols import SolverStep
 
-from .conftest import FakeSolver, make_config, make_problem, make_runner
+from .conftest import (
+    FakeSolver,
+    ScriptedEscalationChannel,
+    make_config,
+    make_problem,
+    make_runner,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -2452,3 +2462,227 @@ class TestReadLogTailIsTheOneReaderOfARawLog:
         assert tail.score_values == ()
         assert tail.baseline_score is None
         assert tail.final_progress is None
+
+
+# --------------------------------------------------------------------------- #
+# Round-8 regression -- reconciliation was vacuous for a crashed close-out
+# --------------------------------------------------------------------------- #
+
+
+class TestReconcileChecksTheSummaryAgainstTheHeaderBesideIt:
+    """Every other field ``reconcile_summary`` checks is definitional at write
+    time, so on its own it could never catch a dishonest close-out.
+
+    ``runner._close_out_crashed_attempt`` derives its terminal ``metrics.json``
+    from the same ``read_log_tail`` call reconciliation then re-derives from,
+    which makes the resource numbers agree by construction -- deliberately so,
+    since a summary built from anything else would trade an ``INCOMPLETE``
+    verdict for a ``FAILED`` one. The consequence nobody had drawn is that
+    those checks can only detect a *later edit*: the close-out's own new
+    assertions -- which attempt, which round, which seed, and what killed it
+    -- were compared against nothing at all.
+
+    The proof was a summary claiming a different ``round_id`` and ``seed``
+    than the chain header **in the same directory**, reconciling with zero
+    mismatches. Identity now comes off the header the log actually carries.
+    """
+
+    @staticmethod
+    async def _real_attempt(
+        store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> Path:
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        output_dir = store.round_dir(0)
+        await runner.run_attempt(
+            make_problem("s1", scores=(1.0, 2.0)), make_config(), output_dir=output_dir
+        )
+        return output_dir / "attempts" / "s1"
+
+    @pytest.mark.parametrize(
+        ("field", "forged"),
+        [
+            ("attempt_id", "some-other-attempt"),
+            ("problem_id", "some-other-problem"),
+            ("round_id", "r99"),
+            ("seed", 4321),
+        ],
+    )
+    async def test_a_summary_naming_a_different_run_than_the_log_is_a_mismatch(
+        self,
+        store: TrajectoryStore,
+        workspaces: TempWorkspaceProvider,
+        clock: FakeClock,
+        field: str,
+        forged: object,
+    ) -> None:
+        """Driven against a real attempt, then one identity field edited.
+
+        Nothing else is touched -- not a line, not the sidecar, not a single
+        resource number -- so every pre-existing check still agrees. The whole
+        finding is that the summary and the log beside it describe different
+        runs.
+        """
+        metrics_dir = await self._real_attempt(store, workspaces, clock)
+        summary = json.loads((metrics_dir / "metrics.json").read_text(encoding="utf-8"))
+        assert summary[field] != forged, "fixture assumption broken: field not actually changed"
+        summary[field] = forged
+        _write_summary(metrics_dir, summary)
+
+        verdict = await reconcile_summary(metrics_dir)
+        assert verdict.state is ReconcileState.FAILED
+        assert verdict.mismatches == (field,)
+        # The chain itself is untouched: the two checks report different
+        # faults and this one is not a chain break.
+        assert (await verify_metrics_chain(metrics_dir)).ok is True
+
+    async def test_the_cross_generation_close_out_shape_no_longer_reconciles(
+        self,
+        store: TrajectoryStore,
+        workspaces: TempWorkspaceProvider,
+        clock: FakeClock,
+    ) -> None:
+        """The exact artifact defect 2 produced, checked from the other side.
+
+        Even if a summary asserting a later generation's ``round_id`` and
+        ``seed`` were somehow written over an earlier generation's chain
+        again, reconciliation now names both fields instead of blessing the
+        file. Two independent guards, because the writer's guard only protects
+        the writer.
+        """
+        metrics_dir = await self._real_attempt(store, workspaces, clock)
+        summary = json.loads((metrics_dir / "metrics.json").read_text(encoding="utf-8"))
+        summary["round_id"] = "gen2"
+        summary["seed"] = 99
+        summary["final_state"] = "crashed_in_harness:OSError"
+        _write_summary(metrics_dir, summary)
+
+        verdict = await reconcile_summary(metrics_dir)
+        assert verdict.state is ReconcileState.FAILED
+        assert sorted(verdict.mismatches) == ["round_id", "seed"]
+        assert (await verify.verify_run(metrics_dir)).state is verify.RunState.FAILED
+
+    async def test_honest_runs_of_every_shape_still_reconcile_clean(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """The false-alarm half, and the only reason to trust the check above.
+
+        Four honest shapes in one results tree: a plain attempt, an attempt
+        that interrupted its operator, a re-driven attempt (whose live
+        directory carries the *second* generation's identity), and the
+        rotated ``prior-1/`` generation beneath it (whose summary and header
+        must still agree with each other after being moved together).
+        """
+        output_dir = store.round_dir(0)
+        plain = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        await plain.run_attempt(
+            make_problem("plain", scores=(1.0, 2.0)), make_config(), output_dir=output_dir
+        )
+
+        escalating = make_runner(
+            solver=FakeSolver(
+                (
+                    SolverStep(tokens=10, note="work"),
+                    SolverStep(tokens=10, note="stuck", escalate=EscalationReason.HARNESS_FAILURE),
+                    SolverStep(tokens=10, note="work"),
+                )
+            ),
+            store=store,
+            workspaces=workspaces,
+            clock=clock,
+            escalations=ScriptedEscalationChannel([EscalationVerdict.CONTINUE]),
+        )
+        await escalating.run_attempt(
+            make_problem("escalated", scores=(1.0,)), make_config(), output_dir=output_dir
+        )
+
+        redriven = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        problem = make_problem("redriven", scores=(1.0, 2.0))
+        await redriven.run_attempt(problem, make_config(), output_dir=output_dir)
+        await redriven.run_attempt(
+            problem, make_config(run_id="r01", seed=99), output_dir=output_dir
+        )
+
+        directories = [
+            output_dir / "attempts" / "plain",
+            output_dir / "attempts" / "escalated",
+            output_dir / "attempts" / "redriven",
+            output_dir / "attempts" / "redriven" / "prior-1",
+        ]
+        for directory in directories:
+            verdict = await reconcile_summary(directory)
+            assert verdict.state is ReconcileState.OK, f"{directory}: {verdict.mismatches}"
+
+        # The two generations genuinely carry different identities -- this
+        # would be a false alarm waiting to happen if the check compared a
+        # summary against anything but its own directory's header.
+        live = json.loads((output_dir / "attempts" / "redriven" / "metrics.json").read_text())
+        rotated = json.loads(
+            (output_dir / "attempts" / "redriven" / "prior-1" / "metrics.json").read_text()
+        )
+        assert (live["round_id"], live["seed"]) == ("r01", 99)
+        assert (rotated["round_id"], rotated["seed"]) == ("r00", 7)
+
+    async def test_a_summary_with_no_sidecar_beside_it_is_not_flagged_by_identity(
+        self, tmp_path: Path
+    ) -> None:
+        """A missing header is ``verify_metrics_chain``'s finding, not this one.
+
+        Reporting one fault as two findings is the drift this module warns
+        about elsewhere, and a summary that has no header to disagree with has
+        not been caught claiming anything.
+        """
+        lines = [_line(i) for i in range(3)]
+        _write_raw_jsonl(tmp_path, lines)
+        last = lines[-1]
+        _write_summary(
+            tmp_path,
+            {
+                "attempt_id": "whatever-it-likes",
+                "round_id": "r99",
+                "seed": 4321,
+                "steps_recorded": len(lines),
+                "consumed_steps": last["consumed_steps"],
+                "consumed_tokens": last["tokens_used"],
+                "consumed_wall_clock_seconds": last["wall_clock_s"],
+                "cap_extensions": last["cap_extensions"],
+                "final_progress": None,
+                "outcome": last["outcome_code"],
+                "baseline_score": lines[0]["speedup"],
+                "best_score": last["speedup"],
+            },
+        )
+
+        verdict = await reconcile_summary(tmp_path)
+        assert verdict.state is ReconcileState.OK, verdict.mismatches
+
+    async def test_a_summary_that_omits_an_identity_field_is_not_flagged(
+        self, tmp_path: Path
+    ) -> None:
+        """ "Makes no claim" is not "makes a false claim".
+
+        ``results.write_attempt_summary`` emits all four fields
+        unconditionally, so a summary missing one came from outside that
+        writer -- something reconciliation is not the place to re-litigate,
+        and something that must not turn into a false ``FAILED`` on a
+        directory whose numbers all agree.
+        """
+        lines = [_line(i) for i in range(3)]
+        _build_chain(tmp_path, _header(), lines)
+        last = lines[-1]
+        _write_summary(
+            tmp_path,
+            {
+                "steps_recorded": len(lines),
+                "consumed_steps": last["consumed_steps"],
+                "consumed_tokens": last["tokens_used"],
+                "consumed_wall_clock_seconds": last["wall_clock_s"],
+                "cap_extensions": last["cap_extensions"],
+                "final_progress": None,
+                "outcome": last["outcome_code"],
+                "baseline_score": lines[0]["speedup"],
+                "best_score": last["speedup"],
+            },
+        )
+
+        verdict = await reconcile_summary(tmp_path)
+        assert verdict.state is ReconcileState.OK, verdict.mismatches

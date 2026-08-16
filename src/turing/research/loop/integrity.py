@@ -961,6 +961,70 @@ def _check_exact(mismatches: list[str], field: str, actual: object, expected: ob
         mismatches.append(field)
 
 
+#: The fields a ``metrics.json`` and the chain header beside it both state
+#: about *which attempt this directory is*. Every one of them is written by
+#: ``results.write_attempt_summary`` from the same values
+#: ``results.MetricsWriter``'s header was built from, one call apart in
+#: ``runner.run_attempt``, so on any honest run they agree by construction —
+#: which is what makes a disagreement evidence rather than noise.
+#:
+#: ``score_scale`` and ``started_at_ms`` are in the header too and are
+#: deliberately **not** here. ``score_scale`` is a property of the problem's
+#: verifier, not of this attempt's identity, and it is already load-bearing
+#: elsewhere in this module (it is what the score-series key set is derived
+#: around); re-checking it here would add a second, differently-worded owner
+#: of the same fact. ``started_at_ms`` never reaches the summary at all, so
+#: there is nothing to compare it against.
+_IDENTITY_FIELDS: tuple[str, ...] = ("attempt_id", "problem_id", "round_id", "seed")
+
+
+def _check_identity(
+    mismatches: list[str],
+    summary: Mapping[str, object],
+    header: Mapping[str, object] | None,
+) -> None:
+    """Flag a summary that claims a different attempt than the log beside it.
+
+    **Why this is not redundant with the checks below.** Every other field
+    :func:`reconcile_summary` compares is re-derived by the same
+    :func:`read_log_tail` call the comparison uses, which makes agreement
+    definitional for any summary written *from* that tail — exactly what
+    ``runner._close_out_crashed_attempt`` does for a contained crash. Those
+    checks can therefore only catch a post-hoc edit; they cannot catch a
+    dishonest write. The close-out's genuinely new assertions are its
+    identity and its ``final_state``, and until this function existed nothing
+    checked any of them: a summary naming a different ``round_id`` and
+    ``seed`` than the chain header **in the same directory** reconciled with
+    zero mismatches (round 3, driven — a re-drive that crashed before
+    rotation adopted the previous generation's chain and ``verify`` reported
+    ``OK``).
+
+    **A missing field is not a mismatch, on either side.** The header is
+    absent entirely when the sidecar is missing or unreadable — a state
+    :func:`verify_metrics_chain` already reports in its own words, and
+    double-reporting one fault as two findings is the drift this module warns
+    about elsewhere. An individual field absent from either document is
+    likewise skipped: this function's finding is *"these two disagree about
+    who they describe"*, and a document that makes no claim cannot disagree
+    with one. ``results.write_attempt_summary`` emits all four unconditionally,
+    so absence means a summary from outside that writer, which reconciliation
+    is not the place to re-litigate.
+
+    Raw values, compared with ``!=`` and nothing else — no coercion. A
+    ``seed`` of ``7`` and one of ``"7"`` are two different claims about how
+    the run was seeded, and quietly agreeing they are the same would be this
+    module deciding a comparison it exists to make honestly (see
+    :class:`LogTail`).
+    """
+    if header is None:
+        return
+    for field in _IDENTITY_FIELDS:
+        if field not in header or field not in summary:
+            continue
+        if summary[field] != header[field]:
+            mismatches.append(field)
+
+
 def _check_close(
     mismatches: list[str],
     field: str,
@@ -1122,6 +1186,10 @@ def _reconcile_summary_sync(directory: Path) -> ReconcileVerdict:
     ============================  =========================================
     ``metrics.json`` field        Must equal, derived from the log
     ============================  =========================================
+    ``attempt_id``                the chain header's ``attempt_id``
+    ``problem_id``                the chain header's ``problem_id``
+    ``round_id``                  the chain header's ``round_id``
+    ``seed``                      the chain header's ``seed``
     ``steps_recorded``            number of lines
     ``consumed_steps``            last line's ``consumed_steps`` field
     ``consumed_tokens``           last line's ``tokens_used``
@@ -1183,6 +1251,17 @@ def _reconcile_summary_sync(directory: Path) -> ReconcileVerdict:
     see :class:`LogTail`. What stays here is the comparison and the verdict,
     which is this function's own job and nobody else's.
 
+    **The four identity rows are the only ones this function can catch a
+    dishonest *write* with, and that is why they are here.** Everything below
+    them is re-derived by the same ``read_log_tail`` call the comparison uses,
+    so for a summary written *from* that tail — which is exactly what
+    ``runner._close_out_crashed_attempt`` writes for a contained crash —
+    agreement is definitional at write time, and these checks can only ever
+    detect a later edit. The identity fields are the close-out's own new
+    assertions, checked against the header of the chain it sits beside; see
+    :func:`_check_identity` for the driven case that motivated them and for
+    why a *missing* field on either side is not a mismatch.
+
     A missing ``metrics.json`` is :attr:`ReconcileState.INCOMPLETE` — not
     ``ok``, and not a FAIL either — with an empty ``mismatches`` tuple and a
     reason naming the summary as absent. See :class:`ReconcileState` for why
@@ -1191,8 +1270,10 @@ def _reconcile_summary_sync(directory: Path) -> ReconcileVerdict:
     ``prior-N/``, and calling it a failure was a false alarm that never
     cleared. Absence is still not a pass; ``verify`` exits non-zero on it.
 
-    This function deliberately does **not** consult the chain before deciding
-    that. Re-reading and re-hashing ``metrics.jsonl`` here would duplicate
+    This function deliberately does **not** verify the chain before deciding
+    that — reading the sidecar's header for the identity rows above is not
+    the same thing, and neither re-hashes a line nor re-derives a digest.
+    Re-reading and re-hashing ``metrics.jsonl`` here would duplicate
     :func:`verify_metrics_chain`'s entire job for one branch, and two copies
     of that logic is precisely the drift this module warns about elsewhere.
     The composition — "intact chain **and** absent summary means unfinished;
@@ -1255,6 +1336,7 @@ def _reconcile_summary_sync(directory: Path) -> ReconcileVerdict:
     score_values = tail.score_values
 
     mismatches: list[str] = []
+    _check_identity(mismatches, summary, tail.header)
     _check_exact(mismatches, "steps_recorded", summary.get("steps_recorded"), steps_recorded)
     if last is not None:
         _check_exact(

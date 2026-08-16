@@ -404,6 +404,20 @@ def _rotate_stale_metrics(metrics_dir: Path) -> None:
 _CRASHED_FINAL_STATE_PREFIX = "crashed_in_harness"
 
 
+class _ForeignChainError(Exception):
+    """The chain in an attempt directory is not the chain of the attempt that crashed.
+
+    Raised by :func:`_read_crashed_attempt_record` and caught separately from
+    every other failure by :meth:`RoundRunner._close_out_crashed_attempt`,
+    because the two mean opposite things: an ordinary failure there is
+    "reporting broke, the loss is still disclosed elsewhere", while this one
+    is "reporting worked and correctly declined to speak for someone else's
+    log". Collapsing them into one ``except`` would log a deliberate,
+    correct refusal under an event name an operator greps for when the
+    reporting layer is broken.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class _CrashedAttemptRecord:
     """The terminal summary fields for a crashed attempt, read off its own log.
@@ -444,12 +458,49 @@ def _as_number(value: object) -> float | None:
     return float(value)
 
 
-def _read_crashed_attempt_record(metrics_dir: Path, escalations_dir: Path) -> _CrashedAttemptRecord:
+def _read_crashed_attempt_record(
+    metrics_dir: Path,
+    escalations_dir: Path,
+    *,
+    expected_problem_id: str,
+    expected_round_id: str,
+    expected_seed: int,
+) -> _CrashedAttemptRecord:
     """Re-derive one crashed attempt's terminal summary from its own files.
 
     Raises rather than returning a partial record: every caller is already
     inside a guard that logs and moves on, and a half-derived summary written
     over an honest log is the one outcome worse than no summary at all.
+
+    **The header must name this attempt, or nothing is derived.** The chain
+    header is the only place an attempt's identity survives on disk, and it is
+    checked field by field — ``problem_id``, ``round_id``, ``seed`` — against
+    the attempt that actually crashed, raising :class:`_ForeignChainError`
+    when any of them disagrees or is missing. This is not defensive
+    programming; the directory genuinely can hold a *previous generation's*
+    chain at this moment. ``run_attempt`` materialises the workspace (I/O
+    against a template that can be pruned, evicted or fill a disk) **before**
+    it calls ``_rotate_stale_metrics``, so an exception in that window leaves
+    the earlier generation's trio untouched and un-rotated: an intact chain
+    with no summary — the honest "killed before its summary write" shape that
+    ``verify`` reports ``INCOMPLETE`` and that rotation exists to preserve.
+    Without this check the close-out adopted that chain, wrote a summary
+    asserting the *current* round's ``round_id`` and ``seed`` and an exception
+    type that never touched it, and ``verify`` blessed the result ``OK``,
+    because every field it reconciles was re-derived from the very log the
+    summary had just been misattributed to. Two harms, either sufficient: a
+    fabricated claim about a run that did not make it, and the destruction of
+    the one honest state — ``INCOMPLETE`` — that said the earlier generation
+    was killed unfinished.
+
+    ``attempt_id`` is deliberately *not* in the comparison: it is minted
+    inside ``run_attempt`` and dies with the exception, so there is nothing to
+    compare against here. The trio that is checked is what the summary would
+    otherwise claim from the current config, and it pins the generation
+    whenever a re-drive changes the round or the seed. A re-drive under the
+    *same* ``run_id`` and seed is not distinguishable by any surviving
+    evidence, and is left as the documented limit of this guard rather than
+    guessed at.
 
     ``escalation_count`` is counted from the round's ``escalations/``
     directory rather than defaulted to ``0``. The in-memory request list died
@@ -471,6 +522,21 @@ def _read_crashed_attempt_record(metrics_dir: Path, escalations_dir: Path) -> _C
     attempt_id = header.get("attempt_id")
     if not isinstance(attempt_id, str) or not attempt_id:
         raise ContractViolationError(f"{metrics_dir}'s chain header carries no attempt_id")
+
+    foreign = [
+        f"{field}={header.get(field)!r} (expected {expected!r})"
+        for field, expected in (
+            ("problem_id", expected_problem_id),
+            ("round_id", expected_round_id),
+            ("seed", expected_seed),
+        )
+        if header.get(field) != expected
+    ]
+    if foreign:
+        raise _ForeignChainError(
+            f"{metrics_dir}'s chain header names a different attempt ({attempt_id}): "
+            + "; ".join(foreign)
+        )
 
     numbers = {
         name: _as_number(last.get(key))
@@ -513,6 +579,38 @@ def _read_crashed_attempt_record(metrics_dir: Path, escalations_dir: Path) -> _C
         baseline_score=_as_number(tail.baseline_score),
         escalation_count=escalation_count,
     )
+
+
+def _parent_attempts_completed(parent: RoundRecord | None) -> bool | None:
+    """Whether the parent round measured its whole corpus, as *it* recorded it.
+
+    Read off the parent's persisted ``all_attempts_completed`` gate rather
+    than recomputed, because it cannot be recomputed: the parent's losses
+    lived in a previous ``run_round`` call's ``attempt_failures``, and the
+    only surviving statement about them is the gate that call wrote. A round
+    that lost an attempt has cells reduced over a strict subset of the corpus,
+    and that is exactly as fatal to a delta when it happens on the parent side
+    of the subtraction as on this one — see :func:`compute_deltas`, which had
+    the argument in its docstring while the parent's gate was never read.
+
+    Three answers, not two. ``None`` means the record carries no such gate at
+    all — a record written before the gate existed, or one reconstructed by a
+    caller that dropped it. That is *unknown*, not *fine*, and
+    :func:`compute_deltas` refuses it: the failure this guards is a phantom
+    gain emitted with every gate green, so "silent" is the exact state it
+    cannot be allowed to resolve to. A non-``bool`` value is folded into
+    ``None`` for the same reason — a truthy string in a gate map is not a
+    measurement of anything.
+
+    ``parent is None`` answers ``True`` rather than ``None``: there is no
+    parent to be short a problem, and every consumer already refuses a
+    parentless round through ``REFUSED_NO_PARENT``. Answering ``None`` there
+    would relabel round 0's honest "no baseline yet" as a suspect baseline.
+    """
+    if parent is None:
+        return True
+    value = parent.gates.get("all_attempts_completed")
+    return value if isinstance(value, bool) else None
 
 
 class RoundRunner:
@@ -1414,9 +1512,27 @@ class RoundRunner:
         * ``metrics.json`` already present. The crash happened after the
           summary landed, so the honest terminal record is already there and
           overwriting it with a cruder one would lose information.
-        * a header naming a different problem, or an unreadable one. Then this
-          directory's chain is not this attempt's, and a summary written over
-          it would be a claim about someone else's log.
+        * a chain header that names a different attempt — a different
+          ``problem_id``, ``round_id`` or ``seed``, or one of those missing.
+          Then this directory's chain belongs to an earlier generation and a
+          summary written over it would be a claim about someone else's log.
+          (A header that cannot be read *at all* is left alone too, by the
+          generic guard below rather than by this check: with no header there
+          is nothing to attribute a summary to, and it takes the same "write
+          nothing" path.) This is reachable, not hypothetical:
+          ``run_attempt`` materialises the workspace before it rotates the
+          stale trio aside, so a crash in that window finds the previous
+          generation's chain still in place, intact and summary-less — the
+          honest ``INCOMPLETE`` shape a killed attempt leaves and rotation
+          promises to preserve. :func:`_read_crashed_attempt_record` enforces
+          the check (see its docstring for the full driven example and for why
+          ``attempt_id`` is not part of it); the refusal is logged under its
+          own event name so it cannot be mistaken for reporting failing.
+
+        Because the header must match the current attempt before anything is
+        written, ``target_score`` — taken from *this* config's criterion — is
+        necessarily the criterion the log was produced under. It could not be
+        while an adopted foreign chain was reachable.
         """
         metrics_dir = output_dir / "attempts" / problem.id
         try:
@@ -1425,7 +1541,12 @@ class RoundRunner:
             if not (metrics_dir / "metrics.jsonl").exists():
                 return
             record = await asyncio.to_thread(
-                _read_crashed_attempt_record, metrics_dir, output_dir / "escalations"
+                _read_crashed_attempt_record,
+                metrics_dir,
+                output_dir / "escalations",
+                expected_problem_id=problem.id,
+                expected_round_id=config.run_id,
+                expected_seed=config.seed,
             )
             criterion = config.criterion_for(problem.id)
             await write_attempt_summary(
@@ -1452,6 +1573,28 @@ class RoundRunner:
                 cap_extensions=record.cap_extensions,
                 escalation_count=record.escalation_count,
                 steps_recorded=record.steps_recorded,
+            )
+        except _ForeignChainError as exc:
+            # Not a failure: the guard fired and nothing was written. Logged
+            # at ERROR anyway, because the *reason* it fired — a previous
+            # generation's chain still sitting where this attempt's belongs —
+            # is a real finding about the results tree, and the directory will
+            # keep reporting INCOMPLETE until someone looks at it.
+            logger.error(
+                "research.results.crashed_attempt_summary_refused",
+                problem_id=problem.id,
+                run_id=config.run_id,
+                round_index=config.round_index,
+                directory=str(metrics_dir),
+                reason=str(exc),
+                detail=(
+                    "this directory holds a different attempt's chain (an earlier "
+                    "generation that was never rotated aside, because the crash "
+                    "happened before rotation); no summary is written over it — that "
+                    "would assert this round's identity and exception over a log they "
+                    "never touched, and would destroy the honest INCOMPLETE state that "
+                    "says the earlier attempt was killed unfinished"
+                ),
             )
         except Exception:
             logger.exception(
@@ -1662,6 +1805,7 @@ class RoundRunner:
 
         parent_scores: tuple[TypeScore, ...] | None = None
         comparable = True
+        parent_attempts_completed: bool | None = True
         if parent is not None:
             if config.parent_round_id != parent.run_id:
                 raise ContractViolationError(
@@ -1679,6 +1823,22 @@ class RoundRunner:
                     eval_set_hash=eval_set_hash,
                     detail="rounds measured on different eval sets are not comparable",
                 )
+            parent_attempts_completed = _parent_attempts_completed(parent)
+            if parent_attempts_completed is not True:
+                logger.error(
+                    "research.round.parent_attempts_lost",
+                    round_index=config.round_index,
+                    run_id=config.run_id,
+                    parent_round_id=parent.run_id,
+                    parent_all_attempts_completed=parent_attempts_completed,
+                    detail=(
+                        "the parent round did not measure its full corpus (or does not "
+                        "record whether it did), so its cells are the reduced side of "
+                        "every subtraction this round would report; the deltas and the "
+                        "saturation verdicts are refused. Re-driving this round does not "
+                        "fix it — the baseline has to be re-measured"
+                    ),
+                )
 
         floors = floors_by_cell(floors_seq)
         # Two separate facts, deliberately not folded into one flag.
@@ -1691,6 +1851,17 @@ class RoundRunner:
         # refusals read differently in the verdict on purpose, because the
         # operator actions they call for are different (re-derive the corpus
         # vs. re-drive the lost problem).
+        #
+        # ``parent_attempts_completed`` is the third fact, and it is *this*
+        # round's gate asked of the parent record rather than anything
+        # recomputed here: a delta is a subtraction, and it is contaminated
+        # by a missing problem on either side. It is deliberately not written
+        # into ``gates`` below — every entry there is a statement about this
+        # round, and a gate whose subject is a different round would be read
+        # (by the desktop's flywheel pane, among others) as this round having
+        # failed something. The refusal travels in the channel built for it
+        # instead: ``refused_parent_attempt_lost`` per cell, in the record,
+        # the trajectory row and the verdict line.
         all_attempts_completed = not failures
         deltas = compute_deltas(
             type_scores,
@@ -1700,6 +1871,7 @@ class RoundRunner:
             basis=config.cost_basis,
             comparable=comparable,
             all_attempts_completed=all_attempts_completed,
+            parent_attempts_completed=parent_attempts_completed,
         )
         assessments = assess_saturation(
             type_scores,
@@ -1707,6 +1879,7 @@ class RoundRunner:
             floors,
             comparable=comparable,
             all_attempts_completed=all_attempts_completed,
+            parent_attempts_completed=parent_attempts_completed,
         )
         gates = {
             "eval_set_stable": comparable,
@@ -1834,7 +2007,18 @@ class RoundRunner:
                 # ``delta`` map, ``saturation`` entries reading
                 # ``refused_attempt_lost``, and
                 # ``constraints.all_attempts_completed: false``.
-                comparable_to_parent=None if parent is None else (comparable and not failures),
+                #
+                # The parent's own completeness is in this conjunction for the
+                # same reason ``not failures`` is: the question is whether
+                # these numbers may be compared with the parent's, and a
+                # parent that measured a subset of the corpus (or is silent
+                # about whether it did) makes the answer no from the other
+                # side of the subtraction.
+                comparable_to_parent=(
+                    None
+                    if parent is None
+                    else (comparable and not failures and parent_attempts_completed is True)
+                ),
                 cells=cells,
                 wall_clock_seconds=elapsed,
                 tokens=cost.tokens,
