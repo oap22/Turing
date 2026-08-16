@@ -621,6 +621,30 @@ class TestMetricsWriterRefusesToSpliceOntoAnExistingChain:
 
         assert path.read_text() == before
 
+    async def test_a_non_empty_sidecar_with_no_log_still_raises(self, tmp_path: Path) -> None:
+        """RES-19: a half-rotated ``prior-N/`` looks like this from the inside.
+
+        ``runner._rotate_stale_metrics`` now moves the trio as one atomic
+        set, but the residual window between "some files moved" and "the
+        rotation committed" can still leave a real ``metrics.chain.json``
+        sitting with no ``metrics.jsonl`` beside it -- exactly the shape a
+        crash mid-rotation used to (and, in the residual window, still can)
+        produce. A writer that only checked ``metrics.jsonl`` would read
+        "missing" here and start appending as if this were a fresh
+        directory, silently discarding the evidence that a rotation was left
+        half-done. The refusal must fire on the sidecar alone.
+        """
+        path = tmp_path / "metrics.jsonl"
+        sidecar_path = tmp_path / "metrics.chain.json"
+        first = MetricsWriter(path, header=_header(attempt_id="attempt-1"))
+        await first.append(_line(step=0))
+        assert sidecar_path.stat().st_size > 0
+        path.unlink()
+        assert not path.exists()
+
+        with pytest.raises(ContractViolationError):
+            MetricsWriter(path, header=_header(attempt_id="attempt-2"))
+
     def test_a_missing_file_does_not_raise(self, tmp_path: Path) -> None:
         path = tmp_path / "does" / "not" / "exist" / "metrics.jsonl"
         MetricsWriter(path, header=_header())  # must not raise

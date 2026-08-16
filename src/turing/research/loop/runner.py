@@ -352,11 +352,101 @@ _ROTATED_NAMES: tuple[str, ...] = (*_METRICS_TRIO, *PLOT_FILENAMES)
 #: by :meth:`RoundRunner._viewer_runs` to tell a superseded chain from a live
 #: one now that its walk is depth-independent; kept next to the function that
 #: mints the names so the two cannot drift.
+#:
+#: Deliberately does **not** match :data:`_STAGING_DIR_NAME` (a leading dot,
+#: no digits) — a leftover staging directory is a rotation-in-progress, not a
+#: rotated generation, and must stay invisible to this filter until
+#: :func:`_rotate_stale_metrics` has finished committing it.
 _PRIOR_DIR_PATTERN = re.compile(r"prior-\d+")
+
+#: The subdirectory :func:`_rotate_stale_metrics` stages the trio and plots
+#: into before committing them, in one rename, to a numbered ``prior-N/``.
+#: One fixed name rather than one per rotation: the call site is fully
+#: synchronous (no ``await`` between staging and commit), so at most one
+#: rotation is ever in flight for a given ``metrics_dir``, and a leftover
+#: from an earlier crash is drained and committed — see
+#: :func:`_commit_staged_rotation` — before a new one is ever staged, so the
+#: name is always free by the time it would be reused. Leading dot so it
+#: sorts away from ordinary metrics files and never collides with a
+#: problem-id path segment (``contracts._reject_unsafe_problem_id`` already
+#: refuses ids that could shadow ``prior-<digits>``; a dot-prefixed name
+#: needs no matching refusal because no problem id may contain one).
+_STAGING_DIR_NAME = ".rotating"
+
+
+def _next_free_prior_suffix(metrics_dir: Path) -> int:
+    """The smallest ``N >= 1`` for which ``metrics_dir / f"prior-{N}"`` is free."""
+    suffix = 1
+    while (metrics_dir / f"prior-{suffix}").exists():
+        suffix += 1
+    return suffix
+
+
+def _commit_staged_rotation(metrics_dir: Path, staging_dir: Path) -> None:
+    """Finish moving the trio/plots into ``staging_dir``, then commit it as ``prior-N/``.
+
+    Called from two shapes of caller, and cannot (needs not) tell them apart:
+
+    1. :func:`_rotate_stale_metrics`, right after creating ``staging_dir``
+       empty — the ordinary rotation, nothing moved yet.
+    2. :func:`_rotate_stale_metrics`'s self-heal, on a ``staging_dir`` a
+       previous, crashed call already left behind holding *some* subset of
+       :data:`_ROTATED_NAMES` — whatever it managed to move before it died.
+
+    Either way the move loop below is the same: a name still sitting in
+    ``metrics_dir`` gets moved in; a name already staged (case 2, partially)
+    is simply absent from ``metrics_dir`` and skipped — ``Path.exists()`` on
+    the source is enough to tell the two apart, no bookkeeping required. So a
+    crash between individual file moves is always recoverable by calling this
+    again with the same ``staging_dir``.
+
+    **The final step is what makes the whole set atomic.** One
+    ``Path.rename`` moves ``staging_dir`` onto a freshly chosen, currently
+    non-existent ``prior-N/`` — the same directory-entry-swap primitive that
+    already made each individual file move atomic, just applied one level up.
+    An observer walking ``metrics_dir`` therefore never finds a ``prior-N/``
+    holding some but not all of the files this rotation moved: either the
+    entry does not exist yet (rotation still staging, or not yet started), or
+    it exists complete (rotation committed). There is no third, half-written
+    state to observe — which is the property three sequential per-file
+    renames into a pre-existing ``prior-N/`` never had.
+
+    **The merge above has no generation-identity check and no cross-process
+    lock.** A name already staged is trusted to belong to the same rotation
+    as whatever this call is about to move in — nothing here reads either
+    side's chain header to confirm that. That is safe only because this
+    function has exactly one call site, :func:`_rotate_stale_metrics`, which
+    itself has exactly one call site, :meth:`RoundRunner.run_attempt`, and
+    the whole sequence — self-heal, staging, commit — runs synchronously
+    with no ``await`` between the moment it decides a rotation is needed and
+    the moment it constructs the new attempt's :class:`~turing.research.loop.results.MetricsWriter`.
+    At most one rotation is ever in flight per ``metrics_dir`` *within this
+    process*; a second process racing the same ``metrics_dir`` — two
+    ``turing`` instances pointed at one results tree — is out of scope here
+    and not defended against. In that shape the final ``staging_dir.rename``
+    can land on a ``prior-N/`` a concurrent commit picked at the same
+    moment: on POSIX that rename fails with ``OSError`` (renaming onto an
+    existing non-empty directory is refused) rather than silently merging or
+    clobbering the other process's files, so the failure is loud and costs
+    exactly the one attempt whose rotation lost the race — it does not
+    corrupt the winner's ``prior-N/``. Adding a real lock is filed
+    separately; nothing here should be read as one.
+    """
+    for name in _ROTATED_NAMES:
+        src = metrics_dir / name
+        if not src.exists():
+            continue
+        src.rename(staging_dir / name)
+    suffix = _next_free_prior_suffix(metrics_dir)
+    prior_dir = metrics_dir / f"prior-{suffix}"
+    staging_dir.rename(prior_dir)
+    logger.info(
+        "research.results.metrics_rotated", staging_dir=str(staging_dir), dest=str(prior_dir)
+    )
 
 
 def _rotate_stale_metrics(metrics_dir: Path) -> None:
-    """Move a prior attempt's chained trio — and its plots — aside.
+    """Move a prior attempt's chained trio — and its plots — aside, as one atomic set.
 
     A re-run of an attempt into an already-used ``output_dir`` is legitimate
     and reachable — a closed subscription window, a killed process, a
@@ -373,13 +463,45 @@ def _rotate_stale_metrics(metrics_dir: Path) -> None:
     only exist where a non-empty ``metrics.jsonl`` already did: the renderer
     is fed points read back out of it.
 
-    When a real prior chain is found, every name in :data:`_ROTATED_NAMES` is
-    moved, un-renamed, into a numbered ``prior-N/`` subdirectory: not deleted
-    (the earlier attempt's evidence survives, chart included), not resumed
-    (the new writer starts a fresh chain from its own header), and — because
-    the filenames inside that subdirectory are still the canonical
-    ``metrics.jsonl`` / ``metrics.chain.json`` / ``metrics.json`` — still
-    independently checkable by
+    **Staged, then committed in one rename — not three-plus sequential
+    per-file renames into a pre-existing ``prior-N/``.** Each individual
+    ``Path.rename`` is atomic; the *set* of them is not, and a process killed
+    between two of them used to leave ``prior-N/`` holding, say, a log with
+    no chain sidecar (fails verification on its own) while ``metrics_dir``
+    kept a stale sidecar with no log — which ``MetricsWriter``'s refusal used
+    to miss (see its docstring), so the next drive wrote a fresh chain beside
+    that orphaned sidecar and **both** generations then failed verification
+    on completely honest data. The fix: build the destination in a hidden
+    staging directory (:data:`_STAGING_DIR_NAME`, inside ``metrics_dir`` —
+    same filesystem, so every move below is a cheap directory-entry swap, not
+    a copy) and only rename the *directory* onto its numbered ``prior-N/``
+    name once every file that exists has landed inside it. See
+    :func:`_commit_staged_rotation` for why that last rename is what makes
+    the whole set observable as only ever "before" or "after", never
+    in-between.
+
+    **Self-heals a leftover staging directory on entry, before deciding
+    whether this call needs to start a new rotation.** A crash between two
+    of the moves above — or between the last move and the final commit —
+    leaves ``metrics_dir / _STAGING_DIR_NAME`` behind, holding whatever
+    subset of the trio/plots it had gotten to. Every call to this function
+    (which is to say, the start of every attempt — see the call site in
+    :meth:`RoundRunner.run_attempt`) checks for that directory first and, if
+    present, finishes committing it via :func:`_commit_staged_rotation`
+    before touching ``metrics_dir``'s own ``metrics.jsonl``. This closes the
+    residual window the staging approach still has: the interval between
+    "some files moved" and "directory committed" is no longer *file-level*
+    torn (a rename either lands or it does not), but it is still a window a
+    kill can land in, and self-heal is what keeps that window from becoming
+    permanent the way the old three-rename version's was.
+
+    When a (possibly self-healed) rotation is needed, every name in
+    :data:`_ROTATED_NAMES` ends up, un-renamed, in a numbered ``prior-N/``
+    subdirectory: not deleted (the earlier attempt's evidence survives, chart
+    included), not resumed (the new writer starts a fresh chain from its own
+    header), and — because the filenames inside that subdirectory are still
+    the canonical ``metrics.jsonl`` / ``metrics.chain.json`` / ``metrics.json``
+    — still independently checkable by
     :func:`~turing.research.loop.integrity.verify_metrics_chain` and
     :func:`~turing.research.loop.integrity.reconcile_summary`, and still found
     by ``python -m turing.research.loop.verify``'s directory walk, which
@@ -391,22 +513,36 @@ def _rotate_stale_metrics(metrics_dir: Path) -> None:
     only misleading while it sits where the *current* attempt's chart belongs;
     under ``prior-N/``, beside the exact metrics it was drawn from, it is the
     superseded generation's evidence and is labelled as such by its path.
+
+    **A non-directory at** :data:`_STAGING_DIR_NAME` **is a loud, named
+    error, not a silent no-op.** Nothing else in this module ever creates a
+    plain file there — the only writer of that path is ``staging_dir.mkdir``,
+    a few lines below, and its target is always a directory. So a file
+    sitting at that name is foreign: manual interference, a different tool,
+    a corrupted checkout. Checking only ``staging_dir.is_dir()`` before
+    self-healing would treat that shape exactly like "no rotation in
+    progress" and fall straight through into ``staging_dir.mkdir(...)``,
+    which raises a bare ``FileExistsError`` naming nothing about what is
+    actually wrong or what the operator should do about it. Refusing here,
+    by name, keeps that failure legible instead of trading one confusing
+    exception for another.
     """
+    staging_dir = metrics_dir / _STAGING_DIR_NAME
+    if staging_dir.exists() and not staging_dir.is_dir():
+        raise ContractViolationError(
+            f"{staging_dir} exists and is not a directory; {_STAGING_DIR_NAME!r} is "
+            "reserved for the hidden staging directory a rotation-in-progress builds "
+            "its destination in, and must be either a directory or absent — remove or "
+            "rename this file before retrying"
+        )
+    if staging_dir.is_dir():
+        _commit_staged_rotation(metrics_dir, staging_dir)
+
     jsonl_path = metrics_dir / "metrics.jsonl"
     if not (jsonl_path.exists() and jsonl_path.stat().st_size > 0):
         return
-    suffix = 1
-    while (metrics_dir / f"prior-{suffix}").exists():
-        suffix += 1
-    prior_dir = metrics_dir / f"prior-{suffix}"
-    prior_dir.mkdir(parents=True, exist_ok=True)
-    for name in _ROTATED_NAMES:
-        src = metrics_dir / name
-        if not src.exists():
-            continue
-        dest = prior_dir / name
-        src.rename(dest)
-        logger.info("research.results.metrics_rotated", src=str(src), dest=str(dest))
+    staging_dir.mkdir(parents=True)
+    _commit_staged_rotation(metrics_dir, staging_dir)
 
 
 #: Written into a contained attempt's ``metrics.json`` as ``final_state``,
@@ -1785,6 +1921,7 @@ class RoundRunner:
                 match.parent.relative_to(results_root).as_posix()
                 for match in loop_dir.glob("round-*/attempts/**/metrics.jsonl")
                 if not _PRIOR_DIR_PATTERN.fullmatch(match.parent.name)
+                and match.parent.name != _STAGING_DIR_NAME
             }
         )
 
