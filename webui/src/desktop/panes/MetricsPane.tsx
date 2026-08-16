@@ -1,9 +1,12 @@
-// Live metrics pane: tails every `metrics.jsonl`/`metrics.json` under the
-// `results` root, auto-follows the newest run, and lets the operator pin
-// additional runs to overlay for comparison. Shows one series at a time via
-// tabs (rather than every series stacked, which read as jumbled and clipped
-// its own top tick label against the row above it — see Chart.tsx for the
-// tick-clipping fix). Also watches `.viewer.json` at the results root so a
+// Live metrics pane: tails every `metrics.jsonl` under the `results` root,
+// auto-follows the newest run, and lets the operator pin additional runs to
+// overlay for comparison. (The `metrics.json` summaries that sit beside those
+// step logs are deliberately NOT runs — see `isChartRunFile` in metrics.ts for
+// why listing them made a completed round render as "no metrics yet".) Shows
+// one series at a time via tabs (rather than every series stacked, which read
+// as jumbled and clipped its own top tick label against the row above it —
+// see Chart.tsx for the tick-clipping fix, and for why the chart's React keys
+// must not be built from a display label). Watches `.viewer.json` too, so a
 // coding agent can point the pane at a specific series/run set — see
 // desktop/README.md's "Agent-driven viewing" section for the file format.
 
@@ -12,9 +15,12 @@ import { inv, subscribe } from "../tauri";
 import Chart from "./Chart";
 import {
   etaOf,
+  isChartRunFile,
+  matchesViewerRuns,
   parseMetricsText,
   parseViewerFile,
   pickSeries,
+  runIdOf,
   seriesOf,
   type Point,
   type ViewerFile,
@@ -39,11 +45,6 @@ const RESULTS_ROOT = "results";
 const SERIES_STORAGE_KEY = "turing.metrics.series";
 const VIEWER_FILE_REL = ".viewer.json";
 
-function runLabelOf(relPath: string): string {
-  const parts = relPath.split("/");
-  return parts.length > 1 ? parts[0] : relPath;
-}
-
 interface RunMultiSelectProps {
   runFiles: Entry[];
   selected: string[];
@@ -58,7 +59,7 @@ interface RunMultiSelectProps {
 function RunMultiSelect({ runFiles, selected, onChange }: RunMultiSelectProps) {
   const options = [
     { value: "auto", label: "auto (newest)" },
-    ...runFiles.map((f) => ({ value: f.rel_path, label: runLabelOf(f.rel_path) })),
+    ...runFiles.map((f) => ({ value: f.rel_path, label: runIdOf(f.rel_path) })),
   ];
 
   function toggle(value: string) {
@@ -87,6 +88,10 @@ function RunMultiSelect({ runFiles, selected, onChange }: RunMultiSelectProps) {
               role="option"
               aria-selected={isSelected}
               onClick={() => toggle(opt.value)}
+              // The label is a full run path and the box is ~160px wide, so
+              // rows clip. A tooltip means a clipped row is still
+              // identifiable without horizontal scrolling.
+              title={opt.label}
               className={`block w-full whitespace-nowrap px-2 py-0.5 text-left text-xs ${
                 isSelected ? "bg-term-raised text-term-accent" : "text-term-fg"
               }`}
@@ -125,14 +130,19 @@ export default function MetricsPane() {
       const entries = await inv<Entry[]>("fs_list", {
         root: RESULTS_ROOT,
         rel: "",
-        exts: ["jsonl", "json"],
+        // `json` used to be listed too, purely so `metrics.json` could be
+        // offered as a run; it never was one. Every other `.json` in the tree
+        // (`round.json`, `trajectory.json`, `metrics.chain.json`) was listed
+        // and discarded, so dropping the extension just stops walking them.
+        exts: ["jsonl"],
       });
       if (cancelled) return;
-      const filtered = entries.filter((e) => {
-        const base = e.rel_path.split("/").pop() ?? "";
-        return base === "metrics.jsonl" || base === "metrics.json";
-      });
-      setRunFiles(filtered);
+      // `fs_list` is newest-mtime-first and `runFiles[0]` is what auto-follow
+      // charts, so this filter is also what guarantees auto-follow lands on a
+      // file that can have points at all — a rotated `prior-N/metrics.jsonl`
+      // is still a real chain and stays listed, just never emitted into
+      // `.viewer.json`'s `runs`.
+      setRunFiles(entries.filter((e) => isChartRunFile(e.rel_path)));
     }
     void load();
     return () => {
@@ -143,7 +153,7 @@ export default function MetricsPane() {
   async function tailRun(path: string) {
     let run = runsRef.current.get(path);
     if (!run) {
-      run = { path, label: runLabelOf(path), offset: 0, points: [], arrivals: [] };
+      run = { path, label: runIdOf(path), offset: 0, points: [], arrivals: [] };
       runsRef.current.set(path, run);
     }
     const chunk = await inv<{ data: string; offset: number }>("fs_tail", {
@@ -187,31 +197,52 @@ export default function MetricsPane() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activePaths, tick]);
 
-  // Refs so the fs-change / viewer-file handlers below always see current
-  // values without re-subscribing the listener on every render.
-  const runFilesRef = useRef(runFiles);
-  runFilesRef.current = runFiles;
-  const seriesNamesRef = useRef(seriesNames);
-  seriesNamesRef.current = seriesNames;
+  // The last `.viewer.json` delivery, held as state rather than applied on the
+  // spot. `.viewer.json` is read at mount, but the run list and the series
+  // names it refers to only exist after `fs_list` and the first tail have
+  // come back — and the read reliably WINS that race (confirmed in a real
+  // session: the viewer file was read several hundred milliseconds before
+  // `fs_list` returned). Applying it at read time therefore dropped every
+  // reference it made against state that was still empty, which is the other
+  // half of why `runs` looked inert. Holding the request and honouring it when
+  // what it names shows up is what makes the file actually control the pane.
+  const [viewerRequest, setViewerRequest] = useState<ViewerFile | null>(null);
+  // Which request each half has already been honoured for, by object identity
+  // (`parseViewerFile` returns a fresh object per read). "Once per delivery"
+  // rather than "whenever the deps change": a series re-applied every time a
+  // run discovers a new key would silently undo the operator's own tab click.
+  const runsHonoredFor = useRef<ViewerFile | null>(null);
+  const seriesHonoredFor = useRef<ViewerFile | null>(null);
 
-  function applyViewerFile(parsed: ViewerFile) {
-    if (parsed.series && seriesNamesRef.current.includes(parsed.series)) {
-      selectSeries(parsed.series);
-    }
-    setTitles(parsed.titles ?? {});
-    if (parsed.runs && parsed.runs.length > 0) {
-      const matched = runFilesRef.current
-        .filter((f) => parsed.runs?.includes(runLabelOf(f.rel_path)))
-        .map((f) => f.rel_path);
-      if (matched.length > 0) setSelected(matched);
-    }
-  }
+  useEffect(() => {
+    const runs = viewerRequest?.runs;
+    if (!runs || runs.length === 0 || runsHonoredFor.current === viewerRequest) return;
+    const matched = runFiles.filter((f) => matchesViewerRuns(f.rel_path, runs)).map((f) => f.rel_path);
+    // A total miss is "the runs this file names aren't on this machine (yet)",
+    // not "show nothing" — leave the operator's current selection alone and
+    // stay unhonoured so a later run list can still satisfy it.
+    if (matched.length === 0) return;
+    runsHonoredFor.current = viewerRequest;
+    setSelected(matched);
+  }, [viewerRequest, runFiles]);
+
+  useEffect(() => {
+    const series = viewerRequest?.series;
+    if (!series || seriesHonoredFor.current === viewerRequest) return;
+    if (!seriesNames.includes(series)) return;
+    seriesHonoredFor.current = viewerRequest;
+    selectSeries(series);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewerRequest, seriesNames]);
 
   async function loadViewerFile() {
     try {
       const text = await inv<string>("fs_read_text", { root: RESULTS_ROOT, rel: VIEWER_FILE_REL });
       const parsed = parseViewerFile(text);
-      if (parsed) applyViewerFile(parsed);
+      if (!parsed) return;
+      // Titles need nothing else to exist, so they apply immediately.
+      setTitles(parsed.titles ?? {});
+      setViewerRequest(parsed);
     } catch {
       // No viewer file (or unreadable) — nothing to apply, not an error.
     }
@@ -237,9 +268,28 @@ export default function MetricsPane() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const newestPath = runFiles[0]?.rel_path;
-  const newestRun = newestPath ? runsRef.current.get(newestPath) : undefined;
-  const eta = newestRun ? etaOf(newestRun.points, newestRun.arrivals) : null;
+  // The runs actually on the chart, in the order the chart draws them. The ETA
+  // strip is derived from this list rather than from `runFiles[0]` (the newest
+  // *file*, which is not necessarily selected and — while summaries counted as
+  // runs — was never a run with any points, so the strip read
+  // `steps/s: — eta: — last step: —` permanently). A readout that describes
+  // something other than what is plotted is worse than no readout.
+  const activeRuns = useMemo(
+    () =>
+      activePaths
+        .map((path) => runsRef.current.get(path))
+        .filter((r): r is RunState => r !== undefined),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activePaths, tick],
+  );
+
+  // With several runs pinned there is no single honest ETA — they finish at
+  // different times — so rather than average them into a number describing no
+  // run at all, the strip describes exactly one: the first one charted. It is
+  // rendered with that run's name attached, because an unlabelled ETA beside a
+  // multi-run overlay is itself a small lie about which run it belongs to.
+  const etaRun = activeRuns[0];
+  const eta = etaRun ? etaOf(etaRun.points, etaRun.arrivals) : null;
 
   const activeSeries = useMemo(
     () => pickSeries(seriesNames, storedSeries),
@@ -248,15 +298,16 @@ export default function MetricsPane() {
 
   const chartSeries = useMemo(() => {
     if (!activeSeries) return [];
-    return activePaths
-      .map((path) => runsRef.current.get(path))
-      .filter((r): r is RunState => r !== undefined)
-      .map((run) => ({
-        label: `${run.label}/${titles[activeSeries] ?? activeSeries}`,
-        points: seriesOf(run.points).get(activeSeries) ?? [],
-      }));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePaths, activeSeries, titles, tick]);
+    return activeRuns.map((run) => ({
+      // Identity for React's key, kept separate from the display label: the
+      // run's file path is unique per run by construction (it is the
+      // `runsRef` map key) and the series name is fixed across the list, so
+      // no two entries can collide however the labels read. See Chart.tsx.
+      id: `${run.path}::${activeSeries}`,
+      label: `${run.label}/${titles[activeSeries] ?? activeSeries}`,
+      points: seriesOf(run.points).get(activeSeries) ?? [],
+    }));
+  }, [activeRuns, activeSeries, titles]);
 
   return (
     <div className="flex h-full flex-col text-xs">
@@ -269,9 +320,10 @@ export default function MetricsPane() {
             `string[]` contract and "auto" sentinel as before, just built from
             toggleable rows. */}
         <RunMultiSelect runFiles={runFiles} selected={selected} onChange={setSelected} />
-        {eta && (
-          <div className="ml-2 font-mono text-term-dim">
-            <span>steps/s: {eta.stepsPerSec?.toFixed(2) ?? "—"}</span>
+        {eta && etaRun && (
+          <div data-testid="metrics-eta" className="ml-2 truncate font-mono text-term-dim">
+            <span title={etaRun.label}>{etaRun.label}</span>
+            <span className="ml-3">steps/s: {eta.stepsPerSec?.toFixed(2) ?? "—"}</span>
             <span className="ml-3">eta: {eta.etaSec !== null ? `${Math.round(eta.etaSec)}s` : "—"}</span>
             <span className="ml-3">last step: {eta.lastStep ?? "—"}</span>
           </div>

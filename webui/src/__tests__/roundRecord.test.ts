@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import {
   comparableToParent,
   parseRoundRecord,
+  parseRoundSummary,
   roundDirName,
 } from "../desktop/panes/roundRecord";
 
@@ -205,6 +206,131 @@ describe("parseRoundRecord — degrades instead of blanking", () => {
   });
 });
 
+describe("parseRoundRecord — problems[]", () => {
+  // Verbatim from a real `round-01/round.json`. The nested id is the point:
+  // problem ids are free-form path components, and this one appeared nowhere
+  // in the pane as text until these rows existed.
+  const REAL_PROBLEMS = {
+    ...REAL_ROUND,
+    problems: [
+      {
+        passed_correctness: true,
+        problem_id: "cuda/matmul-speedup",
+        problem_type: "speedup",
+        score: 2.4,
+        score_scale: "speedup_ratio",
+        scored: true,
+        split: "practice",
+      },
+      {
+        passed_correctness: true,
+        problem_id: "kaggle/titanic",
+        problem_type: "kaggle",
+        score: 55.0,
+        score_scale: "leaderboard_percentile",
+        scored: true,
+        split: "held_out",
+      },
+    ],
+  };
+
+  it("keeps the nested problem id intact and keys it to its cell", () => {
+    const rec = parseRoundRecord(JSON.stringify(REAL_PROBLEMS))!;
+    expect(rec.problems).toEqual([
+      {
+        problemId: "cuda/matmul-speedup",
+        cell: "speedup/practice",
+        score: 2.4,
+        scoreScale: "speedup_ratio",
+        scored: true,
+        passedCorrectness: true,
+      },
+      {
+        problemId: "kaggle/titanic",
+        cell: "kaggle/held_out",
+        score: 55,
+        scoreScale: "leaderboard_percentile",
+        scored: true,
+        passedCorrectness: true,
+      },
+    ]);
+  });
+
+  it("keeps an unscored or failed problem rather than dropping it", () => {
+    const rec = parseRoundRecord(
+      JSON.stringify({
+        problems: [
+          {
+            problem_id: "cuda/matmul-speedup",
+            problem_type: "speedup",
+            split: "practice",
+            scored: false,
+            passed_correctness: false,
+          },
+        ],
+      }),
+    )!;
+    expect(rec.problems[0].scored).toBe(false);
+    expect(rec.problems[0].passedCorrectness).toBe(false);
+    expect(rec.problems[0].score).toBeNull();
+  });
+
+  it("names an unnamed problem rather than rendering nothing", () => {
+    const rec = parseRoundRecord(JSON.stringify({ problems: [{ score: 1 }] }))!;
+    expect(rec.problems[0].problemId).toBe("?");
+    expect(rec.problems[0].cell).toBe("?/?");
+  });
+
+  it("is an empty list for a round record that predates problems[]", () => {
+    expect(parseRoundRecord(JSON.stringify(REAL_ROUND))!.problems).toEqual([]);
+  });
+});
+
+describe("parseRoundSummary", () => {
+  // The real `round-01/metrics.json` for the round that lost an attempt.
+  const REAL_SUMMARY = {
+    schema_version: 1,
+    round_index: 1,
+    run_id: "r01",
+    parent_round_id: "r00",
+    eval_set_hash: "6b7ba05",
+    seed: 7,
+    comparable_to_parent: false,
+    cells: [],
+    verdict: "1 of 4 attempt(s) failed and are absent from every cell",
+  };
+
+  it("reads the persisted comparability and its lineage", () => {
+    expect(parseRoundSummary(JSON.stringify(REAL_SUMMARY))).toEqual({
+      roundIndex: 1,
+      runId: "r01",
+      parentRoundId: "r00",
+      comparableToParent: false,
+    });
+  });
+
+  it("keeps a baseline's null distinct from a false", () => {
+    const s = parseRoundSummary(
+      JSON.stringify({ round_index: 0, comparable_to_parent: null }),
+    )!;
+    expect(s.comparableToParent).toBeNull();
+  });
+
+  it("returns null for anything that isn't a JSON object", () => {
+    expect(parseRoundSummary("")).toBeNull();
+    expect(parseRoundSummary("{ mid-write")).toBeNull();
+    expect(parseRoundSummary("[]")).toBeNull();
+  });
+
+  it("refuses a non-boolean comparability instead of coercing it", () => {
+    // "false" is truthy; coercing it would paint the round green.
+    const s = parseRoundSummary(
+      JSON.stringify({ comparable_to_parent: "false" }),
+    )!;
+    expect(s.comparableToParent).toBeNull();
+  });
+});
+
 describe("comparableToParent", () => {
   /** A record with the given eval-set hash, own run id, and parent run id. */
   const rec = (hash: string, runId: string, parentId: string | null) =>
@@ -216,36 +342,98 @@ describe("comparableToParent", () => {
       }),
     )!;
 
+  /** The round summary that sits beside it. */
+  const summary = (runId: string, comparable: boolean | null) =>
+    parseRoundSummary(
+      JSON.stringify({ run_id: runId, comparable_to_parent: comparable }),
+    )!;
+
   const parent = rec("a", "r01", null);
+  const child = rec("a", "r02", "r01");
 
-  it("is true when parent and child share an eval set", () => {
-    expect(comparableToParent(rec("a", "r02", "r01"), parent)).toBe(true);
+  it("reports what the round summary persisted, not what the hashes imply", () => {
+    // The regression: a round that lost an attempt keeps a stable eval set, so
+    // hash-only recomputation called it comparable and painted it green beside
+    // a failed all_attempts_completed gate and two refused_attempt_lost cells.
+    expect(comparableToParent(child, parent, summary("r02", false))).toEqual({
+      comparable: false,
+      basis: "summary",
+    });
   });
 
-  it("is false when the eval set changed under the comparison", () => {
-    // Comparing across eval sets is what the contracts refuse to do; the
-    // detail view must say so rather than show a meaningless delta.
-    expect(comparableToParent(rec("b", "r02", "r01"), parent)).toBe(false);
+  it("is true only when the summary says so", () => {
+    expect(comparableToParent(child, parent, summary("r02", true))).toEqual({
+      comparable: true,
+      basis: "summary",
+    });
   });
 
-  it("is null for a baseline with no parent", () => {
-    expect(comparableToParent(rec("a", "r00", null), null)).toBeNull();
-    expect(comparableToParent(rec("a", "r00", null), parent)).toBeNull();
+  it("is unknown — never comparable — when no summary was written", () => {
+    // Matching hashes are necessary for comparability, not sufficient. The
+    // fallback fails in the one direction that matters, so there is none.
+    expect(comparableToParent(child, parent, null)).toEqual({
+      comparable: null,
+      basis: "unknown",
+    });
   });
 
-  it("is null when the candidate is not actually the named parent", () => {
+  it("is unknown when the summary is present but unreadable", () => {
+    // `parseRoundSummary` hands the pane null for a mid-write file; that must
+    // land in the same place as a missing one, not in the hash fallback.
+    expect(
+      comparableToParent(child, parent, parseRoundSummary("{ mid-write")),
+    ).toEqual({ comparable: null, basis: "unknown" });
+  });
+
+  it("ignores a summary that describes a different round", () => {
+    // A stale read from the previously-expanded round must not answer for
+    // this one — the same misattribution the loop/index stamping prevents.
+    expect(comparableToParent(child, parent, summary("rXX", true))).toEqual({
+      comparable: null,
+      basis: "unknown",
+    });
+  });
+
+  it("is unknown for a baseline with no parent, summary or not", () => {
+    const baseline = rec("a", "r00", null);
+    expect(comparableToParent(baseline, null, null)).toEqual({
+      comparable: null,
+      basis: "no-parent",
+    });
+    expect(comparableToParent(baseline, parent, summary("r00", null))).toEqual({
+      comparable: null,
+      basis: "no-parent",
+    });
+  });
+
+  it("still refuses on its own when the eval set changed", () => {
+    // The hash comparison may refuse but never affirm: a changed eval set
+    // makes the comparison impossible whatever any file says, so this holds
+    // with no summary and outranks a summary that disagrees.
+    expect(comparableToParent(rec("b", "r02", "r01"), parent, null)).toEqual({
+      comparable: false,
+      basis: "eval-set-changed",
+    });
+    expect(
+      comparableToParent(rec("b", "r02", "r01"), parent, summary("r02", true)),
+    ).toEqual({ comparable: false, basis: "eval-set-changed" });
+  });
+
+  it("does not refuse from a round that is not actually the parent", () => {
     // The pane finds the parent by index, which is usually right but is not
-    // guaranteed. Comparing against the wrong round would be worse than
-    // saying nothing.
+    // guaranteed; a stranger's hash says nothing about this comparison.
     expect(
-      comparableToParent(rec("a", "r02", "r01"), rec("a", "rXX", null)),
-    ).toBeNull();
+      comparableToParent(child, rec("b", "rXX", null), summary("r02", true)),
+    ).toEqual({ comparable: true, basis: "summary" });
   });
 
-  it("is null when either hash is missing rather than guessing", () => {
-    expect(comparableToParent(rec("", "r02", "r01"), parent)).toBeNull();
+  it("falls back to the summary when a hash is missing rather than guessing", () => {
     expect(
-      comparableToParent(rec("a", "r02", "r01"), rec("", "r01", null)),
-    ).toBeNull();
+      comparableToParent(rec("", "r02", "r01"), parent, summary("r02", true)),
+    ).toEqual({ comparable: true, basis: "summary" });
+    expect(comparableToParent(rec("", "r02", "r01"), parent, null)).toEqual({
+      comparable: null,
+      basis: "unknown",
+    });
   });
 });
