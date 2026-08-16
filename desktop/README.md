@@ -255,8 +255,24 @@ file resets the run to that chunk alone; a chunk with any other start is
 discarded, never appended. A trailing partial line is not consumed. `verified`
 means the verdict's `chain_head` equals the `_chain` digest of the **last
 non-blank line the pane holds**, and any last non-blank line it cannot parse
-makes the run `stale`. Every state the badge shows is derived from files that
-are **currently beside the run**, re-read whenever the run's own file changes.
+makes the run `stale` — as does an appended chunk that holds only blank lines,
+which the writer never emits and `integrity.py` treats as a malformed record.
+Every state the badge shows is derived from files that are **currently beside
+the run**, re-read whenever the run's own file changes.
+
+Two limits on "one file generation", stated honestly. (a) Where the platform
+reports no file identity (`dev`/`ino` are `null` — anything but unix),
+identity-based reset is unavailable and detection is length-only: a re-drive
+whose new file is at least as long as the held offset is not seen as a new
+generation there. (b) An in-place rewrite of the **same** inode that ends
+longer than the pane's offset (`cp other.jsonl metrics.jsonl`) is invisible to
+both identity and length; it is caught only by the **seam check** — because a
+held offset always sits just after a `\n`, the first non-blank line of an
+appended chunk must parse as a JSON object, and if it does not the run is
+forgotten and re-read from byte 0. That is a heuristic, not identity: a rewrite
+whose lines happen to end at the same byte offsets as the old ones passes it,
+and the badge then answers for the rewrite's last line over a chart that still
+begins with the old file's points.
 
 Each clause is load-bearing. A line count is a property two different logs can
 share, and a re-drive (the metrics trio and the verdict move together into
@@ -282,8 +298,11 @@ a clean run amber forever.
 bytes `[start, offset)` cut at the last `\n`, the fragment after it re-read
 complete on the next call; `start` is where the read began (the caller's
 offset, or `0` with `restarted: true` when the file was shorter than it);
-`dev`/`ino` are the file's identity on unix and `null` elsewhere. Every offset
-is computed on the bytes in Rust; the pane does no byte arithmetic of its own.
+`dev`/`ino` are the file's identity on unix and `null` elsewhere. Length and
+identity are read by `fstat` on the handle the bytes are then read from — one
+open, not a stat followed by an open — so a rotation between the two cannot
+label a new file's bytes with the old file's identity. Every offset is computed
+on the bytes in Rust; the pane does no byte arithmetic of its own.
 
 | Badge | Meaning |
 |---|---|

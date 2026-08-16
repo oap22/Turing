@@ -261,12 +261,15 @@ fn file_identity(_meta: &fs::Metadata) -> (Option<u64>, Option<u64>) {
 }
 
 fn tail_impl(path: &Path, offset: u64) -> Result<TailChunk, String> {
-    let meta = fs::metadata(path).map_err(|e| e.to_string())?;
+    // Open first, then fstat the open handle: `len`, `dev`, `ino` and the
+    // bytes all come from the same file, so a rotation between a stat and an
+    // open cannot label a new file's bytes with the old file's identity.
+    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
     let len = meta.len();
     let restarted = offset > len;
     let start = if restarted { 0 } else { offset };
     let (dev, ino) = file_identity(&meta);
-    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
     file.seek(SeekFrom::Start(start))
         .map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
@@ -483,6 +486,21 @@ mod tests {
         assert_eq!(chunk.offset, 4);
         assert!(chunk.restarted);
         assert_eq!(chunk.ino, first.ino);
+    }
+
+    #[test]
+    fn tail_restarted_boundary_is_strictly_past_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log2b.txt");
+        fs::write(&path, "abc\n").unwrap();
+        // offset == len: caught up, not restarted; nothing to read.
+        let at_end = tail_impl(&path, 4).unwrap();
+        assert!(!at_end.restarted);
+        assert_eq!((at_end.start, at_end.offset, at_end.data.as_str()), (4, 4, ""));
+        // offset == len + 1: one past the end is a shorter file — restart.
+        let past = tail_impl(&path, 5).unwrap();
+        assert!(past.restarted);
+        assert_eq!((past.start, past.offset, past.data.as_str()), (0, 4, "abc\n"));
     }
 
     #[test]

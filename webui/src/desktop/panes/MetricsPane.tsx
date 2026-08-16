@@ -16,12 +16,21 @@
 // equals the offset it holds AND the identity matches — a changed identity or
 // a shorter file resets the run to that chunk alone; a chunk with any other
 // start is discarded, never appended. A trailing partial line is not consumed.
+// Two qualifications: (a) where the platform reports no identity (`dev`/`ino`
+// null — non-unix), identity-based reset is unavailable and detection is
+// length-only, so a re-drive to a file at least as long as the held offset
+// is caught only if the seam check below catches it; (b) an in-place rewrite
+// of the SAME inode that ends longer than the pane's offset is caught only by
+// the seam check — the first non-blank line of an appended chunk must parse
+// as a JSON object, else the run is re-read from 0 — which is a heuristic,
+// not identity: a rewrite whose lines end where the old ones did passes it.
 // `verified` means the verdict's `chain_head` equals the `_chain` digest of the
-// last non-blank line the pane holds, and any last non-blank line it cannot
-// parse makes the run `stale`. See `metrics.ts` for why the digest binding is
-// load-bearing; `tailRun` below is where the byte side of this is kept, and
-// the `fs-change` handler is where the verdict is re-read beside every change
-// to the run.
+// last non-blank line of the bytes that last arrived, and a last line it
+// cannot parse — or an appended chunk holding only blank lines, which
+// `integrity.py` calls a malformed record — makes the run `stale`. See
+// `metrics.ts` for why the digest binding is load-bearing; `tailRun` below is
+// where the byte side of this is kept, and the `fs-change` handler is where
+// the verdict is re-read beside every change to the run.
 
 import { Fragment, useEffect, useId, useMemo, useRef, useState } from "react";
 import { inv, subscribe } from "../tauri";
@@ -98,6 +107,23 @@ interface RunState {
 
 function identOf(chunk: TailChunk): string | null {
   return chunk.dev === null || chunk.ino === null ? null : `${chunk.dev}:${chunk.ino}`;
+}
+
+/**
+ * Whether the first non-blank line of a chunk is a JSON object — the seam
+ * check for an append (see `tailOnce`). A chunk with no non-blank line at all
+ * passes: there is no seam to judge, and its (blank) bytes are judged by the
+ * digest rule instead.
+ */
+function firstLineIsObject(data: string): boolean {
+  const first = data.split("\n").find((line) => line.trim() !== "");
+  if (first === undefined) return true;
+  try {
+    const parsed: unknown = JSON.parse(first);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
+  } catch {
+    return false;
+  }
 }
 
 /** Forget everything a run holds, so the next chunk is read from byte 0. */
@@ -309,7 +335,12 @@ export default function MetricsPane() {
    *              && (generation changed || chunk.restarted)
    *           → the run becomes this chunk alone.
    *   APPEND  else if !generation changed && chunk.start === run.offset
-   *           → the chunk is the run's next bytes.
+   *           → the chunk is the run's next bytes — subject to the SEAM
+   *             CHECK when run.offset > 0: the chunk's first non-blank line
+   *             must parse as a JSON object (the held offset sits just after
+   *             a `\n`, so a whole line begins there). If it does not, the
+   *             same inode was rewritten in place to something longer than
+   *             what the pane held, and the chunk is treated as RE-READ.
    *   RE-READ else if generation changed
    *           → nothing in this chunk is ours (it was read from an offset
    *             that only meant something in the old file, and a chunk
@@ -325,6 +356,13 @@ export default function MetricsPane() {
    * the watcher's debounce), a length check sees nothing and the old points
    * get the new lines stapled on, with a `verified` badge over the seam. A
    * truncate in place (same inode, shorter) is the case `restarted` covers.
+   *
+   * Two limits, stated plainly. Where the platform reports no identity
+   * (`dev`/`ino` null, non-unix), the generation check is unavailable and
+   * only lengths (`restarted`) and the seam check remain. And a rewrite of
+   * the SAME inode that ends longer than the pane's offset is caught only by
+   * the seam check — a heuristic that sees a mid-line landing, not a rewrite
+   * whose lines happen to end where the old ones did.
    */
   async function tailOnce(run: RunState) {
     let chunk: TailChunk;
@@ -363,6 +401,20 @@ export default function MetricsPane() {
     // Nothing new past what the pane holds: same offset, same file. This is
     // the common answer to a verdict-event re-tail and must not re-render.
     if (append && chunk.offset === run.offset) return;
+    // SEAM CHECK, on an append that began mid-file: the held offset sits just
+    // after a `\n` of the file it was read from, so the chunk's first
+    // non-blank line must be a whole line — a JSON object. If it is not, the
+    // offset landed inside a line of some other content: the same inode was
+    // rewritten in place and ended longer than what the pane held, which no
+    // identity or length check can see. Treat it as a generation change.
+    // (Only a heuristic — a rewrite whose lines happen to end where the old
+    // ones did is invisible here; see the contract comment above.)
+    if (append && run.offset > 0 && !firstLineIsObject(chunk.data)) {
+      forgetRun(run);
+      run.pending = true;
+      forceRender((n) => n + 1);
+      return;
+    }
     run.offset = chunk.offset;
     const newPoints = parseMetricsText(chunk.data);
     if (reset) {
@@ -372,16 +424,15 @@ export default function MetricsPane() {
       run.points = [...run.points, ...newPoints];
       run.arrivals = [...run.arrivals, Date.now()];
     }
-    // The digest of the last non-blank line this run now holds — what the
-    // badge is bound to. `fs_tail` returns whole lines only, so if the chunk
-    // has a non-blank line at all, its last one IS the run's last line, and
-    // its digest (or `null`, if it will not parse — which reads `stale`)
-    // replaces the previous one. A chunk of only blank lines leaves the
-    // previous digest standing on an append; a reset starts from the chunk
-    // regardless, since the previous digest belonged to a file that is no
-    // longer here.
-    const digest = chainDigestOfLastLine(chunk.data);
-    run.lastDigest = reset || chunk.data.trim() !== "" ? digest : run.lastDigest;
+    // The digest of the last non-blank line of the bytes that just arrived —
+    // what the badge is bound to. `fs_tail` returns whole lines only, so if
+    // the chunk has a non-blank line at all, its last one IS the run's last
+    // line, and its digest (or `null`, if it will not parse — which reads
+    // `stale`) replaces the previous one. A non-empty chunk of only blank
+    // lines ALSO clears the digest: the writer never emits an interior blank
+    // line, `integrity.py` treats one as a malformed record, and the pane must
+    // not keep saying chain ok over bytes the loop's own check would fail.
+    run.lastDigest = chainDigestOfLastLine(chunk.data);
     forceRender((n) => n + 1);
   }
 

@@ -757,6 +757,57 @@ describe("MetricsPane — a replacement file at least as long as the held offset
   });
 });
 
+describe("MetricsPane — a rewrite of the same inode, longer than what the pane holds", () => {
+  it("B1: the seam check catches a held offset that lands inside a line of the rewrite", async () => {
+    contents.set(RUN_FILE, chain(2, 0.03, 2.5, "r0bad"));
+    verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2, headOf("r0bad", 2)));
+    viewerJson = JSON.stringify({ runs: [RUN] });
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    const oldLen = contents.get(RUN_FILE)!.length;
+
+    // `cp other/metrics.jsonl metrics.jsonl`: truncate + write, SAME inode,
+    // and longer than what the pane holds — no identity or length check can
+    // see it. Its lines are one byte longer each (10.5 vs 2.5), so the held
+    // offset lands two bytes before the end of the rewrite's line 2 and the
+    // chunk `fs_tail` returns begins `}\n`: not a whole line, not an object.
+    const rewrite = chain(3, 0.03, 10.5, "rewrite");
+    expect(rewrite.slice(oldLen, oldLen + 2)).toBe("}\n");
+    contents.set(RUN_FILE, rewrite);
+    emitFsChange(RUN_FILE);
+    verdictFiles.set(RUN_VERDICT, verdictJson("ok", 3, headOf("rewrite", 3)));
+    emitFsChange(RUN_VERDICT);
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+
+    // The rewrite alone — not old lines 1–2 with the rewrite's line 3 stapled
+    // on under a green badge (which the digest and line count both allow).
+    screen.getByRole("button", { name: "speedup_ratio" }).click();
+    await waitFor(() => expect(document.querySelectorAll("polyline").length).toBe(1));
+    expect(document.querySelector("polyline")!.getAttribute("points")!.split(" ").length).toBe(3);
+    const ticks = yTicks();
+    expect(ticks.length).toBeGreaterThan(0);
+    for (const t of ticks) expect(t).toBeGreaterThan(9);
+  });
+
+  it("counts `dev` in identity: the same inode number on another device is another file", async () => {
+    contents.set(RUN_FILE, chain(2, 0.03, 2.5, "r0bad"));
+    viewerJson = JSON.stringify({ runs: [RUN] });
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 2"));
+    const base = invMock.getMockImplementation()!;
+    invMock.mockImplementation(async (cmd: string, args: Record<string, unknown> = {}) => {
+      const r = await base(cmd, args);
+      return cmd === "fs_tail" ? { ...r, dev: 2 } : r;
+    });
+    // Same length, same `ino`, different `dev`: with `dev` ignored this reads
+    // as "nothing new" and the old numbers stay on the chart.
+    contents.set(RUN_FILE, chain(2, 0.03, 7.5, "other"));
+    emitFsChange(RUN_FILE);
+    screen.getByRole("button", { name: "speedup_ratio" }).click();
+    await waitFor(() => expect(yTicks().every((t) => t > 7) && yTicks().length > 0).toBe(true));
+  });
+});
+
 describe("MetricsPane — two events for one run a few milliseconds apart", () => {
   it("A3: the last append's event and the verdict's event do not wipe the run", async () => {
     // Attempt running: 2 lines charted, no verdict yet.
@@ -857,6 +908,21 @@ describe("MetricsPane — the bytes at the end of the file", () => {
     emitFsChange(RUN_FILE);
     await waitFor(() => expect(badge()).toHaveAttribute("data-state", "stale"));
     // The two good lines are still charted; only the claim about them changed.
+    expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 2");
+  });
+
+  it("E1: reads stale once a blank line follows the checked one — integrity.py calls that malformed", async () => {
+    verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2, RUN_HEAD));
+    viewerJson = JSON.stringify({ runs: [RUN] });
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+
+    // A lone `\n` after the verdict. The writer never emits an interior blank
+    // line and `verify` on disk treats one as a malformed record; the pane
+    // must not keep saying chain ok over bytes the loop's own check fails.
+    contents.set(RUN_FILE, `${chain(2, 0.03, 1.1, "r0bad")}\n`);
+    emitFsChange(RUN_FILE);
+    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "stale"));
     expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 2");
   });
 });
