@@ -130,6 +130,45 @@ class TestRenderAttemptPlots:
         for filename in PLOT_FILENAMES:
             assert (first / filename).read_bytes() == (second / filename).read_bytes()
 
+    async def test_a_skipped_plot_leaves_an_earlier_render_on_disk_untouched(
+        self, tmp_path: Path
+    ) -> None:
+        """The invariant ``runner._rotate_stale_metrics`` exists to compensate for.
+
+        "Skipped" means *nothing is written*, so a second render into a
+        directory a first render already used leaves the first plot in place,
+        byte for byte, while the plots that do have their series are rewritten.
+        For an attempt directory that means one chart from each of two
+        different attempts sitting side by side, which is what rotation now
+        prevents by moving the previous attempt's plots into ``prior-N/``
+        before the re-drive starts.
+
+        Do not "fix" this by blanking or deleting a skipped plot here: an
+        empty chart in the images pane reads as "the run produced nothing",
+        which is the false claim the skip exists to avoid (see the module
+        docstring). This test pins the behaviour so the trade stays visible to
+        whoever reads it next.
+        """
+        scored = (
+            {"step": 1, "progress": 0.0, "score": 1.0, "tokens_used": 10, "wall_clock_s": 1.0},
+            {"step": 2, "progress": 1.0, "score": 2.0, "tokens_used": 20, "wall_clock_s": 2.0},
+        )
+        first = await render_attempt_plots(tmp_path, scored, forcing_series="score", target=2.0)
+        assert set(p.name for p in first) == set(PLOT_FILENAMES)
+        progress_before = (tmp_path / "progress.svg").read_bytes()
+        cap_before = (tmp_path / "cap.svg").read_bytes()
+
+        # A second attempt that never verified: no progress, no raw score, but
+        # the cap series is on every line it managed to write.
+        unscored = (
+            {"step": 0, "tokens_used": 99, "wall_clock_s": 9.0},
+            {"step": 0, "tokens_used": 99, "wall_clock_s": 9.0},
+        )
+        second = await render_attempt_plots(tmp_path, unscored, forcing_series="score", target=2.0)
+        assert [p.name for p in second] == ["cap.svg"]
+        assert (tmp_path / "cap.svg").read_bytes() != cap_before
+        assert (tmp_path / "progress.svg").read_bytes() == progress_before
+
     async def test_a_very_large_point_count_renders_without_error(self, tmp_path: Path) -> None:
         points = tuple(
             {

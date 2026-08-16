@@ -18,6 +18,13 @@ enter ``trajectory.json``: a seed run has no parent and is not a point on the
 curve. The wrinkle recorded in the brief — the agent is stochastic *within* a
 project as well as across seeds — is why every seed's per-problem scores are
 kept in the artifact rather than only the reduced spread.
+
+Because it is not a round, it does not inherit a round's tolerances either.
+:meth:`RoundRunner.run_attempts` deliberately *contains* an attempt that
+raises: the round keeps its other ten problems, drops the lost one from its
+cells, and says so through ``all_attempts_completed``. That is right for a
+round and wrong here — see :meth:`NoiseFloorRunner.run`, which refuses a seed
+that lost an attempt instead of reducing a floor from it.
 """
 
 from __future__ import annotations
@@ -46,12 +53,47 @@ if TYPE_CHECKING:
 
     from turing.research.contracts import Cap, EngineIdentity, Problem, TypeScore
     from turing.research.loop.metrics import Cell, NoiseFloor
-    from turing.research.loop.runner import PassCriterion, RoundRunner
+    from turing.research.loop.runner import AttemptFailure, PassCriterion, RoundRunner
     from turing.research.loop.trajectory import TrajectoryStore
 
 logger = structlog.get_logger(__name__)
 
 __all__ = ["NoiseFloorConfig", "NoiseFloorReport", "NoiseFloorRunner"]
+
+
+def _incomplete_seed_refusal(
+    *,
+    seed: int,
+    run_id: str,
+    corpus_size: int,
+    failures: Sequence[AttemptFailure],
+) -> ContractViolationError:
+    """Build the refusal for a seed that did not measure the whole corpus.
+
+    A function rather than an inline ``raise`` because two call sites reach it:
+    a seed that lost *some* attempts (:attr:`RoundRunner.attempt_failures` is
+    non-empty and ``run_attempts`` returned) and a seed that lost *all* of them
+    (``run_attempts`` refuses on its own, with a message that does not know
+    which seed it was running). Both are the same fault and an operator reading
+    the log at 3am should not have to tell them apart, so both produce this
+    message.
+
+    The message names the seed, its run id and every lost problem id, because
+    the whole point of failing here is that the next person to look does not
+    have to reconstruct it from a traceback and a directory listing.
+    """
+    lost = ", ".join(f"{failure.problem_id} ({failure.error})" for failure in failures)
+    return ContractViolationError(
+        f"noise-floor seed {seed} (run {run_id!r}) lost {len(failures)} of "
+        f"{corpus_size} attempt(s): {lost}. The floor is refused rather than "
+        "reduced from what survived: a floor is the yardstick every later round's "
+        "marginal gain is called signal or noise against, so it is only meaningful "
+        "measured over the same problem set those rounds are measured over. A seed "
+        "missing a problem contributes a cell mean taken over a different set than "
+        "its sibling seeds, so the resulting spread is part run-to-run variance and "
+        "part 'which problems ran' — and nothing downstream can separate the two "
+        "again. Fix the cause and re-run the noise floor from seed 1."
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,11 +191,108 @@ class NoiseFloorRunner:
         self._runner = runner
         self._trajectory = trajectory
 
+    def _refuse_seed(
+        self,
+        *,
+        seed: int,
+        run_id: str,
+        corpus: Sequence[Problem],
+        failures: Sequence[AttemptFailure],
+    ) -> ContractViolationError:
+        """Log the incomplete seed, then hand back the refusal to raise.
+
+        Returns the exception instead of raising it so the caller keeps the
+        ``raise ... from exc`` chain on the total-loss path; the logging is
+        here so both paths emit the same event exactly once.
+
+        Logged as well as raised because the two readers differ: the exception
+        text is for whoever is at the terminal, the structured event is for the
+        overnight log an operator greps in the morning. ``lost`` is a plain
+        list of problem ids so ``research.noise_floor.seed_incomplete`` answers
+        "which seed, which problems" without opening the traceback.
+        """
+        logger.error(
+            "research.noise_floor.seed_incomplete",
+            seed=seed,
+            run_id=run_id,
+            lost=[failure.problem_id for failure in failures],
+            errors=[failure.error for failure in failures],
+            measured=len(corpus) - len(failures),
+            corpus=len(corpus),
+            detail=(
+                "this seed measured a different problem set than its siblings, so the "
+                "spread across seeds would be part variance and part corpus; no floor "
+                "is written and the remaining seeds are not run"
+            ),
+        )
+        return _incomplete_seed_refusal(
+            seed=seed,
+            run_id=run_id,
+            corpus_size=len(corpus),
+            failures=failures,
+        )
+
     async def run(
         self,
         corpus: Sequence[Problem],
         config: NoiseFloorConfig,
     ) -> NoiseFloorReport:
+        """Measure every seed on the whole corpus, or refuse to report a floor.
+
+        **Why a seed that lost an attempt is fatal here but not in a round.**
+        :meth:`RoundRunner.run_attempts` contains a raising attempt: the round
+        drops that problem, keeps the rest, and flags itself with
+        ``all_attempts_completed=False``. A round is a *point* — a smaller n,
+        honestly labelled, is still a reading. A noise floor is a *yardstick*:
+        it is the divisor that turns "round 4 improved by 0.8 points" into
+        signal or noise, and it is compared against rounds run on the full
+        corpus. Reduce it from seeds that measured different problem sets and
+        the spread stops being run-to-run variance and becomes partly a
+        measure of which problems happened to run — and every saturation
+        verdict downstream inherits that without any way to detect it.
+
+        ``measure_noise_floor`` cannot catch this. It guards *cell presence*
+        (every ``(type, split)`` present in every seed), which is blind to a
+        seed whose cell simply averaged one fewer problem: two problems in one
+        seed and three in another still produce a cell in both, and the mean
+        moves. So the guard has to be here, where the losses are still
+        attributable to a seed.
+
+        **Deterministic vs transient failures do not get different
+        treatment**, and the distinction is worth stating because it is the
+        obvious place to soften this. A colliding ``score_scale`` is a
+        property of the *problem* and so is lost by every seed identically:
+        the resulting floor is at least internally consistent, just measured
+        over a narrower corpus than advertised. A transient loss (I/O, a
+        killed process, a flaky verifier) hits one seed and not the others and
+        is the case that silently corrupts the floor. Both refuse, for two
+        reasons. First, this runner cannot tell them apart at the point of
+        failure — it has an exception string and one seed's worth of evidence;
+        "deterministic" is only knowable after the *other* seeds have run and
+        lost the same problem, which is exactly the hours of subscription time
+        the fail-fast below is spending to avoid. Second, even the benign case
+        is not benign: a floor measured over ten problems is not the yardstick
+        for a round measured over eleven, so a consistently narrower floor is
+        still a floor whose problem set does not match what it will be used to
+        judge. The honest fix for a deterministically broken problem is to
+        take it out of the corpus — which changes ``eval_set_hash``, which the
+        round comparison already checks — not to let the floor quietly measure
+        a different set than the rounds do.
+
+        **Refused per seed, immediately.** The remaining seeds are hours of
+        opportunistic compute that can only produce a report already known to
+        be unusable, and stopping at the first bad seed keeps the message
+        pinned to one seed and one list of problem ids. Nothing is written:
+        ``noise-floor.json`` stays absent, and absent is exactly what the
+        downstream refusals (``compute_deltas``, ``assess_saturation``,
+        ``noise_floor_available``) are already built to handle. A partial
+        artifact would be read as a measurement.
+
+        Raises:
+            ContractViolationError: a seed lost one or more attempts, or —
+                from ``measure_noise_floor`` and :class:`NoiseFloorConfig` —
+                too few seeds or a cell missing from some seed.
+        """
         await self._trajectory.ensure_layout()
         existing = await self._trajectory.load_trajectory()
         if existing.get("rounds"):
@@ -177,7 +316,31 @@ class NoiseFloorRunner:
                 run_id=seed_config.run_id,
                 problems=len(corpus),
             )
-            outcomes = await self._runner.run_attempts(corpus, seed_config, output_dir=output_dir)
+            try:
+                outcomes = await self._runner.run_attempts(
+                    corpus, seed_config, output_dir=output_dir
+                )
+            except ContractViolationError as exc:
+                # ``run_attempts`` refuses outright when *every* attempt was
+                # lost, and it sets ``attempt_failures`` before doing so
+                # precisely so this caller can still say which problems went.
+                # Re-raised with the seed attached; any other contract
+                # violation (an empty corpus, say) is not ours to relabel.
+                if not self._runner.attempt_failures:
+                    raise
+                raise self._refuse_seed(
+                    seed=seed,
+                    run_id=seed_config.run_id,
+                    corpus=corpus,
+                    failures=self._runner.attempt_failures,
+                ) from exc
+            if self._runner.attempt_failures:
+                raise self._refuse_seed(
+                    seed=seed,
+                    run_id=seed_config.run_id,
+                    corpus=corpus,
+                    failures=self._runner.attempt_failures,
+                )
             escalations += sum(o.escalation_count for o in outcomes)
             scored = [
                 ScoredProblem.from_result(

@@ -45,6 +45,9 @@ round's results into a future self-edit summary is
 
 from __future__ import annotations
 
+import asyncio
+import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -64,6 +67,7 @@ from turing.research.contracts import (
     RoundCost,
     RoundRecord,
 )
+from turing.research.loop import integrity
 from turing.research.loop.metrics import (
     DEFAULT_SCORE_FLOORS,
     CostBasis,
@@ -74,7 +78,7 @@ from turing.research.loop.metrics import (
     floors_by_cell,
     round_verdict,
 )
-from turing.research.loop.plots import render_attempt_plots, render_round_plot
+from turing.research.loop.plots import PLOT_FILENAMES, render_attempt_plots, render_round_plot
 from turing.research.loop.protocols import SolverTask, SystemClock
 from turing.research.loop.results import (
     MetricsLine,
@@ -116,6 +120,7 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 __all__ = [
+    "AttemptFailure",
     "AttemptOutcome",
     "PassCriterion",
     "RoundConfig",
@@ -223,14 +228,46 @@ class AttemptOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class AttemptFailure:
+    """One problem whose attempt raised instead of returning an outcome.
+
+    Deliberately **not** an :class:`AttemptOutcome`, and deliberately carrying
+    neither an :class:`~turing.research.contracts.Attempt` nor a score. An
+    attempt that raised out of :meth:`RoundRunner.run_attempt` has no
+    trustworthy terminal state and no result — the exception can come from
+    anywhere between the first metrics line and ``write_attempt_log`` — so
+    there is no honest value to put in either field. Anything with a score
+    slot on it will eventually be read as a score; the type that cannot hold
+    one cannot be misread. See :meth:`RoundRunner.run_attempts` for why these
+    are kept out of the scored set entirely rather than floored into it.
+    """
+
+    problem_id: str
+    #: ``"<ExcType>: <message>"``. A string, not the exception: a
+    #: :class:`RoundOutcome` is a value the caller may hold, serialise or log
+    #: long after the round, and keeping a live exception here would keep its
+    #: whole traceback — and every frame's locals, including workspace paths
+    #: and solver state — alive with it. The traceback that matters is already
+    #: in the ``research.attempt.crashed`` log entry.
+    error: str
+
+
+@dataclass(frozen=True, slots=True)
 class RoundOutcome:
-    """The round record plus everything that produced it."""
+    """The round record plus everything that produced it.
+
+    ``attempts`` holds only the attempts that produced an outcome. Problems
+    lost to a raising attempt are in ``failures`` and are absent from
+    ``scored``, from ``record.type_scores`` and from ``record.cost`` — see
+    :meth:`RoundRunner.run_attempts`.
+    """
 
     record: RoundRecord
     attempts: tuple[AttemptOutcome, ...]
     scored: tuple[ScoredProblem, ...]
     assessments: tuple[SaturationAssessment, ...]
     trajectory_row: Mapping[str, Any] | None = None
+    failures: tuple[AttemptFailure, ...] = ()
 
 
 def _is_better(new: VerificationResult, old: VerificationResult | None) -> bool:
@@ -271,14 +308,39 @@ def _spend_carried_on_error(exc: BaseException) -> CapConsumption:
 
 
 #: The hash-chained trio :class:`~turing.research.loop.results.MetricsWriter`
-#: refuses to splice onto. Everything else under an attempt's directory
-#: (checkpoints, the attempt log, the plots) is a wholesale overwrite that
-#: self-heals on a re-drive; this trio is not, because it is chained.
+#: refuses to splice onto. Chained, so a re-drive cannot overwrite it in place
+#: and has to move it aside instead.
 _METRICS_TRIO = ("metrics.jsonl", "metrics.chain.json", "metrics.json")
+
+#: Rotated aside with the trio, for a different reason. Checkpoints and the
+#: attempt log really are wholesale overwrites that self-heal on a re-drive.
+#: **The plots are not**, and the docstring here used to claim they were.
+#: :func:`~turing.research.loop.plots.render_attempt_plots` *skips* — writes
+#: nothing at all — when the series a plot needs is absent from every point,
+#: so an attempt that dies before its first verification rewrites ``cap.svg``
+#: (``tokens_used`` is on every line, including the terminal one) and leaves
+#: the *previous* attempt's ``progress.svg`` sitting untouched beside it. The
+#: attempt directory then holds two charts drawn from two different attempts,
+#: and the desktop's images pane draws them side by side with nothing marking
+#: one as stale — the exact failure rotation exists to prevent, displaced from
+#: the JSONL to the SVG. Skipping rather than blanking is the right behaviour
+#: for the renderer (an empty chart reads as "the run produced nothing"), so
+#: the staleness has to be resolved here, at the one point that already knows
+#: a new generation is starting.
+#:
+#: Named files rather than a glob over ``*.svg``: rotation must never sweep
+#: aside a file the runner did not write.
+_ROTATED_NAMES: tuple[str, ...] = (*_METRICS_TRIO, *PLOT_FILENAMES)
+
+#: Matches the subdirectory names :func:`_rotate_stale_metrics` creates. Used
+#: by :meth:`RoundRunner._viewer_runs` to tell a superseded chain from a live
+#: one now that its walk is depth-independent; kept next to the function that
+#: mints the names so the two cannot drift.
+_PRIOR_DIR_PATTERN = re.compile(r"prior-\d+")
 
 
 def _rotate_stale_metrics(metrics_dir: Path) -> None:
-    """Move a prior, non-empty ``metrics.jsonl`` (and its companions) aside.
+    """Move a prior attempt's chained trio — and its plots — aside.
 
     A re-run of an attempt into an already-used ``output_dir`` is legitimate
     and reachable — a closed subscription window, a killed process, a
@@ -289,18 +351,30 @@ def _rotate_stale_metrics(metrics_dir: Path) -> None:
     existing chain (see its docstring), so without this, a legitimate
     re-drive would crash instead of re-reporting.
 
-    The check mirrors the writer's own refusal condition exactly — a
+    The trigger mirrors the writer's own refusal condition exactly — a
     missing or zero-byte ``metrics.jsonl`` is not a chain and is left alone.
-    When a real prior chain is found, the whole trio is moved, un-renamed,
-    into a numbered ``prior-N/`` subdirectory: not deleted (the earlier
-    attempt's data survives), not resumed (the new writer starts a fresh
-    chain from its own header), and — because the filenames inside that
-    subdirectory are still the canonical ``metrics.jsonl`` /
-    ``metrics.chain.json`` / ``metrics.json`` — still independently
-    checkable by :func:`~turing.research.loop.integrity.verify_metrics_chain`
-    and :func:`~turing.research.loop.integrity.reconcile_summary`, and still
-    found by ``python -m turing.research.loop.verify``'s directory walk,
-    which matches ``metrics.jsonl`` at every depth under a root.
+    That one file is also the right trigger for the plots, because a plot can
+    only exist where a non-empty ``metrics.jsonl`` already did: the renderer
+    is fed points read back out of it.
+
+    When a real prior chain is found, every name in :data:`_ROTATED_NAMES` is
+    moved, un-renamed, into a numbered ``prior-N/`` subdirectory: not deleted
+    (the earlier attempt's evidence survives, chart included), not resumed
+    (the new writer starts a fresh chain from its own header), and — because
+    the filenames inside that subdirectory are still the canonical
+    ``metrics.jsonl`` / ``metrics.chain.json`` / ``metrics.json`` — still
+    independently checkable by
+    :func:`~turing.research.loop.integrity.verify_metrics_chain` and
+    :func:`~turing.research.loop.integrity.reconcile_summary`, and still found
+    by ``python -m turing.research.loop.verify``'s directory walk, which
+    matches ``metrics.jsonl`` at every depth under a root. Adding SVGs to that
+    directory does not disturb the walk: it keys on ``metrics.jsonl`` alone,
+    and ``prior-N/`` already contained one before the plots joined it.
+
+    Preserving beats deleting for the plots specifically. A stale chart is
+    only misleading while it sits where the *current* attempt's chart belongs;
+    under ``prior-N/``, beside the exact metrics it was drawn from, it is the
+    superseded generation's evidence and is labelled as such by its path.
     """
     jsonl_path = metrics_dir / "metrics.jsonl"
     if not (jsonl_path.exists() and jsonl_path.stat().st_size > 0):
@@ -310,13 +384,294 @@ def _rotate_stale_metrics(metrics_dir: Path) -> None:
         suffix += 1
     prior_dir = metrics_dir / f"prior-{suffix}"
     prior_dir.mkdir(parents=True, exist_ok=True)
-    for name in _METRICS_TRIO:
+    for name in _ROTATED_NAMES:
         src = metrics_dir / name
         if not src.exists():
             continue
         dest = prior_dir / name
         src.rename(dest)
         logger.info("research.results.metrics_rotated", src=str(src), dest=str(dest))
+
+
+#: Written into a contained attempt's ``metrics.json`` as ``final_state``,
+#: with the exception's type appended. Deliberately **not** a member of
+#: :class:`~turing.research.contracts.AttemptState`: the attempt reached no
+#: lifecycle state — it stopped existing — and a reader (or a future ``if
+#: final_state == "failed_within_cap"``) must not be able to mistake a
+#: harness crash for an outcome the experiment measured. It is prefixed
+#: rather than free prose so the whole class is greppable in one pass over a
+#: results tree.
+_CRASHED_FINAL_STATE_PREFIX = "crashed_in_harness"
+
+
+def _mint_attempt_id(config: RoundConfig, problem: Problem) -> str:
+    """The identity one attempt is known by, minted once per attempt.
+
+    Lifted out of :meth:`RoundRunner.run_attempt` so the *caller* can mint it
+    and keep it. That is the whole fix for the round-4 defect: the id is the
+    only field in the chain header that distinguishes two generations of the
+    same attempt, and it used to be created inside ``run_attempt`` — where it
+    died with any exception, leaving :meth:`RoundRunner._close_out_crashed_attempt`
+    nothing to compare a found chain against. Minted here and passed down, it
+    survives the exception in the caller's frame, so the close-out can always
+    answer "is this directory's chain the one *this* attempt wrote?" exactly.
+
+    The ``uuid4`` suffix is what makes it a generation discriminator rather
+    than a restatement of ``run_id``/``problem_id``: a re-drive under a
+    byte-identical ``RoundConfig`` — the built-in shape of the noise floor's
+    "fix the cause and re-run from seed 1" workflow, whose per-seed ``run_id``
+    is derived deterministically as ``<run_id>-seed-<n>`` — still gets a fresh
+    id here, where every other identity field repeats.
+    """
+    return f"{config.run_id}-{problem.id}-{uuid.uuid4().hex[:8]}"
+
+
+class _ForeignChainError(Exception):
+    """The chain in an attempt directory is not the chain of the attempt that crashed.
+
+    Raised by :func:`_read_crashed_attempt_record` and caught separately from
+    every other failure by :meth:`RoundRunner._close_out_crashed_attempt`,
+    because the two mean opposite things: an ordinary failure there is
+    "reporting broke, the loss is still disclosed elsewhere", while this one
+    is "reporting worked and correctly declined to speak for someone else's
+    log". Collapsing them into one ``except`` would log a deliberate,
+    correct refusal under an event name an operator greps for when the
+    reporting layer is broken.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class _CrashedAttemptRecord:
+    """The terminal summary fields for a crashed attempt, read off its own log.
+
+    Every value here is re-derived from ``metrics.jsonl`` and the chain
+    sidecar rather than carried out of :meth:`RoundRunner.run_attempt` —
+    which is not merely convenient but necessary. The exception can come from
+    anywhere in that method, so its local ``attempt`` is gone and no in-memory
+    value is trustworthy at the point this is built. Deriving from the log
+    also makes the resulting ``metrics.json`` reconcile with that log by
+    construction: :func:`~turing.research.loop.integrity.reconcile_summary`
+    checks the summary against exactly these fields, so a summary built from
+    anything else would trade an ``INCOMPLETE`` verdict for a ``FAILED`` one —
+    strictly worse, because ``FAILED`` is that tool's word for dishonesty.
+    """
+
+    attempt_id: str
+    outcome: Outcome
+    steps_recorded: int
+    consumed_steps: int
+    consumed_tokens: int
+    consumed_wall_clock_seconds: float
+    cap_extensions: int
+    final_progress: float | None
+    baseline_score: float | None
+    escalation_count: int
+
+
+def _as_number(value: object) -> float | None:
+    """``value`` as a float when it is a real JSON number, else ``None``.
+
+    ``bool`` is excluded explicitly: it is an ``int`` subclass in Python, and
+    silently writing ``True`` into a numeric summary field as ``1`` would put
+    a value in ``metrics.json`` that the log does not contain.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _read_crashed_attempt_record(
+    metrics_dir: Path,
+    escalations_dir: Path,
+    *,
+    expected_attempt_id: str,
+    expected_problem_id: str,
+    expected_round_id: str,
+    expected_seed: int,
+) -> _CrashedAttemptRecord:
+    """Re-derive one crashed attempt's terminal summary from its own files.
+
+    Raises rather than returning a partial record: every caller is already
+    inside a guard that logs and moves on, and a half-derived summary written
+    over an honest log is the one outcome worse than no summary at all.
+
+    **The header must name this attempt, or nothing is derived.** The chain
+    header is the only place an attempt's identity survives on disk, and it is
+    checked field by field — ``attempt_id``, ``problem_id``, ``round_id``,
+    ``seed`` — against the attempt that actually crashed, raising
+    :class:`_ForeignChainError` when any of them disagrees or is missing. This
+    is not defensive programming; the directory genuinely can hold a *previous
+    generation's* chain at this moment. ``run_attempt`` materialises the
+    workspace (I/O against a template that can be pruned, evicted or fill a
+    disk) **before** it calls ``_rotate_stale_metrics``, so an exception in
+    that window leaves the earlier generation's trio untouched and un-rotated:
+    an intact chain with no summary — the honest "killed before its summary
+    write" shape that ``verify`` reports ``INCOMPLETE`` and that rotation
+    exists to preserve. Without this check the close-out adopted that chain,
+    wrote a summary asserting the *current* round's ``round_id`` and ``seed``
+    and an exception type that never touched it, and ``verify`` blessed the
+    result ``OK``, because every field it reconciles was re-derived from the
+    very log the summary had just been misattributed to. Two harms, either
+    sufficient: a fabricated claim about a run that did not make it, and the
+    destruction of the one honest state — ``INCOMPLETE`` — that said the
+    earlier generation was killed unfinished.
+
+    **``attempt_id`` is the field that actually decides it, and the other
+    three are kept for the message.** Round 3 left ``attempt_id`` out on the
+    grounds that it was minted inside ``run_attempt`` and died with the
+    exception; that made ``problem_id``/``round_id``/``seed`` the whole guard,
+    and those three are *equal across generations by construction* in the only
+    re-run workflow this package ships. ``NoiseFloorConfig.round_config_for``
+    derives each seed's ``run_id`` deterministically as
+    ``<run_id>-seed-<n>``, and the refusal an incomplete seed raises tells the
+    operator to "fix the cause and re-run the noise floor from seed 1" — so
+    the sanctioned recovery reuses the identical ``run_id`` *and* seed, into
+    the identical ``noise_floor_seed_dir``. A gen-2 attempt crashing in
+    ``materialise`` therefore matched all three, adopted gen 1's chain, and
+    overwrote a killed attempt's honest ``INCOMPLETE`` with
+    ``crashed_in_harness:OSError`` — flipping the directory to ``OK`` under
+    ``verify``, the pre-writeup gate. :func:`_mint_attempt_id` is now called by
+    ``run_attempts`` *before* ``run_attempt``, so the crashed attempt's own id
+    survives in the caller's frame and reaches here; its ``uuid4`` suffix
+    differs between generations even when every other field repeats. The other
+    three stay in the comparison because they cost nothing and they are what
+    makes the refusal *readable* — "round_id='gen1' (expected 'gen2')" tells
+    an operator which generation is sitting in the directory, where a bare
+    id mismatch would not.
+
+    This is a different comparison from
+    :data:`~turing.research.loop.integrity._IDENTITY_FIELDS`, which
+    ``reconcile_summary`` uses, and the two must not be conflated.
+    That one compares a ``metrics.json`` against the header *beside it* and
+    excludes ``started_at_ms`` because that field never reaches a summary —
+    a statement about which fields the two **documents** have in common. This
+    one compares the header against the **live attempt** that just crashed,
+    where the available evidence is whatever survived the exception in the
+    caller's frame. Different sides, different evidence, so neither list is
+    the other's.
+
+    ``started_at_ms`` cannot serve here, which is why the id is minted
+    upstream instead. ``run_attempt`` awaits ``materialise`` *before* it reads
+    the clock and builds the :class:`~turing.research.contracts.Attempt`, so
+    at the canonical crash point no start time has been taken at all; the
+    nearest substitute — a watermark stamped by the caller before the call and
+    compared with ``>=`` — would rest on wall-clock monotonicity *across
+    processes*, which ``SystemClock.now_ms`` (``time.time()``) does not
+    provide. An NTP step, a container clock reset, or simply a re-run inside
+    the same millisecond would make a previous generation's header look
+    current, and the guard would adopt exactly the chain it exists to refuse.
+    A ``uuid4`` needs no clock and no ordering assumption.
+
+    ``escalation_count`` is counted from the round's ``escalations/``
+    directory rather than defaulted to ``0``. The in-memory request list died
+    with the attempt, but the requests themselves were written to disk before
+    the loop suspended on each one, so the real number is recoverable — and
+    writing ``0`` for an attempt that interrupted its operator three times
+    would be a fabricated number in a file whose entire purpose is to be
+    citable. Files that do not parse, or that name a different attempt, are
+    skipped: this is a count of evidence found, not an assertion about
+    evidence missing.
+    """
+    tail = integrity.read_log_tail(metrics_dir)
+    last = tail.last_line
+    if last is None:
+        raise ContractViolationError(f"{metrics_dir} has no parseable metrics lines")
+    header = tail.header
+    if header is None:
+        raise ContractViolationError(f"{metrics_dir} has no readable chain header")
+    attempt_id = header.get("attempt_id")
+    if not isinstance(attempt_id, str) or not attempt_id:
+        raise ContractViolationError(f"{metrics_dir}'s chain header carries no attempt_id")
+
+    foreign = [
+        f"{field}={header.get(field)!r} (expected {expected!r})"
+        for field, expected in (
+            ("attempt_id", expected_attempt_id),
+            ("problem_id", expected_problem_id),
+            ("round_id", expected_round_id),
+            ("seed", expected_seed),
+        )
+        if header.get(field) != expected
+    ]
+    if foreign:
+        raise _ForeignChainError(
+            f"{metrics_dir}'s chain header names a different attempt ({attempt_id}): "
+            + "; ".join(foreign)
+        )
+
+    numbers = {
+        name: _as_number(last.get(key))
+        for name, key in (
+            ("outcome", "outcome_code"),
+            ("consumed_steps", "consumed_steps"),
+            ("consumed_tokens", "tokens_used"),
+            ("consumed_wall_clock_seconds", "wall_clock_s"),
+            ("cap_extensions", "cap_extensions"),
+        )
+    }
+    missing = sorted(name for name, value in numbers.items() if value is None)
+    if missing:
+        raise ContractViolationError(
+            f"{metrics_dir}'s last metrics line is missing or non-numeric in {missing}"
+        )
+
+    escalation_count = 0
+    for path in sorted(escalations_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        request = payload.get("request") if isinstance(payload, dict) else None
+        if isinstance(request, dict) and request.get("attempt_id") == attempt_id:
+            escalation_count += 1
+
+    return _CrashedAttemptRecord(
+        attempt_id=attempt_id,
+        # ``Outcome(...)`` rather than a cast: an outcome code the enum does
+        # not define is a corrupt log, and inventing a code for it here would
+        # put a number in metrics.json that no state maps to.
+        outcome=Outcome(int(numbers["outcome"] or 0)),
+        steps_recorded=tail.line_count,
+        consumed_steps=int(numbers["consumed_steps"] or 0),
+        consumed_tokens=int(numbers["consumed_tokens"] or 0),
+        consumed_wall_clock_seconds=numbers["consumed_wall_clock_seconds"] or 0.0,
+        cap_extensions=int(numbers["cap_extensions"] or 0),
+        final_progress=_as_number(tail.final_progress),
+        baseline_score=_as_number(tail.baseline_score),
+        escalation_count=escalation_count,
+    )
+
+
+def _parent_attempts_completed(parent: RoundRecord | None) -> bool | None:
+    """Whether the parent round measured its whole corpus, as *it* recorded it.
+
+    Read off the parent's persisted ``all_attempts_completed`` gate rather
+    than recomputed, because it cannot be recomputed: the parent's losses
+    lived in a previous ``run_round`` call's ``attempt_failures``, and the
+    only surviving statement about them is the gate that call wrote. A round
+    that lost an attempt has cells reduced over a strict subset of the corpus,
+    and that is exactly as fatal to a delta when it happens on the parent side
+    of the subtraction as on this one — see :func:`compute_deltas`, which had
+    the argument in its docstring while the parent's gate was never read.
+
+    Three answers, not two. ``None`` means the record carries no such gate at
+    all — a record written before the gate existed, or one reconstructed by a
+    caller that dropped it. That is *unknown*, not *fine*, and
+    :func:`compute_deltas` refuses it: the failure this guards is a phantom
+    gain emitted with every gate green, so "silent" is the exact state it
+    cannot be allowed to resolve to. A non-``bool`` value is folded into
+    ``None`` for the same reason — a truthy string in a gate map is not a
+    measurement of anything.
+
+    ``parent is None`` answers ``True`` rather than ``None``: there is no
+    parent to be short a problem, and every consumer already refuses a
+    parentless round through ``REFUSED_NO_PARENT``. Answering ``None`` there
+    would relabel round 0's honest "no baseline yet" as a suspect baseline.
+    """
+    if parent is None:
+        return True
+    value = parent.gates.get("all_attempts_completed")
+    return value if isinstance(value, bool) else None
 
 
 class RoundRunner:
@@ -337,11 +692,25 @@ class RoundRunner:
         self._escalations = escalations
         self._clock = clock or SystemClock()
         self._operator_wait_seconds = 0.0
+        self._attempt_failures: tuple[AttemptFailure, ...] = ()
 
     @property
     def clock(self) -> Clock:
         """The injected clock, so callers timestamp against the same one."""
         return self._clock
+
+    @property
+    def attempt_failures(self) -> tuple[AttemptFailure, ...]:
+        """Problems lost to a raising attempt during the last :meth:`run_attempts`.
+
+        Reset at the head of every :meth:`run_attempts` call, the same
+        per-invocation lifetime ``_operator_wait_seconds`` already has, so a
+        noise-floor runner's seed-by-seed calls each report their own losses
+        instead of accumulating them. Returned rather than raised because the
+        round that lost an attempt still has real results to record for the
+        rest of the corpus — see :meth:`run_attempts`.
+        """
+        return self._attempt_failures
 
     # -- one attempt -------------------------------------------------------- #
 
@@ -351,9 +720,18 @@ class RoundRunner:
         config: RoundConfig,
         *,
         output_dir: Path,
+        attempt_id: str | None = None,
     ) -> AttemptOutcome:
-        """Work one problem until it passes, the cap trips, or it is abandoned."""
-        attempt_id = f"{config.run_id}-{problem.id}-{uuid.uuid4().hex[:8]}"
+        """Work one problem until it passes, the cap trips, or it is abandoned.
+
+        ``attempt_id`` is minted here when the caller does not supply one, so a
+        direct call still works. :meth:`run_attempts` *does* supply one, and
+        must: the id is the only evidence that distinguishes two generations of
+        the same attempt, and minting it inside this method meant it died with
+        any exception raised out of it — see :func:`_mint_attempt_id` and
+        :meth:`_close_out_crashed_attempt`.
+        """
+        attempt_id = attempt_id or _mint_attempt_id(config, problem)
         workspace = await self._workspaces.materialise(problem, attempt_id=attempt_id)
         now = self._clock.now_ms()
         attempt = Attempt(
@@ -642,10 +1020,18 @@ class RoundRunner:
         # wrapped in the try/except below: it is a chain-extending write
         # with the same integrity contract as the per-step appends above
         # (also unwrapped) — a swallowed failure here would silently break
-        # the hash chain on the file's own last line. It runs after the
-        # attempt's real work and its checkpoint are already durably
-        # recorded, so raising here cannot turn a solved attempt into a
-        # lost one.
+        # the hash chain on the file's own last line.
+        #
+        # What that costs, stated exactly (the earlier claim here — "raising
+        # here cannot turn a solved attempt into a lost one" — was too
+        # strong): the workspace and the checkpoint written just above are
+        # durable, so the *work* survives a raise. But this append precedes
+        # write_attempt_log and the AttemptOutcome return below, so a raise
+        # does cost this attempt its attempts/<problem-id>.json log and its
+        # place in the round's cells. What it can no longer do is take the
+        # rest of the round with it: run_attempts contains a raising attempt
+        # to that attempt and reports the loss through the round's
+        # all_attempts_completed gate. See its docstring.
         await metrics_writer.append(
             MetricsLine(
                 step=attempt.step_index,
@@ -1009,13 +1395,375 @@ class RoundRunner:
 
         Used directly by the noise-floor runner, whose seed runs are *not*
         rounds and must not enter ``trajectory.json``.
+
+        **One attempt's failure is contained to that attempt.** Everything
+        inside :meth:`run_attempt` that is *not* the sanctioned reporting
+        guard raises straight out of it, and that is correct: the per-step and
+        terminal ``metrics_writer.append`` calls are chain-extending writes,
+        and swallowing a failure there would silently break the hash chain
+        that ``verify`` exists to check. It is *this* loop that must not
+        propagate. Without the guard below, one problem discards every attempt
+        the round had already completed — no round record, no trajectory row,
+        no cells — and the reachable trigger is not exotic:
+        ``problem.verifier.score_scale`` is free-form by design
+        (``contracts.py``), it becomes the metrics key naming the raw score,
+        and ``results._validate_scored_metric`` rejects a scale colliding with
+        a reserved or core line key. ``progress``, ``step``, ``ts``,
+        ``total_steps``, ``tokens_used``, ``consumed_steps`` and
+        ``wall_clock_s`` are all plausible scale names and all fatal at that
+        problem's first verification. Ten completed attempts must not be
+        thrown away by the eleventh problem's *name*.
+
+        **A lost attempt is dropped from the results, not floored into
+        them.** The alternative — synthesising an ``AttemptOutcome`` with
+        ``best_result=None`` — looks safer and is worse: that is exactly the
+        shape of an honest attempt that ran its cap and never scored, so
+        ``ScoredProblem.from_result`` would enter the problem into its cell at
+        the scale floor and ``build_type_scores`` would average an instrument
+        failure in as a capability reading. A crashed harness would then
+        register as the agent performing at its worst, manufacturing a
+        regression against the parent round out of a bug in this file. This
+        module is the experiment's instrument; a measurement it did not take
+        must be reported as absent, never as a bad one. For the colliding-
+        scale trigger specifically, the floored outcome is not even
+        constructible: ``ScoredProblem.from_result`` refuses a scale with no
+        declared floor, so a synthesised outcome would only move the same
+        abort from the metrics line to the scoring pass.
+
+        Absent is not silent. Each loss is logged with its traceback
+        (``research.attempt.crashed``), returned to :meth:`run_round` via
+        :attr:`attempt_failures`, and surfaced in the round record's
+        ``all_attempts_completed`` gate and verdict line, so no reader of the
+        round can mistake ``n=10`` for a ten-problem corpus. It also *refuses
+        the round's deltas outright* — see :meth:`run_round` — because a cell
+        mean over nine problems is not comparable with a parent's over ten,
+        and the bias is one-directional: a mean rises when its weakest member
+        drops out, so a contained crash left unrefused manufactures a
+        marginal gain out of a bug in this file.
+
+        **A lost attempt still gets a finished record on disk.**
+        :meth:`_close_out_crashed_attempt` writes the terminal
+        ``metrics.json`` :meth:`run_attempt` never reached, so a round that
+        is over stops reporting itself as unfinished to ``verify``. That is a
+        reporting completion, not a rehabilitation: the attempt is still
+        absent from every cell and still counted as a loss here.
+
+        If **every** attempt is lost the round is refused outright rather than
+        recorded with zero cells: an empty round record is a baseline that
+        measures nothing, and a later round comparing against it would compute
+        deltas from an absence.
+
+        **The noise-floor caller has a stricter bar than this, and it is not
+        enforced here.** ``measure_noise_floor`` guards that every *cell* is
+        present in every seed, which cannot see a seed that measured a cell
+        over one fewer *problem* — and a spread computed over a shifting
+        problem set measures the set, not the agent. A colliding
+        ``score_scale`` is a property of the problem and so is lost by every
+        seed identically (consistent, just narrower); a transient failure
+        hitting one seed only is not. ``NoiseFloorRunner.run`` therefore wants
+        to refuse a seed with a non-empty :attr:`attempt_failures` rather than
+        report a floor from it. That check belongs at that call site — a round
+        legitimately continues where a floor must not — and the property
+        exists for it.
+
+        Not caught: :class:`asyncio.CancelledError`,
+        :class:`KeyboardInterrupt` and :class:`SystemExit` are
+        ``BaseException``\\ s and stay outside ``except Exception`` on
+        purpose. A cancelled round must stop, not quietly re-label the
+        cancellation as a per-problem harness failure and keep working
+        through the corpus.
         """
         if not corpus:
             raise ContractViolationError("a round with no problems measures nothing")
         outcomes: list[AttemptOutcome] = []
+        failures: list[AttemptFailure] = []
+        self._attempt_failures = ()
         for problem in corpus:
-            outcomes.append(await self.run_attempt(problem, config, output_dir=output_dir))
+            # Minted here, not inside ``run_attempt``, so it outlives an
+            # exception raised out of it and the close-out below can tell this
+            # attempt's chain from a previous generation's — the one field
+            # that can, when a re-drive repeats run_id, problem_id and seed.
+            attempt_id = _mint_attempt_id(config, problem)
+            try:
+                outcomes.append(
+                    await self.run_attempt(
+                        problem, config, output_dir=output_dir, attempt_id=attempt_id
+                    )
+                )
+            except Exception as exc:
+                logger.exception(
+                    "research.attempt.crashed",
+                    problem_id=problem.id,
+                    run_id=config.run_id,
+                    round_index=config.round_index,
+                    error=f"{type(exc).__name__}: {exc}",
+                    detail=(
+                        "the attempt raised out of run_attempt and produced no outcome; it "
+                        "is absent from this round's cells rather than scored at its floor, "
+                        "and the remaining problems still run"
+                    ),
+                )
+                failures.append(
+                    AttemptFailure(problem_id=problem.id, error=f"{type(exc).__name__}: {exc}")
+                )
+                await self._close_out_crashed_attempt(
+                    problem=problem,
+                    config=config,
+                    output_dir=output_dir,
+                    exc_type=type(exc).__name__,
+                    attempt_id=attempt_id,
+                )
+        # Set before the refusal below so a caller inspecting the runner after
+        # a total-loss raise can still see which problems were lost.
+        self._attempt_failures = tuple(failures)
+        if not outcomes:
+            raise ContractViolationError(
+                f"every one of the {len(corpus)} attempt(s) failed; a round with no "
+                "measured attempt has no cells, and recording it would put a baseline "
+                "in the trajectory that a later round computes its deltas against"
+            )
         return tuple(outcomes)
+
+    async def _close_out_crashed_attempt(
+        self,
+        *,
+        problem: Problem,
+        config: RoundConfig,
+        output_dir: Path,
+        exc_type: str,
+        attempt_id: str,
+    ) -> None:
+        """Give a contained attempt a terminal ``metrics.json``, or leave it alone.
+
+        **What this fixes.** ``metrics.json`` is written once, at the end of
+        :meth:`run_attempt`, so an attempt whose exception was contained never
+        reaches it. ``verify`` reads an intact chain with no summary beside it
+        as :attr:`~turing.research.loop.integrity.ReconcileState.INCOMPLETE`
+        and exits ``2``, which is correct and load-bearing for a round that is
+        *still running* — and wrong here, because this round is finished and
+        that directory will never gain a summary. The whole results root then
+        reports ``2`` forever, a pre-writeup gate demanding ``0`` can never
+        pass on the tree, and an operator taught "``2`` means still running"
+        learns to ignore it: a fresh cry-wolf, which is the exact failure
+        class this contract exists to remove. Worse, the same event produced
+        two different codes depending on *where* the attempt died — a crash
+        before the first append leaves no ``metrics.jsonl``, so ``find_runs``
+        never sees the directory and the root exits ``0``. One event class,
+        one code, and the code is decided by whether the round finished, not
+        by which line of ``run_attempt`` raised.
+
+        **The record is honest, not a placeholder.** ``best_score`` is
+        ``null``: this attempt produced no grade, and a floor value here would
+        be the same fabricated-regression bug :meth:`run_attempts` refuses one
+        level up. Every resource number is re-derived from the attempt's own
+        log by :func:`_read_crashed_attempt_record`, so the summary reconciles
+        with the log rather than merely coexisting with it — a summary built
+        from anything else would turn an ``INCOMPLETE`` into a ``FAILED``, and
+        ``FAILED`` is ``verify``'s word for dishonesty. ``final_state`` names
+        the crash and is deliberately not an
+        :class:`~turing.research.contracts.AttemptState` value; see
+        :data:`_CRASHED_FINAL_STATE_PREFIX`. The loss stays disclosed exactly
+        where it was — the ``research.attempt.crashed`` log, the round's
+        ``all_attempts_completed`` gate, the verdict prefix, and the refused
+        deltas — and ``INCOMPLETE`` goes back to meaning what the docs say it
+        means: genuinely unfinished.
+
+        **It cannot break the hash chain.** ``metrics.json`` is not a chained
+        file: nothing here opens ``metrics.jsonl`` or the sidecar for writing,
+        and the chain's digests do not cover the summary. The two files it
+        does read, it reads.
+
+        **It cannot mask the exception it is reporting on.** The caller is
+        already inside ``except Exception``; every failure in here is caught
+        and logged rather than raised, so a reporting problem can neither
+        replace the original traceback (already logged, with the exception
+        chained through ``logger.exception`` before this runs) nor escalate a
+        contained per-attempt loss into a lost round. That is the same
+        sanctioned-swallowed-error rule :meth:`run_attempt`'s emission block
+        follows, applied on the error path where it matters more.
+
+        **Three cases are deliberately left alone**, each ending in a code
+        that is already right:
+
+        * no ``metrics.jsonl`` (the attempt died before its first append —
+          the canonical ``score_scale``-collision trigger). ``find_runs``
+          keys on that file, so the directory is not a run and never affected
+          the exit code. Writing a summary for a run that does not exist would
+          *create* a finding, not clear one.
+        * ``metrics.json`` already present. The crash happened after the
+          summary landed, so the honest terminal record is already there and
+          overwriting it with a cruder one would lose information.
+        * a chain header that names a different attempt — a different
+          ``attempt_id``, ``problem_id``, ``round_id`` or ``seed``, or one of
+          those missing. Then this directory's chain belongs to an earlier
+          generation and a summary written over it would be a claim about
+          someone else's log. (A header that cannot be read *at all* is left
+          alone too, by the generic guard below rather than by this check: with
+          no header there is nothing to attribute a summary to, and it takes
+          the same "write nothing" path.) This is reachable, not hypothetical:
+          ``run_attempt`` materialises the workspace before it rotates the
+          stale trio aside, so a crash in that window finds the previous
+          generation's chain still in place, intact and summary-less — the
+          honest ``INCOMPLETE`` shape a killed attempt leaves and rotation
+          promises to preserve. :func:`_read_crashed_attempt_record` enforces
+          the check (see its docstring for the full driven example, and for why
+          ``attempt_id`` is the field that decides it); the refusal is logged
+          under its own event name so it cannot be mistaken for reporting
+          failing.
+
+        ``attempt_id`` is a parameter rather than something read back off disk
+        precisely so it can be *compared* with what is on disk. The caller
+        mints it before calling :meth:`run_attempt` (:func:`_mint_attempt_id`)
+        so it outlives the exception; reading it out of the header instead
+        would make the guard compare the found chain against itself, which is
+        what round 3's version effectively did and why a re-drive repeating
+        ``run_id``, ``problem_id`` and ``seed`` — the noise floor's documented
+        "re-run from seed 1" recovery, by construction — walked straight
+        through it.
+
+        Because the header must match the current attempt before anything is
+        written, ``target_score`` — taken from *this* config's criterion — is
+        necessarily the criterion the log was produced under. It could not be
+        while an adopted foreign chain was reachable.
+        """
+        metrics_dir = output_dir / "attempts" / problem.id
+        try:
+            if (metrics_dir / "metrics.json").exists():
+                return
+            if not (metrics_dir / "metrics.jsonl").exists():
+                return
+            record = await asyncio.to_thread(
+                _read_crashed_attempt_record,
+                metrics_dir,
+                output_dir / "escalations",
+                expected_attempt_id=attempt_id,
+                expected_problem_id=problem.id,
+                expected_round_id=config.run_id,
+                expected_seed=config.seed,
+            )
+            criterion = config.criterion_for(problem.id)
+            await write_attempt_summary(
+                metrics_dir,
+                problem_id=problem.id,
+                attempt_id=record.attempt_id,
+                round_id=config.run_id,
+                seed=config.seed,
+                problem_type=problem.problem_type.value,
+                split=problem.split.value,
+                score_scale=problem.verifier.score_scale,
+                outcome=record.outcome,
+                final_state=f"{_CRASHED_FINAL_STATE_PREFIX}:{exc_type}",
+                # No score, and no floor standing in for one. This attempt
+                # was not graded; the cells above already exclude it.
+                best_score=None,
+                best_passed_correctness=None,
+                baseline_score=record.baseline_score,
+                target_score=None if criterion is None else criterion.min_score,
+                final_progress=record.final_progress,
+                consumed_steps=record.consumed_steps,
+                consumed_tokens=record.consumed_tokens,
+                consumed_wall_clock_seconds=record.consumed_wall_clock_seconds,
+                cap_extensions=record.cap_extensions,
+                escalation_count=record.escalation_count,
+                steps_recorded=record.steps_recorded,
+            )
+        except _ForeignChainError as exc:
+            # Not a failure: the guard fired and nothing was written. Logged
+            # at ERROR anyway, because the *reason* it fired — a previous
+            # generation's chain still sitting where this attempt's belongs —
+            # is a real finding about the results tree, and the directory will
+            # keep reporting INCOMPLETE until someone looks at it.
+            logger.error(
+                "research.results.crashed_attempt_summary_refused",
+                problem_id=problem.id,
+                run_id=config.run_id,
+                round_index=config.round_index,
+                directory=str(metrics_dir),
+                reason=str(exc),
+                detail=(
+                    "this directory holds a different attempt's chain (an earlier "
+                    "generation that was never rotated aside, because the crash "
+                    "happened before rotation); no summary is written over it — that "
+                    "would assert this round's identity and exception over a log they "
+                    "never touched, and would destroy the honest INCOMPLETE state that "
+                    "says the earlier attempt was killed unfinished"
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "research.results.crashed_attempt_summary_failed",
+                problem_id=problem.id,
+                run_id=config.run_id,
+                round_index=config.round_index,
+                directory=str(metrics_dir),
+                detail=(
+                    "the contained attempt keeps its intact chain with no summary, so "
+                    "verify reports it INCOMPLETE and the results root exits 2; the "
+                    "attempt loss itself is already reported by research.attempt.crashed"
+                ),
+            )
+        else:
+            logger.info(
+                "research.results.crashed_attempt_summary_written",
+                problem_id=problem.id,
+                run_id=config.run_id,
+                round_index=config.round_index,
+                directory=str(metrics_dir),
+                final_state=f"{_CRASHED_FINAL_STATE_PREFIX}:{exc_type}",
+            )
+
+    def _viewer_runs(self) -> list[str]:
+        """Every attempt directory with a metrics chain, across every round on disk.
+
+        Deriving this from the filesystem rather than the current round's
+        in-memory ``outcomes`` is the fix for the bug where ``.viewer.json``
+        showed only the latest round: ``outcomes`` only ever holds *this*
+        round's attempts, so building the list from it — even merged into
+        whatever the file already held — would still lose every earlier
+        round the moment the runner process restarts between rounds and that
+        in-memory state is gone. The directories are exactly as durable as
+        ``metrics.jsonl`` itself, so re-deriving them from disk on every round
+        costs nothing a restart doesn't already pay, and never depends on a
+        prior ``.viewer.json`` having been written honestly (or at all).
+
+        **The walk is depth-independent, and it has to be.** An attempt's
+        metrics directory is ``attempts/<problem.id>``, and ``problem.id`` is
+        an unvalidated path component (RES-16) that operators may plausibly
+        namespace — ``"cuda/matmul-speedup"`` is a reasonable id and produces
+        ``attempts/cuda/matmul-speedup/metrics.jsonl``. A single-segment glob
+        (``attempts/*/metrics.jsonl``) matched exactly one path segment, so
+        such a run vanished from ``.viewer.json`` with no log line and no
+        warning while ``verify`` — whose walk has always been recursive —
+        went on finding and checking it. Silently listing fewer runs than
+        exist is the same class of fault as listing only the latest round,
+        which this method was written to fix. Rejecting the id instead would
+        be a change to ``contracts.py``, not to a reporting call site.
+
+        Rotated ``prior-N/`` chains (see :func:`_rotate_stale_metrics`) are
+        still excluded, now by directory *name* rather than by depth, since
+        depth no longer distinguishes them. That is exact for every
+        directory this runner creates: ``prior-N/`` is only ever the last
+        segment before a rotated ``metrics.jsonl``. The residual is a problem
+        id whose final segment is literally ``prior-<digits>``, which would be
+        skipped; that belongs to id validation in ``contracts.py`` and not
+        here, and the failure it causes (a run missing from a viewer list) is
+        the milder of the two — the alternative rule would draw a superseded
+        attempt's chart as if it were live.
+
+        An attempt whose ``MetricsWriter`` never took its first
+        :meth:`~turing.research.loop.results.MetricsWriter.append`
+        (``metrics.jsonl`` is created lazily, on that first write) is
+        correctly absent, the same as it would be from ``outcomes``.
+        """
+        loop_dir = self._trajectory.loop_dir
+        results_root = loop_dir.parent
+        return sorted(
+            {
+                match.parent.relative_to(results_root).as_posix()
+                for match in loop_dir.glob("round-*/attempts/**/metrics.jsonl")
+                if not _PRIOR_DIR_PATTERN.fullmatch(match.parent.name)
+            }
+        )
 
     @staticmethod
     def _floors_from_report(
@@ -1102,6 +1850,22 @@ class RoundRunner:
             )
 
         outcomes = await self.run_attempts(corpus, config, output_dir=output_dir)
+        failures = self._attempt_failures
+        if failures:
+            logger.error(
+                "research.round.attempts_lost",
+                round_index=config.round_index,
+                run_id=config.run_id,
+                lost=[f.problem_id for f in failures],
+                errors=[f.error for f in failures],
+                measured=len(outcomes),
+                corpus=len(corpus),
+                detail=(
+                    "these problems are absent from this round's cells and cost; the "
+                    "round's n is smaller than the corpus and is not comparable "
+                    "problem-for-problem with a round that measured all of them"
+                ),
+            )
         elapsed = max(0.0, self._clock.monotonic() - started - self._operator_wait_seconds)
 
         scored = tuple(
@@ -1112,12 +1876,29 @@ class RoundRunner:
         cost = RoundCost(
             wall_clock_seconds=elapsed,
             tokens=sum(o.attempt.consumed.tokens for o in outcomes),
+            # Measured attempts, not attempted ones. RoundCost is driving
+            # function #3's numerator and ``type_scores`` is its denominator's
+            # source; counting an attempt here whose score is missing from
+            # there would compute cost-per-unit-gain over two different sets
+            # of problems. ``wall_clock_seconds`` cannot be split that way (it
+            # is one clock over the whole round) and ``tokens`` undercounts by
+            # whatever a lost attempt spent before it raised, since its
+            # ``Attempt`` died with it — so a round with a non-empty
+            # ``failures`` list reads slightly cheap, and the
+            # ``all_attempts_completed`` gate below is what says so.
             attempts=len(outcomes),
         )
+        # Same undercount as cost.tokens, and it lands on driving function #4:
+        # escalations a lost attempt raised before it died went to a real
+        # operator but are not counted here, because the request list died with
+        # the attempt. Human-gate load therefore reads low on a round whose
+        # all_attempts_completed gate is False, which is the second reason that
+        # gate has to be written rather than inferred from these numbers.
         escalation_count = sum(o.escalation_count for o in outcomes)
 
         parent_scores: tuple[TypeScore, ...] | None = None
         comparable = True
+        parent_attempts_completed: bool | None = True
         if parent is not None:
             if config.parent_round_id != parent.run_id:
                 raise ContractViolationError(
@@ -1135,8 +1916,46 @@ class RoundRunner:
                     eval_set_hash=eval_set_hash,
                     detail="rounds measured on different eval sets are not comparable",
                 )
+            parent_attempts_completed = _parent_attempts_completed(parent)
+            if parent_attempts_completed is not True:
+                logger.error(
+                    "research.round.parent_attempts_lost",
+                    round_index=config.round_index,
+                    run_id=config.run_id,
+                    parent_round_id=parent.run_id,
+                    parent_all_attempts_completed=parent_attempts_completed,
+                    detail=(
+                        "the parent round did not measure its full corpus (or does not "
+                        "record whether it did), so its cells are the reduced side of "
+                        "every subtraction this round would report; the deltas and the "
+                        "saturation verdicts are refused. Re-driving this round does not "
+                        "fix it — the baseline has to be re-measured"
+                    ),
+                )
 
         floors = floors_by_cell(floors_seq)
+        # Two separate facts, deliberately not folded into one flag.
+        # ``comparable`` is "the parent measured the same corpus"; it is the
+        # eval-set gate and nothing else, because ``trajectory.py`` derives
+        # ``trajectory_restart`` from exactly that question and a lost attempt
+        # is emphatically *not* a trajectory restart — the next round still
+        # descends from this one. ``all_attempts_completed`` is "this round
+        # measured all of that corpus". A delta needs both, and the two
+        # refusals read differently in the verdict on purpose, because the
+        # operator actions they call for are different (re-derive the corpus
+        # vs. re-drive the lost problem).
+        #
+        # ``parent_attempts_completed`` is the third fact, and it is *this*
+        # round's gate asked of the parent record rather than anything
+        # recomputed here: a delta is a subtraction, and it is contaminated
+        # by a missing problem on either side. It is deliberately not written
+        # into ``gates`` below — every entry there is a statement about this
+        # round, and a gate whose subject is a different round would be read
+        # (by the desktop's flywheel pane, among others) as this round having
+        # failed something. The refusal travels in the channel built for it
+        # instead: ``refused_parent_attempt_lost`` per cell, in the record,
+        # the trajectory row and the verdict line.
+        all_attempts_completed = not failures
         deltas = compute_deltas(
             type_scores,
             parent_scores,
@@ -1144,13 +1963,44 @@ class RoundRunner:
             cost=cost,
             basis=config.cost_basis,
             comparable=comparable,
+            all_attempts_completed=all_attempts_completed,
+            parent_attempts_completed=parent_attempts_completed,
         )
-        assessments = assess_saturation(type_scores, parent_scores, floors, comparable=comparable)
+        assessments = assess_saturation(
+            type_scores,
+            parent_scores,
+            floors,
+            comparable=comparable,
+            all_attempts_completed=all_attempts_completed,
+            parent_attempts_completed=parent_attempts_completed,
+        )
         gates = {
             "eval_set_stable": comparable,
             "lineage_recorded": config.round_index == 0 or config.parent_round_id is not None,
             "noise_floor_available": bool(floors_seq),
+            # False means at least one problem is missing from the cells
+            # above. Every other number in this record is computed over the
+            # attempts that survived, so without this gate a round of ten
+            # measured problems and a round of eleven are indistinguishable
+            # on disk. ``gates`` is written into both the round record and
+            # trajectory.json's per-round ``constraints``, which is the
+            # narrowest honest channel available here — ``round_verdict``
+            # lives in metrics.py and takes only assessments, and
+            # ``write_round_summary``'s payload is fixed by results.py.
+            "all_attempts_completed": all_attempts_completed,
         }
+        # Refusals first, never summarised away — the same rule
+        # ``round_verdict`` applies to unscorable cells, applied to unmeasured
+        # problems. The verdict string is the one line an operator reads off
+        # a trajectory row, so a round missing a problem must say so there and
+        # not only in a gate flag two levels down.
+        verdict = round_verdict(assessments)
+        if failures:
+            lost = ", ".join(f.problem_id for f in failures)
+            verdict = (
+                f"{len(failures)} of {len(corpus)} attempt(s) failed and are absent from "
+                f"every cell ({lost}); {verdict}"
+            )
         record = RoundRecord(
             round_index=config.round_index,
             run_id=config.run_id,
@@ -1163,7 +2013,7 @@ class RoundRunner:
             escalation_count=escalation_count,
             created_at_ms=self._clock.now_ms(),
             gates=gates,
-            verdict=round_verdict(assessments),
+            verdict=verdict,
         )
         await self._trajectory.write_round_record(
             record, scored=scored, assessments=assessments, noise_floors=floors_seq
@@ -1230,7 +2080,38 @@ class RoundRunner:
                 # does not exist while the trajectory row for the same
                 # round recorded null. trajectory.py owns that null and is
                 # do-not-touch, so the summary is what changes to match it.
-                comparable_to_parent=None if parent is None else comparable,
+                #
+                # It is ``comparable and all_attempts_completed``, not
+                # ``comparable`` alone, and the asymmetry with the
+                # identically-named trajectory.json field is intentional
+                # rather than the drift it looks like. This field answers the
+                # question a reader of a round summary is actually asking --
+                # *may these numbers be compared with the parent's?* -- for
+                # which a matching eval-set hash is necessary and not
+                # sufficient: a round that lost an attempt reduced its cells
+                # over a strict subset of the problems the parent's cells were
+                # reduced over. trajectory.py's field is narrower by
+                # construction (it is computed from the previous *row*, which
+                # carries an eval_set_hash and knows nothing about lost
+                # attempts) and, more importantly, must stay narrow, because
+                # ``trajectory_restart`` is derived from it and a lost attempt
+                # does not restart the trajectory. The row carries this
+                # round's incomparability the other way instead: an empty
+                # ``delta`` map, ``saturation`` entries reading
+                # ``refused_attempt_lost``, and
+                # ``constraints.all_attempts_completed: false``.
+                #
+                # The parent's own completeness is in this conjunction for the
+                # same reason ``not failures`` is: the question is whether
+                # these numbers may be compared with the parent's, and a
+                # parent that measured a subset of the corpus (or is silent
+                # about whether it did) makes the answer no from the other
+                # side of the subtraction.
+                comparable_to_parent=(
+                    None
+                    if parent is None
+                    else (comparable and not failures and parent_attempts_completed is True)
+                ),
                 cells=cells,
                 wall_clock_seconds=elapsed,
                 tokens=cost.tokens,
@@ -1238,18 +2119,41 @@ class RoundRunner:
                 escalations=escalation_count,
                 verdict=record.verdict,
             )
-            await render_round_plot(output_dir, cells)
-            runs = sorted(
-                f"{self._trajectory.loop_dir.name}/{output_dir.name}/attempts/{o.problem.id}"
-                for o in outcomes
-            )
-            await write_viewer_config(self._trajectory.loop_dir.parent, runs=runs)
+            # Viewer config ahead of the plot, deliberately — this used to be
+            # last. ``render_round_plot`` does ``float(cell["mean_score"])``
+            # with no guard, so a missing/non-numeric mean_score raises and
+            # everything after it in this block never runs; with the plot
+            # last, that took the viewer config down too, and an unrelated
+            # matplotlib problem left the desktop pane pointed at a stale (or
+            # in round 0's case, nonexistent) run list. Both writes here are
+            # cheap, structural JSON — nothing here should ever raise, so the
+            # plot (the one call in this block with a genuine, known failure
+            # mode) is what moves, not these.
+            await write_viewer_config(self._trajectory.loop_dir.parent, runs=self._viewer_runs())
         except Exception:
             logger.exception(
                 "research.results.round_emit_failed",
                 round_index=config.round_index,
                 run_id=config.run_id,
             )
+        else:
+            # Isolated in its own try/except rather than folded into the one
+            # above: render_round_plot's known failure mode (unguarded
+            # float(cell["mean_score"])) is a different fault than a summary
+            # or viewer-config write failing outright, and collapsing both
+            # into "round_emit_failed" would read, on an overnight log, as
+            # "this round's results never landed" when the JSON in fact did.
+            # `else` rather than unconditional: cells is only guaranteed
+            # bound if the try above completed without raising.
+            try:
+                await render_round_plot(output_dir, cells)
+            except Exception:
+                logger.exception(
+                    "research.results.round_plot_failed",
+                    round_index=config.round_index,
+                    run_id=config.run_id,
+                    directory=str(output_dir),
+                )
 
         return RoundOutcome(
             record=record,
@@ -1257,4 +2161,5 @@ class RoundRunner:
             scored=scored,
             assessments=assessments,
             trajectory_row=row,
+            failures=failures,
         )

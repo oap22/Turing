@@ -26,6 +26,15 @@ an SVG without opening the desktop app.
 absent from every point is skipped, not rendered as a blank figure — an empty
 chart in the images pane reads as "the run produced nothing," which is a
 different and false claim from "there was nothing to plot yet."
+
+The corollary is a caller's problem, not this module's: *skipped* means the
+file on disk is left exactly as it was, so a second attempt rendering into a
+directory a first attempt already wrote can leave one attempt's chart beside
+the other's. Blanking a skipped plot here would trade a false claim for a
+worse one, so the runner rotates the previous attempt's plots into
+``prior-N/`` before a re-drive starts instead — see
+``runner._rotate_stale_metrics`` and :data:`PLOT_FILENAMES`, which is exported
+for exactly that call site.
 """
 
 from __future__ import annotations
