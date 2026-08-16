@@ -410,6 +410,27 @@ def _commit_staged_rotation(metrics_dir: Path, staging_dir: Path) -> None:
     it exists complete (rotation committed). There is no third, half-written
     state to observe — which is the property three sequential per-file
     renames into a pre-existing ``prior-N/`` never had.
+
+    **The merge above has no generation-identity check and no cross-process
+    lock.** A name already staged is trusted to belong to the same rotation
+    as whatever this call is about to move in — nothing here reads either
+    side's chain header to confirm that. That is safe only because this
+    function has exactly one call site, :func:`_rotate_stale_metrics`, which
+    itself has exactly one call site, :meth:`RoundRunner.run_attempt`, and
+    the whole sequence — self-heal, staging, commit — runs synchronously
+    with no ``await`` between the moment it decides a rotation is needed and
+    the moment it constructs the new attempt's :class:`~turing.research.loop.results.MetricsWriter`.
+    At most one rotation is ever in flight per ``metrics_dir`` *within this
+    process*; a second process racing the same ``metrics_dir`` — two
+    ``turing`` instances pointed at one results tree — is out of scope here
+    and not defended against. In that shape the final ``staging_dir.rename``
+    can land on a ``prior-N/`` a concurrent commit picked at the same
+    moment: on POSIX that rename fails with ``OSError`` (renaming onto an
+    existing non-empty directory is refused) rather than silently merging or
+    clobbering the other process's files, so the failure is loud and costs
+    exactly the one attempt whose rotation lost the race — it does not
+    corrupt the winner's ``prior-N/``. Adding a real lock is filed
+    separately; nothing here should be read as one.
     """
     for name in _ROTATED_NAMES:
         src = metrics_dir / name
@@ -492,8 +513,28 @@ def _rotate_stale_metrics(metrics_dir: Path) -> None:
     only misleading while it sits where the *current* attempt's chart belongs;
     under ``prior-N/``, beside the exact metrics it was drawn from, it is the
     superseded generation's evidence and is labelled as such by its path.
+
+    **A non-directory at** :data:`_STAGING_DIR_NAME` **is a loud, named
+    error, not a silent no-op.** Nothing else in this module ever creates a
+    plain file there — the only writer of that path is ``staging_dir.mkdir``,
+    a few lines below, and its target is always a directory. So a file
+    sitting at that name is foreign: manual interference, a different tool,
+    a corrupted checkout. Checking only ``staging_dir.is_dir()`` before
+    self-healing would treat that shape exactly like "no rotation in
+    progress" and fall straight through into ``staging_dir.mkdir(...)``,
+    which raises a bare ``FileExistsError`` naming nothing about what is
+    actually wrong or what the operator should do about it. Refusing here,
+    by name, keeps that failure legible instead of trading one confusing
+    exception for another.
     """
     staging_dir = metrics_dir / _STAGING_DIR_NAME
+    if staging_dir.exists() and not staging_dir.is_dir():
+        raise ContractViolationError(
+            f"{staging_dir} exists and is not a directory; {_STAGING_DIR_NAME!r} is "
+            "reserved for the hidden staging directory a rotation-in-progress builds "
+            "its destination in, and must be either a directory or absent — remove or "
+            "rename this file before retrying"
+        )
     if staging_dir.is_dir():
         _commit_staged_rotation(metrics_dir, staging_dir)
 
@@ -1880,6 +1921,7 @@ class RoundRunner:
                 match.parent.relative_to(results_root).as_posix()
                 for match in loop_dir.glob("round-*/attempts/**/metrics.jsonl")
                 if not _PRIOR_DIR_PATTERN.fullmatch(match.parent.name)
+                and match.parent.name != _STAGING_DIR_NAME
             }
         )
 

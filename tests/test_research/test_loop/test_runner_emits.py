@@ -40,6 +40,7 @@ from turing.research.loop.integrity import (
 from turing.research.loop.metrics import SaturationVerdict
 from turing.research.loop.noise_floor import NoiseFloorConfig, NoiseFloorRunner
 from turing.research.loop.protocols import SolverStep
+from turing.research.loop.results import MetricsWriter as results_MetricsWriter
 from turing.research.loop.results import Outcome
 from turing.research.loop.results import _validate_scored_metric as results_validate
 from turing.research.loop.runner import PassCriterion
@@ -58,6 +59,8 @@ from .conftest import (
     make_problem,
     make_runner,
 )
+from .test_results import _header as results_header
+from .test_results import _line as results_line
 from .test_runner import floors_for
 
 if TYPE_CHECKING:
@@ -867,6 +870,111 @@ class TestIntegrityAgainstARealRun:
         assert chain_verdict.ok is True, chain_verdict.reason
         reconcile_verdict = await reconcile_summary(metrics_dir)
         assert reconcile_verdict.ok is True, reconcile_verdict.mismatches
+
+
+# --------------------------------------------------------------------------- #
+# RES-19 adversarial review — ``.rotating/`` is a rotation in progress, never
+# a run, and its presence as anything other than a directory is a loud, named
+# error.
+# --------------------------------------------------------------------------- #
+
+
+class TestStagingDirectoryNeverReportsAsARun:
+    """``_STAGING_DIR_NAME`` (``.rotating``) must stay invisible to every code
+    path that discovers runs by walking the results tree, and a foreign
+    non-directory sitting at that name must fail loudly rather than silently
+    or with a bare ``FileExistsError``.
+    """
+
+    async def test_find_runs_skips_a_staging_directory_beside_a_live_run(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """A partially staged trio must not make an honest, finished run look
+        broken.
+
+        ``run-a/metrics.jsonl`` here is a real, complete attempt (trio plus
+        summary, verifies OK). ``run-a/.rotating/metrics.jsonl`` stands in for
+        the leftover a crash mid-rotation leaves behind: a real chain, honest
+        as far as it goes, but with no summary beside it because rotation
+        never got to commit it. Before the fix, ``find_runs``'s
+        ``rglob("metrics.jsonl")`` walk reports the staging directory as a
+        second run, and that second, summary-less "run" drags the whole
+        root's verdict down to INCOMPLETE even though nothing here is
+        actually wrong.
+        """
+        from turing.research.loop.runner import _STAGING_DIR_NAME
+
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        config = make_config(pass_criteria={"s1": PassCriterion(min_score=2.0)})
+        outcome = await runner.run_attempt(
+            make_problem("s1", scores=(1.0, 5.0)), config, output_dir=store.round_dir(0)
+        )
+        assert outcome.attempt.state is AttemptState.PASSED
+
+        run_dir = store.round_dir(0) / "attempts" / "s1"
+        assert (await verify_cli.verify_run(run_dir)).state is verify_cli.RunState.OK
+
+        staging_dir = run_dir / _STAGING_DIR_NAME
+        leftover = results_MetricsWriter(
+            staging_dir / "metrics.jsonl",
+            header=results_header(attempt_id="stale-generation", problem_id="s1"),
+        )
+        await leftover.append(results_line())
+
+        attempts_root = run_dir.parent
+        assert verify_cli.find_runs(attempts_root) == [run_dir]
+
+        exit_code = await _verify_exit_code(attempts_root)
+        assert exit_code == verify_cli.EXIT_OK
+
+    async def test_viewer_runs_omits_a_staging_directory(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """``.viewer.json`` must not leak ``.rotating`` into the desktop's run
+        list either -- the comment above ``_PRIOR_DIR_PATTERN`` already
+        promises this filter keeps the staging directory invisible.
+        """
+        from turing.research.loop.runner import _STAGING_DIR_NAME
+
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        await runner.run_round([make_problem("s1")], make_config())
+
+        run_dir = store.round_dir(0) / "attempts" / "s1"
+        staging_dir = run_dir / _STAGING_DIR_NAME
+        leftover = results_MetricsWriter(
+            staging_dir / "metrics.jsonl",
+            header=results_header(attempt_id="stale-generation", problem_id="s1"),
+        )
+        await leftover.append(results_line())
+
+        viewer_runs = runner._viewer_runs()
+        assert viewer_runs == ["loop-test-loop/round-00/attempts/s1"]
+        assert not any(_STAGING_DIR_NAME in entry for entry in viewer_runs)
+
+    async def test_a_regular_file_named_rotating_is_a_named_contract_violation(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """``.rotating`` must be a directory or absent -- never a plain file.
+
+        Before the fix, a foreign file at this name made
+        ``_rotate_stale_metrics`` raise a bare ``FileExistsError`` out of
+        ``staging_dir.mkdir(...)``, naming nothing about what the caller
+        should do about it. It must instead raise
+        :class:`ContractViolationError` naming the offending path.
+        """
+        from turing.research.loop.runner import _STAGING_DIR_NAME, _rotate_stale_metrics
+
+        problem = make_problem("s1")
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        config = make_config()
+        await runner.run_attempt(problem, config, output_dir=store.round_dir(0))
+
+        metrics_dir = store.round_dir(0) / "attempts" / "s1"
+        staging_dir = metrics_dir / _STAGING_DIR_NAME
+        staging_dir.write_text("not a directory")
+
+        with pytest.raises(ContractViolationError, match=r"\.rotating"):
+            _rotate_stale_metrics(metrics_dir)
 
 
 # --------------------------------------------------------------------------- #

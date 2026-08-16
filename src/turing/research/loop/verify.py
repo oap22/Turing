@@ -96,6 +96,7 @@ from turing.research.loop.integrity import (
     reconcile_summary,
     verify_metrics_chain,
 )
+from turing.research.loop.runner import _STAGING_DIR_NAME
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -187,8 +188,28 @@ def find_runs(root: Path) -> list[Path]:
     like pointing it at a whole results root — the caller does not need to
     know which kind of directory it was handed. Sorted for a deterministic
     report across runs of this tool.
+
+    **Skips every candidate under a** :data:`~turing.research.loop.runner._STAGING_DIR_NAME`
+    **directory.** ``runner._rotate_stale_metrics`` builds a rotation's
+    destination inside ``attempts/<problem-id>/.rotating/`` before committing
+    it, in one rename, to a numbered ``prior-N/``; a crash in that window can
+    leave a real, honest ``metrics.jsonl`` sitting there with no summary
+    beside it, because the commit that would give it one never landed. That
+    directory is a rotation in progress, not a run — reporting it as one used
+    to make an otherwise complete, verified attempt look INCOMPLETE (or, with
+    a genuinely broken leftover, FAILED) on the strength of a file nobody
+    but ``_rotate_stale_metrics`` was ever meant to read, and that the very
+    next attempt into this directory heals on its own. The check is by path
+    *segment*, not prefix, so a legitimate ``prior-N/`` — which this walk
+    must keep finding — is never caught by it.
     """
-    return sorted({path.parent for path in root.rglob("metrics.jsonl")})
+    return sorted(
+        {
+            path.parent
+            for path in root.rglob("metrics.jsonl")
+            if _STAGING_DIR_NAME not in path.relative_to(root).parts
+        }
+    )
 
 
 def _combine(chain: ChainVerdict, reconcile: ReconcileVerdict) -> RunState:

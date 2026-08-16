@@ -993,6 +993,26 @@ constructing a writer now also refuses over a non-empty `metrics.chain.json`
 with no `metrics.jsonl` beside it, since that shape is exactly what the
 residual staging window can (briefly) leave behind.
 
+**`.rotating/` is a benign staging artifact, not a run.** The hidden
+directory the paragraph above stages a rotation's destination into is named
+`attempts/<problem-id>/.rotating/`. Between the moment it is created and the
+moment it is committed onto its numbered `prior-N/` name, it can hold a real,
+honest `metrics.jsonl` — moved there mid-rotation — with no `metrics.json`
+summary beside it, because the commit that would give it one has not landed
+yet. That is expected, not damage: it is drained by the very next attempt
+into the same `attempts/<problem-id>/` directory, which finishes committing
+any leftover `.rotating/` before it does anything else (see above), and it is
+never left behind by a healthy process — only by one that was killed inside
+the staging window. Both tools that discover runs by walking the results
+tree know to skip it: `verify`'s `find_runs` and the desktop's
+`.viewer.json`-writing `_viewer_runs` both exclude any path with a
+`.rotating` segment, the same way they already exclude `prior-N/` (by name,
+not by depth). An operator who finds a `.rotating/` directory sitting next to
+a live attempt does not need to clean it up — the next re-drive does that on
+its own — and should worry only if it is present as anything *other* than a
+directory, which `_rotate_stale_metrics` refuses outright, by name, as a
+`ContractViolationError` rather than a bare `FileExistsError`.
+
 **Telling a re-drive apart from an alteration.** `verify`'s directory walk
 finds *every* directory anywhere under `<path>` containing a file literally
 named `metrics.jsonl`, at any depth — which means it walks into `prior-N/`
