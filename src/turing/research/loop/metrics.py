@@ -229,9 +229,16 @@ def build_type_scores(scored: Sequence[ScoredProblem]) -> tuple[TypeScore, ...]:
     Returns one :class:`TypeScore` per cell, ordered by type then split so the
     trajectory is byte-stable across runs. **There is no corpus-wide return
     value and there must never be one.**
+
+    A cell's mean is only a number if every score in it is on the same scale,
+    so a cell that mixes ``score_scale`` values is refused outright. Widening
+    which scales exist (declared floors, RES-15) must never make two of them
+    poolable — flooring a ``val_loss`` problem beside a ``speedup`` problem
+    would average seconds with losses and call it a score.
     """
     buckets: dict[Cell, dict[str, float]] = {}
     passes: dict[Cell, int] = {}
+    scales: dict[Cell, tuple[str, str]] = {}
     for item in scored:
         cell = (item.problem_type, item.split)
         bucket = buckets.setdefault(cell, {})
@@ -239,6 +246,13 @@ def build_type_scores(scored: Sequence[ScoredProblem]) -> tuple[TypeScore, ...]:
             raise ContractViolationError(
                 f"problem {item.problem_id!r} scored twice in one round; each problem "
                 "contributes to its cell exactly once"
+            )
+        first = scales.setdefault(cell, (item.problem_id, item.score_scale))
+        if first[1] != item.score_scale:
+            raise ContractViolationError(
+                f"cell {cell[0].value}/{cell[1].value} mixes score scales: problem "
+                f"{first[0]!r} scores on {first[1]!r} but {item.problem_id!r} scores on "
+                f"{item.score_scale!r}; scores on different scales are never averaged"
             )
         bucket[item.problem_id] = item.score
         passes[cell] = passes.get(cell, 0) + (1 if item.passed_correctness else 0)
