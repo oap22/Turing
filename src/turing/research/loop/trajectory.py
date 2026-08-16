@@ -41,20 +41,26 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from turing.research.contracts import ContractViolationError
+from turing.research.contracts import (
+    Attempt,
+    AttemptState,
+    Cap,
+    CapConsumption,
+    ContractViolationError,
+    VerificationResult,
+)
 from turing.research.loop.protocols import SystemClock
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
-    from pathlib import Path
 
     from turing.research.contracts import (
-        Attempt,
-        Cap,
         EscalationDecision,
         EscalationRequest,
         RoundRecord,
@@ -74,10 +80,14 @@ logger = structlog.get_logger(__name__)
 __all__ = [
     "TRAJECTORY_FILENAME",
     "TRAJECTORY_SCHEMA_VERSION",
+    "AttemptDisposition",
     "AttemptLog",
+    "RunIdentity",
     "StepLog",
+    "StoredAttempt",
     "TrajectoryStore",
     "cell_key",
+    "decode_attempt_checkpoint",
     "encode_assessment",
     "encode_noise_floor",
     "encode_round_record",
@@ -182,6 +192,160 @@ class AttemptLog:
             "workspace_path": self.workspace_path,
             "steps": [s.to_json() for s in self.steps],
         }
+
+
+# --------------------------------------------------------------------------- #
+# Resume: what is already on disk, and what counts as done
+# --------------------------------------------------------------------------- #
+
+
+class AttemptDisposition(str, Enum):  # noqa: UP042
+    """What a restart may do with an attempt it finds already on disk.
+
+    The four values are the whole resume decision. See
+    :meth:`TrajectoryStore.load_stored_attempt` for the rules that pick one.
+    """
+
+    #: Nothing usable for this run — drive the attempt from scratch.
+    ABSENT = "absent"
+    #: Finished; reuse its outcome and spend no compute on it.
+    COMPLETE = "complete"
+    #: Interrupted mid-flight; carry on from the checkpoint.
+    RESUMABLE = "resumable"
+    #: Suspended on an operator decision that has not arrived; re-enter the
+    #: wait rather than re-driving the attempt.
+    AWAITING_DECISION = "awaiting_decision"
+
+
+@dataclass(frozen=True, slots=True)
+class RunIdentity:
+    """Which run a stored attempt would have to belong to, to be reusable.
+
+    Resume reuses *this* run's own work. A checkpoint left by a different
+    ``run_id``, a different ``seed``, or a corpus with a different
+    ``eval_set_hash`` is a **previous generation**, not a resume point:
+    adopting its numbers would report a measurement this run never took. That
+    distinction is what keeps the sanctioned re-drive workflows — a new round
+    id, a re-measured baseline — from silently inheriting the old numbers, and
+    it is the same identity comparison
+    ``runner._read_crashed_attempt_record`` makes for the metrics chain.
+    """
+
+    round_id: str
+    seed: int
+    eval_set_hash: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class StoredAttempt:
+    """One attempt as it exists on disk, with the resume question answered."""
+
+    problem_id: str
+    disposition: AttemptDisposition
+    #: The rebuilt checkpoint. ``None`` only for :attr:`AttemptDisposition.ABSENT`.
+    attempt: Attempt | None = None
+    steps: tuple[StepLog, ...] = ()
+    escalation_ids: tuple[str, ...] = ()
+    attempt_log_path: Path | None = None
+    #: Why this disposition, in one line, for the log an operator greps at 3am.
+    reason: str = ""
+
+    @property
+    def is_complete(self) -> bool:
+        return self.disposition is AttemptDisposition.COMPLETE
+
+    @property
+    def is_resumable(self) -> bool:
+        return self.disposition in (
+            AttemptDisposition.RESUMABLE,
+            AttemptDisposition.AWAITING_DECISION,
+        )
+
+    @property
+    def best_result(self) -> VerificationResult | None:
+        """The verification this attempt reported, as the checkpoint recorded it.
+
+        The runner writes ``result=best`` onto every checkpoint it takes, so
+        the terminal checkpoint carries exactly the result the attempt would
+        have returned. ``None`` is honest — the attempt produced no usable
+        verification — and :meth:`ScoredProblem.from_result` floors it.
+        """
+        return None if self.attempt is None else self.attempt.result
+
+
+def _decode_result(payload: Any) -> VerificationResult | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise ContractViolationError("an attempt checkpoint's result must be a JSON object")
+    return VerificationResult(
+        problem_id=payload["problem_id"],
+        verifier_id=payload["verifier_id"],
+        score=payload["score"],
+        passed_correctness=payload["passed_correctness"],
+        score_scale=payload["score_scale"],
+        raw_measurements=payload.get("raw_measurements", {}),
+        detail=payload.get("detail", ""),
+    )
+
+
+def decode_attempt_checkpoint(payload: Mapping[str, Any]) -> Attempt:
+    """Rebuild the :class:`~turing.research.contracts.Attempt` a checkpoint holds.
+
+    The inverse of :meth:`TrajectoryStore.write_attempt_checkpoint`, and the
+    whole of resume from a caller's point of view: no replay, no
+    reconstruction of intermediate state. Construction goes through
+    :class:`~turing.research.contracts.Attempt`, so its invariants (notably
+    "``ABANDONED`` requires an ``escalation_id``") are re-checked on the way
+    back in rather than trusted from the file.
+
+    Deliberately **not** shared with
+    :func:`turing.research.solver.checkpoints.attempt_from_json`, which
+    decodes the same shape: :mod:`turing.research.loop` has no import
+    dependency on :mod:`turing.research.solver` and gains nothing by growing
+    one for twenty lines.
+    """
+    return Attempt(
+        attempt_id=payload["attempt_id"],
+        problem_id=payload["problem_id"],
+        round_id=payload["round_id"],
+        seed=payload["seed"],
+        workspace_path=Path(payload["workspace_path"]),
+        cap=Cap(
+            max_steps=payload["cap"]["max_steps"],
+            max_tokens=payload["cap"]["max_tokens"],
+            max_wall_clock_seconds=payload["cap"]["max_wall_clock_seconds"],
+            extension_count=payload["cap"].get("extension_count", 0),
+        ),
+        consumed=CapConsumption(
+            steps=payload["consumed"]["steps"],
+            tokens=payload["consumed"]["tokens"],
+            wall_clock_seconds=payload["consumed"]["wall_clock_seconds"],
+        ),
+        state=AttemptState(payload["state"]),
+        step_index=payload["step_index"],
+        checkpoint_seq=payload["checkpoint_seq"],
+        resume_token=payload.get("resume_token"),
+        started_at_ms=payload.get("started_at_ms"),
+        updated_at_ms=payload.get("updated_at_ms"),
+        result=_decode_result(payload.get("result")),
+        escalation_id=payload.get("escalation_id"),
+    )
+
+
+def _decode_step_log(payload: Mapping[str, Any]) -> StepLog:
+    return StepLog(
+        index=payload["index"],
+        at_ms=payload["at_ms"],
+        tokens=payload["tokens"],
+        wall_clock_seconds=payload["wall_clock_seconds"],
+        note=payload.get("note", ""),
+        made_progress=payload.get("made_progress", False),
+        escalate_requested=payload.get("escalate_requested"),
+        score=payload.get("score"),
+        passed_correctness=payload.get("passed_correctness"),
+        verifier_error=payload.get("verifier_error"),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -473,20 +637,49 @@ class TrajectoryStore:
         await asyncio.to_thread(_write_json, path, log.to_json())
         return path
 
-    async def write_attempt_checkpoint(self, attempt: Attempt, *, output_dir: Path) -> Path:
+    def attempt_checkpoint_path(self, problem_id: str, *, output_dir: Path) -> Path:
+        return output_dir / "checkpoints" / f"{problem_id}.json"
+
+    async def write_attempt_checkpoint(
+        self,
+        attempt: Attempt,
+        *,
+        output_dir: Path,
+        eval_set_hash: str = "",
+    ) -> Path:
         """Persist the latest immutable checkpoint of an attempt.
 
         Reloading this file *is* resume: an interruption — a closed
         subscription window, a killed process — costs the remainder of the
         attempt, not the attempt. Written after every step and, critically,
         before the loop suspends on an escalation.
+
+        Two fields exist for the *reader* rather than the writer, and both were
+        added when resume stopped being a story and became a code path
+        (RES-17):
+
+        * The full ``result`` — ``problem_id``, ``verifier_id`` and
+          ``raw_measurements`` alongside the score. The operator-facing
+          rendering in ``escalation.encode_request`` keeps only the four
+          human-readable fields, which is right there and wrong here: a
+          resumed round reports a skipped attempt's score straight out of this
+          file, so the file has to round-trip a whole
+          :class:`~turing.research.contracts.VerificationResult` rather than a
+          summary of one.
+        * ``eval_set_hash``, so a checkpoint cannot be reused by a run
+          measuring a *different corpus*. ``run_id`` and ``seed`` alone do not
+          catch it: the noise floor's per-seed run id is derived
+          deterministically as ``<run_id>-seed-<n>``, so a corpus edited
+          between two invocations of the same floor repeats both. See
+          :class:`RunIdentity`.
         """
-        path = output_dir / "checkpoints" / f"{attempt.problem_id}.json"
+        path = self.attempt_checkpoint_path(attempt.problem_id, output_dir=output_dir)
         payload = {
             "attempt_id": attempt.attempt_id,
             "problem_id": attempt.problem_id,
             "round_id": attempt.round_id,
             "seed": attempt.seed,
+            "eval_set_hash": eval_set_hash,
             "workspace_path": str(attempt.workspace_path),
             "state": attempt.state.value,
             "step_index": attempt.step_index,
@@ -509,14 +702,244 @@ class TrajectoryStore:
             "result": None
             if attempt.result is None
             else {
+                "problem_id": attempt.result.problem_id,
+                "verifier_id": attempt.result.verifier_id,
                 "score": attempt.result.score,
                 "score_scale": attempt.result.score_scale,
                 "passed_correctness": attempt.result.passed_correctness,
+                "raw_measurements": dict(attempt.result.raw_measurements),
                 "detail": attempt.result.detail,
             },
         }
         await asyncio.to_thread(_write_json, path, payload)
         return path
+
+    # -- resume ------------------------------------------------------------ #
+
+    async def load_stored_attempt(
+        self,
+        problem_id: str,
+        *,
+        output_dir: Path,
+        identity: RunIdentity,
+    ) -> StoredAttempt:
+        """What is already on disk for one ``(run, problem)``, and what to do with it.
+
+        **Complete — reuse the outcome, spend nothing.** All of:
+
+        * the checkpoint decodes and names this ``identity``
+          (``round_id`` / ``seed`` / ``eval_set_hash``);
+        * its state is terminal — ``PASSED``, ``FAILED_WITHIN_CAP`` or
+          ``ABANDONED`` (:data:`~turing.research.contracts.TERMINAL_ATTEMPT_STATES`);
+        * the attempt log ``attempts/<problem-id>.json`` is beside it;
+        * the attempt summary ``attempts/<problem-id>/metrics.json`` is beside
+          it.
+
+        The last two are not belt-and-braces. ``metrics.json`` is written once,
+        at the end of ``run_attempt``, and its absence beside an intact chain
+        is exactly the shape ``python -m turing.research.loop.verify`` reports
+        ``INCOMPLETE`` — a process killed between its last append and its
+        summary write. Skipping such an attempt would have this resume path
+        call *finished* what the pre-writeup gate calls *unfinished*, and the
+        two must not disagree about the same directory. So a terminal
+        checkpoint with no finished record on disk is re-driven: the honest
+        reading of "we cannot tell what it reported".
+
+        **The three states that are deliberately not complete:**
+
+        * ``PAUSED`` / ``PENDING`` / ``RUNNING`` / ``VERIFYING`` →
+          :attr:`AttemptDisposition.RESUMABLE`. This is the load-bearing case:
+          subscription windows close mid-attempt, and an interruption must
+          cost the remainder of the attempt, not the attempt.
+        * ``ESCALATED`` with its request file still on disk →
+          :attr:`AttemptDisposition.AWAITING_DECISION`. ``ESCALATED`` is
+          neither terminal nor resumable — only an operator moves it — so the
+          restart re-enters the wait on that same request. Re-driving would
+          both throw away the work and raise a second escalation for one
+          event, inflating driving function #4.
+        * anything unreadable, foreign, or contradictory →
+          :attr:`AttemptDisposition.ABSENT`, i.e. drive it. Every refusal
+          direction here is towards *spending compute*, never towards
+          adopting a number this run did not measure.
+
+        ``ABANDONED`` counts as complete, and that is a deliberate reading of
+        the state rather than an oversight: it is reachable only through an
+        operator ``ABANDON`` verdict, so re-driving it would re-ask a question
+        the operator has already answered.
+        """
+        return await asyncio.to_thread(self._read_stored_attempt, problem_id, output_dir, identity)
+
+    async def load_completed_attempt(
+        self,
+        round_index: int,
+        problem_id: str,
+        *,
+        identity: RunIdentity,
+    ) -> StoredAttempt | None:
+        """The finished attempt for ``(round, problem)``, or ``None``.
+
+        The narrow, round-shaped form of :meth:`load_stored_attempt`: it
+        answers only "is there something here this round may reuse instead of
+        re-driving?", and ``None`` covers every reason the answer is no —
+        nothing on disk, a previous generation's work, an interrupted attempt,
+        an open escalation, a terminal checkpoint whose record never finished.
+        The completeness rules, in full, are in
+        :meth:`load_stored_attempt`.
+        """
+        stored = await self.load_stored_attempt(
+            problem_id, output_dir=self.round_dir(round_index), identity=identity
+        )
+        return stored if stored.is_complete else None
+
+    async def list_completed_seeds(
+        self,
+        identities: Mapping[int, RunIdentity],
+        problem_ids: Sequence[str],
+    ) -> tuple[int, ...]:
+        """Which noise-floor seeds already measured **every** problem, completely.
+
+        A seed is all-or-nothing here, and that follows from what a floor is
+        for rather than from convenience. ``NoiseFloorRunner.run`` refuses a
+        seed that measured a strict subset of the corpus — the spread across
+        seeds would be part run-to-run variance and part "which problems ran"
+        — so "this seed is done" can only mean *every* problem in
+        ``problem_ids`` has a complete attempt under
+        :meth:`noise_floor_seed_dir`. A seed with some problems finished is
+        not listed; it is driven, and the per-problem skip inside
+        ``run_attempts`` is what keeps its finished attempts from being paid
+        for twice.
+
+        ``identities`` is keyed by seed because each seed run has its own
+        ``run_id`` (``<run_id>-seed-<n>``); the eval-set hash is shared.
+        """
+        completed: list[int] = []
+        for seed, identity in identities.items():
+            output_dir = self.noise_floor_seed_dir(seed)
+            stored = [
+                await self.load_stored_attempt(problem_id, output_dir=output_dir, identity=identity)
+                for problem_id in problem_ids
+            ]
+            if stored and all(item.is_complete for item in stored):
+                completed.append(seed)
+        return tuple(sorted(completed))
+
+    def _read_stored_attempt(
+        self,
+        problem_id: str,
+        output_dir: Path,
+        identity: RunIdentity,
+    ) -> StoredAttempt:
+        """The blocking half of :meth:`load_stored_attempt`, run in a thread."""
+
+        def absent(reason: str) -> StoredAttempt:
+            return StoredAttempt(
+                problem_id=problem_id,
+                disposition=AttemptDisposition.ABSENT,
+                reason=reason,
+            )
+
+        checkpoint_path = self.attempt_checkpoint_path(problem_id, output_dir=output_dir)
+        try:
+            raw = _read_json(checkpoint_path)
+        except (OSError, json.JSONDecodeError) as exc:
+            return absent(f"{checkpoint_path} could not be read: {exc}")
+        if raw is None:
+            return absent("no checkpoint on disk")
+        if not isinstance(raw, dict):
+            return absent(f"{checkpoint_path} is not an attempt checkpoint")
+        try:
+            attempt = decode_attempt_checkpoint(raw)
+        except (KeyError, TypeError, ValueError, ContractViolationError) as exc:
+            return absent(f"{checkpoint_path} could not be decoded: {type(exc).__name__}: {exc}")
+
+        stored_identity = RunIdentity(
+            round_id=attempt.round_id,
+            seed=attempt.seed,
+            eval_set_hash=str(raw.get("eval_set_hash", "")),
+        )
+        if attempt.problem_id != problem_id or stored_identity != identity:
+            return absent(
+                f"checkpoint belongs to a different run "
+                f"(problem_id={attempt.problem_id!r}, round_id={stored_identity.round_id!r}, "
+                f"seed={stored_identity.seed!r}, "
+                f"eval_set_hash={stored_identity.eval_set_hash!r})"
+            )
+
+        log_path = output_dir / "attempts" / f"{problem_id}.json"
+        steps: tuple[StepLog, ...] = ()
+        escalation_ids: tuple[str, ...] = ()
+        log_raw: Any = None
+        try:
+            log_raw = _read_json(log_path)
+        except (OSError, json.JSONDecodeError):
+            log_raw = None
+        if isinstance(log_raw, dict):
+            try:
+                steps = tuple(
+                    _decode_step_log(entry)
+                    for entry in log_raw.get("steps", [])
+                    if isinstance(entry, dict)
+                )
+            except (KeyError, TypeError, ValueError):
+                steps = ()
+            escalation_ids = tuple(
+                str(value) for value in log_raw.get("escalation_ids", []) if isinstance(value, str)
+            )
+
+        def found(
+            disposition: AttemptDisposition, *, reason: str, log: Path | None
+        ) -> StoredAttempt:
+            return StoredAttempt(
+                problem_id=problem_id,
+                disposition=disposition,
+                attempt=attempt,
+                steps=steps,
+                escalation_ids=escalation_ids,
+                attempt_log_path=log,
+                reason=reason,
+            )
+
+        if attempt.is_terminal:
+            if not isinstance(log_raw, dict):
+                return absent(
+                    f"terminal checkpoint ({attempt.state.value}) with no readable attempt "
+                    f"log at {log_path}; the attempt did not finish reporting"
+                )
+            summary_path = output_dir / "attempts" / problem_id / "metrics.json"
+            if not summary_path.exists():
+                return absent(
+                    f"terminal checkpoint ({attempt.state.value}) with no summary at "
+                    f"{summary_path}; verify calls that directory INCOMPLETE and so does this"
+                )
+            return found(
+                AttemptDisposition.COMPLETE,
+                reason=f"terminal state {attempt.state.value} with a finished record on disk",
+                log=log_path,
+            )
+
+        if attempt.state is AttemptState.ESCALATED:
+            if not attempt.escalation_id:
+                return absent("ESCALATED checkpoint carries no escalation_id to re-open")
+            request_path = output_dir / "escalations" / f"{attempt.escalation_id}.json"
+            if not request_path.exists():
+                return absent(
+                    f"ESCALATED checkpoint names request {attempt.escalation_id!r} but "
+                    f"{request_path} is missing"
+                )
+            return found(
+                AttemptDisposition.AWAITING_DECISION,
+                reason=f"suspended on operator request {attempt.escalation_id}",
+                log=log_path if isinstance(log_raw, dict) else None,
+            )
+
+        if attempt.is_resumable:
+            return found(
+                AttemptDisposition.RESUMABLE,
+                reason=f"interrupted in {attempt.state.value} at step {attempt.step_index}",
+                log=log_path if isinstance(log_raw, dict) else None,
+            )
+
+        return absent(f"checkpoint state {attempt.state.value} is neither terminal nor resumable")
 
     async def write_escalation(
         self,
