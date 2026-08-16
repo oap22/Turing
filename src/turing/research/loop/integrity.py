@@ -113,7 +113,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from turing.research.contracts import ContractViolationError
+from turing.research.contracts import (
+    DIAGNOSTIC_KEY_PREFIX,
+    RESERVED_METRICS_KEYS,
+    ContractViolationError,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -148,36 +152,22 @@ _SIDECAR_REQUIRED_KEYS = frozenset({"version", "header", "seed", "final", "lines
 
 #: Every key ``MetricsLine.to_json`` (``results.py``) emits itself, i.e. the
 #: reserved axis/meta fields plus every core per-step field it writes before
-#: the caller's own ``metrics``/``diagnostics`` entries. This list is copied
-#: by hand rather than imported from ``results.py``: ``results.py`` imports
-#: *this* module (:func:`chain_next` seeds its hash chain), so importing back
-#: would be circular. A key renamed in ``MetricsLine.to_json`` and not
-#: mirrored here would make :func:`reconcile_summary` misclassify a core
-#: field as a score-series value or vice versa — keep the two lists in sync
-#: by hand if that method ever changes.
-_CORE_LINE_KEYS = frozenset(
-    {
-        "step",
-        "total_steps",
-        "ts",
-        "outcome_code",
-        "correctness_pass",
-        "tokens_used",
-        "tokens_cap",
-        "steps_cap",
-        "consumed_steps",
-        "wall_clock_s",
-        "wall_clock_cap_s",
-        "cap_extensions",
-        "step_wall_clock_s",
-        "verify_wall_clock_s",
-        "step_tokens",
-        "made_progress",
-        "progress",
-    }
-)
+#: the caller's own ``metrics``/``diagnostics`` entries. A key renamed in
+#: ``MetricsLine.to_json`` and not mirrored here would make
+#: :func:`reconcile_summary` misclassify a core field as a score-series value
+#: or vice versa.
+#:
+#: This used to be a hand-copy, because ``results.py`` imports *this* module
+#: (:func:`chain_next` seeds its hash chain) and importing back would be
+#: circular, with a drift test in ``test_integrity.py`` as the only thing
+#: keeping the two in sync. It is now imported from ``contracts.py``, which
+#: both modules already import and which needs the same set to refuse a
+#: ``score_scale`` that would collide with one of these keys. One definition,
+#: three readers, no drift to test for — what the test now guards instead is
+#: that ``MetricsLine.to_json`` really emits exactly this set.
+_CORE_LINE_KEYS = RESERVED_METRICS_KEYS
 
-_DIAG_PREFIX = "diag_"
+_DIAG_PREFIX = DIAGNOSTIC_KEY_PREFIX
 
 _METRICS_JSONL_FILENAME = "metrics.jsonl"
 _METRICS_SUMMARY_FILENAME = "metrics.json"
@@ -1241,8 +1231,8 @@ def _reconcile_summary_sync(directory: Path) -> ReconcileVerdict:
     A line's "score-series" value is whichever of its keys is neither a core
     field :class:`~turing.research.loop.results.MetricsLine.to_json` always
     emits, nor prefixed ``diag_``, nor :data:`CHAIN_FIELD` — see
-    ``_CORE_LINE_KEYS`` above for why that set is hand-copied rather than
-    imported.
+    ``_CORE_LINE_KEYS`` above for where that set is defined and why it is a
+    single shared one.
 
     Every derivation above is delegated to :func:`read_log_tail` rather than
     inlined here, because ``runner.py`` has to make the *same* derivations to

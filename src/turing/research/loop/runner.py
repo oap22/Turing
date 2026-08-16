@@ -1404,15 +1404,21 @@ class RoundRunner:
         that ``verify`` exists to check. It is *this* loop that must not
         propagate. Without the guard below, one problem discards every attempt
         the round had already completed — no round record, no trajectory row,
-        no cells — and the reachable trigger is not exotic:
-        ``problem.verifier.score_scale`` is free-form by design
-        (``contracts.py``), it becomes the metrics key naming the raw score,
-        and ``results._validate_scored_metric`` rejects a scale colliding with
-        a reserved or core line key. ``progress``, ``step``, ``ts``,
-        ``total_steps``, ``tokens_used``, ``consumed_steps`` and
-        ``wall_clock_s`` are all plausible scale names and all fatal at that
-        problem's first verification. Ten completed attempts must not be
-        thrown away by the eleventh problem's *name*.
+        no cells — and the reachable triggers are not exotic: a workspace
+        template that cannot be read (pruned, evicted, a full disk), a
+        rotation the results tree will not permit, a backend whose usage
+        accounting reports a non-finite token count. Ten completed attempts
+        must not be thrown away by the eleventh problem's I/O.
+
+        The trigger this guard was originally built around — a
+        ``problem.verifier.score_scale`` colliding with a reserved or core
+        metrics key, fatal at that problem's *first verification* — is gone:
+        ``contracts._reject_unusable_score_scale`` refuses such a scale where
+        the verifier declares it, so a corpus carrying one now fails before
+        the round starts, at zero compute, instead of losing an attempt
+        mid-round. The containment stays: it guards "``run_attempt`` raised",
+        not any particular cause, and the remaining causes are I/O against a
+        results tree and a workspace this process does not own.
 
         **A lost attempt is dropped from the results, not floored into
         them.** The alternative — synthesising an ``AttemptOutcome`` with
@@ -1457,10 +1463,10 @@ class RoundRunner:
         enforced here.** ``measure_noise_floor`` guards that every *cell* is
         present in every seed, which cannot see a seed that measured a cell
         over one fewer *problem* — and a spread computed over a shifting
-        problem set measures the set, not the agent. A colliding
-        ``score_scale`` is a property of the problem and so is lost by every
-        seed identically (consistent, just narrower); a transient failure
-        hitting one seed only is not. ``NoiseFloorRunner.run`` therefore wants
+        problem set measures the set, not the agent. An unreadable workspace
+        template is a property of the problem and so is lost by every seed
+        identically (consistent, just narrower); a transient failure hitting
+        one seed only is not. ``NoiseFloorRunner.run`` therefore wants
         to refuse a seed with a non-empty :attr:`attempt_failures` rather than
         report a floor from it. That check belongs at that call site — a round
         legitimately continues where a floor must not — and the property
@@ -1586,7 +1592,7 @@ class RoundRunner:
         that is already right:
 
         * no ``metrics.jsonl`` (the attempt died before its first append —
-          the canonical ``score_scale``-collision trigger). ``find_runs``
+          a workspace that could not be materialised, say). ``find_runs``
           keys on that file, so the directory is not a run and never affected
           the exit code. Writing a summary for a run that does not exist would
           *create* a finding, not clear one.
@@ -1728,27 +1734,28 @@ class RoundRunner:
 
         **The walk is depth-independent, and it has to be.** An attempt's
         metrics directory is ``attempts/<problem.id>``, and ``problem.id`` is
-        an unvalidated path component (RES-16) that operators may plausibly
-        namespace — ``"cuda/matmul-speedup"`` is a reasonable id and produces
+        a path component operators may plausibly namespace —
+        ``"cuda/matmul-speedup"`` is a reasonable id and produces
         ``attempts/cuda/matmul-speedup/metrics.jsonl``. A single-segment glob
         (``attempts/*/metrics.jsonl``) matched exactly one path segment, so
         such a run vanished from ``.viewer.json`` with no log line and no
         warning while ``verify`` — whose walk has always been recursive —
         went on finding and checking it. Silently listing fewer runs than
         exist is the same class of fault as listing only the latest round,
-        which this method was written to fix. Rejecting the id instead would
-        be a change to ``contracts.py``, not to a reporting call site.
+        which this method was written to fix. Nesting stays supported; what
+        ``contracts._reject_unsafe_problem_id`` refuses (RES-16) is the
+        narrower set of ids that escape the results root or collide with a
+        directory this runner mints itself.
 
         Rotated ``prior-N/`` chains (see :func:`_rotate_stale_metrics`) are
         still excluded, now by directory *name* rather than by depth, since
         depth no longer distinguishes them. That is exact for every
         directory this runner creates: ``prior-N/`` is only ever the last
-        segment before a rotated ``metrics.jsonl``. The residual is a problem
-        id whose final segment is literally ``prior-<digits>``, which would be
-        skipped; that belongs to id validation in ``contracts.py`` and not
-        here, and the failure it causes (a run missing from a viewer list) is
-        the milder of the two — the alternative rule would draw a superseded
-        attempt's chart as if it were live.
+        segment before a rotated ``metrics.jsonl``. The residual this filter
+        used to concede — a problem id whose final segment is literally
+        ``prior-<digits>``, which would be skipped — is closed at the other
+        end: ``contracts._reject_unsafe_problem_id`` refuses such an id at
+        problem-definition time, naming this filter as the reason.
 
         An attempt whose ``MetricsWriter`` never took its first
         :meth:`~turing.research.loop.results.MetricsWriter.append`

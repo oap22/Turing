@@ -642,6 +642,53 @@ the end.
 `attempts/<problem-id>/` (a directory, written by this contract) are
 different names on disk and coexist without collision.
 
+### Problem ids and score scales are validated where they are declared
+
+Two values in a corpus definition are written straight into this tree, and
+both used to fail far from where they were written — one silently, one at the
+cost of an attempt already half-run. Both are checked in `Problem.__post_init__` /
+`Verifier.__post_init__` (`contracts.py`), so a corpus carrying a bad one
+fails **before the round starts**, at zero compute, rather than after a
+workspace has been copied and a solver has run.
+
+**`problem.id` is a path component.** It names `attempts/<id>/`,
+`attempts/<id>.json` and `checkpoints/<id>.json`. Nesting stays legal —
+`cuda/matmul-speedup` is a supported layout — but an id is refused when it
+would escape the results root or collide with something the runner mints
+itself:
+
+| refused | why |
+| --- | --- |
+| `..` in any segment; a leading `/` | leaves the results root |
+| an empty segment (leading, trailing or doubled `/`); a whitespace-only one | the path layer discards it, so two ids would name one directory |
+| NUL or any other control character | cannot survive the chain header, the log fields, or a terminal |
+| a `\` or a `:` anywhere | Windows separator / drive-and-UNC prefix; `fsroots.rs` rewrites `\` to `/` when it reports an entry, and macOS's Finder layer still swaps `:` and `/` |
+| a `.`-prefixed segment | `fsroots.rs`'s `should_skip` skips dot-prefixed names, so the run would be invisible to the metrics and images panes |
+| a final segment matching `prior-<digits>` | that is the rotation namespace: `_viewer_runs` filters those out of `.viewer.json`, and a shorter id one segment above would rotate its own superseded generation on top of it |
+| more than 4 `/`-separated segments | `fsroots.rs` walks at most `MAX_DEPTH = 8` below the root, and a noise-floor seed run already sits four levels down |
+| longer than 128 characters | `NAME_MAX` (255) per component and `PATH_MAX` (1024) for the whole path; 128 leaves ~800 characters for the root and the filenames beneath |
+
+Each refusal names the consumer that motivates it, because the rules are not
+a naming convention — an operator who trips one needs to know which reader
+would have swallowed their run.
+
+**`score_scale` names an emitted metrics key.** The runner writes the raw
+score under the problem's own scale (`"speedup":1.99` in the sample lines
+below), so a scale that cannot be a metrics key is fatal to the attempt at
+its first verification. It stays free-form; what is refused is a scale that is empty,
+that wears the `diag_` prefix, or that collides with one of the seventeen
+keys every line already carries: `step`, `total_steps`, `ts`, `outcome_code`,
+`correctness_pass`, `tokens_used`, `tokens_cap`, `steps_cap`,
+`consumed_steps`, `wall_clock_s`, `wall_clock_cap_s`, `cap_extensions`,
+`step_wall_clock_s`, `verify_wall_clock_s`, `step_tokens`, `made_progress`,
+`progress`. Several of those are plausible scale names — `progress` for a
+problem graded on fraction-of-target, `tokens_used` for one graded on token
+efficiency — which is exactly why the refusal has to be early and loud. That
+list lives in `contracts.RESERVED_METRICS_KEYS` and is imported by
+`results.py` (which emits the keys), `integrity.py` (which has to tell a core
+field from a score series) and the scale check itself: one definition, three
+readers.
+
 ### The `metrics.jsonl` line contract
 
 One JSON object per line, appended — never rewritten — as the attempt runs.
@@ -800,10 +847,14 @@ round's problems, so a list built from them — even merged into whatever
 restarted between rounds and that in-memory state was gone. Re-deriving from
 the filesystem on every write costs nothing a restart doesn't already pay.
 
-The walk is depth-independent, because `problem.id` is an unvalidated path
-component an operator may reasonably namespace — `"cuda/matmul-speedup"`
-produces `attempts/cuda/matmul-speedup/metrics.jsonl`, two segments below
-`attempts/`, and the list includes it at whatever depth it lands. A rotated
+The walk is depth-independent, because `problem.id` is a path component an
+operator may reasonably namespace — `"cuda/matmul-speedup"` produces
+`attempts/cuda/matmul-speedup/metrics.jsonl`, two segments below `attempts/`,
+and the list includes it at whatever depth it lands. Nesting is supported, not
+merely tolerated; what *is* refused, at problem-definition time, is the
+narrower set of ids that would escape the results root or collide with a
+directory the runner mints itself (see "Problem ids and score scales are
+validated where they are declared", below). A rotated
 `prior-N/` directory (see Integrity, below) is excluded by name rather than
 by depth, since depth no longer tells a live chain from a superseded one once
 nested ids are in the mix. Reproduced for real — two rounds, one nested id,
@@ -1113,12 +1164,13 @@ produced no grade and a floor value would be the same fabricated-regression
 bug the round's cell computation already refuses one level up, and
 `final_state: "crashed_in_harness:<ExcType>"`, deliberately not a value of
 `AttemptState`, so it can never be misread as an outcome the experiment
-measured. Reproduced for real, a colliding `score_scale` tripping mid-attempt
-(after one line was already on disk) inside an otherwise-normal round:
+measured. Reproduced for real, a backend reporting a non-finite token count
+mid-attempt (after one line was already on disk — the attempt checkpoint's
+`allow_nan=False` writer refuses it) inside an otherwise-normal round:
 
 ```
 $ .venv/bin/python -m turing.research.loop.verify <results-root>
-.../attempts/bad: OK (2 line(s) checked)
+.../attempts/bad: OK (1 line(s) checked)
 .../attempts/good: OK (4 line(s) checked)
 detects alteration; does not prevent it — see OPEN-QUESTIONS R2/Q11
 $ echo $?
@@ -1126,7 +1178,7 @@ $ echo $?
 ```
 
 `bad`'s own `metrics.json` there reads `"best_score": null,
-"final_state": "crashed_in_harness:ContractViolationError"` — a finding, not
+"final_state": "crashed_in_harness:ValueError"` — a finding, not
 a pass, but a *finished* one, and `verify` now agrees. The round record still
 says exactly what happened (`all_attempts_completed: false`, the verdict
 prefix, no delta for the affected cell — see "A round record / trajectory"
@@ -1252,11 +1304,10 @@ the summary and plot writers later in that function — so the `OSError` it
 raises (`prior_dir.mkdir(...)` denied) still propagates straight out of
 `run_attempt` itself, uncaught, exactly as before. What changed is what is
 sitting one level up. `run_attempts` now wraps *every* call to `run_attempt`
-in the same per-attempt guard that contains a colliding `score_scale` (see
-"One attempt's failure is contained to that attempt", above), and a rotation
-`OSError` is an ordinary `Exception` to that guard — it does not know or care
-that this exception came from a directory the loop cannot write to rather
-than a bad metrics key.
+in the same per-attempt guard that contains every other attempt-local crash
+(see "One attempt's failure is contained to that attempt", above), and a
+rotation `OSError` is an ordinary `Exception` to that guard — it does not know
+or care which line of `run_attempt` raised it.
 
 - **A round completes anyway, minus the one problem.** Reproduced for real,
   re-driving a directory whose rotation raises `PermissionError`: `run_round`
