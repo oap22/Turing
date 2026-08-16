@@ -313,13 +313,21 @@ class ScriptedEscalationChannel:
 
 
 class NeverAnswersChannel:
-    """A channel that would suspend forever — used to prove the loop waits."""
+    """A channel that would suspend forever — used to prove the loop waits.
+
+    Takes ``reopened`` like every other channel, so a restart that re-enters
+    a wait on it is exercised with the same signature the runner uses.
+    """
 
     def __init__(self) -> None:
         self.requests: list[EscalationRequest] = []
+        self.calls: list[tuple[str, bool]] = []
 
-    async def request_decision(self, request: EscalationRequest) -> EscalationDecision:
+    async def request_decision(
+        self, request: EscalationRequest, *, reopened: bool = False
+    ) -> EscalationDecision:
         self.requests.append(request)
+        self.calls.append((request.request_id, reopened))
         raise AssertionError("should not be reached in tests that never answer")
 
 

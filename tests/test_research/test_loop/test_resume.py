@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -46,6 +47,7 @@ from turing.research.loop.trajectory import (
     AttemptDisposition,
     RunIdentity,
     StoredAttempt,
+    TrajectoryStore,
     cell_key,
 )
 from turing.research.problems.adapter import bind_eval_set_hash
@@ -65,12 +67,9 @@ from .conftest import (
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from turing.research.contracts import Attempt as AttemptType
     from turing.research.contracts import EscalationDecision, EscalationRequest
     from turing.research.loop.protocols import SolverTask
-    from turing.research.loop.trajectory import TrajectoryStore
 
 
 # --------------------------------------------------------------------------- #
@@ -373,6 +372,7 @@ class TestAPausedAttemptIsResumed:
             output_dir=store.round_dir(0),
             eval_set_hash=config.eval_set_hash,
             config_digest=config.config_digest(),
+            configured_cap=DEFAULT_CAP,
         )
 
         solver = FakeSolver([SolverStep(tokens=5)])
@@ -656,6 +656,7 @@ async def _write_checkpoint(
         output_dir=output_dir,
         eval_set_hash=config.eval_set_hash,
         config_digest=config.config_digest(),
+        configured_cap=DEFAULT_CAP,
     )
 
 
@@ -981,7 +982,7 @@ class TestAResumeWithoutItsWorkspaceRefuses:
         assert [o.problem.id for o in outcomes] == ["s2"]
         assert [f.problem_id for f in runner.attempt_failures] == ["s1"]
         error = runner.attempt_failures[0].error
-        assert "ContractViolationError" in error
+        assert error.startswith("WorkspaceMissingError: ")  # a ContractViolationError subclass
         assert str(gone) in error
         assert str(checkpoint) in error  # the remedy names the file to delete
         assert "restore the workspace" in error
@@ -1510,3 +1511,775 @@ class TestRunIdentityIsolatesEachCoordinate:
             )
             == config.identity()
         )
+
+
+# --------------------------------------------------------------------------- #
+# Round 2 of the adversarial review: the contract, restated
+#
+# "Resume never adopts a number this run did not measure under this exact
+# configuration; it never overwrites a prior measurement — a re-drive lands in
+# a new generation beside the old one; a finished round is returned as a no-op
+# success ONLY for the identical measurement (same eval_set_hash, engine,
+# config_digest, resume on) and refuses without writing otherwise; --dry-run
+# performs every validation the real run performs before its first write; one
+# driver owns a results tree at a time."
+# --------------------------------------------------------------------------- #
+
+
+def _floor_config(**overrides: object) -> NoiseFloorConfig:
+    base: dict = {  # type: ignore[type-arg]
+        "run_id": "nf",
+        "eval_set_hash": "",
+        "engine": ENGINE,
+        "seeds": (1, 2, 3),
+        "default_cap": DEFAULT_CAP,
+    }
+    base.update(overrides)
+    return NoiseFloorConfig(**base)  # type: ignore[arg-type]
+
+
+class TestTheHashIsBoundWithTheMaterialItWasPromisedWith:
+    """Round-2 blocker, at the runner seam.
+
+    The driver promises ``fingerprint_corpus(corpus, extra=material)``; the
+    runners must re-derive it with the *same* ``extra``, or every real run
+    refuses itself. ``eval_set_material`` rides on the config for that.
+    """
+
+    async def test_run_round_binds_a_promise_made_with_extra_material(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        from turing.research.problems.adapter import fingerprint_corpus
+
+        corpus = _corpus(2)
+        material = ("significance_multiplier=1.5", "spec:s1")
+        promised = fingerprint_corpus(corpus, extra=material)
+        config = make_config(eval_set_hash=promised, eval_set_material=material)
+        outcome = await make_runner(
+            solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock
+        ).run_round(corpus, config)
+        assert outcome.record.eval_set_hash == promised
+        # And the checkpoints were stamped with it, so a restart reuses them.
+        raw = json.loads((store.round_dir(0) / "checkpoints" / "s1.json").read_text())
+        assert raw["eval_set_hash"] == promised
+
+    async def test_the_noise_floor_binds_it_the_same_way(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        from turing.research.problems.adapter import fingerprint_corpus
+
+        corpus = _corpus(2)
+        material = ("significance_multiplier=1.5",)
+        promised = fingerprint_corpus(corpus, extra=material)
+        report = await NoiseFloorRunner(
+            make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+            store,
+        ).run(corpus, _floor_config(eval_set_hash=promised, eval_set_material=material))
+        assert report.eval_set_hash == promised
+
+    async def test_a_promise_made_with_other_material_is_still_refused(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """The binding did not become 'trust the promise'."""
+        from turing.research.problems.adapter import fingerprint_corpus
+
+        corpus = _corpus(2)
+        promised = fingerprint_corpus(corpus, extra=("a",))
+        with pytest.raises(ContractViolationError, match="does not match the corpus fingerprint"):
+            await make_runner(
+                solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock
+            ).run_round(corpus, make_config(eval_set_hash=promised, eval_set_material=("b",)))
+
+    def test_bind_eval_set_hash_threads_extra_to_the_one_definition(self) -> None:
+        from turing.research.problems.adapter import fingerprint_corpus
+
+        corpus = _corpus(1)
+        assert bind_eval_set_hash(corpus, extra=("x",)) == fingerprint_corpus(corpus, extra=("x",))
+        assert bind_eval_set_hash(corpus, extra=("x",)) != fingerprint_corpus(corpus)
+
+
+class TestAFinishedRoundIsANoOpOnlyForTheIdenticalMeasurement:
+    """Finding 2: ``run_id`` alone does not make it the same round."""
+
+    async def test_a_changed_engine_and_cap_refuse_instead_of_returning_the_old_record(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        corpus = _corpus(2)
+        config = make_config()
+        await make_runner(
+            solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock
+        ).run_round(corpus, config)
+        record_before = (store.round_dir(0) / "round.json").read_bytes()
+        changed = replace(
+            config,
+            engine=replace(ENGINE, scaffold_git_sha="deadbee"),
+            default_cap=Cap(max_steps=6, max_tokens=10_000, max_wall_clock_seconds=600.0),
+        )
+        solver = FakeSolver()
+        with pytest.raises(ContractViolationError) as excinfo:
+            await make_runner(
+                solver=solver, store=store, workspaces=workspaces, clock=clock
+            ).run_round(corpus, changed)
+        message = str(excinfo.value)
+        assert "measured differently" in message
+        assert "engine" in message
+        assert "config_digest" in message
+        assert "eval_set_hash" not in message.split("measured differently")[1].split(".")[0]
+        assert "different measurement" in message
+        assert "new loop slug" in message
+        assert solver.calls == []
+        assert (store.round_dir(0) / "round.json").read_bytes() == record_before
+        assert len((await store.load_trajectory())["rounds"]) == 1
+
+    async def test_a_changed_corpus_refuses_and_names_the_eval_set_hash(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        config = make_config()
+        await make_runner(
+            solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock
+        ).run_round(_corpus(2), config)
+        solver = FakeSolver()
+        with pytest.raises(ContractViolationError, match="eval_set_hash") as excinfo:
+            await make_runner(
+                solver=solver, store=store, workspaces=workspaces, clock=clock
+            ).run_round(_corpus(3), config)
+        assert "measured differently" in str(excinfo.value)
+        assert solver.calls == []
+
+    async def test_a_changed_seed_refuses(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        corpus = _corpus(1)
+        await make_runner(
+            solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock
+        ).run_round(corpus, make_config(seed=7))
+        with pytest.raises(ContractViolationError, match="seed: recorded 7, this run 8"):
+            await make_runner(
+                solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock
+            ).run_round(corpus, make_config(seed=8))
+
+    async def test_no_resume_on_a_finished_round_refuses(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        corpus = _corpus(1)
+        config = make_config()
+        await make_runner(
+            solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock
+        ).run_round(corpus, config)
+        record_before = (store.round_dir(0) / "round.json").read_bytes()
+        solver = FakeSolver()
+        with pytest.raises(ContractViolationError, match="--no-resume cannot re-measure"):
+            await make_runner(
+                solver=solver, store=store, workspaces=workspaces, clock=clock
+            ).run_round(corpus, config, resume=False)
+        assert solver.calls == []
+        assert (store.round_dir(0) / "round.json").read_bytes() == record_before
+
+    async def test_the_identical_measurement_is_still_the_no_op(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Positive control: the rule did not become 'always refuse'."""
+        corpus = _corpus(2)
+        config = make_config()
+        await make_runner(
+            solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock
+        ).run_round(corpus, config)
+        outcome = await make_runner(
+            solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock
+        ).run_round(corpus, config)
+        assert outcome.already_finished is True
+
+    async def test_round_json_and_the_row_carry_the_config_digest(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        config = make_config()
+        await make_runner(
+            solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock
+        ).run_round(_corpus(1), config)
+        record = json.loads((store.round_dir(0) / "round.json").read_text())
+        row = (await store.load_trajectory())["rounds"][0]
+        assert record["config_digest"] == config.config_digest()
+        assert row["config_digest"] == config.config_digest()
+
+    async def test_a_record_naming_another_run_id_than_the_row_refuses(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Mutation m1c: dropping the ``round.json`` run_id check must fail this."""
+        corpus = _corpus(1)
+        config = make_config()
+        await make_runner(
+            solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock
+        ).run_round(corpus, config)
+        record_path = store.round_dir(0) / "round.json"
+        record = json.loads(record_path.read_text())
+        record["run_id"] = "someone-else"
+        record_path.write_text(json.dumps(record))
+        solver = FakeSolver()
+        with pytest.raises(ContractViolationError, match="names 'someone-else'"):
+            await make_runner(
+                solver=solver, store=store, workspaces=workspaces, clock=clock
+            ).run_round(corpus, config)
+        assert solver.calls == []
+
+
+class TestAKillBetweenTheRowAndTheRecord:
+    """Finding 7 (and the behavioural half of finding 11's m1b)."""
+
+    async def test_the_row_lands_before_the_record(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Behavioural, not a spy: kill the record write and look at the disk."""
+        corpus = _corpus(1)
+        config = make_config()
+
+        async def killed(*args: object, **kwargs: object) -> Path:
+            raise KeyboardInterrupt("killed between the two writes")
+
+        store.write_round_record = killed  # type: ignore[method-assign]
+        with pytest.raises(KeyboardInterrupt):
+            await make_runner(
+                solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock
+            ).run_round(corpus, config)
+        rows = (await store.load_trajectory())["rounds"]
+        assert [r["run_id"] for r in rows] == [config.run_id]  # appended first
+        assert not (store.round_dir(0) / "round.json").exists()  # never written
+
+    async def test_the_identical_rerun_refuses_with_an_accurate_remedy(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        corpus = _corpus(1)
+        config = make_config()
+        await make_runner(
+            solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock
+        ).run_round(corpus, config)
+        (store.round_dir(0) / "round.json").unlink()  # the kill window, after the fact
+
+        solver = FakeSolver()
+        with pytest.raises(ContractViolationError) as excinfo:
+            await make_runner(
+                solver=solver, store=store, workspaces=workspaces, clock=clock
+            ).run_round(corpus, config)
+        message = str(excinfo.value)
+        assert "round.json is missing" in message
+        assert "killed between appending the row and writing the record" in message
+        assert "this round did finish" in message
+        # The remedy is to restore the record, not to take a new index — the
+        # row cannot rebuild it, and the message says what the row lacks.
+        assert "Restore" in message
+        assert "per-problem scores" in message
+        assert "a re-measurement gets a new round index" not in message
+        assert solver.calls == []
+        assert not (store.round_dir(0) / "round.json").exists()
+
+
+class TestAReDriveLandsBesideThePriorGenerationNotOverIt:
+    """Finding 3: ``--no-resume`` must not destroy the earlier checkpoints."""
+
+    async def test_no_resume_on_the_floor_rotates_checkpoint_and_log_with_the_chain(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        corpus = _corpus(2)
+        cfg = _floor_config()
+        await NoiseFloorRunner(
+            make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+            store,
+        ).run(corpus, cfg)
+        seed_dir = store.noise_floor_seed_dir(1)
+        first_checkpoint = json.loads((seed_dir / "checkpoints" / "s1.json").read_text())
+        first_log = json.loads((seed_dir / "attempts" / "s1.json").read_text())
+        first_chain = (seed_dir / "attempts" / "s1" / "metrics.jsonl").read_bytes()
+
+        second = NoiseFloorRunner(
+            make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+            store,
+        )
+        await second.run(corpus, cfg, resume=False)
+        assert second.skipped_seeds == ()
+
+        prior = seed_dir / "attempts" / "s1" / "prior-1"
+        assert json.loads((prior / "checkpoint.json").read_text()) == first_checkpoint
+        assert json.loads((prior / "attempt-log.json").read_text()) == first_log
+        assert (prior / "metrics.jsonl").read_bytes() == first_chain
+        # The live slot holds the new generation, under a new attempt id.
+        new_checkpoint = json.loads((seed_dir / "checkpoints" / "s1.json").read_text())
+        assert new_checkpoint["attempt_id"] != first_checkpoint["attempt_id"]
+        new_log = json.loads((seed_dir / "attempts" / "s1.json").read_text())
+        assert new_log["attempt_id"] == new_checkpoint["attempt_id"]
+        assert not (prior / "checkpoint.json").is_symlink()
+
+    async def test_a_resumed_attempt_keeps_its_checkpoint_and_log_in_place(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Only a fresh generation moves them; a resume *is* the same generation."""
+        problem = make_problem("s1", scores=(1.0,), default_cap=Cap(4, 10_000, 600.0))
+        config = make_config()
+        with pytest.raises(KeyboardInterrupt):
+            await make_runner(
+                solver=DieOnThirdStep(), store=store, workspaces=workspaces, clock=clock
+            ).run_attempts([problem], config, output_dir=store.round_dir(0))
+        second = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        await second.run_attempts([problem], config, output_dir=store.round_dir(0))
+        assert second.resumed_problems == ("s1",)
+        prior = store.round_dir(0) / "attempts" / "s1" / "prior-1"
+        assert (prior / "metrics.jsonl").exists()  # the chain restarted, as documented
+        assert not (prior / "checkpoint.json").exists()
+        assert not (prior / "attempt-log.json").exists()
+
+    async def test_a_previous_generation_with_a_checkpoint_but_no_chain_is_still_preserved(
+        self,
+        store: TrajectoryStore,
+        workspaces: TempWorkspaceProvider,
+        clock: FakeClock,
+        tmp_path: Path,
+    ) -> None:
+        """A checkpoint can carry a score; a fresh drive must not overwrite it."""
+        config = make_config()
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        old = _paused_attempt(config=config, workspace=workspace, attempt_id="old-generation")
+        await _write_checkpoint(store, old, config, output_dir=store.round_dir(0))
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        await runner.run_attempts(
+            [make_problem("s1")], config, output_dir=store.round_dir(0), resume=False
+        )
+        prior = store.round_dir(0) / "attempts" / "s1" / "prior-1"
+        assert json.loads((prior / "checkpoint.json").read_text())["attempt_id"] == "old-generation"
+        assert (
+            json.loads((store.round_dir(0) / "checkpoints" / "s1.json").read_text())["attempt_id"]
+            != "old-generation"
+        )
+
+
+class TestOneDriverOwnsAResultsTree:
+    """Finding 4: two drivers over one tree must not drive the same attempt."""
+
+    async def test_a_second_store_over_the_same_tree_is_refused_while_the_first_drives(
+        self, tmp_path: Path, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        import os
+
+        problem = make_problem("s1", scores=(1.0,), default_cap=Cap(4, 10_000, 600.0))
+        config = make_config()
+        store_a = TrajectoryStore(tmp_path / "results", "test-loop", clock=clock)
+        store_b = TrajectoryStore(tmp_path / "results", "test-loop", clock=clock)  # "process B"
+
+        class SlowSolver:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            async def step(self, task: SolverTask, attempt: AttemptType) -> SolverStep:
+                self.calls.append((task.id, attempt.attempt_id))
+                await asyncio.sleep(0.05)
+                return SolverStep(tokens=10, note="work")
+
+        a, b = SlowSolver(), SlowSolver()
+        ra = make_runner(solver=a, store=store_a, workspaces=workspaces, clock=clock)
+        rb = make_runner(solver=b, store=store_b, workspaces=workspaces, clock=clock)
+
+        async def second() -> object:
+            await asyncio.sleep(0.08)
+            return await rb.run_attempts([problem], config, output_dir=store_b.round_dir(0))
+
+        ra_out, rb_out = await asyncio.gather(
+            ra.run_attempts([problem], config, output_dir=store_a.round_dir(0)),
+            second(),
+            return_exceptions=True,
+        )
+        assert not isinstance(ra_out, BaseException), ra_out
+        assert isinstance(rb_out, ContractViolationError), rb_out
+        assert "held by another driver" in str(rb_out)
+        assert f"pid {os.getpid()}" in str(rb_out)
+        assert b.calls == []  # B never drove A's attempt (or any)
+        assert a.calls != []
+        # Released when A finished, so B can run afterwards — and reuses A's work.
+        again = make_runner(solver=b, store=store_b, workspaces=workspaces, clock=clock)
+        await again.run_attempts([problem], config, output_dir=store_b.round_dir(0))
+        assert again.skipped_problems == ("s1",)
+        assert not store_a.driver_lock_path.exists()
+
+    async def test_the_lock_is_released_when_the_round_dies(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        with pytest.raises(KeyboardInterrupt):
+            await make_runner(
+                solver=KilledSolver(die_after_problems=1),
+                store=store,
+                workspaces=workspaces,
+                clock=clock,
+            ).run_round(_corpus(2), make_config())
+        assert not store.driver_lock_path.exists()
+
+    async def test_a_stale_lock_is_reclaimed_and_a_live_one_refuses(
+        self, store: TrajectoryStore, tmp_path: Path
+    ) -> None:
+        import os
+        import subprocess
+
+        store.loop_dir.mkdir(parents=True)
+        with subprocess.Popen(["true"]) as proc:
+            proc.wait()
+        store.driver_lock_path.write_text(
+            json.dumps({"pid": proc.pid, "started_at_ms": 1, "host": os.uname().nodename})
+        )
+        async with store.driver_lock():
+            holder = store.read_driver_lock()
+            assert holder is not None
+            assert holder.pid == os.getpid()  # reclaimed and re-taken
+            other = TrajectoryStore(tmp_path / "results", "test-loop")
+            with pytest.raises(ContractViolationError, match=f"pid {os.getpid()}"):
+                await other.acquire_driver_lock()
+            # The read-only form refuses too.
+            with pytest.raises(ContractViolationError, match="one driver owns"):
+                other.refuse_if_driver_lock_live()
+        assert not store.driver_lock_path.exists()
+        other.refuse_if_driver_lock_live()  # nothing to refuse once released
+
+    async def test_the_lock_is_reentrant_for_the_same_store(self, store: TrajectoryStore) -> None:
+        async with store.driver_lock():
+            async with store.driver_lock():
+                assert store.driver_lock_path.exists()
+            assert store.driver_lock_path.exists()  # inner exit did not drop it
+        assert not store.driver_lock_path.exists()
+
+    async def test_a_lock_on_another_host_is_treated_as_live(self, store: TrajectoryStore) -> None:
+        store.loop_dir.mkdir(parents=True)
+        store.driver_lock_path.write_text(
+            json.dumps({"pid": 1, "started_at_ms": 1, "host": "some-other-machine"})
+        )
+        with pytest.raises(ContractViolationError, match="some-other-machine"):
+            await store.acquire_driver_lock()
+
+    async def test_an_unreadable_lock_refuses_and_names_the_file(
+        self, store: TrajectoryStore
+    ) -> None:
+        store.loop_dir.mkdir(parents=True)
+        store.driver_lock_path.write_text("not json")
+        with pytest.raises(ContractViolationError, match="not a readable driver lock"):
+            await store.acquire_driver_lock()
+
+
+class TestAnIdenticalRerunLeavesNoiseFloorJsonAlone:
+    """Finding 5: the no-op procedure must not rewrite a results-tree file."""
+
+    async def test_byte_identical_after_an_identical_rerun(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        corpus = _corpus(2)
+        cfg = _floor_config()
+        await NoiseFloorRunner(
+            make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+            store,
+        ).run(corpus, cfg)
+        before = store.noise_floor_path.read_bytes()
+        second = NoiseFloorRunner(
+            make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+            store,
+        )
+        await second.run(corpus, cfg)
+        assert second.skipped_seeds == (1, 2, 3)
+        assert store.noise_floor_path.read_bytes() == before
+
+    async def test_a_changed_floor_is_still_written(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Positive control: idempotence did not become 'never rewrite'."""
+        corpus = _corpus(2)
+        await NoiseFloorRunner(
+            make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+            store,
+        ).run(corpus, _floor_config())
+        before = json.loads(store.noise_floor_path.read_text())
+        await NoiseFloorRunner(
+            make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+            store,
+        ).run(corpus, _floor_config(seeds=(1, 2, 3, 4)))
+        after = json.loads(store.noise_floor_path.read_text())
+        assert after["seeds"] == [1, 2, 3, 4]
+        assert after != before
+
+
+class TestThePerProblemCapAndTheHarnessAreInTheIdentity:
+    """Finding 6: two measurement inputs the digest and the fingerprint both missed."""
+
+    async def test_an_edited_problem_default_cap_re_drives_the_attempt(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        config = make_config()
+        small = make_problem("s1", scores=(1.0,), default_cap=Cap(2, 10_000, 600.0))
+        await make_runner(
+            solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock
+        ).run_attempts([small], config, output_dir=store.round_dir(0))
+        big = make_problem("s1", scores=(1.0,), default_cap=Cap(6, 10_000, 600.0))
+        solver = FakeSolver()
+        runner = make_runner(solver=solver, store=store, workspaces=workspaces, clock=clock)
+        outcomes = await runner.run_attempts([big], config, output_dir=store.round_dir(0))
+        assert runner.skipped_problems == ()
+        assert outcomes[0].attempt.cap.max_steps == 6
+        assert solver.calls != []
+
+    async def test_the_checkpoint_records_the_configured_cap(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        config = make_config()
+        problem = make_problem("s1", default_cap=Cap(2, 10_000, 600.0))
+        await make_runner(
+            solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock
+        ).run_attempts([problem], config, output_dir=store.round_dir(0))
+        raw = json.loads((store.round_dir(0) / "checkpoints" / "s1.json").read_text())
+        assert raw["configured_cap"] == {
+            "max_steps": 2,
+            "max_tokens": 10_000,
+            "max_wall_clock_seconds": 600.0,
+        }
+
+    async def test_an_operator_extended_cap_does_not_look_like_a_changed_cap(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """``configured_cap`` is the start cap; ``cap`` grows with EXTEND_CAP."""
+        from turing.research.contracts import CapExtension, EscalationDecision
+
+        problem = make_problem("s1")
+        config = make_config(escalate_on_cap_exhaustion=True)
+        channel = ScriptedEscalationChannel(
+            [
+                EscalationDecision(
+                    request_id="ignored",
+                    verdict=EscalationVerdict.EXTEND_CAP,
+                    decided_at_ms=1,
+                    cap_extension=CapExtension(extra_steps=2),
+                ),
+                EscalationVerdict.CONTINUE,
+            ]
+        )
+        first = make_runner(
+            solver=FakeSolver(),
+            store=store,
+            workspaces=workspaces,
+            clock=clock,
+            escalations=channel,
+        )
+        outcomes = await first.run_attempts([problem], config, output_dir=store.round_dir(0))
+        assert outcomes[0].attempt.cap.extension_count >= 1
+        raw = json.loads((store.round_dir(0) / "checkpoints" / "s1.json").read_text())
+        assert raw["cap"]["max_steps"] > raw["configured_cap"]["max_steps"]
+
+        solver = FakeSolver()
+        second = make_runner(solver=solver, store=store, workspaces=workspaces, clock=clock)
+        await second.run_attempts([problem], config, output_dir=store.round_dir(0))
+        assert second.skipped_problems == ("s1",)
+        assert solver.calls == []
+
+    async def test_a_checkpoint_without_the_field_is_a_previous_generation(
+        self,
+        store: TrajectoryStore,
+        workspaces: TempWorkspaceProvider,
+        clock: FakeClock,
+        tmp_path: Path,
+    ) -> None:
+        config = make_config()
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        await store.write_attempt_checkpoint(
+            _paused_attempt(config=config, workspace=workspace),
+            output_dir=store.round_dir(0),
+            eval_set_hash=config.eval_set_hash,
+            config_digest=config.config_digest(),
+        )
+        stored = await store.load_stored_attempt(
+            "s1", output_dir=store.round_dir(0), identity=config.identity(), cap=DEFAULT_CAP
+        )
+        assert stored.disposition is AttemptDisposition.ABSENT
+        assert "configured_cap None" in stored.reason
+        # Without a cap to compare, the probe is as it was.
+        stored = await store.load_stored_attempt(
+            "s1", output_dir=store.round_dir(0), identity=config.identity()
+        )
+        assert stored.disposition is AttemptDisposition.RESUMABLE
+
+    async def test_the_noise_floor_does_not_reuse_a_seed_measured_at_another_problem_cap(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        cfg = _floor_config()
+        small = [make_problem("s1", scores=(1.0,), default_cap=Cap(2, 10_000, 600.0))]
+        await NoiseFloorRunner(
+            make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+            store,
+        ).run(small, cfg)
+        big = [make_problem("s1", scores=(1.0,), default_cap=Cap(6, 10_000, 600.0))]
+        second = NoiseFloorRunner(
+            make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+            store,
+        )
+        await second.run(big, cfg)
+        assert second.skipped_seeds == ()
+
+    def test_harness_identity_is_in_the_digest_and_python_executable_is_in_it(self) -> None:
+        from turing.research.problems.speedup import SpeedupAdapter
+
+        base = make_config()
+        assert (
+            make_config(harness_identity=("python_executable=/a",)).config_digest()
+            != make_config(harness_identity=("python_executable=/b",)).config_digest()
+        )
+        assert make_config(harness_identity=("x",)).config_digest() != base.config_digest()
+        # ``eval_set_material`` is *not* in the digest: it is inside eval_set_hash.
+        assert make_config(eval_set_material=("m",)).config_digest() == base.config_digest()
+        adapter = SpeedupAdapter(
+            harness_root=Path("/h"), reference_root=Path("/r"), python_executable="/opt/py"
+        )
+        assert adapter.harness_identity() == ("python_executable=/opt/py",)
+        assert "python_executable" not in " ".join(adapter.eval_set_material())
+
+    def test_the_noise_floor_config_forwards_both(self) -> None:
+        cfg = _floor_config(eval_set_material=("m",), harness_identity=("h",))
+        seed_config = cfg.round_config_for(1)
+        assert seed_config.eval_set_material == ("m",)
+        assert seed_config.harness_identity == ("h",)
+
+
+class TestAMissingWorkspaceRefusalWritesNothing:
+    """Finding 8: 'refuses before anything is written' has to be true."""
+
+    async def test_no_crashed_summary_lands_beside_the_paused_checkpoint(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        import shutil
+
+        problem = make_problem("s1", scores=(1.0,), default_cap=Cap(4, 10_000, 600.0))
+        config = make_config()
+        with pytest.raises(KeyboardInterrupt):
+            await make_runner(
+                solver=DieOnThirdStep(), store=store, workspaces=workspaces, clock=clock
+            ).run_attempts([problem], config, output_dir=store.round_dir(0))
+        checkpoint = json.loads((store.round_dir(0) / "checkpoints" / "s1.json").read_text())
+        shutil.rmtree(checkpoint["workspace_path"])
+        snapshot = {
+            p.relative_to(store.round_dir(0)): p.read_bytes()
+            for p in store.round_dir(0).rglob("*")
+            if p.is_file()
+        }
+
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        await runner.run_attempts(
+            [problem, make_problem("s2")], config, output_dir=store.round_dir(0)
+        )
+        assert [f.problem_id for f in runner.attempt_failures] == ["s1"]
+        after = {
+            p.relative_to(store.round_dir(0)): p.read_bytes()
+            for p in store.round_dir(0).rglob("*")
+            if p.is_file()
+            and not str(p.relative_to(store.round_dir(0))).startswith(
+                ("attempts/s2", "checkpoints/s2")
+            )
+        }
+        assert after == snapshot  # nothing new under s1, nothing rewritten
+        assert not (store.round_dir(0) / "attempts" / "s1" / "metrics.json").exists()
+        # And it is still resumable once the workspace is back.
+        Path(checkpoint["workspace_path"]).mkdir(parents=True)
+        third = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        await third.run_attempts([problem], config, output_dir=store.round_dir(0))
+        assert third.resumed_problems == ("s1",)
+
+
+class TestTheGatesAndTheScratchFileAreLoadBearing:
+    """Finding 11: tests the verifier's mutations must fail."""
+
+    async def test_the_summary_gate_is_reached_and_checks_the_attempt_id(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """m7b: the log names the checkpoint's attempt, so only the summary can refuse."""
+        problem = make_problem("s1")
+        config = make_config()
+        await make_runner(
+            solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock
+        ).run_attempts([problem], config, output_dir=store.round_dir(0))
+        checkpoint_path = store.round_dir(0) / "checkpoints" / "s1.json"
+        log_path = store.round_dir(0) / "attempts" / "s1.json"
+        for path in (checkpoint_path, log_path):
+            raw = json.loads(path.read_text())
+            raw["attempt_id"] = "generation-two"
+            path.write_text(json.dumps(raw))
+        # metrics.json still names generation one.
+        stored = await store.load_stored_attempt(
+            "s1", output_dir=store.round_dir(0), identity=config.identity()
+        )
+        assert stored.disposition is AttemptDisposition.ABSENT
+        assert "summary" in stored.reason
+        assert "does not finish this one" in stored.reason
+
+    def test_write_json_uses_a_unique_scratch_name_per_call(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """m10a: a fixed ``<name>.tmp`` lets two writers interleave."""
+        import re
+
+        from turing.research.loop.trajectory import _write_json
+
+        seen: list[str] = []
+        real_replace = Path.replace
+
+        def spy(self: Path, target: Path) -> Path:
+            seen.append(self.name)
+            return real_replace(self, target)
+
+        monkeypatch.setattr(Path, "replace", spy)
+        target = tmp_path / "x.json"
+        _write_json(target, {"a": 1})
+        _write_json(target, {"a": 2})
+        assert len(seen) == 2
+        assert len(set(seen)) == 2, seen
+        import os
+
+        for name in seen:
+            assert re.fullmatch(rf"x\.json\.{os.getpid()}\.[0-9a-f]{{32}}\.tmp", name), name
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["x.json"]
+
+    def test_a_refused_serialisation_leaves_no_scratch_file(self, tmp_path: Path) -> None:
+        """m10b, half one: a NaN is refused before the scratch file exists."""
+        from turing.research.loop.trajectory import _write_json
+
+        with pytest.raises(ValueError):
+            _write_json(tmp_path / "x.json", {"a": float("nan")})
+        assert list(tmp_path.iterdir()) == []
+
+    def test_a_failed_replace_leaves_no_scratch_file(self, tmp_path: Path) -> None:
+        """m10b, half two: the scratch file *was* written and the ``replace`` failed.
+
+        The NaN case alone cannot tell a ``finally`` cleanup from none, because
+        ``json.dumps`` raises before the scratch file is created. A target
+        that is a directory gets past the dump and fails at ``replace``,
+        which is where a dropped cleanup leaves a corpse.
+        """
+        from turing.research.loop.trajectory import _write_json
+
+        target = tmp_path / "x.json"
+        target.mkdir()
+        with pytest.raises(OSError):
+            _write_json(target, {"a": 1})
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["x.json"]
+        assert target.is_dir() and list(target.iterdir()) == []
+
+
+class TestTheReopenedKwargIsUniform:
+    """Finding 9: every channel fake accepts ``reopened`` the way the real one does."""
+
+    async def test_never_answers_channel_accepts_reopened(self) -> None:
+        from turing.research.contracts import EscalationRequest
+
+        from .conftest import NeverAnswersChannel
+
+        channel = NeverAnswersChannel()
+        request = EscalationRequest(
+            request_id="e",
+            problem_id="s1",
+            attempt_id="a",
+            round_id="r",
+            reason=EscalationReason.NO_VIABLE_APPROACH,
+            summary="stuck",
+            cap=DEFAULT_CAP,
+            consumed=CapConsumption(),
+            created_at_ms=1,
+        )
+        with pytest.raises(AssertionError):
+            await channel.request_decision(request, reopened=True)
+        assert channel.calls == [("e", True)]

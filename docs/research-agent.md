@@ -186,6 +186,18 @@ The corpus's `{harness}` benchmark drivers are still declared rather than
 written, so **the first thing a real invocation does today is refuse**, listing
 every missing script — at zero compute, rather than losing an attempt to it.
 
+**One driver per results tree.** The driver takes `<loop-dir>/.driver.lock`
+(pid, host, start time; created with `O_CREAT|O_EXCL`) before its first write
+and holds it for the whole invocation, floor and round; `RoundRunner.run_attempts`
+— the seam every entry point passes through — takes the same lock, so a
+second process over the same `--loop-slug` is refused with the first's pid
+rather than resuming its live attempts as its own and rotating its metrics
+chain aside. A lock whose pid is no longer alive on this host is stale (the
+previous driver was killed) and is reclaimed with a
+`research.driver_lock.reclaimed` log line; a lock from another host cannot be
+probed and is treated as live. The dry run reads the lock and refuses on a
+live one, without taking it.
+
 A round is: every problem in the corpus, one attempt each, scored, with the
 results written into a run directory. Round 0 uses the frozen scaffold and no
 self-editing.
@@ -233,9 +245,13 @@ spent. § Resume, below, is how.
 is built and tested.
 
 **The contract**, which everything in this section serves: *resume never
-adopts a number this run did not measure under this exact configuration, never
-destroys a measurement, and re-running a finished sweep with the identical
-command is a no-op success.*
+adopts a number this run did not measure under this exact configuration; it
+never overwrites a prior measurement — a re-drive lands in a new generation
+beside the old one; a finished round is returned as a no-op success ONLY for
+the identical measurement (same `eval_set_hash`, `engine`, `config_digest`,
+resume on) and refuses without writing otherwise; `--dry-run` performs every
+validation the real run performs before its first write; one driver owns a
+results tree at a time.*
 
 **Kill the driver and run the identical command again.** That is the whole
 operator procedure. Nothing needs a flag, a cleanup, or a decision about which
@@ -258,30 +274,87 @@ happens then (the finished attempts are re-driven, not half-reused).
 
 Useful flags: `--seeds 1 2 3` (≥3, distinct; the first also seeds round 0),
 `--noise-floor-only`, `--dry-run`, and `--no-resume` (drive every attempt from
-scratch — the honest way to *re-measure* rather than continue). Exit `0`
+scratch — the honest way to *re-measure* rather than continue; what it
+displaces is preserved, see "A re-drive lands beside the old generation"
+below, and it is refused against a round that already finished). Exit `0`
 finished — or, on a restart, already finished — `2` refused with the reason,
 `130` interrupted, which is a pause and not a loss.
 
 **What `--dry-run` touches, exactly.** It loads the corpus and refuses a missing
 harness script, reads the scaffold repo's `HEAD`, reads the three settings
 objects and constructs the Anthropic SDK client (a missing credential refuses
-here, at zero compute; no request is sent), and builds the same
-`NoiseFloorConfig` and `RoundConfig` the real run would — so `--seeds 1
---dry-run` refuses exactly as `--seeds 1 --yes` would. It does **not** create
-the results directory, materialise a workspace, or call a model. Exit `0` from
-a dry run means the identical command with `--yes` in place of `--dry-run`
-gets past preflight.
+here, at zero compute; no request is sent), builds the same `NoiseFloorConfig`
+and `RoundConfig` the real run would — so `--seeds 1 --dry-run` refuses
+exactly as `--seeds 1 --yes` would — and then performs every read-only check
+the runners perform before their first write: it binds the eval-set hash
+against the corpus the same way they do (one definition of the hash,
+`fingerprint_corpus`, called with the adapter's `eval_set_material` on both
+sides — a real `--yes` run used to refuse itself here, after creating the
+results tree, because the driver hashed with that material and the runners
+without), reads `.driver.lock` and refuses if another driver holds the tree,
+and reads `trajectory.json` / `round-00/round.json` and refuses if round 0
+finished under this slug but was measured differently. It does **not** create
+the results directory, take the lock, materialise a workspace, or call a
+model. Exit `0` from a dry run means the identical command with `--yes` in
+place of `--dry-run` gets past preflight.
 
-**A restart after the round finished.** The round's row is already in
-`trajectory.json` and `round-NN/round.json` names the same `run_id`, so the
-driver returns what the first process wrote — decoded off disk, nothing driven,
-nothing rewritten — logs `research.round.already_finished`, prints `round 00:
-already finished under run_id …; nothing driven, nothing written`, and exits
-`0`. (Before this was fixed, the restart rewrote `round.json` with a new cost
-and timestamp and *then* refused, exit `2`, on every restart forever.) If the
-index is taken but by a *different* `run_id`, that is a genuine re-measurement
-under a used index and it is refused before anything is written — the
-trajectory is append-only; a re-measurement gets a new index.
+**A restart after the round finished — the identical measurement.** The
+round's row is already in `trajectory.json`, `round-NN/round.json` names the
+same `run_id`, and the record's `eval_set_hash`, `engine` and `config_digest`
+(written into `round.json` and into the row for exactly this comparison) and
+the row's `seed` all equal this invocation's, so the driver returns what the
+first process wrote — decoded off disk, nothing driven, nothing rewritten —
+logs `research.round.already_finished`, prints `round 00: already finished
+under run_id … with this eval set, engine and configuration; nothing driven,
+nothing written`, and exits `0`. (Before this was fixed, the restart rewrote
+`round.json` with a new cost and timestamp and *then* refused, exit `2`, on
+every restart forever.) Anything else is refused before anything is written,
+and the message says which:
+
+- the index is taken by a *different* `run_id` — a re-measurement under a used
+  index; the trajectory is append-only, a re-measurement gets a new index;
+- the same `run_id`, but a different `eval_set_hash`, `engine`,
+  `config_digest` or `seed` — *this is a different measurement — use a new
+  loop slug/round index*. `run_id` alone used to be enough, so a finished
+  round was handed back as this run's success under a changed scaffold, cap
+  or corpus;
+- the same measurement, but `--no-resume` — *the round is finished;
+  `--no-resume` cannot re-measure into a finished index*;
+- the row is there but `round.json` is missing — the process was killed
+  between appending the row and writing the record. The row cannot rebuild
+  it (it carries the cell means, deltas, cost, gates and verdict, but not the
+  per-problem scores or `created_at_ms`), so the driver refuses and says so:
+  restore `round-NN/round.json` from a backup or from the per-attempt
+  checkpoints and summaries; a new round index is *not* the remedy, because
+  this round did finish;
+- `round.json` names a different `run_id` than the row — the directory
+  disagrees with the file it mirrors and needs an operator, not a rewrite.
+
+The driver runs the finished-round check in its preflight (both `--dry-run`
+and `--yes`), so a round finished under another configuration is refused
+before a single noise-floor seed is re-driven under the new one.
+
+**A re-drive lands beside the old generation, never over it.** A fresh drive
+into a slot that already holds an attempt — `--no-resume`, or a stored
+attempt the resume probe called a previous generation — moves *everything*
+that generation left into the next `attempts/<problem-id>/prior-N/`: the
+metrics trio and plots (as `_rotate_stale_metrics` always did, unchanged) and,
+now, the checkpoint (`prior-N/checkpoint.json`) and the attempt log
+(`prior-N/attempt-log.json`), under fixed names because a nested problem id
+would give both files the same basename. Before this, `--no-resume` on the
+noise floor re-drove every seed under the same deterministic `nf-seed-N` run
+ids and *overwrote* `checkpoints/<problem>.json` and `attempts/<problem>.json`
+in place — the record carrying the earlier score and identity — while
+carefully preserving the chain that then had no checkpoint to reconcile with.
+A *resumed* attempt keeps its checkpoint and log where they are (they are what
+it resumes from) and only its chain restarts. `verify` and the desktop are
+untouched: both key on `metrics.jsonl`, and `prior-N/` already held one.
+
+**An identical re-run leaves `noise-floor.json` alone.** The floor is
+re-derived on every invocation, so the identical command arrives with the same
+report and a fresh timestamp; if the file on disk equals the new report in
+every field but `created_at_ms`, it is not rewritten and keeps its original
+timestamp (`research.noise_floor.unchanged`). Any real difference is written.
 
 ### What counts as complete
 
@@ -297,10 +370,11 @@ which the runner rewrites after every step and before every escalation.
 | `ABANDONED` | complete | reuse it — you already answered; re-driving would re-ask |
 | `PAUSED` | **not** complete | resume from the checkpoint: same attempt id, same workspace, carried consumption |
 | `PENDING` / `RUNNING` / `VERIFYING` | **not** complete | same as `PAUSED` — a crash can land in any of them |
-| `ESCALATED`, no decision yet | **not** complete | re-enter the wait on *that* request; the escalation still counts once. The restart polls for the answer *before* paging you again and then keeps the reminder cadence — a run restarted five times asks once |
+| `ESCALATED`, no decision yet | **not** complete | re-enter the wait on *that* request; the escalation still counts once. The restart polls for the answer *before* paging you again and then keeps the reminder cadence — a run restarted five times asks once. The cost of that, stated: a reopened wait pages only once a full reminder interval (`research_escalation_repush_seconds`, default 1800 s) has elapsed *since the restart*, so if the earlier process died before its first push you first hear of the request 30 minutes after the restart — and with reminders disabled (`repush_interval_seconds=None`) not at all until the next fresh escalation; the request file is on disk throughout and `python -m turing.research.loop.cli --loop-dir <dir> --list` shows it |
 | `ESCALATED`, but `escalations/<id>.json` does not decode or names another attempt | — | there is no question to re-enter, so the attempt is driven again — never lost |
-| any resumable state, but the checkpoint's `workspace_path` no longer exists | — | **refused**, and the problem is reported *lost* for this round: driving on would run the solver and the verifier against a directory that is not there and score the result. Restore the workspace at that path, or delete `checkpoints/<problem-id>.json` to drive the attempt fresh (which resets its consumption) |
-| checkpoint unreadable (not JSON, not UTF-8, a directory) | — | treated as absent: drive it. Nothing the resume probe reads can take the round down |
+| any resumable state, but the checkpoint's `workspace_path` no longer exists | — | **refused**, and the problem is reported *lost* for this round: driving on would run the solver and the verifier against a directory that is not there and score the result. Nothing is written — the checkpoint, log and chain stay exactly as the interrupted process left them, and no crashed summary is written beside the `PAUSED` checkpoint — so once you restore the workspace at that path the attempt resumes; or delete `checkpoints/<problem-id>.json` to drive it fresh (which resets its consumption) |
+| checkpoint unreadable (not JSON, not UTF-8) | — | treated as absent: drive it. Nothing the resume probe reads can take the round down |
+| the checkpoint path is a *directory* | — | the probe says absent, but the attempt's first checkpoint write then raises `IsADirectoryError` and the problem is reported *lost* for this round (contained to that problem; the rest of the round runs). Rotation moves files, not directories, so the squatter stays where it is until you remove it |
 | no checkpoint | — | drive it |
 
 `PAUSED` is the load-bearing row. It is why an interruption costs the remainder
@@ -323,11 +397,21 @@ this page and `verify` cannot disagree about the same directory:
   not bless a later checkpoint it never described.
 
 One identity condition applies to every row: the checkpoint must name the
-**same run, measured the same way** — `run_id`, `seed`, `eval_set_hash` *and*
-`config_digest`. The digest is a SHA-256 over the measurement-affecting
-configuration: the engine (backend, both models, scaffold sha), the default
-cap, the pass criteria, `verify_every_step`, `escalate_on_cap_exhaustion`,
-`max_escalations_per_attempt` and the score floors. A checkpoint from a
+**same run, measured the same way** — `run_id`, `seed`, `eval_set_hash`,
+`config_digest` *and* `configured_cap`. The digest is a SHA-256 over the
+measurement-affecting configuration: the engine (backend, both models,
+scaffold sha), the default cap, the pass criteria, `verify_every_step`,
+`escalate_on_cap_exhaustion`, `max_escalations_per_attempt`, the score floors
+and `harness_identity` — the instrument the corpus fingerprint does not name;
+for the speedup family, the `python_executable` the timing harness runs
+under, so the same corpus timed under two interpreters is two measurements.
+`configured_cap` is per attempt, not per round: it is the cap the attempt was
+*started* under (`Problem.default_cap` if the problem declares one, else the
+round's default), written on every checkpoint and compared on resume, because
+a per-problem cap is outside the round's digest and an edited one would
+otherwise reuse an attempt measured at the old cap. It is deliberately not
+`cap`, which an operator `EXTEND_CAP` legitimately raises mid-attempt — an
+extended attempt is still the same measurement. A checkpoint from a
 different round id, a different seed, a corpus that has since changed, or a
 configuration that has since changed is a *previous generation*, not a resume
 point, and is re-driven. That is what stops a deliberate re-measurement from
@@ -362,7 +446,13 @@ so it is only meaningful measured over the whole corpus.
   saw; the earlier one is in `prior-N/`. The attempt log
   `attempts/<problem-id>.json` is the one artifact that *does* span it: it is
   rewritten after every step, so a restart carries the earlier rows forward
-  and the finished log's rows equal `consumed.steps`.
+  and the finished log's rows equal `consumed.steps` — with one stated
+  exception. The order within a step is checkpoint, then log, then metrics
+  line, so a kill that lands between the checkpoint write and the log write
+  leaves the checkpoint one step ahead of the log; the resumed attempt
+  carries the log's rows forward, and the finished log is then one row short
+  of `consumed.steps` for that step. The chain and the checkpoint still hold
+  the step; only the log's row list is short.
 - **A killed attempt's directory reports `INCOMPLETE` forever.** That is not
   new and not a defect: an intact chain with no summary is the true statement
   about a process that was killed, and rotation preserves it exactly as found.
@@ -781,8 +871,10 @@ the end.
 ~/research-results/
   .viewer.json                            points the desktop's metrics pane at "progress"
   loop-<slug>/
+    .driver.lock                          pid/host/started_at of the one driver over this tree
     trajectory.json                       (already existed)
     round-00/
+      round.json                          the round record; carries config_digest — see § Resume
       metrics.json                        round summary — per-cell, never pooled
       scores.svg                          grouped bar chart, one bar per cell
       attempts/
@@ -793,6 +885,10 @@ the end.
           metrics.chain.json              hash-chain sidecar (see Integrity, below)
           progress.svg
           cap.svg
+          prior-N/                        a superseded generation, moved aside whole:
+            metrics.jsonl, metrics.json, metrics.chain.json, *.svg
+            checkpoint.json               its checkpoint  (was checkpoints/<problem-id>.json)
+            attempt-log.json              its attempt log (was attempts/<problem-id>.json)
       checkpoints/
         <problem-id>.json                 the resume record — see § Resume
       escalations/                        (already existed)

@@ -114,6 +114,9 @@ class NoiseFloorConfig:
     score_floors: Mapping[str, float] = field(default_factory=lambda: DEFAULT_SCORE_FLOORS)
     escalate_on_cap_exhaustion: bool = False
     max_escalations_per_attempt: int = 3
+    #: Forwarded to every seed's :class:`RoundConfig`; see the fields there.
+    eval_set_material: tuple[str, ...] = ()
+    harness_identity: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if len(self.seeds) < MIN_NOISE_FLOOR_SEEDS:
@@ -126,6 +129,8 @@ class NoiseFloorConfig:
                 "seeds must be distinct; re-running one seed measures determinism, not noise"
             )
         object.__setattr__(self, "seeds", tuple(self.seeds))
+        object.__setattr__(self, "eval_set_material", tuple(self.eval_set_material))
+        object.__setattr__(self, "harness_identity", tuple(self.harness_identity))
 
     def round_config_for(self, seed: int) -> RoundConfig:
         """The per-seed execution config.
@@ -146,6 +151,8 @@ class NoiseFloorConfig:
             max_escalations_per_attempt=self.max_escalations_per_attempt,
             pass_criteria=self.pass_criteria,
             score_floors=self.score_floors,
+            eval_set_material=self.eval_set_material,
+            harness_identity=self.harness_identity,
         )
 
 
@@ -229,7 +236,10 @@ class NoiseFloorRunner:
         escalations = 0
         for problem in corpus:
             stored = await self._trajectory.load_stored_attempt(
-                problem.id, output_dir=output_dir, identity=identity
+                problem.id,
+                output_dir=output_dir,
+                identity=identity,
+                cap=problem.default_cap or config.default_cap,
             )
             if not stored.is_complete:  # pragma: no cover — list_completed_seeds checked
                 raise ContractViolationError(
@@ -365,8 +375,21 @@ class NoiseFloorRunner:
         Raises:
             ContractViolationError: a seed lost one or more attempts, or —
                 from ``measure_noise_floor`` and :class:`NoiseFloorConfig` —
-                too few seeds or a cell missing from some seed.
+                too few seeds or a cell missing from some seed; or another
+                driver holds this results tree (one driver per tree — the
+                whole measurement runs under
+                :meth:`~turing.research.loop.trajectory.TrajectoryStore.driver_lock`).
         """
+        async with self._trajectory.driver_lock():
+            return await self._run_locked(corpus, config, resume=resume)
+
+    async def _run_locked(
+        self,
+        corpus: Sequence[Problem],
+        config: NoiseFloorConfig,
+        *,
+        resume: bool,
+    ) -> NoiseFloorReport:
         await self._trajectory.ensure_layout()
         existing = await self._trajectory.load_trajectory()
         if existing.get("rounds"):
@@ -380,7 +403,9 @@ class NoiseFloorRunner:
             )
         per_seed: dict[int, tuple[TypeScore, ...]] = {}
         escalations = 0
-        eval_set_hash = bind_eval_set_hash(corpus, config.eval_set_hash)
+        eval_set_hash = bind_eval_set_hash(
+            corpus, config.eval_set_hash, extra=config.eval_set_material
+        )
         self._skipped_seeds = ()
         # The per-seed identity is the *bound* seed config's — the same object
         # ``run_attempts`` stamps onto every checkpoint — so it carries the
@@ -399,7 +424,9 @@ class NoiseFloorRunner:
         already_measured: tuple[int, ...] = ()
         if resume:
             already_measured = await self._trajectory.list_completed_seeds(
-                identities, [problem.id for problem in corpus]
+                identities,
+                [problem.id for problem in corpus],
+                caps={problem.id: problem.default_cap or config.default_cap for problem in corpus},
             )
         for seed in config.seeds:
             seed_config = seed_configs[seed]

@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -74,7 +75,7 @@ from turing.research.loop.metrics import (
 from turing.research.loop.protocols import SystemClock
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import AsyncIterator, Mapping, Sequence
 
     from turing.research.contracts import EscalationDecision
     from turing.research.loop.metrics import Cell, CostBasis, NoiseFloor
@@ -83,10 +84,12 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 __all__ = [
+    "DRIVER_LOCK_FILENAME",
     "TRAJECTORY_FILENAME",
     "TRAJECTORY_SCHEMA_VERSION",
     "AttemptDisposition",
     "AttemptLog",
+    "DriverLockHolder",
     "RunIdentity",
     "StepLog",
     "StoredAttempt",
@@ -108,6 +111,53 @@ TRAJECTORY_SCHEMA_VERSION = 1
 TRAJECTORY_FILENAME = "trajectory.json"
 NOISE_FLOOR_DIRNAME = "noise-floor"
 NOISE_FLOOR_FILENAME = "noise-floor.json"
+#: ``<loop-dir>/.driver.lock`` — one driver owns a results tree at a time.
+DRIVER_LOCK_FILENAME = ".driver.lock"
+
+
+@dataclass(frozen=True, slots=True)
+class DriverLockHolder:
+    """What ``.driver.lock`` says about the process that holds a results tree.
+
+    ``pid`` and ``host`` together are the liveness question; ``started_at_ms``
+    is for the operator reading the refusal. A holder on another host cannot
+    be probed from here and is treated as live — refusing is the safe
+    direction, and the message says which file to remove if it is not.
+    """
+
+    pid: int
+    started_at_ms: int
+    host: str
+    path: Path
+
+    def is_alive(self) -> bool:
+        if self.host != _hostname():
+            return True
+        return _pid_alive(self.pid)
+
+
+def _hostname() -> str:
+    return os.uname().nodename
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether ``pid`` names a live process on this host.
+
+    ``os.kill(pid, 0)`` sends no signal; it only asks the kernel whether the
+    target exists. ``PermissionError`` means it exists and belongs to someone
+    else, which is still *alive*.
+    """
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def cell_key(cell: Cell) -> str:
@@ -563,13 +613,26 @@ def encode_round_record(
     scored: Sequence[ScoredProblem] = (),
     assessments: Sequence[SaturationAssessment] = (),
     noise_floors: Sequence[NoiseFloor] = (),
+    config_digest: str = "",
 ) -> dict[str, Any]:
-    """Full round artifact — ``round-NN/round.json``."""
+    """Full round artifact — ``round-NN/round.json``.
+
+    ``config_digest`` is ``RoundConfig.config_digest()`` for the config the
+    round was measured under. It is not a :class:`RoundRecord` field — the
+    record is the *result*, and the digest is a property of the measurement —
+    but it is written beside the record so a restart can tell "this round is
+    finished" from "a round by this name is finished, measured some other
+    way": ``RoundRunner.run_round`` returns a finished round as a no-op only
+    when the stored ``eval_set_hash``, ``engine`` and ``config_digest`` all
+    equal this run's. Empty means the writer had no config (a hand-built
+    record in a test) and never equals a real digest.
+    """
     return {
         "round_index": record.round_index,
         "run_id": record.run_id,
         "parent_round_id": record.parent_round_id,
         "eval_set_hash": record.eval_set_hash,
+        "config_digest": config_digest,
         "created_at_ms": record.created_at_ms,
         "engine": {
             "backend": record.engine.backend,
@@ -648,11 +711,14 @@ def encode_trajectory_row(
     seed: int | None = None,
     cap: Cap | None = None,
     verify_every_step: bool | None = None,
+    config_digest: str = "",
 ) -> dict[str, Any]:
     """One row of ``trajectory.json`` — the four numbers plus lineage.
 
     Every per-cell field is an object keyed by ``"<type>/<split>"``. There is
-    no scalar ``primary``: see the module docstring.
+    no scalar ``primary``: see the module docstring. ``config_digest`` is the
+    same value :func:`encode_round_record` carries, so the row and the record
+    can be checked against each other.
     """
     floors = {cell_key(f.cell): f.value for f in noise_floors}
     n = {cell_key((ts.problem_type, ts.split)): ts.n for ts in record.type_scores}
@@ -661,6 +727,7 @@ def encode_trajectory_row(
         "run_id": record.run_id,
         "parent_round": record.parent_round_id,
         "eval_set_hash": record.eval_set_hash,
+        "config_digest": config_digest,
         "comparable_to_parent": comparable_to_parent,
         "engine": {
             "backend": record.engine.backend,
@@ -772,6 +839,13 @@ class TrajectoryStore:
         self._root = results_root
         self._slug = loop_slug
         self._clock = clock or SystemClock()
+        #: Re-entrancy depth of :meth:`driver_lock` for *this* store object.
+        #: One driver process holds one store; nested seams (the driver
+        #: around the whole run, ``run_round`` around the round,
+        #: ``run_attempts`` around the attempts) share the hold rather than
+        #: refusing each other. A second store object over the same tree —
+        #: which is what a second process is — does not share it.
+        self._driver_lock_depth = 0
 
     @property
     def loop_slug(self) -> str:
@@ -812,6 +886,163 @@ class TrajectoryStore:
 
         await asyncio.to_thread(_mk)
 
+    # -- the driver lock --------------------------------------------------- #
+
+    @property
+    def driver_lock_path(self) -> Path:
+        return self.loop_dir / DRIVER_LOCK_FILENAME
+
+    def read_driver_lock(self) -> DriverLockHolder | None:
+        """Who holds this tree, per ``.driver.lock``, or ``None`` if nobody.
+
+        Read-only — the dry run uses it to perform the same check the real
+        run's acquisition performs, without creating anything.
+
+        Raises:
+            ContractViolationError: the file exists but does not decode. It
+                cannot be told from a live driver, so it is refused with the
+                path to remove once the operator has confirmed no driver runs.
+        """
+        path = self.driver_lock_path
+        try:
+            raw = _read_json(path)
+        except (OSError, ValueError) as exc:
+            raise ContractViolationError(
+                f"{path} exists but is not a readable driver lock ({exc}); it cannot be "
+                "told from a live driver. If no driver is running over this results tree, "
+                "remove the file and re-run"
+            ) from exc
+        if raw is None:
+            return None
+        try:
+            return DriverLockHolder(
+                pid=int(raw["pid"]),
+                started_at_ms=int(raw["started_at_ms"]),
+                host=str(raw["host"]),
+                path=path,
+            )
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise ContractViolationError(
+                f"{path} exists but is not a driver lock ({type(exc).__name__}: {exc}); it "
+                "cannot be told from a live driver. If no driver is running over this "
+                "results tree, remove the file and re-run"
+            ) from exc
+
+    def refuse_if_driver_lock_live(self) -> None:
+        """The dry run's half of :meth:`acquire_driver_lock`: check, never take."""
+        holder = self.read_driver_lock()
+        if holder is not None and holder.is_alive():
+            raise self._held_by(holder)
+
+    def _held_by(self, holder: DriverLockHolder) -> ContractViolationError:
+        return ContractViolationError(
+            f"{self.loop_dir} is held by another driver (pid {holder.pid} on "
+            f"{holder.host}, started {holder.started_at_ms}); one driver owns a results "
+            "tree at a time — a second would resume the first's live attempts as its own "
+            "and rotate the live metrics chain aside. Wait for it, kill it, or use a new "
+            f"--loop-slug. If that pid is not a driver, remove {holder.path} and re-run"
+        )
+
+    async def acquire_driver_lock(self) -> None:
+        """Take ``.driver.lock`` for this store, or refuse.
+
+        ``O_CREAT | O_EXCL`` on the lock path is the atomic test-and-set;
+        the file then holds ``pid``, ``started_at_ms`` and ``host``. A lock
+        whose pid is not alive on this host is *stale* — the previous driver
+        was killed without releasing — and is reclaimed with a
+        ``research.driver_lock.reclaimed`` log line; a live one refuses with
+        the holder's pid. Re-entrant per store object (see ``__init__``).
+
+        The loop directory is created here if it does not exist, because the
+        lock file lives in it and must land before any other write. That is
+        the one write a refused ``--yes`` run may leave behind and it is by
+        design: the driver takes the lock only after every read-only preflight
+        has passed, and a dry run never calls this.
+        """
+        if self._driver_lock_depth > 0:
+            self._driver_lock_depth += 1
+            return
+
+        def _take() -> None:
+            self.loop_dir.mkdir(parents=True, exist_ok=True)
+            path = self.driver_lock_path
+            for _attempt in range(2):
+                try:
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                except FileExistsError:
+                    holder = self.read_driver_lock()
+                    if holder is None:
+                        # Vanished between the failed create and the read —
+                        # the previous holder released. Try once more.
+                        continue
+                    if holder.is_alive():
+                        raise self._held_by(holder) from None
+                    logger.warning(
+                        "research.driver_lock.reclaimed",
+                        path=str(path),
+                        stale_pid=holder.pid,
+                        stale_started_at_ms=holder.started_at_ms,
+                        detail=(
+                            "the lock names a pid that is not alive on this host; the "
+                            "previous driver was killed without releasing it and this "
+                            "run takes over the results tree"
+                        ),
+                    )
+                    path.unlink(missing_ok=True)
+                    continue
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        {
+                            "pid": os.getpid(),
+                            "started_at_ms": self._clock.now_ms(),
+                            "host": _hostname(),
+                        },
+                        handle,
+                    )
+                    handle.write("\n")
+                return
+            raise ContractViolationError(
+                f"could not take {path}: it kept reappearing between a failed create and "
+                "the next; another driver is racing for this results tree"
+            )
+
+        await asyncio.to_thread(_take)
+        self._driver_lock_depth = 1
+        logger.info("research.driver_lock.acquired", path=str(self.driver_lock_path))
+
+    async def release_driver_lock(self) -> None:
+        """Drop one level of the hold; the file goes when the last level does."""
+        if self._driver_lock_depth == 0:
+            return
+        self._driver_lock_depth -= 1
+        if self._driver_lock_depth > 0:
+            return
+
+        def _drop() -> None:
+            path = self.driver_lock_path
+            try:
+                holder = self.read_driver_lock()
+            except ContractViolationError:
+                holder = None
+            # Only ever remove our own lock: a stale-reclaim by another
+            # process in the meantime (which would mean this process looked
+            # dead to it) must not have its lock pulled from under it.
+            if holder is not None and (holder.pid != os.getpid() or holder.host != _hostname()):
+                return
+            path.unlink(missing_ok=True)
+
+        await asyncio.to_thread(_drop)
+        logger.info("research.driver_lock.released", path=str(self.driver_lock_path))
+
+    @asynccontextmanager
+    async def driver_lock(self) -> AsyncIterator[None]:
+        """``async with store.driver_lock():`` — acquire, and release on any exit."""
+        await self.acquire_driver_lock()
+        try:
+            yield
+        finally:
+            await self.release_driver_lock()
+
     # -- attempts ---------------------------------------------------------- #
 
     async def write_attempt_log(self, log: AttemptLog, *, output_dir: Path) -> Path:
@@ -829,6 +1060,7 @@ class TrajectoryStore:
         output_dir: Path,
         eval_set_hash: str = "",
         config_digest: str = "",
+        configured_cap: Cap | None = None,
     ) -> Path:
         """Persist the latest immutable checkpoint of an attempt.
 
@@ -859,6 +1091,18 @@ class TrajectoryStore:
           measuring under a *different configuration* — a raised cap, a
           swapped scaffold, a flipped ``verify_every_step``. See
           :attr:`RunIdentity.config_digest`.
+        * ``configured_cap`` — the cap this attempt was *started* under,
+          resolved per problem (``Problem.default_cap or
+          RoundConfig.default_cap``) and never extended. It is distinct from
+          ``cap``, which an operator ``EXTEND`` legitimately raises
+          mid-attempt. The round's ``config_digest`` covers only the round's
+          default; a problem that declares its own cap can have that cap
+          edited between two invocations with the digest unchanged, and
+          without this field the attempt measured at the old cap would be
+          reused as if measured at the new one. :meth:`load_stored_attempt`
+          compares it when the caller passes ``cap``. ``None`` is written
+          only by callers that have no problem in hand (a hand-built
+          checkpoint in a test) and is never equal to a real cap.
         """
         path = self.attempt_checkpoint_path(attempt.problem_id, output_dir=output_dir)
         payload = {
@@ -882,6 +1126,7 @@ class TrajectoryStore:
                 "max_wall_clock_seconds": attempt.cap.max_wall_clock_seconds,
                 "extension_count": attempt.cap.extension_count,
             },
+            "configured_cap": None if configured_cap is None else _encode_cap(configured_cap),
             "consumed": {
                 "steps": attempt.consumed.steps,
                 "tokens": attempt.consumed.tokens,
@@ -910,19 +1155,30 @@ class TrajectoryStore:
         *,
         output_dir: Path,
         identity: RunIdentity,
+        cap: Cap | None = None,
     ) -> StoredAttempt:
         """What is already on disk for one ``(run, problem)``, and what to do with it.
 
         **The contract**, which every rule below serves and every test of
         resume is a test of: *resume never adopts a number this run did not
-        measure under this exact configuration, never destroys a measurement,
-        and re-running a finished sweep with the identical command is a no-op
-        success.*
+        measure under this exact configuration; it never overwrites a prior
+        measurement — a re-drive lands in a new generation beside the old
+        one; a finished round is returned as a no-op success ONLY for the
+        identical measurement (same* ``eval_set_hash``, ``engine``,
+        ``config_digest``, *resume on) and refuses without writing otherwise;*
+        ``--dry-run`` *performs every validation the real run performs before
+        its first write; one driver owns a results tree at a time.*
 
         **Complete — reuse the outcome, spend nothing.** All of:
 
         * the checkpoint decodes and names this ``identity``
           (``round_id`` / ``seed`` / ``eval_set_hash`` / ``config_digest``);
+        * when ``cap`` is given — the cap this run would start the problem
+          under, ``Problem.default_cap or RoundConfig.default_cap`` — the
+          checkpoint's ``configured_cap`` equals it. A per-problem cap is
+          outside the round's ``config_digest``, so this is the only place
+          an edited ``Problem.default_cap`` is caught; a checkpoint written
+          before the field existed has none and is a previous generation;
         * its state is terminal — ``PASSED``, ``FAILED_WITHIN_CAP`` or
           ``ABANDONED`` (:data:`~turing.research.contracts.TERMINAL_ATTEMPT_STATES`);
         * the attempt log ``attempts/<problem-id>.json`` is beside it **and
@@ -974,7 +1230,9 @@ class TrajectoryStore:
         operator ``ABANDON`` verdict, so re-driving it would re-ask a question
         the operator has already answered.
         """
-        return await asyncio.to_thread(self._read_stored_attempt, problem_id, output_dir, identity)
+        return await asyncio.to_thread(
+            self._read_stored_attempt, problem_id, output_dir, identity, cap
+        )
 
     async def load_completed_attempt(
         self,
@@ -1002,6 +1260,8 @@ class TrajectoryStore:
         self,
         identities: Mapping[int, RunIdentity],
         problem_ids: Sequence[str],
+        *,
+        caps: Mapping[str, Cap] | None = None,
     ) -> tuple[int, ...]:
         """Which noise-floor seeds already measured **every** problem, completely.
 
@@ -1018,12 +1278,21 @@ class TrajectoryStore:
 
         ``identities`` is keyed by seed because each seed run has its own
         ``run_id`` (``<run_id>-seed-<n>``); the eval-set hash is shared.
+        ``caps``, keyed by problem id, is the cap each problem would be
+        started under and is forwarded to :meth:`load_stored_attempt`'s
+        ``cap`` — a seed whose attempts were measured under a since-edited
+        per-problem cap is not complete.
         """
         completed: list[int] = []
         for seed, identity in identities.items():
             output_dir = self.noise_floor_seed_dir(seed)
             stored = [
-                await self.load_stored_attempt(problem_id, output_dir=output_dir, identity=identity)
+                await self.load_stored_attempt(
+                    problem_id,
+                    output_dir=output_dir,
+                    identity=identity,
+                    cap=None if caps is None else caps.get(problem_id),
+                )
                 for problem_id in problem_ids
             ]
             if stored and all(item.is_complete for item in stored):
@@ -1035,6 +1304,7 @@ class TrajectoryStore:
         problem_id: str,
         output_dir: Path,
         identity: RunIdentity,
+        cap: Cap | None = None,
     ) -> StoredAttempt:
         """The blocking half of :meth:`load_stored_attempt`, run in a thread."""
 
@@ -1081,6 +1351,16 @@ class TrajectoryStore:
                 f"eval_set_hash={identity.eval_set_hash!r}, "
                 f"config_digest={identity.config_digest!r})"
             )
+        if cap is not None:
+            expected = _encode_cap(cap)
+            stored_cap = raw.get("configured_cap")
+            if stored_cap != expected:
+                return absent(
+                    f"checkpoint was measured under configured_cap {stored_cap!r}; this run "
+                    f"would start {problem_id!r} under {expected!r}. A per-problem cap is "
+                    "outside the round's config_digest, so an attempt measured at one cap "
+                    "is a previous generation to a run that would apply another"
+                )
 
         log_path = output_dir / "attempts" / f"{problem_id}.json"
         steps: tuple[StepLog, ...] = ()
@@ -1219,6 +1499,7 @@ class TrajectoryStore:
         scored: Sequence[ScoredProblem] = (),
         assessments: Sequence[SaturationAssessment] = (),
         noise_floors: Sequence[NoiseFloor] = (),
+        config_digest: str = "",
     ) -> Path:
         path = self.round_dir(record.round_index) / "round.json"
         payload = encode_round_record(
@@ -1226,6 +1507,7 @@ class TrajectoryStore:
             scored=scored,
             assessments=assessments,
             noise_floors=noise_floors,
+            config_digest=config_digest,
         )
         await asyncio.to_thread(_write_json, path, payload)
         return path
@@ -1272,6 +1554,7 @@ class TrajectoryStore:
         seed: int | None = None,
         cap: Cap | None = None,
         verify_every_step: bool | None = None,
+        config_digest: str = "",
     ) -> dict[str, Any]:
         """Append one round object to ``trajectory.json``, flagging lineage.
 
@@ -1325,6 +1608,7 @@ class TrajectoryStore:
             seed=seed,
             cap=cap,
             verify_every_step=verify_every_step,
+            config_digest=config_digest,
         )
         row["engine_changed"] = engine_changed
         row["trajectory_restart"] = comparable is False
@@ -1349,8 +1633,48 @@ class TrajectoryStore:
     # -- noise floor ------------------------------------------------------- #
 
     async def write_noise_floor(self, payload: Mapping[str, Any]) -> Path:
-        await asyncio.to_thread(_write_json, self.noise_floor_path, dict(payload))
-        return self.noise_floor_path
+        """Write ``noise-floor.json``, unless it already says exactly this.
+
+        The floor is re-derived on every invocation (``NoiseFloorRunner.run``
+        reuses complete seeds rather than short-circuiting on the file), so
+        an identical re-run arrives here with the same report and a fresh
+        ``created_at_ms``. Rewriting then would make the documented no-op
+        procedure touch a results-tree file on every restart, and the only
+        byte that moved would be a timestamp claiming the floor was measured
+        later than it was. So: if the file on disk decodes and equals the new
+        payload in every field but ``created_at_ms``, it is left as it is,
+        original timestamp included. Any other difference — a seed added, a
+        cell moved, a file that does not decode — is written over, because
+        the report in hand is the one this run measured.
+        """
+        path = self.noise_floor_path
+        fresh = dict(payload)
+
+        def _write_unless_same() -> None:
+            try:
+                existing = _read_json(path)
+            except (OSError, ValueError):
+                existing = None
+            if isinstance(existing, dict):
+                # Compared as JSON values, so a tuple in the payload equals
+                # the list it would have been written as.
+                normalised = json.loads(json.dumps(fresh, sort_keys=True, allow_nan=False))
+                theirs = {k: v for k, v in existing.items() if k != "created_at_ms"}
+                ours = {k: v for k, v in normalised.items() if k != "created_at_ms"}
+                if theirs == ours:
+                    logger.info(
+                        "research.noise_floor.unchanged",
+                        path=str(path),
+                        detail=(
+                            "an identical re-run re-derived the same floor; the file on "
+                            "disk is left as the first process wrote it"
+                        ),
+                    )
+                    return
+            _write_json(path, fresh)
+
+        await asyncio.to_thread(_write_unless_same)
+        return path
 
     async def load_noise_floor(self) -> dict[str, Any] | None:
         raw = await asyncio.to_thread(_read_json, self.noise_floor_path)

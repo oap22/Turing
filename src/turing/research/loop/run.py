@@ -16,9 +16,14 @@ is already on disk::
 Kill it at any point and run the identical command again: completed attempts are
 reused, an interrupted attempt continues from its checkpoint, an attempt
 suspended on an operator decision re-enters that wait, and a round that had
-already finished is returned as it was written — a no-op success, not a
-refusal. See the "Resume" section of ``docs/research-agent.md`` for the
-completeness table this rests on, and
+already finished *under this exact configuration* is returned as it was written
+— a no-op success, not a refusal. A finished round measured some other way
+(a different corpus, scaffold, cap or criterion under the same slug) is refused
+before anything is driven, as is ``--no-resume`` against a finished round: the
+trajectory is append-only, and a re-measurement gets a new slug. One driver
+owns a results tree at a time — ``<loop-dir>/.driver.lock`` — and a second is
+refused with the first's pid. See the "Resume" section of
+``docs/research-agent.md`` for the completeness table this rests on, and
 :meth:`~turing.research.loop.trajectory.TrajectoryStore.load_stored_attempt` for
 the rules themselves.
 
@@ -37,13 +42,18 @@ the rules themselves.
   harness script, read the scaffold repo's ``HEAD``, read
   ``ResearchLoopSettings`` / ``SolverSettings`` / ``BackendSettings`` and
   construct the Anthropic SDK client (a missing credential refuses here, at
-  zero compute; no request is sent), and construct the
+  zero compute; no request is sent), construct the
   :class:`~turing.research.loop.noise_floor.NoiseFloorConfig` and
   :class:`~turing.research.loop.runner.RoundConfig` the real run would use —
-  so ``--seeds 1 --dry-run`` refuses exactly as ``--seeds 1`` would. It
-  **does not** create the results directory, materialise a workspace, or
-  call a model. Exit ``0`` from a dry run means the identical command with
-  ``--yes`` in place of ``--dry-run`` gets past preflight.
+  so ``--seeds 1 --dry-run`` refuses exactly as ``--seeds 1`` would — and
+  then perform every read-only check the runners perform before their first
+  write: bind the eval-set hash against the corpus the same way they do,
+  read ``.driver.lock`` and refuse if another driver holds the tree, and
+  read ``trajectory.json`` / ``round-00/round.json`` and refuse if round 0
+  finished under this slug but measured differently. It **does not** create
+  the results directory, take the lock, materialise a workspace, or call a
+  model. Exit ``0`` from a dry run means the identical command with ``--yes``
+  in place of ``--dry-run`` gets past preflight.
 
 **What this driver deliberately does not do**, each refused loudly rather than
 faked:
@@ -91,12 +101,12 @@ import structlog
 from turing.research.contracts import ContractViolationError, EngineIdentity
 from turing.research.loop.escalation import build_operator_channel
 from turing.research.loop.noise_floor import NoiseFloorConfig, NoiseFloorRunner
-from turing.research.loop.runner import RoundConfig, RoundRunner
+from turing.research.loop.runner import RoundConfig, RoundRunner, find_finished_round
 from turing.research.loop.settings import ResearchLoopSettings
 from turing.research.loop.solver_bridge import SolverBridge
 from turing.research.loop.trajectory import TrajectoryStore
 from turing.research.loop.workspace import CopyTreeWorkspaceProvider
-from turing.research.problems.adapter import fingerprint_corpus
+from turing.research.problems.adapter import bind_eval_set_hash, fingerprint_corpus
 from turing.research.problems.speedup import SpeedupAdapter
 from turing.research.solver import InMemoryCheckpointStore, Solver, WorkspaceManager
 from turing.research.solver.config import SolverSettings
@@ -258,12 +268,17 @@ async def _drive(args: argparse.Namespace) -> int:
     )
 
     store = TrajectoryStore(settings.research_results_root, args.loop_slug)
-    eval_set_hash = fingerprint_corpus(corpus, extra=adapter.eval_set_material())
+    eval_set_material = adapter.eval_set_material()
+    harness_identity = adapter.harness_identity()
+    eval_set_hash = fingerprint_corpus(corpus, extra=eval_set_material)
 
     # Both configs are built *before* the dry-run return so that a dry run
     # validates exactly what a real run would: ``--seeds 1`` refuses inside
     # ``NoiseFloorConfig.__post_init__`` here, on both paths, rather than
-    # passing a dry run it would fail for real.
+    # passing a dry run it would fail for real. ``eval_set_material`` rides
+    # on the configs so the runners re-derive the hash with the same
+    # ``extra`` it was fingerprinted with — one definition of the hash,
+    # ``fingerprint_corpus``, called the same way on both sides.
     floor_config = NoiseFloorConfig(
         run_id=f"{args.loop_slug}-noise-floor",
         eval_set_hash=eval_set_hash,
@@ -271,6 +286,8 @@ async def _drive(args: argparse.Namespace) -> int:
         seeds=tuple(args.seeds),
         default_cap=solver_settings.default_cap(),
         escalate_on_cap_exhaustion=solver_settings.research_escalate_on_cap_exhausted,
+        eval_set_material=eval_set_material,
+        harness_identity=harness_identity,
     )
     round_config = RoundConfig(
         round_index=0,
@@ -281,7 +298,31 @@ async def _drive(args: argparse.Namespace) -> int:
         seed=args.seeds[0],
         default_cap=solver_settings.default_cap(),
         escalate_on_cap_exhaustion=solver_settings.research_escalate_on_cap_exhausted,
+        eval_set_material=eval_set_material,
+        harness_identity=harness_identity,
     )
+
+    # The rest of the preflight: every check the runners perform before
+    # their first write, performed here on both the dry-run and the real
+    # path so exit 0 from a dry run means the ``--yes`` run gets past all
+    # of them. Each is read-only. In order:
+    #
+    # 1. The hash binding both runners perform — the same call, so a
+    #    promise the runners would refuse is refused here.
+    # 2. Whether another driver holds this results tree (the lock is only
+    #    *read* here; the real path takes it below, after the gates).
+    # 3. Whether round 0 already finished under this run_id and, if so,
+    #    whether it was the identical measurement. A finished round measured
+    #    some other way is refused before a single seed is re-driven under
+    #    the new configuration; an identical one is a no-op later.
+    try:
+        bind_eval_set_hash(corpus, eval_set_hash, extra=eval_set_material)
+        store.refuse_if_driver_lock_live()
+        if not args.noise_floor_only:
+            await find_finished_round(store, round_config, resume=args.resume)
+    except ContractViolationError:
+        await backend.aclose()
+        raise
 
     sys.stdout.write(
         f"loop      {store.loop_dir}\n"
@@ -310,66 +351,96 @@ async def _drive(args: argparse.Namespace) -> int:
             "or --dry-run to stop here (nothing was written)"
         )
 
-    # The results tree is created only past both gates above; a dry run and a
-    # refused run leave the results root exactly as they found it.
-    await store.ensure_layout()
+    # Past both gates. The backend is closed on every exit from here —
+    # refusal, interruption or success — so a refused run does not leak the
+    # SDK client it built in preflight.
+    try:
+        return await _drive_past_gates(
+            args,
+            settings=settings,
+            store=store,
+            solver=solver,
+            corpus=corpus,
+            floor_config=floor_config,
+            round_config=round_config,
+        )
+    finally:
+        await backend.aclose()
 
-    # The floor is measured every invocation, and on a restart that costs
-    # nothing: ``NoiseFloorRunner.run`` reuses every complete seed and
-    # re-derives its cells from their checkpoints, producing the same report it
-    # produced the first time. Short-circuiting on ``has_noise_floor`` instead
-    # would be cheaper by one directory walk and wrong: nothing decodes
-    # ``noise-floor.json`` back into a :class:`NoiseFloorReport`, so round 0
-    # would be driven with no floor at all — no delta, no saturation verdict,
-    # and a ``research.round.no_noise_floor`` warning nobody asked for.
-    floor_runner = NoiseFloorRunner(
-        _build_runner(
+
+async def _drive_past_gates(
+    args: argparse.Namespace,
+    *,
+    settings: ResearchLoopSettings,
+    store: TrajectoryStore,
+    solver: SolverBridge,
+    corpus: Sequence[Problem],
+    floor_config: NoiseFloorConfig,
+    round_config: RoundConfig,
+) -> int:
+    """The floor, then round 0, under the driver lock. Every write happens here."""
+    # The lock is the first write, and it is taken only past every read-only
+    # preflight and both gates: a dry run and a refused run leave the results
+    # root exactly as they found it. Held for the whole invocation — floor
+    # and round — so a second driver cannot slip in between the two.
+    async with store.driver_lock():
+        await store.ensure_layout()
+
+        # The floor is measured every invocation, and on a restart that costs
+        # nothing: ``NoiseFloorRunner.run`` reuses every complete seed and
+        # re-derives its cells from their checkpoints, producing the same
+        # report it produced the first time. Short-circuiting on
+        # ``has_noise_floor`` instead would be cheaper by one directory walk
+        # and wrong: nothing decodes ``noise-floor.json`` back into a
+        # :class:`NoiseFloorReport`, so round 0 would be driven with no floor
+        # at all — no delta, no saturation verdict, and a
+        # ``research.round.no_noise_floor`` warning nobody asked for.
+        floor_runner = NoiseFloorRunner(
+            _build_runner(
+                solver=solver,
+                store=store,
+                settings=settings,
+                escalations_dir=store.noise_floor_dir / "escalations",
+            ),
+            store,
+        )
+        report = await floor_runner.run(corpus, floor_config, resume=args.resume)
+        sys.stdout.write(
+            f"noise floor: {len(report.floors)} cell(s) over seeds {list(report.seeds)}"
+            f" (reused {list(floor_runner.skipped_seeds)})\n"
+        )
+
+        if args.noise_floor_only:
+            return EXIT_OK
+
+        round_runner = _build_runner(
             solver=solver,
             store=store,
             settings=settings,
-            escalations_dir=store.noise_floor_dir / "escalations",
-        ),
-        store,
-    )
-    report = await floor_runner.run(corpus, floor_config, resume=args.resume)
-    sys.stdout.write(
-        f"noise floor: {len(report.floors)} cell(s) over seeds {list(report.seeds)}"
-        f" (reused {list(floor_runner.skipped_seeds)})\n"
-    )
-
-    if args.noise_floor_only:
-        await backend.aclose()
-        return EXIT_OK
-
-    round_runner = _build_runner(
-        solver=solver,
-        store=store,
-        settings=settings,
-        escalations_dir=store.escalations_dir(0),
-    )
-    outcome = await round_runner.run_round(
-        corpus,
-        round_config,
-        noise_floor=report,
-        resume=args.resume,
-    )
-    if outcome.already_finished:
+            escalations_dir=store.escalations_dir(0),
+        )
+        outcome = await round_runner.run_round(
+            corpus,
+            round_config,
+            noise_floor=report,
+            resume=args.resume,
+        )
+        if outcome.already_finished:
+            sys.stdout.write(
+                f"round 00: already finished under run_id {outcome.record.run_id!r} with "
+                "this eval set, engine and configuration; nothing driven, nothing "
+                "written\n"
+                f"verdict: {outcome.record.verdict}\n"
+            )
+            return EXIT_OK
         sys.stdout.write(
-            f"round 00: already finished under run_id {outcome.record.run_id!r}; "
-            "nothing driven, nothing written\n"
+            f"round 00: {len(outcome.attempts)} attempt(s), "
+            f"{len(round_runner.skipped_problems)} reused, "
+            f"{len(round_runner.resumed_problems)} resumed, "
+            f"{len(outcome.failures)} lost\n"
             f"verdict: {outcome.record.verdict}\n"
         )
-        await backend.aclose()
         return EXIT_OK
-    sys.stdout.write(
-        f"round 00: {len(outcome.attempts)} attempt(s), "
-        f"{len(round_runner.skipped_problems)} reused, "
-        f"{len(round_runner.resumed_problems)} resumed, "
-        f"{len(outcome.failures)} lost\n"
-        f"verdict: {outcome.record.verdict}\n"
-    )
-    await backend.aclose()
-    return EXIT_OK
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -385,7 +456,9 @@ def build_parser() -> argparse.ArgumentParser:
             "to assemble and validate everything and stop. Without either, the preflight "
             "runs and the invocation refuses with exit 2 and nothing written.\n"
             "Kill a run at any point and re-run the identical command (--yes included) "
-            "to resume; a round that already finished is a no-op success.\n"
+            "to resume; a round that already finished under the identical configuration "
+            "is a no-op success, and one finished under another is refused. One driver "
+            "per results tree (<loop-dir>/.driver.lock).\n"
             "Rounds greater than 0 are loop 2 and are refused; see the module "
             "docstring for the full list of what is not wired.\n"
             "exit codes:\n"
