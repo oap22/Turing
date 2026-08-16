@@ -6,9 +6,12 @@ import { render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   etaOf,
+  isChartRunFile,
+  matchesViewerRuns,
   parseMetricsText,
   parseViewerFile,
   pickSeries,
+  runIdOf,
   seriesOf,
 } from "../desktop/panes/metrics";
 import Chart from "../desktop/panes/Chart";
@@ -44,6 +47,122 @@ describe("parseMetricsText", () => {
   it("returns an empty array for empty input", () => {
     expect(parseMetricsText("")).toEqual([]);
     expect(parseMetricsText("   \n  \n")).toEqual([]);
+  });
+});
+
+describe("isChartRunFile", () => {
+  // The regression this guards: `results.py` writes *summaries* named
+  // `metrics.json` (`write_attempt_summary`, `write_round_summary`), the round
+  // summary is the last metrics-named file a round writes, and `fs_list` is
+  // newest-first — so accepting that basename put auto-follow on a
+  // pretty-printed JSON object and the operator saw "no metrics yet" the
+  // moment a round completed.
+  it("accepts the step log and rejects the summaries beside it", () => {
+    expect(isChartRunFile("loop/round-00/attempts/cuda/matmul-speedup/metrics.jsonl")).toBe(true);
+    expect(isChartRunFile("demo-run/metrics.jsonl")).toBe(true);
+    expect(isChartRunFile("metrics.jsonl")).toBe(true);
+
+    expect(isChartRunFile("loop/round-00/metrics.json")).toBe(false);
+    expect(isChartRunFile("loop/round-00/attempts/cuda/matmul-speedup/metrics.json")).toBe(false);
+    expect(isChartRunFile("loop/round-00/round.json")).toBe(false);
+    expect(isChartRunFile("loop/round-00/attempts/x/metrics.chain.json")).toBe(false);
+  });
+
+  // A summary must not merely be un-followed — it must not present as a
+  // chartable run at all, because `parseMetricsText` yields nothing for it.
+  it("a summary object it would have listed carries no series (#401 behaviour, unchanged)", () => {
+    const summary = JSON.stringify(
+      { schema_version: 1, problem_id: "flat-baseline", best_score: 2.05, consumed_steps: 3 },
+      null,
+      2,
+    );
+    expect(parseMetricsText(summary)).toEqual([]);
+    expect(seriesOf(parseMetricsText(summary)).size).toBe(0);
+  });
+});
+
+describe("runIdOf", () => {
+  // The old label was the first path segment — the loop name — so the real
+  // listbox showed 18 rows all reading `loop-probe`.
+  it("names the run directory, keeping the round and a nested problem id legible", () => {
+    expect(runIdOf("loop-probe/round-00/attempts/cuda/matmul-speedup/metrics.jsonl")).toBe(
+      "loop-probe/round-00/attempts/cuda/matmul-speedup",
+    );
+    expect(runIdOf("loop-probe/round-01/attempts/flat-baseline/metrics.jsonl")).toBe(
+      "loop-probe/round-01/attempts/flat-baseline",
+    );
+    expect(runIdOf("demo-run/metrics.jsonl")).toBe("demo-run");
+  });
+
+  it("distinguishes runs that differ only in round or problem id", () => {
+    const ids = [
+      "loop-probe/round-00/attempts/cuda/matmul-speedup/metrics.jsonl",
+      "loop-probe/round-01/attempts/cuda/matmul-speedup/metrics.jsonl",
+      "loop-probe/round-00/attempts/flat-baseline/metrics.jsonl",
+    ].map(runIdOf);
+    expect(new Set(ids).size).toBe(3);
+  });
+
+  it("falls back to the path itself for a run file at the results root", () => {
+    expect(runIdOf("metrics.jsonl")).toBe("metrics.jsonl");
+  });
+});
+
+describe("matchesViewerRuns", () => {
+  // These are verbatim `runs` entries from a real emitted `.viewer.json`
+  // (`RoundRunner._viewer_runs`): attempt *directories*, several segments
+  // deep, against run files named `<dir>/metrics.jsonl`.
+  const runs = [
+    "loop-probe/round-00/attempts/bad-instrument",
+    "loop-probe/round-00/attempts/cuda/matmul-speedup",
+    "loop-probe/round-01/attempts/flat-baseline",
+  ];
+
+  it("selects exactly the runs the loop emitted", () => {
+    expect(matchesViewerRuns("loop-probe/round-00/attempts/bad-instrument/metrics.jsonl", runs)).toBe(true);
+    expect(
+      matchesViewerRuns("loop-probe/round-00/attempts/cuda/matmul-speedup/metrics.jsonl", runs),
+    ).toBe(true);
+    expect(matchesViewerRuns("loop-probe/round-01/attempts/flat-baseline/metrics.jsonl", runs)).toBe(true);
+  });
+
+  it("does not select an unnamed run", () => {
+    expect(matchesViewerRuns("loop-probe/round-01/attempts/kaggle/titanic/metrics.jsonl", runs)).toBe(false);
+    expect(matchesViewerRuns("loop-probe/round-00/attempts/flat-baseline/metrics.jsonl", runs)).toBe(false);
+  });
+
+  // The prefix trap, and the reason this is equality and not `startsWith`: the
+  // runner rotates a superseded chain into `<dir>/prior-N/` and deliberately
+  // leaves it out of `runs`, yet its path begins with the named directory. A
+  // prefix rule would draw a superseded attempt as if the loop had asked for it.
+  it("does not select a sibling directory sharing the whole prefix", () => {
+    expect(
+      matchesViewerRuns("loop-probe/round-00/attempts/cuda/matmul-speedup/prior-1/metrics.jsonl", runs),
+    ).toBe(false);
+    expect(
+      matchesViewerRuns("loop-probe/round-00/attempts/bad-instrument-2/metrics.jsonl", runs),
+    ).toBe(false);
+  });
+
+  // The old code compared against the first path segment, which no
+  // multi-segment entry could ever equal — the field was wholly inert.
+  it("is not satisfied by the loop name alone", () => {
+    expect(matchesViewerRuns("loop-probe/round-00/attempts/bad-instrument/metrics.jsonl", ["loop-probe"])).toBe(
+      false,
+    );
+  });
+
+  it("accepts the run file spelled out, and tolerates a trailing slash", () => {
+    expect(
+      matchesViewerRuns("loop-probe/round-00/attempts/bad-instrument/metrics.jsonl", [
+        "loop-probe/round-00/attempts/bad-instrument/metrics.jsonl",
+      ]),
+    ).toBe(true);
+    expect(
+      matchesViewerRuns("loop-probe/round-00/attempts/bad-instrument/metrics.jsonl", [
+        "loop-probe/round-00/attempts/bad-instrument/",
+      ]),
+    ).toBe(true);
   });
 });
 
@@ -149,6 +268,69 @@ describe("Chart", () => {
     expect(border).not.toBeNull();
     expect(border?.getAttribute("fill")).toBe("none");
     expect(border?.getAttribute("stroke")).toBe("var(--t-edge)");
+  });
+
+  // The ghost-curve defect: the key used to be `s.label`, a display string
+  // that two pinned runs charting the same series produce identically. React
+  // logged "Encountered two children with the same key" and left the
+  // duplicate-keyed nodes mounted, so switching series accumulated polylines
+  // (3 → 4 → 5 → 6 measured in one real session) whose stale data was
+  // rescaled onto the new axis — old `consumed_steps` values drawn as a
+  // plausible-looking `progress` curve.
+  it("renders one polyline per series even when two series share a display label", () => {
+    const series = [
+      {
+        id: "runA/metrics.jsonl::progress",
+        label: "loop-probe/progress",
+        points: [[0, 1], [1, 0.5]] as Array<[number, number]>,
+      },
+      {
+        id: "runB/metrics.jsonl::progress",
+        label: "loop-probe/progress",
+        points: [[0, 2], [1, 1.5]] as Array<[number, number]>,
+      },
+    ];
+    const { container } = render(createElement(Chart, { series }));
+    expect(container.querySelectorAll("polyline").length).toBe(2);
+    // Duplicate testids are the same footgun as duplicate keys.
+    expect(new Set(
+      Array.from(container.querySelectorAll("polyline")).map((p) => p.getAttribute("data-testid")),
+    ).size).toBe(2);
+  });
+
+  it("does not accumulate stale polylines across series switches with colliding labels", () => {
+    // Two runs, the same label on every series (the pre-fix condition), cycled
+    // through three series names and back. Pre-fix this ended at six
+    // polylines; the count must stay at exactly one per charted series.
+    // MetricsPane's real label shape — `<run>/<series title>` — so the label
+    // both collides between the two runs AND changes on every switch, which is
+    // exactly the sequence that left orphaned nodes mounted.
+    function frame(seriesName: string) {
+      return ["runA", "runB"].map((run, i) => ({
+        id: `${run}/metrics.jsonl::${seriesName}`,
+        label: `loop-probe/${seriesName}`,
+        points: [[0, i + 1], [1, i + 2]] as Array<[number, number]>,
+      }));
+    }
+    const { container, rerender } = render(
+      createElement(Chart, { series: frame("progress") }),
+    );
+    for (const name of ["speedup_ratio", "consumed_steps", "progress"]) {
+      rerender(createElement(Chart, { series: frame(name) }));
+      expect(container.querySelectorAll("polyline").length).toBe(2);
+    }
+  });
+
+  // The key must be unique even for a caller that supplies no `id` at all, so
+  // the chart cannot accumulate stale nodes however it is driven.
+  it("stays one-polyline-per-series when labels collide and no id is supplied", () => {
+    const dup = [
+      { label: "same", points: [[0, 1], [1, 2]] as Array<[number, number]> },
+      { label: "same", points: [[0, 3], [1, 4]] as Array<[number, number]> },
+      { label: "same", points: [[0, 5], [1, 6]] as Array<[number, number]> },
+    ];
+    const { container } = render(createElement(Chart, { series: dup }));
+    expect(container.querySelectorAll("polyline").length).toBe(3);
   });
 });
 

@@ -227,8 +227,10 @@ again if you leave it empty.
 ## Panes
 
 `term` (local shell via `portable-pty`), `queue` / `chat` / `obs` (the exact
-browser-tab components, gateway-proxied), `metrics` (tails `metrics.jsonl`/
-`metrics.json`, multi-run overlay, one series at a time via tabs, ETA strip),
+browser-tab components, gateway-proxied), `metrics` (tails `metrics.jsonl` only —
+`metrics.json` is a summary object with no series, and charting it produced an
+empty pane on every completed round; multi-run overlay, one series at a time
+via tabs, ETA strip naming the run it describes),
 `images` (browses result images, see below), `flywheel` (parses
 `<results>/loop-*/trajectory.json` round timelines), `agents` (live
 Claude Code / Codex CLI session list + transcript tail), `agentfeed`
