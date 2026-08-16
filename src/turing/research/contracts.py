@@ -395,6 +395,21 @@ class Verifier(ABC):
     problem_id: str
     description: str
     score_scale: str
+    #: The worst grade :attr:`score_scale` actually emits, for a problem that
+    #: introduces a scale :data:`~turing.research.loop.metrics.DEFAULT_SCORE_FLOORS`
+    #: does not know about. ``None`` (the default) means "not declared": the
+    #: scale must then already be a key in the floors table
+    #: (:data:`~turing.research.loop.metrics.DEFAULT_SCORE_FLOORS`, or a
+    #: round's overridden ``score_floors``) or
+    #: :meth:`~turing.research.loop.metrics.ScoredProblem.from_result` raises.
+    #: Declared here rather than passed alongside the problem because the
+    #: scale itself lives here — the two travel together so a corpus author
+    #: cannot introduce one without the other. Like :attr:`score_scale`, this
+    #: must be the **worst** grade the scale emits, not a neutral midpoint:
+    #: see :data:`~turing.research.loop.metrics.DEFAULT_SCORE_FLOORS` for why.
+    #: ``kw_only`` so a defaulted field on this base class does not force
+    #: every subclass field declared after it to also carry a default.
+    score_floor: float | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         """Refuse a declared scale that could not survive as a metrics key.
@@ -408,6 +423,18 @@ class Verifier(ABC):
         that overrides ``__post_init__`` must call ``super().__post_init__()``.
         """
         _reject_unusable_score_scale(self.score_scale, declared_by=f"verifier {self.verifier_id!r}")
+        if self.score_floor is not None:
+            if isinstance(self.score_floor, bool) or not isinstance(self.score_floor, (int, float)):
+                raise ContractViolationError(
+                    f"verifier {self.verifier_id!r} declares score_floor "
+                    f"{self.score_floor!r}, which is not a plain number"
+                )
+            if not math.isfinite(float(self.score_floor)):
+                raise ContractViolationError(
+                    f"verifier {self.verifier_id!r} declares score_floor "
+                    f"{self.score_floor!r}, which is not finite; a floor a real score can "
+                    "never beat or lose to is not a floor"
+                )
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)

@@ -185,6 +185,22 @@ class RoundConfig:
     #: mislabel the stop as ``FAILED_WITHIN_CAP`` with the cap untouched.
     max_escalations_per_attempt: int = 3
     pass_criteria: Mapping[str, PassCriterion] = field(default_factory=dict)
+    #: What an unscored problem's cell entry is floored to, by score scale.
+    #: Defaults to :data:`~turing.research.loop.metrics.DEFAULT_SCORE_FLOORS`
+    #: (``speedup_ratio`` and ``leaderboard_percentile`` only); an override
+    #: here *replaces* that table rather than extending it, unchanged from
+    #: before a problem could declare its own floor.
+    #:
+    #: A scale absent from this table is not automatically refused: a problem
+    #: whose verifier declares
+    #: :attr:`~turing.research.contracts.Verifier.score_floor` still scores,
+    #: because ``ScoredProblem.from_result`` falls back to that declaration
+    #: when this table has no entry for the scale. This table's entries take
+    #: precedence when both exist — an override here is an explicit operator
+    #: choice for *this round* and must be able to shadow whatever a verifier
+    #: declared. See
+    #: :data:`~turing.research.loop.metrics.DEFAULT_SCORE_FLOORS` for the full
+    #: precedence order.
     score_floors: Mapping[str, float] = field(default_factory=lambda: DEFAULT_SCORE_FLOORS)
     #: When False, skip per-step verification and run the frozen verifier once
     #: when the cap trips. Never verifying floors every cell and fabricates a
