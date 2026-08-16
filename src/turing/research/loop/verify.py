@@ -91,12 +91,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from turing.research.loop.integrity import (
+    STAGING_DIR_NAME as _STAGING_DIR_NAME,
+)
+from turing.research.loop.integrity import (
     ChainState,
     ReconcileState,
     reconcile_summary,
     verify_metrics_chain,
 )
-from turing.research.loop.runner import _STAGING_DIR_NAME
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

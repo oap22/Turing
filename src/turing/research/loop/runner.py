@@ -376,7 +376,7 @@ _PRIOR_DIR_PATTERN = re.compile(r"prior-\d+")
 #: problem-id path segment (``contracts._reject_unsafe_problem_id`` already
 #: refuses ids that could shadow ``prior-<digits>``; a dot-prefixed name
 #: needs no matching refusal because no problem id may contain one).
-_STAGING_DIR_NAME = ".rotating"
+_STAGING_DIR_NAME = integrity.STAGING_DIR_NAME
 
 
 def _next_free_prior_suffix(metrics_dir: Path) -> int:

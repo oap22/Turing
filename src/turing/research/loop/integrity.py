@@ -128,6 +128,7 @@ __all__ = [
     "CHAIN_FIELD",
     "CHAIN_SIDECAR_FILENAME",
     "CHAIN_VERSION",
+    "STAGING_DIR_NAME",
     "ChainState",
     "ChainVerdict",
     "LogTail",
@@ -140,6 +141,15 @@ __all__ = [
     "seed_hash",
     "verify_metrics_chain",
 ]
+
+#: The subdirectory the runner's ``_rotate_stale_metrics`` stages a
+#: superseded metrics trio into before committing it, in one rename, to a
+#: numbered ``prior-N/``. It lives here, in the leaf module, because both the
+#: runner (which mints it) and ``verify`` (which must skip it when walking a
+#: results tree) need it and ``results`` imports ``verify`` — defining it in
+#: the runner would close an import cycle. See ``runner._STAGING_DIR_NAME``
+#: for the full rationale of the fixed, dot-prefixed name.
+STAGING_DIR_NAME = ".rotating"
 
 CHAIN_ALGORITHM = "sha256"
 CHAIN_VERSION = 1
