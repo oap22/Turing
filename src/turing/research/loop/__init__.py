@@ -95,8 +95,11 @@ from turing.research.loop.settings import ResearchLoopSettings
 from turing.research.loop.solver_bridge import SolverBridge
 from turing.research.loop.trajectory import (
     TRAJECTORY_SCHEMA_VERSION,
+    AttemptDisposition,
     AttemptLog,
+    RunIdentity,
     StepLog,
+    StoredAttempt,
     TrajectoryStore,
     cell_key,
 )
@@ -106,6 +109,7 @@ __all__ = [
     "DEFAULT_SCORE_FLOORS",
     "MIN_NOISE_FLOOR_SEEDS",
     "TRAJECTORY_SCHEMA_VERSION",
+    "AttemptDisposition",
     "AttemptLog",
     "AttemptOutcome",
     "Cell",
@@ -127,6 +131,7 @@ __all__ = [
     "RoundConfig",
     "RoundOutcome",
     "RoundRunner",
+    "RunIdentity",
     "SaturationAssessment",
     "SaturationVerdict",
     "ScoredProblem",
@@ -137,6 +142,7 @@ __all__ = [
     "SolverStep",
     "SolverTask",
     "StepLog",
+    "StoredAttempt",
     "SystemClock",
     "TrajectoryStore",
     "WorkspaceProvider",

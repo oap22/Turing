@@ -40,44 +40,67 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import time
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import structlog
 
-from turing.research.contracts import ContractViolationError
+from turing.research.contracts import (
+    Attempt,
+    AttemptState,
+    Cap,
+    CapConsumption,
+    ContractViolationError,
+    EngineIdentity,
+    EscalationReason,
+    EscalationRequest,
+    ProblemType,
+    RoundCost,
+    RoundDelta,
+    RoundRecord,
+    Split,
+    TypeScore,
+    VerificationResult,
+)
+from turing.research.loop.metrics import (
+    SaturationAssessment,
+    SaturationVerdict,
+    ScoredProblem,
+)
 from turing.research.loop.protocols import SystemClock
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
-    from pathlib import Path
+    from collections.abc import AsyncIterator, Mapping, Sequence
 
-    from turing.research.contracts import (
-        Attempt,
-        Cap,
-        EscalationDecision,
-        EscalationRequest,
-        RoundRecord,
-        TypeScore,
-    )
-    from turing.research.loop.metrics import (
-        Cell,
-        CostBasis,
-        NoiseFloor,
-        SaturationAssessment,
-        ScoredProblem,
-    )
+    from turing.research.contracts import EscalationDecision
+    from turing.research.loop.metrics import Cell, CostBasis, NoiseFloor
     from turing.research.loop.protocols import Clock
 
 logger = structlog.get_logger(__name__)
 
 __all__ = [
+    "DRIVER_LOCK_FILENAME",
     "TRAJECTORY_FILENAME",
     "TRAJECTORY_SCHEMA_VERSION",
+    "AttemptDisposition",
     "AttemptLog",
+    "DriverLockHolder",
+    "RunIdentity",
     "StepLog",
+    "StoredAttempt",
     "TrajectoryStore",
     "cell_key",
+    "decode_assessments",
+    "decode_attempt_checkpoint",
+    "decode_escalation_request",
+    "decode_round_record",
+    "decode_scored_problems",
     "encode_assessment",
     "encode_noise_floor",
     "encode_round_record",
@@ -89,6 +112,58 @@ TRAJECTORY_SCHEMA_VERSION = 1
 TRAJECTORY_FILENAME = "trajectory.json"
 NOISE_FLOOR_DIRNAME = "noise-floor"
 NOISE_FLOOR_FILENAME = "noise-floor.json"
+#: ``<loop-dir>/.driver.lock`` — one driver owns a results tree at a time.
+DRIVER_LOCK_FILENAME = ".driver.lock"
+#: How long a second reclaimer of one stale lock waits for the first to finish
+#: before refusing (``_RECLAIM_MUTEX_WAITS`` × ``_RECLAIM_MUTEX_WAIT_SECONDS``).
+#: A reclaim is three syscalls; a second is far more than it needs.
+_RECLAIM_MUTEX_WAITS = 20
+_RECLAIM_MUTEX_WAIT_SECONDS = 0.05
+
+
+@dataclass(frozen=True, slots=True)
+class DriverLockHolder:
+    """What ``.driver.lock`` says about the process that holds a results tree.
+
+    ``pid`` and ``host`` together are the liveness question; ``started_at_ms``
+    is for the operator reading the refusal. A holder on another host cannot
+    be probed from here and is treated as live — refusing is the safe
+    direction, and the message says which file to remove if it is not.
+    """
+
+    pid: int
+    started_at_ms: int
+    host: str
+    path: Path
+
+    def is_alive(self) -> bool:
+        if self.host != _hostname():
+            return True
+        return _pid_alive(self.pid)
+
+
+def _hostname() -> str:
+    return os.uname().nodename
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether ``pid`` names a live process on this host.
+
+    ``os.kill(pid, 0)`` sends no signal; it only asks the kernel whether the
+    target exists. ``PermissionError`` means it exists and belongs to someone
+    else, which is still *alive*.
+    """
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def cell_key(cell: Cell) -> str:
@@ -185,6 +260,317 @@ class AttemptLog:
 
 
 # --------------------------------------------------------------------------- #
+# Resume: what is already on disk, and what counts as done
+# --------------------------------------------------------------------------- #
+
+
+class AttemptDisposition(str, Enum):  # noqa: UP042
+    """What a restart may do with an attempt it finds already on disk.
+
+    The four values are the whole resume decision. See
+    :meth:`TrajectoryStore.load_stored_attempt` for the rules that pick one.
+    """
+
+    #: Nothing usable for this run — drive the attempt from scratch.
+    ABSENT = "absent"
+    #: Finished; reuse its outcome and spend no compute on it.
+    COMPLETE = "complete"
+    #: Interrupted mid-flight; carry on from the checkpoint.
+    RESUMABLE = "resumable"
+    #: Suspended on an operator decision that has not arrived; re-enter the
+    #: wait rather than re-driving the attempt.
+    AWAITING_DECISION = "awaiting_decision"
+
+
+@dataclass(frozen=True, slots=True)
+class RunIdentity:
+    """Which run a stored attempt would have to belong to, to be reusable.
+
+    Resume reuses *this* run's own work. A checkpoint left by a different
+    ``run_id``, a different ``seed``, or a corpus with a different
+    ``eval_set_hash`` is a **previous generation**, not a resume point:
+    adopting its numbers would report a measurement this run never took. That
+    distinction is what keeps the sanctioned re-drive workflows — a new round
+    id, a re-measured baseline — from silently inheriting the old numbers, and
+    it is the same identity comparison
+    ``runner._read_crashed_attempt_record`` makes for the metrics chain.
+
+    ``config_digest`` is the fourth coordinate, and it exists because the
+    first three name *which* run without naming *how it measured*. A round
+    killed under a cap of 2 steps and restarted with a cap of 6 has the same
+    ``run_id``, ``seed`` and corpus; without this field it would reuse the
+    cap-2 scores for the finished problems and drive the rest at cap 6, and
+    the resulting :class:`~turing.research.contracts.RoundRecord` would be
+    one number measured two ways. The same holds for the engine — a floor
+    measured under scaffold ``A`` re-derived and stamped with ``B`` would pass
+    ``run_round``'s engine guard on a floor that never saw ``B``. The digest
+    is ``RoundConfig.config_digest()``: a SHA-256 over the canonical JSON of
+    every measurement-affecting field, so any drift in one of them makes the
+    stored attempt a previous generation and re-drives it — the safe
+    direction. Empty means "compare nothing", which only a caller that has no
+    ``RoundConfig`` (a hand-built identity in a test) should rely on.
+    """
+
+    round_id: str
+    seed: int
+    eval_set_hash: str = ""
+    config_digest: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class StoredAttempt:
+    """One attempt as it exists on disk, with the resume question answered."""
+
+    problem_id: str
+    disposition: AttemptDisposition
+    #: The rebuilt checkpoint. ``None`` only for :attr:`AttemptDisposition.ABSENT`.
+    attempt: Attempt | None = None
+    steps: tuple[StepLog, ...] = ()
+    escalation_ids: tuple[str, ...] = ()
+    attempt_log_path: Path | None = None
+    #: Why this disposition, in one line, for the log an operator greps at 3am.
+    reason: str = ""
+
+    @property
+    def is_complete(self) -> bool:
+        return self.disposition is AttemptDisposition.COMPLETE
+
+    @property
+    def is_resumable(self) -> bool:
+        return self.disposition in (
+            AttemptDisposition.RESUMABLE,
+            AttemptDisposition.AWAITING_DECISION,
+        )
+
+    @property
+    def best_result(self) -> VerificationResult | None:
+        """The verification this attempt reported, as the checkpoint recorded it.
+
+        The runner writes ``result=best`` onto every checkpoint it takes, so
+        the terminal checkpoint carries exactly the result the attempt would
+        have returned. ``None`` is honest — the attempt produced no usable
+        verification — and :meth:`ScoredProblem.from_result` floors it.
+        """
+        return None if self.attempt is None else self.attempt.result
+
+
+def _decode_result(payload: Any) -> VerificationResult | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise ContractViolationError("an attempt checkpoint's result must be a JSON object")
+    return VerificationResult(
+        problem_id=payload["problem_id"],
+        verifier_id=payload["verifier_id"],
+        score=payload["score"],
+        passed_correctness=payload["passed_correctness"],
+        score_scale=payload["score_scale"],
+        raw_measurements=payload.get("raw_measurements", {}),
+        detail=payload.get("detail", ""),
+    )
+
+
+def decode_attempt_checkpoint(payload: Mapping[str, Any]) -> Attempt:
+    """Rebuild the :class:`~turing.research.contracts.Attempt` a checkpoint holds.
+
+    The inverse of :meth:`TrajectoryStore.write_attempt_checkpoint`, and the
+    whole of resume from a caller's point of view: no replay, no
+    reconstruction of intermediate state. Construction goes through
+    :class:`~turing.research.contracts.Attempt`, so its invariants (notably
+    "``ABANDONED`` requires an ``escalation_id``") are re-checked on the way
+    back in rather than trusted from the file.
+
+    Deliberately **not** shared with
+    :func:`turing.research.solver.checkpoints.attempt_from_json`, which
+    decodes the same shape: :mod:`turing.research.loop` has no import
+    dependency on :mod:`turing.research.solver` and gains nothing by growing
+    one for twenty lines.
+    """
+    return Attempt(
+        attempt_id=payload["attempt_id"],
+        problem_id=payload["problem_id"],
+        round_id=payload["round_id"],
+        seed=payload["seed"],
+        workspace_path=Path(payload["workspace_path"]),
+        cap=Cap(
+            max_steps=payload["cap"]["max_steps"],
+            max_tokens=payload["cap"]["max_tokens"],
+            max_wall_clock_seconds=payload["cap"]["max_wall_clock_seconds"],
+            extension_count=payload["cap"].get("extension_count", 0),
+        ),
+        consumed=CapConsumption(
+            steps=payload["consumed"]["steps"],
+            tokens=payload["consumed"]["tokens"],
+            wall_clock_seconds=payload["consumed"]["wall_clock_seconds"],
+        ),
+        state=AttemptState(payload["state"]),
+        step_index=payload["step_index"],
+        checkpoint_seq=payload["checkpoint_seq"],
+        resume_token=payload.get("resume_token"),
+        started_at_ms=payload.get("started_at_ms"),
+        updated_at_ms=payload.get("updated_at_ms"),
+        result=_decode_result(payload.get("result")),
+        escalation_id=payload.get("escalation_id"),
+    )
+
+
+def _decode_step_log(payload: Mapping[str, Any]) -> StepLog:
+    return StepLog(
+        index=payload["index"],
+        at_ms=payload["at_ms"],
+        tokens=payload["tokens"],
+        wall_clock_seconds=payload["wall_clock_seconds"],
+        note=payload.get("note", ""),
+        made_progress=payload.get("made_progress", False),
+        escalate_requested=payload.get("escalate_requested"),
+        score=payload.get("score"),
+        passed_correctness=payload.get("passed_correctness"),
+        verifier_error=payload.get("verifier_error"),
+    )
+
+
+def decode_escalation_request(payload: Any, *, attempt_id: str) -> EscalationRequest | None:
+    """One ``escalations/<id>.json`` file back into the request it recorded.
+
+    ``None`` for anything that is not a readable request **for this attempt**:
+    a payload that is not the ``{"request": ..., "decision": ...}`` shape this
+    store writes, a request naming another attempt, or one missing a field the
+    rebuild needs. Shared by ``runner._read_prior_escalations`` (which counts
+    the requests an attempt already raised) and by :meth:`_read_stored_attempt`
+    (which decides whether an ``ESCALATED`` checkpoint can be re-entered), so
+    the two cannot disagree about whether a request file is usable — the case
+    that used to lose a problem outright: the store said *awaiting decision*
+    because the file existed, the runner then failed to decode it and raised.
+
+    ``best_result`` is dropped rather than decoded: the operator-facing
+    encoding keeps four fields of a
+    :class:`~turing.research.contracts.VerificationResult`, and a half-built
+    result would be a fabricated measurement.
+    """
+    request = payload.get("request") if isinstance(payload, dict) else None
+    if not isinstance(request, dict) or request.get("attempt_id") != attempt_id:
+        return None
+    try:
+        return EscalationRequest(
+            request_id=request["request_id"],
+            problem_id=request["problem_id"],
+            attempt_id=request["attempt_id"],
+            round_id=request["round_id"],
+            reason=EscalationReason(request["reason"]),
+            summary=request.get("summary", ""),
+            cap=Cap(
+                max_steps=request["cap"]["max_steps"],
+                max_tokens=request["cap"]["max_tokens"],
+                max_wall_clock_seconds=request["cap"]["max_wall_clock_seconds"],
+                extension_count=request["cap"].get("extension_count", 0),
+            ),
+            consumed=CapConsumption(
+                steps=request["consumed"]["steps"],
+                tokens=request["consumed"]["tokens"],
+                wall_clock_seconds=request["consumed"]["wall_clock_seconds"],
+            ),
+            created_at_ms=int(request["created_at_ms"]),
+            best_result=None,
+        )
+    except (KeyError, TypeError, ValueError, ContractViolationError):
+        return None
+
+
+def _decode_type_score(payload: Mapping[str, Any]) -> TypeScore:
+    return TypeScore(
+        problem_type=ProblemType(payload["problem_type"]),
+        split=Split(payload["split"]),
+        scores={str(k): float(v) for k, v in payload["scores"].items()},
+        correctness_passes=int(payload["correctness_passes"]),
+    )
+
+
+def decode_round_record(payload: Mapping[str, Any]) -> RoundRecord:
+    """``round-NN/round.json`` back into the :class:`RoundRecord` it encodes.
+
+    The inverse of :func:`encode_round_record` for the record itself; the
+    per-problem ``scored`` list and the saturation assessments beside it have
+    their own decoders. Construction goes through the contract dataclasses,
+    so their invariants are re-checked rather than trusted from the file.
+
+    Written for one caller: a ``run_round`` that finds its round already in
+    ``trajectory.json`` and must return what the first process measured
+    without measuring, or writing, anything (RES-17). It is deliberately
+    *not* the "decode the parent round" piece the driver's ``--round N``
+    refusal names — that refusal has a second, sufficient reason (loop 2's
+    self-edit step), and nothing here loads a *parent*.
+    """
+    engine = payload["engine"]
+    cost = payload["cost"]
+    return RoundRecord(
+        round_index=int(payload["round_index"]),
+        run_id=payload["run_id"],
+        parent_round_id=payload.get("parent_round_id"),
+        eval_set_hash=payload["eval_set_hash"],
+        engine=EngineIdentity(
+            backend=engine["backend"],
+            orchestrator_model=engine["orchestrator_model"],
+            substep_model=engine["substep_model"],
+            scaffold_git_sha=engine["scaffold_git_sha"],
+        ),
+        type_scores=tuple(_decode_type_score(ts) for ts in payload.get("type_scores", [])),
+        deltas=tuple(
+            RoundDelta(
+                problem_type=ProblemType(d["problem_type"]),
+                split=Split(d["split"]),
+                marginal_gain=float(d["marginal_gain"]),
+                noise_floor=float(d["noise_floor"]),
+                cost_per_unit_gain=(
+                    None if d.get("cost_per_unit_gain") is None else float(d["cost_per_unit_gain"])
+                ),
+            )
+            for d in payload.get("deltas", [])
+        ),
+        cost=RoundCost(
+            wall_clock_seconds=float(cost["wall_clock_seconds"]),
+            tokens=int(cost["tokens"]),
+            attempts=int(cost["attempts"]),
+        ),
+        escalation_count=int(payload["escalation_count"]),
+        created_at_ms=int(payload["created_at_ms"]),
+        gates={str(k): v for k, v in payload.get("gates", {}).items()},
+        verdict=str(payload.get("verdict", "")),
+    )
+
+
+def decode_scored_problems(payload: Mapping[str, Any]) -> tuple[ScoredProblem, ...]:
+    """The ``problems`` list of ``round.json`` back into cell contributions."""
+    return tuple(
+        ScoredProblem(
+            problem_id=item["problem_id"],
+            problem_type=ProblemType(item["problem_type"]),
+            split=Split(item["split"]),
+            score=float(item["score"]),
+            passed_correctness=bool(item["passed_correctness"]),
+            score_scale=item["score_scale"],
+            scored=bool(item.get("scored", True)),
+        )
+        for item in payload.get("problems", [])
+    )
+
+
+def decode_assessments(payload: Mapping[str, Any]) -> tuple[SaturationAssessment, ...]:
+    """The ``saturation`` list of ``round.json`` back into assessments."""
+    return tuple(
+        SaturationAssessment(
+            problem_type=ProblemType(item["problem_type"]),
+            split=Split(item["split"]),
+            verdict=SaturationVerdict(item["verdict"]),
+            reason=str(item.get("reason", "")),
+            marginal_gain=item.get("marginal_gain"),
+            noise_floor=item.get("noise_floor"),
+            gain_in_noise_units=item.get("gain_in_noise_units"),
+        )
+        for item in payload.get("saturation", [])
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Encoding
 # --------------------------------------------------------------------------- #
 
@@ -233,13 +619,26 @@ def encode_round_record(
     scored: Sequence[ScoredProblem] = (),
     assessments: Sequence[SaturationAssessment] = (),
     noise_floors: Sequence[NoiseFloor] = (),
+    config_digest: str = "",
 ) -> dict[str, Any]:
-    """Full round artifact — ``round-NN/round.json``."""
+    """Full round artifact — ``round-NN/round.json``.
+
+    ``config_digest`` is ``RoundConfig.config_digest()`` for the config the
+    round was measured under. It is not a :class:`RoundRecord` field — the
+    record is the *result*, and the digest is a property of the measurement —
+    but it is written beside the record so a restart can tell "this round is
+    finished" from "a round by this name is finished, measured some other
+    way": ``RoundRunner.run_round`` returns a finished round as a no-op only
+    when the stored ``eval_set_hash``, ``engine`` and ``config_digest`` all
+    equal this run's. Empty means the writer had no config (a hand-built
+    record in a test) and never equals a real digest.
+    """
     return {
         "round_index": record.round_index,
         "run_id": record.run_id,
         "parent_round_id": record.parent_round_id,
         "eval_set_hash": record.eval_set_hash,
+        "config_digest": config_digest,
         "created_at_ms": record.created_at_ms,
         "engine": {
             "backend": record.engine.backend,
@@ -318,11 +717,14 @@ def encode_trajectory_row(
     seed: int | None = None,
     cap: Cap | None = None,
     verify_every_step: bool | None = None,
+    config_digest: str = "",
 ) -> dict[str, Any]:
     """One row of ``trajectory.json`` — the four numbers plus lineage.
 
     Every per-cell field is an object keyed by ``"<type>/<split>"``. There is
-    no scalar ``primary``: see the module docstring.
+    no scalar ``primary``: see the module docstring. ``config_digest`` is the
+    same value :func:`encode_round_record` carries, so the row and the record
+    can be checked against each other.
     """
     floors = {cell_key(f.cell): f.value for f in noise_floors}
     n = {cell_key((ts.problem_type, ts.split)): ts.n for ts in record.type_scores}
@@ -331,6 +733,7 @@ def encode_trajectory_row(
         "run_id": record.run_id,
         "parent_round": record.parent_round_id,
         "eval_set_hash": record.eval_set_hash,
+        "config_digest": config_digest,
         "comparable_to_parent": comparable_to_parent,
         "engine": {
             "backend": record.engine.backend,
@@ -381,17 +784,41 @@ def encode_trajectory_row(
 
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp")
-    # ``allow_nan=False`` because Python emits bare ``NaN``/``Infinity``, which
-    # is not JSON: every other reader rejects the file outright. The desktop
-    # flywheel pane would blank rather than show one bad number, and a NaN that
-    # reached here would mean a driving function was computed wrong anyway —
-    # better to fail at the write, where the traceback still names the round.
-    tmp.write_text(
-        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    tmp.replace(path)
+    # The scratch name carries the pid and a uuid rather than a fixed
+    # ``<name>.tmp``. Two writers of the same file is not hypothetical here: an
+    # operator who starts a second driver over one results tree (or a
+    # ``--noise-floor-only`` run alongside a full one) has two processes
+    # writing ``checkpoints/<problem>.json``, and with one shared scratch name
+    # they interleave — writer A's partial text, writer B's ``replace``, and a
+    # file that is neither. Unique names make the worst case "the last
+    # ``replace`` wins", which is atomic and yields one whole document.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+    try:
+        # ``allow_nan=False`` because Python emits bare ``NaN``/``Infinity``,
+        # which is not JSON: every other reader rejects the file outright. The
+        # desktop flywheel pane would blank rather than show one bad number,
+        # and a NaN that reached here would mean a driving function was
+        # computed wrong anyway — better to fail at the write, where the
+        # traceback still names the round.
+        tmp.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    finally:
+        # A refused serialisation (the NaN guard above) used to leave its
+        # scratch file behind. With a unique name per call that would
+        # accumulate one corpse per failure instead of one in total, so the
+        # cleanup is no longer optional.
+        tmp.unlink(missing_ok=True)
+
+
+def _next_prior_noise_floor(noise_floor_dir: Path) -> Path:
+    """``noise-floor/prior-N.json`` for the next free ``N``, from 1."""
+    suffix = 1
+    while (noise_floor_dir / f"prior-{suffix}.json").exists():
+        suffix += 1
+    return noise_floor_dir / f"prior-{suffix}.json"
 
 
 def _read_json(path: Path) -> Any | None:
@@ -426,6 +853,13 @@ class TrajectoryStore:
         self._root = results_root
         self._slug = loop_slug
         self._clock = clock or SystemClock()
+        #: Re-entrancy depth of :meth:`driver_lock` for *this* store object.
+        #: One driver process holds one store; nested seams (the driver
+        #: around the whole run, ``run_round`` around the round,
+        #: ``run_attempts`` around the attempts) share the hold rather than
+        #: refusing each other. A second store object over the same tree —
+        #: which is what a second process is — does not share it.
+        self._driver_lock_depth = 0
 
     @property
     def loop_slug(self) -> str:
@@ -466,6 +900,244 @@ class TrajectoryStore:
 
         await asyncio.to_thread(_mk)
 
+    # -- the driver lock --------------------------------------------------- #
+
+    @property
+    def driver_lock_path(self) -> Path:
+        return self.loop_dir / DRIVER_LOCK_FILENAME
+
+    def read_driver_lock(self) -> DriverLockHolder | None:
+        """Who holds this tree, per ``.driver.lock``, or ``None`` if nobody.
+
+        Read-only — the dry run uses it to perform the same check the real
+        run's acquisition performs, without creating anything.
+
+        Raises:
+            ContractViolationError: the file exists but does not decode. It
+                cannot be told from a live driver, so it is refused with the
+                path to remove once the operator has confirmed no driver runs.
+        """
+        path = self.driver_lock_path
+        try:
+            raw = _read_json(path)
+        except (OSError, ValueError) as exc:
+            raise ContractViolationError(
+                f"{path} exists but is not a readable driver lock ({exc}); it cannot be "
+                "told from a live driver. If no driver is running over this results tree, "
+                "remove the file and re-run"
+            ) from exc
+        if raw is None:
+            return None
+        try:
+            return DriverLockHolder(
+                pid=int(raw["pid"]),
+                started_at_ms=int(raw["started_at_ms"]),
+                host=str(raw["host"]),
+                path=path,
+            )
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise ContractViolationError(
+                f"{path} exists but is not a driver lock ({type(exc).__name__}: {exc}); it "
+                "cannot be told from a live driver. If no driver is running over this "
+                "results tree, remove the file and re-run"
+            ) from exc
+
+    def refuse_if_driver_lock_live(self) -> None:
+        """The dry run's half of :meth:`acquire_driver_lock`: check, never take."""
+        holder = self.read_driver_lock()
+        if holder is not None and holder.is_alive():
+            raise self._held_by(holder)
+
+    def _held_by(self, holder: DriverLockHolder) -> ContractViolationError:
+        return ContractViolationError(
+            f"{self.loop_dir} is held by another driver (pid {holder.pid} on "
+            f"{holder.host}, started {holder.started_at_ms}); one driver owns a results "
+            "tree at a time — a second would resume the first's live attempts as its own "
+            "and rotate the live metrics chain aside. Wait for it, kill it, or use a new "
+            f"--loop-slug. If that pid is not a driver, remove {holder.path} and re-run"
+        )
+
+    async def acquire_driver_lock(self) -> None:
+        """Take ``.driver.lock`` for this store, or refuse.
+
+        ``O_CREAT | O_EXCL`` on the lock path is the atomic test-and-set;
+        the file then holds ``pid``, ``started_at_ms`` and ``host``. A lock
+        whose pid is not alive on this host is *stale* — the previous driver
+        was killed without releasing — and is reclaimed with a
+        ``research.driver_lock.reclaimed`` log line; a live one refuses with
+        the holder's pid. Re-entrant per store object (see ``__init__``).
+
+        **Reclaim runs under a mutex, and is a rename.** Two drivers racing
+        over one stale lock both read it and both decide it is stale; with a
+        bare ``unlink`` (or a bare ``rename``) the slower one then removes
+        whatever is at the path *now* — which, if the faster one has already
+        reclaimed and re-created, is the faster one's live lock — and both
+        end up holding the tree. POSIX has no "remove iff the content is
+        still X", so the reclaim is serialised: ``os.mkdir(<lock>.reclaim)``
+        is the atomic-exclusive mutex (a second reclaimer waits briefly, then
+        re-evaluates), and under it the lock is *re-read* and must still be
+        the holder judged stale; only then is it renamed to
+        ``<lock>.stale-<pid>``, the ``O_EXCL`` create performed, and the
+        mutex dropped. The loser's re-read finds the winner's fresh lock,
+        re-evaluates, and is refused naming the winner's pid. Rename rather
+        than unlink so a process killed after the reclaim leaves the file it
+        displaced beside its own; the ``.stale-<pid>`` file is inert (nothing
+        reads it) and is removed once the outcome is known, best-effort. A
+        mutex directory left behind by a driver killed inside the reclaim
+        (microseconds wide) refuses with the directory named — the safe
+        direction, and the remedy is in the message.
+
+        Two limits, both in the safe (refusing) direction. A lock naming a
+        pid on *another host* cannot be probed and is treated as live even
+        if that host's driver is long dead: it refuses forever, until the
+        operator removes ``<loop-dir>/.driver.lock`` by hand (the refusal
+        names the file). And a stale lock whose pid the kernel has since
+        reused for an unrelated process looks live and refuses the same way,
+        with the same remedy.
+
+        The loop directory is created here if it does not exist, because the
+        lock file lives in it and must land before any other write. That is
+        the one write a refused ``--yes`` run may leave behind and it is by
+        design: the driver takes the lock only after every read-only preflight
+        has passed, and a dry run never calls this.
+        """
+        if self._driver_lock_depth > 0:
+            self._driver_lock_depth += 1
+            return
+
+        def _take() -> None:
+            self.loop_dir.mkdir(parents=True, exist_ok=True)
+            path = self.driver_lock_path
+            reclaim_mutex = path.with_name(f"{path.name}.reclaim")
+            reclaimed: Path | None = None
+            vanished = 0
+            mutex_waits = 0
+            try:
+                while True:
+                    try:
+                        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                    except FileExistsError:
+                        holder = self.read_driver_lock()
+                        if holder is None:
+                            # Vanished between the failed create and the read —
+                            # the previous holder released. Try again, but not
+                            # forever.
+                            vanished += 1
+                            if vanished > 2:
+                                raise ContractViolationError(
+                                    f"could not take {path}: it kept reappearing between a "
+                                    "failed create and the next; another driver is racing "
+                                    "for this results tree"
+                                ) from None
+                            continue
+                        if holder.is_alive():
+                            raise self._held_by(holder) from None
+                        # Stale. Reclaim under the reclaim mutex — see the
+                        # docstring for why a bare rename is not enough.
+                        try:
+                            os.mkdir(reclaim_mutex)
+                        except FileExistsError:
+                            mutex_waits += 1
+                            if mutex_waits > _RECLAIM_MUTEX_WAITS:
+                                raise ContractViolationError(
+                                    f"{reclaim_mutex} exists: another driver is reclaiming "
+                                    f"the stale {path} right now, or one was killed in the "
+                                    "middle of doing so. Wait a moment and re-run; if no "
+                                    "driver is running over this results tree, remove that "
+                                    "directory and re-run"
+                                ) from None
+                            time.sleep(_RECLAIM_MUTEX_WAIT_SECONDS)
+                            continue
+                        try:
+                            again = self.read_driver_lock()
+                            if again is None or (again.pid, again.started_at_ms, again.host) != (
+                                holder.pid,
+                                holder.started_at_ms,
+                                holder.host,
+                            ):
+                                # Not the file we judged stale any more:
+                                # released, or taken by a live driver in the
+                                # meantime. Re-evaluate from the top.
+                                continue
+                            stale = path.with_name(f"{path.name}.stale-{os.getpid()}")
+                            os.rename(path, stale)
+                            reclaimed = stale
+                            logger.warning(
+                                "research.driver_lock.reclaimed",
+                                path=str(path),
+                                stale_pid=holder.pid,
+                                stale_started_at_ms=holder.started_at_ms,
+                                detail=(
+                                    "the lock names a pid that is not alive on this host; "
+                                    "the previous driver was killed without releasing it "
+                                    "and this run takes over the results tree"
+                                ),
+                            )
+                            try:
+                                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                            except FileExistsError:
+                                # A newcomer landed between the rename and the
+                                # create. The top of the loop reads it and
+                                # refuses if it is live.
+                                continue
+                        finally:
+                            with suppress(OSError):
+                                os.rmdir(reclaim_mutex)
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        json.dump(
+                            {
+                                "pid": os.getpid(),
+                                "started_at_ms": self._clock.now_ms(),
+                                "host": _hostname(),
+                            },
+                            handle,
+                        )
+                        handle.write("\n")
+                    return
+            finally:
+                # The renamed-aside stale lock is inert; drop it whether this
+                # process took the tree or was refused after reclaiming.
+                if reclaimed is not None:
+                    with suppress(OSError):
+                        reclaimed.unlink()
+
+        await asyncio.to_thread(_take)
+        self._driver_lock_depth = 1
+        logger.info("research.driver_lock.acquired", path=str(self.driver_lock_path))
+
+    async def release_driver_lock(self) -> None:
+        """Drop one level of the hold; the file goes when the last level does."""
+        if self._driver_lock_depth == 0:
+            return
+        self._driver_lock_depth -= 1
+        if self._driver_lock_depth > 0:
+            return
+
+        def _drop() -> None:
+            path = self.driver_lock_path
+            try:
+                holder = self.read_driver_lock()
+            except ContractViolationError:
+                holder = None
+            # Only ever remove our own lock: a stale-reclaim by another
+            # process in the meantime (which would mean this process looked
+            # dead to it) must not have its lock pulled from under it.
+            if holder is not None and (holder.pid != os.getpid() or holder.host != _hostname()):
+                return
+            path.unlink(missing_ok=True)
+
+        await asyncio.to_thread(_drop)
+        logger.info("research.driver_lock.released", path=str(self.driver_lock_path))
+
+    @asynccontextmanager
+    async def driver_lock(self) -> AsyncIterator[None]:
+        """``async with store.driver_lock():`` — acquire, and release on any exit."""
+        await self.acquire_driver_lock()
+        try:
+            yield
+        finally:
+            await self.release_driver_lock()
+
     # -- attempts ---------------------------------------------------------- #
 
     async def write_attempt_log(self, log: AttemptLog, *, output_dir: Path) -> Path:
@@ -473,20 +1145,68 @@ class TrajectoryStore:
         await asyncio.to_thread(_write_json, path, log.to_json())
         return path
 
-    async def write_attempt_checkpoint(self, attempt: Attempt, *, output_dir: Path) -> Path:
+    def attempt_checkpoint_path(self, problem_id: str, *, output_dir: Path) -> Path:
+        return output_dir / "checkpoints" / f"{problem_id}.json"
+
+    async def write_attempt_checkpoint(
+        self,
+        attempt: Attempt,
+        *,
+        output_dir: Path,
+        eval_set_hash: str = "",
+        config_digest: str = "",
+        configured_cap: Cap | None = None,
+    ) -> Path:
         """Persist the latest immutable checkpoint of an attempt.
 
         Reloading this file *is* resume: an interruption — a closed
         subscription window, a killed process — costs the remainder of the
         attempt, not the attempt. Written after every step and, critically,
         before the loop suspends on an escalation.
+
+        Two fields exist for the *reader* rather than the writer, and both were
+        added when resume stopped being a story and became a code path
+        (RES-17):
+
+        * The full ``result`` — ``problem_id``, ``verifier_id`` and
+          ``raw_measurements`` alongside the score. The operator-facing
+          rendering in ``escalation.encode_request`` keeps only the four
+          human-readable fields, which is right there and wrong here: a
+          resumed round reports a skipped attempt's score straight out of this
+          file, so the file has to round-trip a whole
+          :class:`~turing.research.contracts.VerificationResult` rather than a
+          summary of one.
+        * ``eval_set_hash``, so a checkpoint cannot be reused by a run
+          measuring a *different corpus*. ``run_id`` and ``seed`` alone do not
+          catch it: the noise floor's per-seed run id is derived
+          deterministically as ``<run_id>-seed-<n>``, so a corpus edited
+          between two invocations of the same floor repeats both. See
+          :class:`RunIdentity`.
+        * ``config_digest``, so a checkpoint cannot be reused by a run
+          measuring under a *different configuration* — a raised cap, a
+          swapped scaffold, a flipped ``verify_every_step``. See
+          :attr:`RunIdentity.config_digest`.
+        * ``configured_cap`` — the cap this attempt was *started* under,
+          resolved per problem (``Problem.default_cap or
+          RoundConfig.default_cap``) and never extended. It is distinct from
+          ``cap``, which an operator ``EXTEND`` legitimately raises
+          mid-attempt. The round's ``config_digest`` covers only the round's
+          default; a problem that declares its own cap can have that cap
+          edited between two invocations with the digest unchanged, and
+          without this field the attempt measured at the old cap would be
+          reused as if measured at the new one. :meth:`load_stored_attempt`
+          compares it when the caller passes ``cap``. ``None`` is written
+          only by callers that have no problem in hand (a hand-built
+          checkpoint in a test) and is never equal to a real cap.
         """
-        path = output_dir / "checkpoints" / f"{attempt.problem_id}.json"
+        path = self.attempt_checkpoint_path(attempt.problem_id, output_dir=output_dir)
         payload = {
             "attempt_id": attempt.attempt_id,
             "problem_id": attempt.problem_id,
             "round_id": attempt.round_id,
             "seed": attempt.seed,
+            "eval_set_hash": eval_set_hash,
+            "config_digest": config_digest,
             "workspace_path": str(attempt.workspace_path),
             "state": attempt.state.value,
             "step_index": attempt.step_index,
@@ -501,6 +1221,7 @@ class TrajectoryStore:
                 "max_wall_clock_seconds": attempt.cap.max_wall_clock_seconds,
                 "extension_count": attempt.cap.extension_count,
             },
+            "configured_cap": None if configured_cap is None else _encode_cap(configured_cap),
             "consumed": {
                 "steps": attempt.consumed.steps,
                 "tokens": attempt.consumed.tokens,
@@ -509,14 +1230,343 @@ class TrajectoryStore:
             "result": None
             if attempt.result is None
             else {
+                "problem_id": attempt.result.problem_id,
+                "verifier_id": attempt.result.verifier_id,
                 "score": attempt.result.score,
                 "score_scale": attempt.result.score_scale,
                 "passed_correctness": attempt.result.passed_correctness,
+                "raw_measurements": dict(attempt.result.raw_measurements),
                 "detail": attempt.result.detail,
             },
         }
         await asyncio.to_thread(_write_json, path, payload)
         return path
+
+    # -- resume ------------------------------------------------------------ #
+
+    async def load_stored_attempt(
+        self,
+        problem_id: str,
+        *,
+        output_dir: Path,
+        identity: RunIdentity,
+        cap: Cap | None = None,
+    ) -> StoredAttempt:
+        """What is already on disk for one ``(run, problem)``, and what to do with it.
+
+        **The contract**, which every rule below serves and every test of
+        resume is a test of: *resume never adopts a number this run did not
+        measure under this exact configuration; it never overwrites a prior
+        measurement — a re-drive lands in a new generation beside the old
+        one; a finished round is returned as a no-op success ONLY for the
+        identical measurement (same* ``eval_set_hash``, ``engine``,
+        ``config_digest``, *resume on) and refuses without writing otherwise;*
+        ``--dry-run`` *performs every validation the real run performs before
+        its first write; one driver owns a results tree at a time.*
+
+        **Complete — reuse the outcome, spend nothing.** All of:
+
+        * the checkpoint decodes and names this ``identity``
+          (``round_id`` / ``seed`` / ``eval_set_hash`` / ``config_digest``);
+        * when ``cap`` is given — the cap this run would start the problem
+          under, ``Problem.default_cap or RoundConfig.default_cap`` — the
+          checkpoint's ``configured_cap`` equals it. A per-problem cap is
+          outside the round's ``config_digest``, so this is the only place
+          an edited ``Problem.default_cap`` is caught; a checkpoint written
+          before the field existed has none and is a previous generation;
+        * its state is terminal — ``PASSED``, ``FAILED_WITHIN_CAP`` or
+          ``ABANDONED`` (:data:`~turing.research.contracts.TERMINAL_ATTEMPT_STATES`);
+        * the attempt log ``attempts/<problem-id>.json`` is beside it **and
+          names the checkpoint's** ``attempt_id``;
+        * the attempt summary ``attempts/<problem-id>/metrics.json`` is beside
+          it **and names the checkpoint's** ``attempt_id``.
+
+        The last two are not belt-and-braces. ``metrics.json`` is written once,
+        at the end of ``run_attempt``, and its absence beside an intact chain
+        is exactly the shape ``python -m turing.research.loop.verify`` reports
+        ``INCOMPLETE`` — a process killed between its last append and its
+        summary write. Skipping such an attempt would have this resume path
+        call *finished* what the pre-writeup gate calls *unfinished*, and the
+        two must not disagree about the same directory. So a terminal
+        checkpoint with no finished record on disk is re-driven: the honest
+        reading of "we cannot tell what it reported". The ``attempt_id``
+        comparison closes the remaining gap: a log and summary left by a
+        *previous generation* of the same problem (same run, same seed, a
+        different attempt id) are a finished record of some attempt, not of
+        this one, and must not bless a checkpoint they never described.
+
+        **The three states that are deliberately not complete:**
+
+        * ``PAUSED`` / ``PENDING`` / ``RUNNING`` / ``VERIFYING`` →
+          :attr:`AttemptDisposition.RESUMABLE`. This is the load-bearing case:
+          subscription windows close mid-attempt, and an interruption must
+          cost the remainder of the attempt, not the attempt.
+        * ``ESCALATED`` with a request file that decodes and names this
+          attempt → :attr:`AttemptDisposition.AWAITING_DECISION`.
+          ``ESCALATED`` is neither terminal nor resumable — only an operator
+          moves it — so the restart re-enters the wait on that same request.
+          Re-driving would both throw away the work and raise a second
+          escalation for one event, inflating driving function #4. The file
+          is *decoded* here, with the same decoder the runner rebuilds it
+          with (:func:`decode_escalation_request`), not merely stat-ed: a
+          request that exists but does not decode, or names another attempt,
+          is ``ABSENT`` — re-driven — rather than an ``AWAITING_DECISION``
+          the runner then cannot honour and loses the problem to.
+        * anything unreadable, foreign, or contradictory →
+          :attr:`AttemptDisposition.ABSENT`, i.e. drive it. Every refusal
+          direction here is towards *spending compute*, never towards
+          adopting a number this run did not measure. That includes a
+          checkpoint whose bytes are not UTF-8 or not JSON: every read
+          failure is a ``ValueError`` or an ``OSError``, and both mean
+          *absent*, never *the round dies here*.
+
+        ``ABANDONED`` counts as complete, and that is a deliberate reading of
+        the state rather than an oversight: it is reachable only through an
+        operator ``ABANDON`` verdict, so re-driving it would re-ask a question
+        the operator has already answered.
+        """
+        return await asyncio.to_thread(
+            self._read_stored_attempt, problem_id, output_dir, identity, cap
+        )
+
+    async def load_completed_attempt(
+        self,
+        round_index: int,
+        problem_id: str,
+        *,
+        identity: RunIdentity,
+    ) -> StoredAttempt | None:
+        """The finished attempt for ``(round, problem)``, or ``None``.
+
+        The narrow, round-shaped form of :meth:`load_stored_attempt`: it
+        answers only "is there something here this round may reuse instead of
+        re-driving?", and ``None`` covers every reason the answer is no —
+        nothing on disk, a previous generation's work, an interrupted attempt,
+        an open escalation, a terminal checkpoint whose record never finished.
+        The completeness rules, in full, are in
+        :meth:`load_stored_attempt`.
+        """
+        stored = await self.load_stored_attempt(
+            problem_id, output_dir=self.round_dir(round_index), identity=identity
+        )
+        return stored if stored.is_complete else None
+
+    async def list_completed_seeds(
+        self,
+        identities: Mapping[int, RunIdentity],
+        problem_ids: Sequence[str],
+        *,
+        caps: Mapping[str, Cap] | None = None,
+    ) -> tuple[int, ...]:
+        """Which noise-floor seeds already measured **every** problem, completely.
+
+        A seed is all-or-nothing here, and that follows from what a floor is
+        for rather than from convenience. ``NoiseFloorRunner.run`` refuses a
+        seed that measured a strict subset of the corpus — the spread across
+        seeds would be part run-to-run variance and part "which problems ran"
+        — so "this seed is done" can only mean *every* problem in
+        ``problem_ids`` has a complete attempt under
+        :meth:`noise_floor_seed_dir`. A seed with some problems finished is
+        not listed; it is driven, and the per-problem skip inside
+        ``run_attempts`` is what keeps its finished attempts from being paid
+        for twice.
+
+        ``identities`` is keyed by seed because each seed run has its own
+        ``run_id`` (``<run_id>-seed-<n>``); the eval-set hash is shared.
+        ``caps``, keyed by problem id, is the cap each problem would be
+        started under and is forwarded to :meth:`load_stored_attempt`'s
+        ``cap`` — a seed whose attempts were measured under a since-edited
+        per-problem cap is not complete.
+        """
+        completed: list[int] = []
+        for seed, identity in identities.items():
+            output_dir = self.noise_floor_seed_dir(seed)
+            stored = [
+                await self.load_stored_attempt(
+                    problem_id,
+                    output_dir=output_dir,
+                    identity=identity,
+                    cap=None if caps is None else caps.get(problem_id),
+                )
+                for problem_id in problem_ids
+            ]
+            if stored and all(item.is_complete for item in stored):
+                completed.append(seed)
+        return tuple(sorted(completed))
+
+    def _read_stored_attempt(
+        self,
+        problem_id: str,
+        output_dir: Path,
+        identity: RunIdentity,
+        cap: Cap | None = None,
+    ) -> StoredAttempt:
+        """The blocking half of :meth:`load_stored_attempt`, run in a thread."""
+
+        def absent(reason: str) -> StoredAttempt:
+            return StoredAttempt(
+                problem_id=problem_id,
+                disposition=AttemptDisposition.ABSENT,
+                reason=reason,
+            )
+
+        checkpoint_path = self.attempt_checkpoint_path(problem_id, output_dir=output_dir)
+        # ``ValueError`` rather than ``json.JSONDecodeError``: the decode error
+        # is one subclass, ``UnicodeDecodeError`` (a checkpoint whose bytes are
+        # not UTF-8) is another, and a checkpoint that cannot be read is
+        # *absent* whichever way it failed. This function is a resume probe;
+        # nothing it hits may take the round down.
+        try:
+            raw = _read_json(checkpoint_path)
+        except (OSError, ValueError) as exc:
+            return absent(f"{checkpoint_path} could not be read: {exc}")
+        if raw is None:
+            return absent("no checkpoint on disk")
+        if not isinstance(raw, dict):
+            return absent(f"{checkpoint_path} is not an attempt checkpoint")
+        try:
+            attempt = decode_attempt_checkpoint(raw)
+        except (KeyError, TypeError, ValueError, ContractViolationError) as exc:
+            return absent(f"{checkpoint_path} could not be decoded: {type(exc).__name__}: {exc}")
+
+        stored_identity = RunIdentity(
+            round_id=attempt.round_id,
+            seed=attempt.seed,
+            eval_set_hash=str(raw.get("eval_set_hash", "")),
+            config_digest=str(raw.get("config_digest", "")),
+        )
+        if attempt.problem_id != problem_id or stored_identity != identity:
+            return absent(
+                f"checkpoint belongs to a different run "
+                f"(problem_id={attempt.problem_id!r}, round_id={stored_identity.round_id!r}, "
+                f"seed={stored_identity.seed!r}, "
+                f"eval_set_hash={stored_identity.eval_set_hash!r}, "
+                f"config_digest={stored_identity.config_digest!r}; "
+                f"this run is round_id={identity.round_id!r}, seed={identity.seed!r}, "
+                f"eval_set_hash={identity.eval_set_hash!r}, "
+                f"config_digest={identity.config_digest!r})"
+            )
+        if cap is not None:
+            expected = _encode_cap(cap)
+            stored_cap = raw.get("configured_cap")
+            if stored_cap != expected:
+                return absent(
+                    f"checkpoint was measured under configured_cap {stored_cap!r}; this run "
+                    f"would start {problem_id!r} under {expected!r}. A per-problem cap is "
+                    "outside the round's config_digest, so an attempt measured at one cap "
+                    "is a previous generation to a run that would apply another"
+                )
+
+        log_path = output_dir / "attempts" / f"{problem_id}.json"
+        steps: tuple[StepLog, ...] = ()
+        escalation_ids: tuple[str, ...] = ()
+        log_raw: Any = None
+        try:
+            log_raw = _read_json(log_path)
+        except (OSError, ValueError):
+            log_raw = None
+        # A log that names another attempt is a previous generation's record
+        # of this problem, not this attempt's; its steps must not be spliced
+        # onto a resumed attempt, and it must not count towards completeness.
+        if isinstance(log_raw, dict) and log_raw.get("attempt_id") != attempt.attempt_id:
+            log_raw = None
+        if isinstance(log_raw, dict):
+            try:
+                steps = tuple(
+                    _decode_step_log(entry)
+                    for entry in log_raw.get("steps", [])
+                    if isinstance(entry, dict)
+                )
+            except (KeyError, TypeError, ValueError):
+                steps = ()
+            escalation_ids = tuple(
+                str(value) for value in log_raw.get("escalation_ids", []) if isinstance(value, str)
+            )
+
+        def found(
+            disposition: AttemptDisposition, *, reason: str, log: Path | None
+        ) -> StoredAttempt:
+            return StoredAttempt(
+                problem_id=problem_id,
+                disposition=disposition,
+                attempt=attempt,
+                steps=steps,
+                escalation_ids=escalation_ids,
+                attempt_log_path=log,
+                reason=reason,
+            )
+
+        if attempt.is_terminal:
+            if not isinstance(log_raw, dict):
+                return absent(
+                    f"terminal checkpoint ({attempt.state.value}) with no readable attempt "
+                    f"log for attempt {attempt.attempt_id!r} at {log_path}; the attempt did "
+                    "not finish reporting"
+                )
+            summary_path = output_dir / "attempts" / problem_id / "metrics.json"
+            try:
+                summary_raw = _read_json(summary_path)
+            except (OSError, ValueError):
+                summary_raw = None
+            if summary_raw is None:
+                return absent(
+                    f"terminal checkpoint ({attempt.state.value}) with no summary at "
+                    f"{summary_path}; verify calls that directory INCOMPLETE and so does this"
+                )
+            if (
+                not isinstance(summary_raw, dict)
+                or summary_raw.get("attempt_id") != attempt.attempt_id
+            ):
+                return absent(
+                    f"terminal checkpoint ({attempt.state.value}) for attempt "
+                    f"{attempt.attempt_id!r} but the summary at {summary_path} names "
+                    f"{summary_raw.get('attempt_id') if isinstance(summary_raw, dict) else None!r}"
+                    "; a finished record of some other attempt does not finish this one"
+                )
+            return found(
+                AttemptDisposition.COMPLETE,
+                reason=f"terminal state {attempt.state.value} with a finished record on disk",
+                log=log_path,
+            )
+
+        if attempt.state is AttemptState.ESCALATED:
+            if not attempt.escalation_id:
+                return absent("ESCALATED checkpoint carries no escalation_id to re-open")
+            request_path = output_dir / "escalations" / f"{attempt.escalation_id}.json"
+            try:
+                request_raw = _read_json(request_path)
+            except (OSError, ValueError) as exc:
+                return absent(
+                    f"ESCALATED checkpoint names request {attempt.escalation_id!r} but "
+                    f"{request_path} could not be read: {exc}"
+                )
+            if request_raw is None:
+                return absent(
+                    f"ESCALATED checkpoint names request {attempt.escalation_id!r} but "
+                    f"{request_path} is missing"
+                )
+            request = decode_escalation_request(request_raw, attempt_id=attempt.attempt_id)
+            if request is None or request.request_id != attempt.escalation_id:
+                return absent(
+                    f"ESCALATED checkpoint names request {attempt.escalation_id!r} but "
+                    f"{request_path} does not decode as a request for attempt "
+                    f"{attempt.attempt_id!r}; there is no question to re-enter, so the "
+                    "attempt is driven again rather than lost"
+                )
+            return found(
+                AttemptDisposition.AWAITING_DECISION,
+                reason=f"suspended on operator request {attempt.escalation_id}",
+                log=log_path if isinstance(log_raw, dict) else None,
+            )
+
+        if attempt.is_resumable:
+            return found(
+                AttemptDisposition.RESUMABLE,
+                reason=f"interrupted in {attempt.state.value} at step {attempt.step_index}",
+                log=log_path if isinstance(log_raw, dict) else None,
+            )
+
+        return absent(f"checkpoint state {attempt.state.value} is neither terminal nor resumable")
 
     async def write_escalation(
         self,
@@ -544,6 +1594,7 @@ class TrajectoryStore:
         scored: Sequence[ScoredProblem] = (),
         assessments: Sequence[SaturationAssessment] = (),
         noise_floors: Sequence[NoiseFloor] = (),
+        config_digest: str = "",
     ) -> Path:
         path = self.round_dir(record.round_index) / "round.json"
         payload = encode_round_record(
@@ -551,9 +1602,28 @@ class TrajectoryStore:
             scored=scored,
             assessments=assessments,
             noise_floors=noise_floors,
+            config_digest=config_digest,
         )
         await asyncio.to_thread(_write_json, path, payload)
         return path
+
+    async def load_round_record(self, round_index: int) -> dict[str, Any] | None:
+        """The raw ``round-NN/round.json`` document, or ``None`` if none is there.
+
+        Raw rather than decoded, so the caller can read ``run_id`` off a file
+        that may not decode in full; :func:`decode_round_record` is the
+        strict half.
+        """
+        path = self.round_dir(round_index) / "round.json"
+        try:
+            raw = await asyncio.to_thread(_read_json, path)
+        except (OSError, ValueError) as exc:
+            raise ContractViolationError(f"{path} could not be read: {exc}") from exc
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise ContractViolationError(f"{path} is not a round record")
+        return raw
 
     async def load_trajectory(self) -> dict[str, Any]:
         raw = await asyncio.to_thread(_read_json, self.trajectory_path)
@@ -579,6 +1649,7 @@ class TrajectoryStore:
         seed: int | None = None,
         cap: Cap | None = None,
         verify_every_step: bool | None = None,
+        config_digest: str = "",
     ) -> dict[str, Any]:
         """Append one round object to ``trajectory.json``, flagging lineage.
 
@@ -632,6 +1703,7 @@ class TrajectoryStore:
             seed=seed,
             cap=cap,
             verify_every_step=verify_every_step,
+            config_digest=config_digest,
         )
         row["engine_changed"] = engine_changed
         row["trajectory_restart"] = comparable is False
@@ -656,8 +1728,67 @@ class TrajectoryStore:
     # -- noise floor ------------------------------------------------------- #
 
     async def write_noise_floor(self, payload: Mapping[str, Any]) -> Path:
-        await asyncio.to_thread(_write_json, self.noise_floor_path, dict(payload))
-        return self.noise_floor_path
+        """Write ``noise-floor.json``, unless it already says exactly this.
+
+        The floor is re-derived on every invocation (``NoiseFloorRunner.run``
+        reuses complete seeds rather than short-circuiting on the file), so
+        an identical re-run arrives here with the same report and a fresh
+        ``created_at_ms``. Rewriting then would make the documented no-op
+        procedure touch a results-tree file on every restart, and the only
+        byte that moved would be a timestamp claiming the floor was measured
+        later than it was. So: if the file on disk decodes and equals the new
+        payload in every field but ``created_at_ms``, it is left as it is,
+        original timestamp included. Any other difference — a seed added, a
+        cell moved, a file that does not decode — is written, because the
+        report in hand is the one this run measured — but **what it displaces
+        is preserved**: the file that was there is moved to
+        ``noise-floor/prior-N.json`` first (the next free ``N``, numbered the
+        way an attempt's ``prior-N/`` is), byte for byte. A ``--no-resume``
+        re-drive of the floor is a re-measurement, and the earlier report is
+        the earlier measurement's evidence; the same rule that keeps a
+        re-driven attempt's checkpoint out of the bin keeps this out of it.
+        Nothing reads ``prior-N.json`` — it is there for the operator.
+        """
+        path = self.noise_floor_path
+        fresh = dict(payload)
+
+        def _write_unless_same() -> None:
+            try:
+                existing = _read_json(path)
+            except (OSError, ValueError):
+                existing = None
+            if isinstance(existing, dict):
+                # Compared as JSON values, so a tuple in the payload equals
+                # the list it would have been written as.
+                normalised = json.loads(json.dumps(fresh, sort_keys=True, allow_nan=False))
+                theirs = {k: v for k, v in existing.items() if k != "created_at_ms"}
+                ours = {k: v for k, v in normalised.items() if k != "created_at_ms"}
+                if theirs == ours:
+                    logger.info(
+                        "research.noise_floor.unchanged",
+                        path=str(path),
+                        detail=(
+                            "an identical re-run re-derived the same floor; the file on "
+                            "disk is left as the first process wrote it"
+                        ),
+                    )
+                    return
+            if path.is_file():
+                prior = _next_prior_noise_floor(path.parent)
+                path.rename(prior)
+                logger.info(
+                    "research.noise_floor.rotated",
+                    src=str(path),
+                    dest=str(prior),
+                    detail=(
+                        "a different floor is about to be written; the report that was "
+                        "here is a prior measurement and is kept beside it, unchanged"
+                    ),
+                )
+            _write_json(path, fresh)
+
+        await asyncio.to_thread(_write_unless_same)
+        return path
 
     async def load_noise_floor(self) -> dict[str, Any] | None:
         raw = await asyncio.to_thread(_read_json, self.noise_floor_path)

@@ -180,15 +180,26 @@ def fingerprint_corpus(problems: Sequence[Problem], *, extra: Sequence[str] = ()
     return digest.hexdigest()
 
 
-def bind_eval_set_hash(problems: Sequence[Problem], promised: str = "") -> str:
+def bind_eval_set_hash(
+    problems: Sequence[Problem], promised: str = "", *, extra: Sequence[str] = ()
+) -> str:
     """Derive the eval-set hash from the corpus actually in hand.
 
     A caller-promised string is verified, never trusted: drop a problem and
     reuse the old hash and the loop would report a comparable delta on a
     changed eval set — the failure the brief calls fiction. An empty promise
     means derive only.
+
+    ``extra`` is the family-specific material the promise was computed with
+    (:meth:`~turing.research.problems.speedup.SpeedupAdapter.eval_set_material`),
+    threaded through unchanged to :func:`fingerprint_corpus`, so there is one
+    definition of the hash — that function — and both sides of the binding
+    call it with the same arguments. Before it was threaded, the driver
+    promised ``fingerprint_corpus(corpus, extra=material)`` and this
+    re-derived ``fingerprint_corpus(corpus)``: two definitions, and every
+    real run refused itself.
     """
-    derived = fingerprint_corpus(problems)
+    derived = fingerprint_corpus(problems, extra=extra)
     if promised and promised != derived:
         raise ContractViolationError(
             f"eval_set_hash {promised!r} does not match the corpus fingerprint "

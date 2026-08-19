@@ -46,10 +46,11 @@ round's results into a future self-edit summary is
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -58,6 +59,7 @@ import structlog
 from turing.research.contracts import (
     Attempt,
     AttemptState,
+    Cap,
     CapConsumption,
     ContractViolationError,
     EscalationProtocolError,
@@ -93,7 +95,17 @@ from turing.research.loop.results import (
     write_round_summary,
     write_viewer_config,
 )
-from turing.research.loop.trajectory import AttemptLog, StepLog, cell_key
+from turing.research.loop.trajectory import (
+    AttemptLog,
+    RunIdentity,
+    StepLog,
+    StoredAttempt,
+    cell_key,
+    decode_assessments,
+    decode_escalation_request,
+    decode_round_record,
+    decode_scored_problems,
+)
 from turing.research.problems.adapter import bind_eval_set_hash
 
 if TYPE_CHECKING:
@@ -101,7 +113,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from turing.research.contracts import (
-        Cap,
         EngineIdentity,
         EscalationDecision,
         Problem,
@@ -127,6 +138,8 @@ __all__ = [
     "RoundConfig",
     "RoundOutcome",
     "RoundRunner",
+    "WorkspaceMissingError",
+    "find_finished_round",
 ]
 
 
@@ -207,6 +220,21 @@ class RoundConfig:
     #: when the cap trips. Never verifying floors every cell and fabricates a
     #: parent-round delta.
     verify_every_step: bool = True
+    #: The family-specific strings ``eval_set_hash`` was fingerprinted with
+    #: (the speedup adapter's significance multiplier and per-spec material —
+    #: :meth:`~turing.research.problems.speedup.SpeedupAdapter.eval_set_material`).
+    #: :meth:`RoundRunner.run_round` re-derives the hash from the corpus with
+    #: exactly these, so a promised hash and its verification share one
+    #: definition (:func:`~turing.research.problems.adapter.fingerprint_corpus`).
+    #: Not part of :meth:`config_digest`: it is already inside ``eval_set_hash``.
+    eval_set_material: tuple[str, ...] = ()
+    #: Canonical strings naming the measurement instrument that the corpus
+    #: fingerprint does not cover — for the speedup family, the interpreter
+    #: the timing harness runs under
+    #: (:meth:`~turing.research.problems.speedup.SpeedupAdapter.harness_identity`).
+    #: Part of :meth:`config_digest`: two runs timing the same corpus under
+    #: different interpreters took different measurements.
+    harness_identity: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.round_index < 0:
@@ -222,9 +250,95 @@ class RoundConfig:
             raise ContractViolationError("an attempt must be allowed at least one escalation")
         object.__setattr__(self, "pass_criteria", MappingProxyType(dict(self.pass_criteria)))
         object.__setattr__(self, "score_floors", MappingProxyType(dict(self.score_floors)))
+        object.__setattr__(self, "eval_set_material", tuple(self.eval_set_material))
+        object.__setattr__(self, "harness_identity", tuple(self.harness_identity))
 
     def criterion_for(self, problem_id: str) -> PassCriterion | None:
         return self.pass_criteria.get(problem_id)
+
+    def config_digest(self) -> str:
+        """SHA-256 over the canonical JSON of every measurement-affecting field.
+
+        The fourth coordinate of :class:`~turing.research.loop.trajectory.RunIdentity`.
+        ``run_id``, ``seed`` and ``eval_set_hash`` say *which* measurement a
+        checkpoint belongs to; this says *how it was taken*, and a stored
+        attempt whose digest differs is a previous generation, re-driven
+        rather than reused. The fields, and why each is here:
+
+        * ``engine`` — a floor or a half-finished round measured under one
+          scaffold sha must not be re-derived and stamped with another;
+          ``run_round``'s engine guard on the noise floor is only as good as
+          the identity the floor's checkpoints were reused under.
+        * ``default_cap`` — a round killed at cap 2 and restarted at cap 6
+          would otherwise be one record half-measured each way.
+        * ``pass_criteria`` — the bar decides ``PASSED`` vs ``FAILED_WITHIN_CAP``
+          and when an attempt stops spending.
+        * ``verify_every_step`` — decides whether the reported score is the
+          latest verify or the single cap-trip verify.
+        * ``escalate_on_cap_exhaustion`` and ``max_escalations_per_attempt``
+          — decide whether a tripped cap ends the attempt or asks the
+          operator, and how many times.
+        * ``score_floors`` — the value an unscored problem enters its cell at.
+        * ``harness_identity`` — the instrument the corpus fingerprint does
+          not name (the timing harness's interpreter, for speedup problems);
+          the same corpus timed under two interpreters is two measurements.
+
+        Not included: ``round_index`` / ``run_id`` / ``parent_round_id`` /
+        ``seed`` / ``eval_set_hash`` (already identity coordinates, or
+        lineage rather than measurement), ``eval_set_material`` (already
+        inside ``eval_set_hash``) and ``cost_basis`` (a reduction over
+        finished attempts, not a property of any attempt). A **per-problem**
+        cap (``Problem.default_cap``) is not here either — it is a property of
+        one problem, not of the round — and is compared per attempt instead:
+        the checkpoint records the cap the attempt was measured under and
+        ``TrajectoryStore.load_stored_attempt`` refuses one that differs from
+        the cap this run would apply.
+
+        Byte-stable: keys sorted, mappings sorted by key, no whitespace
+        variance, so two processes with equal configs produce equal digests
+        on any platform. A non-finite ``min_score`` (tolerated elsewhere;
+        ``results.usable_target`` normalises it) is encoded as Python's own
+        ``NaN`` / ``Infinity`` token — this text is hashed, never written for
+        another reader, so the JSON-validity concern behind
+        ``trajectory._write_json``'s ``allow_nan=False`` does not apply, and
+        the token is deterministic.
+        """
+        canonical = {
+            "engine": {
+                "backend": self.engine.backend,
+                "orchestrator_model": self.engine.orchestrator_model,
+                "substep_model": self.engine.substep_model,
+                "scaffold_git_sha": self.engine.scaffold_git_sha,
+            },
+            "default_cap": {
+                "max_steps": self.default_cap.max_steps,
+                "max_tokens": self.default_cap.max_tokens,
+                "max_wall_clock_seconds": self.default_cap.max_wall_clock_seconds,
+            },
+            "pass_criteria": {
+                problem_id: {
+                    "min_score": criterion.min_score,
+                    "require_correctness": criterion.require_correctness,
+                }
+                for problem_id, criterion in sorted(self.pass_criteria.items())
+            },
+            "verify_every_step": self.verify_every_step,
+            "escalate_on_cap_exhaustion": self.escalate_on_cap_exhaustion,
+            "max_escalations_per_attempt": self.max_escalations_per_attempt,
+            "score_floors": dict(sorted(self.score_floors.items())),
+            "harness_identity": list(self.harness_identity),
+        }
+        encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def identity(self) -> RunIdentity:
+        """The :class:`RunIdentity` a stored attempt must carry to be this run's."""
+        return RunIdentity(
+            round_id=self.run_id,
+            seed=self.seed,
+            eval_set_hash=self.eval_set_hash,
+            config_digest=self.config_digest(),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +399,15 @@ class RoundOutcome:
     assessments: tuple[SaturationAssessment, ...]
     trajectory_row: Mapping[str, Any] | None = None
     failures: tuple[AttemptFailure, ...] = ()
+    #: True when :meth:`RoundRunner.run_round` found this round already in
+    #: ``trajectory.json`` under this ``run_id`` **and measured this way**
+    #: (same ``eval_set_hash``, ``engine``, ``config_digest`` and ``seed``;
+    #: see :func:`find_finished_round`) and returned what the first process
+    #: wrote — decoded from ``round.json`` — without driving, measuring, or
+    #: writing anything. ``attempts`` is empty on that path: no
+    #: attempt ran in this process, and the per-problem outcomes are in the
+    #: round directory for anyone who wants them.
+    already_finished: bool = False
 
 
 def _is_better(new: VerificationResult, old: VerificationResult | None) -> bool:
@@ -387,7 +510,7 @@ def _next_free_prior_suffix(metrics_dir: Path) -> int:
     return suffix
 
 
-def _commit_staged_rotation(metrics_dir: Path, staging_dir: Path) -> None:
+def _commit_staged_rotation(metrics_dir: Path, staging_dir: Path) -> Path:
     """Finish moving the trio/plots into ``staging_dir``, then commit it as ``prior-N/``.
 
     Called from two shapes of caller, and cannot (needs not) tell them apart:
@@ -448,10 +571,17 @@ def _commit_staged_rotation(metrics_dir: Path, staging_dir: Path) -> None:
     logger.info(
         "research.results.metrics_rotated", staging_dir=str(staging_dir), dest=str(prior_dir)
     )
+    return prior_dir
 
 
-def _rotate_stale_metrics(metrics_dir: Path) -> None:
+def _rotate_stale_metrics(metrics_dir: Path) -> Path | None:
     """Move a prior attempt's chained trio — and its plots — aside, as one atomic set.
+
+    Returns the ``prior-N/`` directory it rotated into, or ``None`` when
+    there was no chain to rotate. The return value is the only thing RES-17
+    added here: :func:`_rotate_prior_generation` moves the checkpoint and the
+    attempt log into the *same* directory, and it has to know which one.
+    Nothing about the trigger, the set of names, or the atomicity changed.
 
     A re-run of an attempt into an already-used ``output_dir`` is legitimate
     and reachable — a closed subscription window, a killed process, a
@@ -545,9 +675,70 @@ def _rotate_stale_metrics(metrics_dir: Path) -> None:
 
     jsonl_path = metrics_dir / "metrics.jsonl"
     if not (jsonl_path.exists() and jsonl_path.stat().st_size > 0):
-        return
+        return None
     staging_dir.mkdir(parents=True)
-    _commit_staged_rotation(metrics_dir, staging_dir)
+    return _commit_staged_rotation(metrics_dir, staging_dir)
+
+
+#: Names the checkpoint and the attempt log take inside ``prior-N/``. Fixed
+#: names rather than the originals' basenames: ``checkpoints/<problem-id>.json``
+#: and ``attempts/<problem-id>.json`` share a basename, and a nested problem
+#: id (``cuda/matmul``) would put ``matmul.json`` beside ``matmul.json``.
+_PRIOR_CHECKPOINT_NAME = "checkpoint.json"
+_PRIOR_ATTEMPT_LOG_NAME = "attempt-log.json"
+
+
+def _rotate_prior_generation(
+    metrics_dir: Path, *, checkpoint_path: Path, log_path: Path
+) -> Path | None:
+    """Move everything a previous generation of this attempt left aside, together.
+
+    A *fresh* drive into an already-used attempt slot — ``--no-resume``, or a
+    stored attempt the resume probe called a previous generation — must land
+    in a new generation beside the old one, never over it. :func:`_rotate_stale_metrics`
+    already does that for the chained trio and the plots; before RES-17 the
+    checkpoint (``checkpoints/<problem-id>.json``) and the attempt log
+    (``attempts/<problem-id>.json``) were rewritten in place, so a
+    ``--no-resume`` re-run of the noise floor destroyed every seed's prior
+    checkpoint — the record that carries the score and the identity the
+    earlier measurement was taken under — while carefully preserving the
+    metrics chain that no longer had a checkpoint to reconcile with.
+
+    So the set that rotates together is extended *here*, around the RES-19
+    function rather than inside it: the trio and plots go where they always
+    went, and the checkpoint and log follow them into the same ``prior-N/``
+    under fixed names. When there is no chain to rotate but a checkpoint or
+    log is present (an attempt killed after its first checkpoint and before
+    its first metrics line, or a hand-placed file), the ``prior-N/`` directory
+    is created for them alone: a checkpoint can carry a score, and a fresh
+    drive must not overwrite it either.
+
+    Only called on the fresh-drive path. A *resumed* attempt keeps its
+    checkpoint and log in place — they are what it resumes from — and only
+    the chain restarts.
+    """
+    prior_dir = _rotate_stale_metrics(metrics_dir)
+    moves = (
+        (checkpoint_path, _PRIOR_CHECKPOINT_NAME),
+        (log_path, _PRIOR_ATTEMPT_LOG_NAME),
+    )
+    # ``is_file`` rather than ``exists``: rotation moves what the runner
+    # wrote, and the runner writes files. A directory squatting on the
+    # checkpoint path is a corrupted tree — left where it is, so the first
+    # checkpoint write raises and the problem is reported lost, rather than
+    # swept aside as if it were a previous generation's evidence.
+    if not any(src.is_file() for src, _ in moves):
+        return prior_dir
+    if prior_dir is None:
+        prior_dir = metrics_dir / f"prior-{_next_free_prior_suffix(metrics_dir)}"
+        prior_dir.mkdir(parents=True, exist_ok=True)
+    for src, name in moves:
+        if not src.is_file():
+            continue
+        dest = prior_dir / name
+        src.rename(dest)
+        logger.info("research.results.attempt_state_rotated", src=str(src), dest=str(dest))
+    return prior_dir
 
 
 #: Written into a contained attempt's ``metrics.json`` as ``final_state``,
@@ -559,6 +750,15 @@ def _rotate_stale_metrics(metrics_dir: Path) -> None:
 #: rather than free prose so the whole class is greppable in one pass over a
 #: results tree.
 _CRASHED_FINAL_STATE_PREFIX = "crashed_in_harness"
+
+
+def _resolved_cap(problem: Problem, config: RoundConfig) -> Cap:
+    """The cap one attempt at ``problem`` starts under: the problem's own, else the round's.
+
+    One definition, used both to build the :class:`Attempt` and to stamp
+    ``configured_cap`` on its checkpoints, so the two cannot disagree.
+    """
+    return problem.default_cap or config.default_cap
 
 
 def _mint_attempt_id(config: RoundConfig, problem: Problem) -> str:
@@ -581,6 +781,21 @@ def _mint_attempt_id(config: RoundConfig, problem: Problem) -> str:
     id here, where every other identity field repeats.
     """
     return f"{config.run_id}-{problem.id}-{uuid.uuid4().hex[:8]}"
+
+
+class WorkspaceMissingError(ContractViolationError):
+    """A resumable checkpoint's workspace is not there; the attempt was refused, not crashed.
+
+    A :class:`ContractViolationError` still — every caller that catches the
+    base class keeps catching this — but its own class so
+    :meth:`RoundRunner.run_attempts` can tell it from a crash and *skip*
+    :meth:`RoundRunner._close_out_crashed_attempt`. The
+    refusal is raised before anything is written, and the attempt on disk is
+    intact and still resumable once the workspace is restored — a close-out
+    would write ``attempts/<problem-id>/metrics.json`` with
+    ``final_state=crashed_in_harness:…`` beside a ``PAUSED`` checkpoint,
+    contradicting both the message ("nothing was written") and the state.
+    """
 
 
 class _ForeignChainError(Exception):
@@ -799,6 +1014,45 @@ def _read_crashed_attempt_record(
     )
 
 
+def _read_prior_escalations(
+    escalations_dir: Path, attempt_id: str
+) -> tuple[EscalationRequest, ...]:
+    """Rebuild one attempt's already-raised requests from ``escalations/``.
+
+    The blocking half of :meth:`RoundRunner._prior_escalations`; see that
+    docstring for why ``best_result`` is dropped and why unreadable files are
+    skipped rather than reported. Ordered by ``created_at_ms`` so the
+    reconstructed list is in the order the operator saw them.
+
+    The per-file decode is
+    :func:`~turing.research.loop.trajectory.decode_escalation_request` — the
+    same one the store's resume probe applies to an ``ESCALATED``
+    checkpoint's request file — so "the store says awaiting decision" and
+    "the runner can rebuild the request" are one predicate, not two that
+    can disagree.
+    """
+    found: list[EscalationRequest] = []
+    for path in sorted(escalations_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        request = payload.get("request") if isinstance(payload, dict) else None
+        if not isinstance(request, dict) or request.get("attempt_id") != attempt_id:
+            continue
+        decoded = decode_escalation_request(payload, attempt_id=attempt_id)
+        if decoded is None:
+            logger.warning(
+                "research.attempt.escalation_unreadable",
+                path=str(path),
+                attempt_id=attempt_id,
+                detail="skipped when rebuilding a resumed attempt's escalation list",
+            )
+            continue
+        found.append(decoded)
+    return tuple(sorted(found, key=lambda r: r.created_at_ms))
+
+
 def _parent_attempts_completed(parent: RoundRecord | None) -> bool | None:
     """Whether the parent round measured its whole corpus, as *it* recorded it.
 
@@ -831,6 +1085,161 @@ def _parent_attempts_completed(parent: RoundRecord | None) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
+async def find_finished_round(
+    trajectory: TrajectoryStore, config: RoundConfig, *, resume: bool
+) -> RoundOutcome | None:
+    """The outcome the first process wrote, if this round already finished *this way*.
+
+    Module-level rather than a method so the driver can run the same
+    check in its preflight — a dry run must refuse everything the real
+    run would refuse before its first write, and a real run must refuse
+    a finished-differently round *before* it re-drives the noise floor
+    under the new configuration, not after.
+
+    ``config`` must be the **bound** config (``eval_set_hash`` derived
+    from the corpus in hand, never empty), because the comparison below
+    is against it. ``None`` means "not in ``trajectory.json``; run it".
+    Otherwise the round is in the append-only file, and the rule is:
+
+    * The row's ``run_id`` is not this run's → refuse. The index is
+      taken by a different round; a re-measurement gets a new index.
+    * The row names this ``run_id`` but ``round-NN/round.json`` is
+      missing → refuse, as *finished but record lost*: a kill between
+      ``append_round`` and ``write_round_record`` leaves exactly this.
+      The row cannot rebuild the record — it carries the cell means,
+      deltas, cost, gates and verdict, but not the per-problem scores
+      (``round.json``'s ``problems`` list) nor ``created_at_ms`` — so the
+      message says what is missing and where it can be restored from.
+      The remedy is *not* a new round index: this round did finish.
+    * ``round.json`` names a different ``run_id`` than the row → refuse;
+      a directory that disagrees with the file it mirrors needs an
+      operator, not a rewrite.
+    * Same ``run_id`` in both, but the record's ``eval_set_hash``,
+      ``engine`` or ``config_digest`` — or the row's ``seed`` — differs
+      from this config's → refuse, naming every coordinate that differs. A finished round is
+      returned as this run's success **only for the identical
+      measurement**; a different corpus, scaffold, cap or criterion under
+      the same name is a different measurement and wants a new loop slug
+      or round index.
+    * All three equal, but ``resume`` is off → refuse. ``--no-resume``
+      means "re-measure", and a finished index cannot be re-measured
+      into: the trajectory is append-only.
+    * All three equal and ``resume`` on → the same measurement, finished;
+      decode the record and return it without writing anything. Logged
+      as ``research.round.already_finished`` so a restart log says why no
+      attempt ran.
+
+    Every refusal happens before any write.
+    """
+    document = await trajectory.load_trajectory()
+    row = next(
+        (r for r in document.get("rounds", []) if r.get("round") == config.round_index),
+        None,
+    )
+    if row is None:
+        return None
+    raw = await trajectory.load_round_record(config.round_index)
+    record_path = trajectory.round_dir(config.round_index) / "round.json"
+    row_run_id = row.get("run_id")
+    record_run_id = None if raw is None else raw.get("run_id")
+    if row_run_id != config.run_id:
+        raise ContractViolationError(
+            f"round {config.round_index} is already in {trajectory.trajectory_path} "
+            f"under run_id {row_run_id!r}; this run is {config.run_id!r}. The trajectory "
+            "is append-only — a re-measurement gets a new round index — and nothing was "
+            "written"
+        )
+    if raw is None:
+        raise ContractViolationError(
+            f"round {config.round_index} finished under this run_id ({config.run_id!r}) "
+            f"— its row is in {trajectory.trajectory_path} — but {record_path} is "
+            "missing: the process was killed between appending the row and writing "
+            "the record. The row cannot rebuild it (it carries cell means, deltas, cost "
+            "and verdict, not the per-problem scores or created_at_ms), so this run "
+            "refuses rather than re-measure a finished round or fabricate its record. "
+            f"Restore {record_path} from a backup, or rebuild it from the per-attempt "
+            f"checkpoints and summaries under {trajectory.round_dir(config.round_index)}; "
+            "a new round index is not the remedy — this round did finish. Nothing was "
+            "written"
+        )
+    if record_run_id != config.run_id:
+        raise ContractViolationError(
+            f"round {config.round_index} is in {trajectory.trajectory_path} under "
+            f"this run_id ({config.run_id!r}) but {record_path} names {record_run_id!r}; "
+            "the round directory disagrees with the trajectory it is supposed to mirror "
+            "and needs an operator, not a rewrite. Nothing was written"
+        )
+    ours: dict[str, object] = {
+        "eval_set_hash": config.eval_set_hash,
+        "engine": {
+            "backend": config.engine.backend,
+            "orchestrator_model": config.engine.orchestrator_model,
+            "substep_model": config.engine.substep_model,
+            "scaffold_git_sha": config.engine.scaffold_git_sha,
+        },
+        "config_digest": config.config_digest(),
+        # The record does not carry the seed (it is not a RoundRecord field);
+        # the row does. A round measured under another seed is another
+        # measurement, whatever the digest says.
+        "seed": config.seed,
+    }
+    theirs: dict[str, object] = {
+        "eval_set_hash": raw.get("eval_set_hash"),
+        "engine": raw.get("engine"),
+        "config_digest": raw.get("config_digest", ""),
+        "seed": row.get("seed"),
+    }
+    differing = [name for name in ours if ours[name] != theirs[name]]
+    if differing:
+        listed = "; ".join(
+            f"{name}: recorded {theirs[name]!r}, this run {ours[name]!r}" for name in differing
+        )
+        raise ContractViolationError(
+            f"round {config.round_index} finished under run_id {config.run_id!r} but was "
+            f"measured differently — {listed}. A finished round is returned as this "
+            "run's result only for the identical measurement; this is a different "
+            "measurement — use a new loop slug/round index. Nothing was written"
+        )
+    if not resume:
+        raise ContractViolationError(
+            f"round {config.round_index} finished under run_id {config.run_id!r} and "
+            "resume is off: the round is finished; --no-resume cannot re-measure into a "
+            "finished index (the trajectory is append-only). Re-run with resume on to "
+            "return the finished record, or use a new loop slug/round index to "
+            "re-measure. Nothing was written"
+        )
+    try:
+        record = decode_round_record(raw)
+        scored = decode_scored_problems(raw)
+        assessments = decode_assessments(raw)
+    except (KeyError, TypeError, ValueError, ContractViolationError) as exc:
+        raise ContractViolationError(
+            f"round {config.round_index} is already in {trajectory.trajectory_path} "
+            f"under this run_id but {record_path} does not decode "
+            f"({type(exc).__name__}: {exc}); nothing was written"
+        ) from exc
+    logger.info(
+        "research.round.already_finished",
+        round_index=config.round_index,
+        run_id=config.run_id,
+        verdict=record.verdict,
+        detail=(
+            "this round is already in trajectory.json under this run_id, measured under "
+            "this eval_set_hash, engine and config_digest; its record is returned as "
+            "the first process wrote it and no attempt is probed, driven or written"
+        ),
+    )
+    return RoundOutcome(
+        record=record,
+        attempts=(),
+        scored=scored,
+        assessments=assessments,
+        trajectory_row=row,
+        failures=(),
+        already_finished=True,
+    )
+
+
 class RoundRunner:
     """Runs one round of the corpus. Unattended except for escalations."""
 
@@ -850,11 +1259,45 @@ class RoundRunner:
         self._clock = clock or SystemClock()
         self._operator_wait_seconds = 0.0
         self._attempt_failures: tuple[AttemptFailure, ...] = ()
+        self._skipped_problems: tuple[str, ...] = ()
+        self._resumed_problems: tuple[str, ...] = ()
 
     @property
     def clock(self) -> Clock:
         """The injected clock, so callers timestamp against the same one."""
         return self._clock
+
+    @property
+    def trajectory(self) -> TrajectoryStore:
+        """The store this runner writes through — and holds the driver lock through.
+
+        Exposed so ``NoiseFloorRunner`` can refuse a *second* store object
+        over the same tree: the lock is re-entrant per store object, and a
+        second one reads the first's hold as another driver's.
+        """
+        return self._trajectory
+
+    @property
+    def skipped_problems(self) -> tuple[str, ...]:
+        """Problems the last :meth:`run_attempts` reused instead of re-driving.
+
+        Reset at the head of every call, the same per-invocation lifetime
+        :attr:`attempt_failures` has. These problems cost this process no
+        compute at all: their outcome came off disk. See
+        :meth:`~turing.research.loop.trajectory.TrajectoryStore.load_stored_attempt`
+        for what "complete" means.
+        """
+        return self._skipped_problems
+
+    @property
+    def resumed_problems(self) -> tuple[str, ...]:
+        """Problems the last :meth:`run_attempts` continued from a checkpoint.
+
+        A resumed attempt still spends compute — it just spends the
+        *remainder* of the attempt rather than the whole of it, which is the
+        guarantee ``Attempt``'s checkpoint model exists to provide.
+        """
+        return self._resumed_problems
 
     @property
     def attempt_failures(self) -> tuple[AttemptFailure, ...]:
@@ -878,6 +1321,8 @@ class RoundRunner:
         *,
         output_dir: Path,
         attempt_id: str | None = None,
+        resume: Attempt | None = None,
+        prior_steps: Sequence[StepLog] = (),
     ) -> AttemptOutcome:
         """Work one problem until it passes, the cap trips, or it is abandoned.
 
@@ -887,34 +1332,122 @@ class RoundRunner:
         the same attempt, and minting it inside this method meant it died with
         any exception raised out of it — see :func:`_mint_attempt_id` and
         :meth:`_close_out_crashed_attempt`.
-        """
-        attempt_id = attempt_id or _mint_attempt_id(config, problem)
-        workspace = await self._workspaces.materialise(problem, attempt_id=attempt_id)
-        now = self._clock.now_ms()
-        attempt = Attempt(
-            attempt_id=attempt_id,
-            problem_id=problem.id,
-            round_id=config.run_id,
-            seed=config.seed,
-            workspace_path=workspace,
-            cap=problem.default_cap or config.default_cap,
-            state=AttemptState.PENDING,
-            started_at_ms=now,
-            updated_at_ms=now,
-        )
-        attempt = attempt.resume(now_ms=now)
 
-        steps: list[StepLog] = []
+        ``resume`` is a checkpoint loaded off disk
+        (:meth:`~turing.research.loop.trajectory.TrajectoryStore.load_stored_attempt`),
+        and it changes four things:
+
+        * **The workspace is not re-materialised.** The partly-solved
+          directory *is* the work; ``CopyTreeWorkspaceProvider`` would delete
+          and re-copy it, which would make "resume" cost exactly as much as a
+          restart while pretending otherwise. It therefore has to *be there*:
+          a checkpoint whose ``workspace_path`` no longer exists refuses with
+          a :class:`WorkspaceMissingError` before anything is written, rather
+          than driving a solver against — and running a verifier on — a
+          directory that is not there and entering that score in a cell. The
+          refusal names the path and the two remedies (restore the workspace,
+          or delete the checkpoint to drive the attempt fresh, which resets
+          its consumption). Inside :meth:`run_attempts` it is contained like
+          any other raise — the problem is reported lost, not scored — except
+          that no crashed summary is written for it: the attempt on disk is
+          intact and resumable, and "nothing was written" has to stay true.
+        * **Identity, consumption and best result carry over**, so the cap
+          keeps counting from where the interruption found it and a resumed
+          attempt cannot buy itself a fresh budget.
+        * **The step rows carry over.** ``prior_steps`` are the rows the
+          previous process wrote to ``attempts/<problem-id>.json`` — that log
+          is rewritten after every step precisely so it survives a kill —
+          and this process appends to them, so the finished log's rows equal
+          ``consumed.steps`` rather than only this generation's share.
+        * **An ``ESCALATED`` checkpoint re-enters the wait** on its own open
+          request instead of re-driving. ``ESCALATED`` is neither terminal nor
+          resumable and only an operator moves it; raising a second request
+          for one event would inflate driving function #4.
+
+        Two known costs of resuming, stated rather than hidden. The metrics
+        chain restarts: ``_rotate_stale_metrics`` moves the pre-interruption
+        trio and plots into ``prior-N/`` (they stay independently verifiable
+        there) and this generation opens a fresh chain, so no single
+        ``metrics.jsonl`` spans the interruption — the attempt log is the one
+        artifact that does span it, and it is the one loop 2 samples (with
+        one caveat: the per-step order is checkpoint, log, metrics line, so
+        a kill between the checkpoint write and the log write leaves the log
+        one row behind the checkpoint, and the finished log stays one row
+        short of ``consumed.steps`` for that step). And ``baseline_score`` in
+        the resumed summary is the first score *this* process observed, not
+        the attempt's original baseline — the earlier one is in the rotated
+        directory.
+
+        A *fresh* drive into a used slot (``resume is None`` with a previous
+        generation on disk) is different: :func:`_rotate_prior_generation`
+        moves the checkpoint and log into ``prior-N/`` along with the chain,
+        so the earlier measurement is preserved rather than overwritten.
+
+        :meth:`run_attempts`, not this method, consults the store. A direct
+        call re-drives, which is what every caller that passes an explicit
+        ``output_dir`` twice already relies on.
+        """
+        criterion = config.criterion_for(problem.id)
+        steps: list[StepLog] = list(prior_steps) if resume is not None else []
         escalations: list[EscalationRequest] = []
         decisions: list[EscalationDecision] = []
-        best: VerificationResult | None = None
-        criterion = config.criterion_for(problem.id)
+
+        if resume is None:
+            attempt_id = attempt_id or _mint_attempt_id(config, problem)
+            workspace = await self._workspaces.materialise(problem, attempt_id=attempt_id)
+            now = self._clock.now_ms()
+            attempt = Attempt(
+                attempt_id=attempt_id,
+                problem_id=problem.id,
+                round_id=config.run_id,
+                seed=config.seed,
+                workspace_path=workspace,
+                cap=_resolved_cap(problem, config),
+                state=AttemptState.PENDING,
+                started_at_ms=now,
+                updated_at_ms=now,
+            )
+            attempt = attempt.resume(now_ms=now)
+            best: VerificationResult | None = None
+        else:
+            if not await asyncio.to_thread(resume.workspace_path.is_dir):
+                raise WorkspaceMissingError(
+                    f"attempt {resume.attempt_id!r} for {problem.id!r} resumes from a "
+                    f"checkpoint whose workspace {resume.workspace_path} no longer exists; "
+                    "driving on would run the solver and the verifier against a directory "
+                    "that is not there and score the result. Either restore the workspace "
+                    "at that path, or delete the checkpoint "
+                    f"{self._trajectory.attempt_checkpoint_path(problem.id, output_dir=output_dir)}"
+                    " so the attempt is driven fresh (which resets its consumption). "
+                    "Nothing was written: the checkpoint, log and chain are as the "
+                    "interrupted process left them"
+                )
+            attempt_id = resume.attempt_id
+            attempt = resume
+            best = resume.result
+            escalations.extend(
+                await self._prior_escalations(output_dir, attempt_id=resume.attempt_id)
+            )
 
         # -- reporting: the seam that makes this attempt visible while it
         # runs, not only after trajectory.json is appended to at round end.
         # See turing.research.loop.results for the file contract.
         metrics_dir = output_dir / "attempts" / problem.id
-        _rotate_stale_metrics(metrics_dir)
+        if resume is None:
+            # A fresh generation: whatever a previous one left — chain, plots,
+            # checkpoint, log — moves aside together, and this one starts
+            # beside it rather than over it.
+            _rotate_prior_generation(
+                metrics_dir,
+                checkpoint_path=self._trajectory.attempt_checkpoint_path(
+                    problem.id, output_dir=output_dir
+                ),
+                log_path=output_dir / "attempts" / f"{problem.id}.json",
+            )
+        else:
+            # A resumed one keeps its checkpoint and log — they are what it
+            # resumes from — and only the chain restarts.
+            _rotate_stale_metrics(metrics_dir)
         metrics_writer = MetricsWriter(
             metrics_dir / "metrics.jsonl",
             header={
@@ -934,7 +1467,42 @@ class RoundRunner:
         baseline_score: float | None = None
         final_progress: float | None = None
 
-        while True:
+        # Two things a resumed attempt does before the loop, in this order.
+        # An ESCALATED checkpoint has to clear its open request *first* — the
+        # operator's verdict is what decides whether there is a loop to enter
+        # at all, and ABANDON means there is not. Everything else takes the
+        # ordinary resume transition back to RUNNING.
+        finished_on_resume = False
+        if resume is not None:
+            if resume.state is AttemptState.ESCALATED:
+                attempt, _ = await self._reopen_escalation(
+                    problem=problem,
+                    attempt=attempt,
+                    best=best,
+                    config=config,
+                    output_dir=output_dir,
+                    escalations=escalations,
+                    decisions=decisions,
+                )
+                finished_on_resume = attempt.is_terminal
+            else:
+                attempt = attempt.resume(now_ms=self._clock.now_ms())
+            logger.info(
+                "research.attempt.resumed_from_checkpoint",
+                problem_id=problem.id,
+                attempt_id=attempt.attempt_id,
+                from_state=resume.state.value,
+                state=attempt.state.value,
+                step_index=attempt.step_index,
+                consumed_steps=attempt.consumed.steps,
+            )
+
+        # ``while not finished_on_resume`` rather than ``while True``: the flag
+        # never changes inside the body, so this is "``while True`` unless the
+        # operator already abandoned the attempt on the reopened escalation".
+        # Guarding with a nested ``if`` instead would re-indent the whole loop
+        # for no gain.
+        while not finished_on_resume:
             attempt, cap_action = await self._enforce_cap(
                 problem=problem,
                 attempt=attempt,
@@ -1051,7 +1619,21 @@ class RoundRunner:
                     verifier_error=verifier_error,
                 )
             )
-            await self._trajectory.write_attempt_checkpoint(attempt, output_dir=output_dir)
+            await self._checkpoint(attempt, config, output_dir, problem=problem)
+            # The log is rewritten after every step, not only at the end, so
+            # a kill between here and the terminal write leaves the rows this
+            # process took on disk for the next process to carry forward
+            # (``prior_steps``). Whole-file rewrite rather than append: the
+            # log is one JSON document, and its size is bounded by the step
+            # cap.
+            await self._write_attempt_log(
+                problem,
+                attempt,
+                best=best,
+                steps=steps,
+                escalations=escalations,
+                output_dir=output_dir,
+            )
 
             observed = None if result is None else progress_tracker.observe(result.score)
             if observed is not None:
@@ -1160,7 +1742,7 @@ class RoundRunner:
                 if attempt.is_terminal:
                     break
 
-        await self._trajectory.write_attempt_checkpoint(attempt, output_dir=output_dir)
+        await self._checkpoint(attempt, config, output_dir, problem=problem)
 
         # Edit D, terminal line (spec's "Terminal-line rule", added
         # 2026-08-14). Every line appended above was written from *inside*
@@ -1183,9 +1765,11 @@ class RoundRunner:
         # here cannot turn a solved attempt into a lost one" — was too
         # strong): the workspace and the checkpoint written just above are
         # durable, so the *work* survives a raise. But this append precedes
-        # write_attempt_log and the AttemptOutcome return below, so a raise
-        # does cost this attempt its attempts/<problem-id>.json log and its
-        # place in the round's cells. What it can no longer do is take the
+        # the terminal write_attempt_log and the AttemptOutcome return below,
+        # so a raise does cost this attempt its *finished* log (the per-step
+        # log on disk still carries a non-terminal final_state, which is what
+        # keeps the resume probe from calling it complete) and its place in
+        # the round's cells. What it can no longer do is take the
         # rest of the round with it: run_attempts contains a raising attempt
         # to that attempt and reports the loss through the round's
         # all_attempts_completed gate. See its docstring.
@@ -1213,26 +1797,14 @@ class RoundRunner:
             )
         )
 
-        log = AttemptLog(
-            problem_id=problem.id,
-            attempt_id=attempt.attempt_id,
-            round_id=attempt.round_id,
-            seed=attempt.seed,
-            split=problem.split.value,
-            problem_type=problem.problem_type.value,
-            final_state=attempt.state.value,
-            steps=tuple(steps),
-            best_score=None if best is None else best.score,
-            best_passed_correctness=None if best is None else best.passed_correctness,
-            score_scale=problem.verifier.score_scale,
-            consumed_steps=attempt.consumed.steps,
-            consumed_tokens=attempt.consumed.tokens,
-            consumed_wall_clock_seconds=attempt.consumed.wall_clock_seconds,
-            cap_extensions=attempt.cap.extension_count,
-            escalation_ids=tuple(e.request_id for e in escalations),
-            workspace_path=str(attempt.workspace_path),
+        path = await self._write_attempt_log(
+            problem,
+            attempt,
+            best=best,
+            steps=steps,
+            escalations=escalations,
+            output_dir=output_dir,
         )
-        path = await self._trajectory.write_attempt_log(log, output_dir=output_dir)
 
         # Reporting failures must not fail an attempt that otherwise solved
         # its problem — this is the one sanctioned swallowed error in this
@@ -1311,6 +1883,64 @@ class RoundRunner:
         best: VerificationResult | None,
     ) -> Attempt:
         return attempt.evolve(now_ms=self._clock.now_ms(), state=state, result=best)
+
+    async def _checkpoint(
+        self, attempt: Attempt, config: RoundConfig, output_dir: Path, *, problem: Problem
+    ) -> Path:
+        """Write the attempt's checkpoint stamped with this run's full identity.
+
+        One place, so every checkpoint carries the same ``eval_set_hash``,
+        ``config_digest`` and ``configured_cap`` the resume probe will compare
+        against; a call site that forgot one would write a checkpoint no
+        restart could reuse. ``configured_cap`` is the cap the attempt was
+        *started* under (:func:`_resolved_cap`), not ``attempt.cap``, which an
+        operator extension raises.
+        """
+        return await self._trajectory.write_attempt_checkpoint(
+            attempt,
+            output_dir=output_dir,
+            eval_set_hash=config.eval_set_hash,
+            config_digest=config.config_digest(),
+            configured_cap=_resolved_cap(problem, config),
+        )
+
+    async def _write_attempt_log(
+        self,
+        problem: Problem,
+        attempt: Attempt,
+        *,
+        best: VerificationResult | None,
+        steps: Sequence[StepLog],
+        escalations: Sequence[EscalationRequest],
+        output_dir: Path,
+    ) -> Path:
+        """Write ``attempts/<problem-id>.json`` as the attempt stands right now.
+
+        Called after every step and once more at the end, so the log on disk
+        is always the whole of what this attempt has done — the property a
+        resumed attempt's ``prior_steps`` relies on. ``final_state`` is the
+        attempt's *current* state, terminal only on the last write.
+        """
+        log = AttemptLog(
+            problem_id=problem.id,
+            attempt_id=attempt.attempt_id,
+            round_id=attempt.round_id,
+            seed=attempt.seed,
+            split=problem.split.value,
+            problem_type=problem.problem_type.value,
+            final_state=attempt.state.value,
+            steps=tuple(steps),
+            best_score=None if best is None else best.score,
+            best_passed_correctness=None if best is None else best.passed_correctness,
+            score_scale=problem.verifier.score_scale,
+            consumed_steps=attempt.consumed.steps,
+            consumed_tokens=attempt.consumed.tokens,
+            consumed_wall_clock_seconds=attempt.consumed.wall_clock_seconds,
+            cap_extensions=attempt.cap.extension_count,
+            escalation_ids=tuple(e.request_id for e in escalations),
+            workspace_path=str(attempt.workspace_path),
+        )
+        return await self._trajectory.write_attempt_log(log, output_dir=output_dir)
 
     async def _enforce_cap(
         self,
@@ -1480,7 +2110,7 @@ class RoundRunner:
             escalation_id=request.request_id,
             result=best,
         )
-        await self._trajectory.write_attempt_checkpoint(attempt, output_dir=output_dir)
+        await self._checkpoint(attempt, config, output_dir, problem=problem)
         await self._trajectory.write_escalation(request, None, output_dir=output_dir)
         logger.warning(
             "research.attempt.escalated",
@@ -1489,10 +2119,49 @@ class RoundRunner:
             request_id=request.request_id,
             reason=reason.value,
         )
+        return await self._resolve_escalation(
+            problem=problem,
+            attempt=attempt,
+            request=request,
+            best=best,
+            config=config,
+            output_dir=output_dir,
+            decisions=decisions,
+        )
 
+    async def _resolve_escalation(
+        self,
+        *,
+        problem: Problem,
+        attempt: Attempt,
+        request: EscalationRequest,
+        best: VerificationResult | None,
+        config: RoundConfig,
+        output_dir: Path,
+        decisions: list[EscalationDecision],
+        reopened: bool = False,
+    ) -> tuple[Attempt, EscalationDecision | None]:
+        """Block on the operator's answer to an already-published request.
+
+        Split out of :meth:`_escalate` so :meth:`_reopen_escalation` can reach
+        it. A restart that finds an ``ESCALATED`` checkpoint must do exactly
+        this half — wait, then apply the verdict — and must *not* do the other
+        half, which would mint a second ``request_id`` for one event and count
+        it twice against driving function #4.
+
+        ``reopened`` is forwarded to the channel so it knows the operator was
+        already paged for this request by the process that raised it: the
+        channel polls for the answer first and keeps its reminder cadence
+        rather than pushing again on every restart. Passed only when true, so
+        a channel written against the one-argument protocol still works on
+        the ordinary path.
+        """
         waited_from = self._clock.monotonic()
         try:
-            decision = await self._escalations.request_decision(request)
+            if reopened:
+                decision = await self._escalations.request_decision(request, reopened=True)
+            else:
+                decision = await self._escalations.request_decision(request)
         finally:
             self._operator_wait_seconds += max(0.0, self._clock.monotonic() - waited_from)
         if decision.request_id != request.request_id:
@@ -1512,7 +2181,7 @@ class RoundRunner:
                 request_id=request.request_id,
             )
             attempt = attempt.evolve(now_ms=now, state=AttemptState.ABANDONED, result=best)
-            await self._trajectory.write_attempt_checkpoint(attempt, output_dir=output_dir)
+            await self._checkpoint(attempt, config, output_dir, problem=problem)
             return attempt, decision
 
         # CONTINUE leaves the cap alone; EXTEND_CAP grows it via the
@@ -1524,7 +2193,7 @@ class RoundRunner:
             assert decision.cap_extension is not None  # guaranteed by EscalationDecision
             attempt = attempt.apply_cap_extension(decision.cap_extension, now_ms=now)
         attempt = attempt.evolve(now_ms=now, state=AttemptState.RUNNING, escalation_id=None)
-        await self._trajectory.write_attempt_checkpoint(attempt, output_dir=output_dir)
+        await self._checkpoint(attempt, config, output_dir, problem=problem)
         logger.info(
             "research.attempt.resumed",
             problem_id=problem.id,
@@ -1535,6 +2204,145 @@ class RoundRunner:
         )
         return attempt, decision
 
+    # -- resume ------------------------------------------------------------- #
+
+    async def _reopen_escalation(
+        self,
+        *,
+        problem: Problem,
+        attempt: Attempt,
+        best: VerificationResult | None,
+        config: RoundConfig,
+        output_dir: Path,
+        escalations: list[EscalationRequest],
+        decisions: list[EscalationDecision],
+    ) -> tuple[Attempt, EscalationDecision | None]:
+        """Re-enter the wait on the request an ``ESCALATED`` checkpoint names.
+
+        The request was published and pushed by a previous process; only the
+        *waiting* died with it. Re-driving the attempt instead would throw
+        away the work **and** raise a second request for one event, which is
+        the worse half: escalations per round is driving function #4, the
+        number the self-improvement claim lives or dies on, and it must count
+        operator interruptions, not process restarts.
+
+        The reconstructed request takes its identity, ``cap``, ``consumed``
+        and ``best_result`` from the checkpoint rather than from the request
+        file — the checkpoint is the authority on all of those, and its
+        ``result`` round-trips in full — and its ``reason``, ``summary`` and
+        ``created_at_ms`` from the file, which is the only place they survive.
+        The ``request_id`` is unchanged, so the decision the operator drops
+        (or already dropped) answers it.
+        """
+        request_id = attempt.escalation_id
+        if not request_id:
+            raise ContractViolationError(
+                f"attempt {attempt.attempt_id!r} is ESCALATED with no escalation_id; there "
+                "is no open request to re-enter and no verdict that could move it"
+            )
+        stored = await self._prior_escalations(output_dir, attempt_id=attempt.attempt_id)
+        open_request = next((r for r in stored if r.request_id == request_id), None)
+        if open_request is None:
+            raise ContractViolationError(
+                f"attempt {attempt.attempt_id!r} is suspended on request {request_id!r} but "
+                f"no readable request file for it is in {output_dir / 'escalations'}; the "
+                "attempt cannot be resumed without the question it is waiting on"
+            )
+        # ``_prior_escalations`` already put every request for this attempt in
+        # the list, the open one included, so this rebinds cap/consumed/best
+        # from the checkpoint rather than adding a duplicate.
+        request = replace(
+            open_request,
+            cap=attempt.cap,
+            consumed=attempt.consumed,
+            best_result=best,
+        )
+        escalations[:] = [request if r.request_id == request_id else r for r in escalations]
+        logger.warning(
+            "research.attempt.escalation_reopened",
+            problem_id=problem.id,
+            attempt_id=attempt.attempt_id,
+            request_id=request_id,
+            reason=request.reason.value,
+            detail=(
+                "a previous process suspended here and died waiting; the same request is "
+                "re-entered rather than re-raised, so it counts once toward human-gate load"
+            ),
+        )
+        return await self._resolve_escalation(
+            problem=problem,
+            attempt=attempt,
+            request=request,
+            best=best,
+            config=config,
+            output_dir=output_dir,
+            decisions=decisions,
+            reopened=True,
+        )
+
+    async def _prior_escalations(
+        self, output_dir: Path, *, attempt_id: str
+    ) -> tuple[EscalationRequest, ...]:
+        """Every request this attempt already raised, read back off disk.
+
+        A resumed attempt's in-memory request list died with the process that
+        raised them, and ``AttemptOutcome.escalation_count`` is what
+        ``run_round`` sums into the round's human-gate load. Rebuilding the
+        list from ``escalations/`` restores that count instead of reporting a
+        resumed attempt as having interrupted nobody — the same
+        count-the-evidence reasoning
+        :func:`_read_crashed_attempt_record` applies to a crashed attempt.
+
+        ``best_result`` is dropped rather than decoded: the operator-facing
+        encoding keeps only four of a
+        :class:`~turing.research.contracts.VerificationResult`'s fields, and a
+        half-built result would be a fabricated measurement in a record whose
+        only remaining job is to be counted. Files that do not parse, or that
+        name a different attempt, are skipped for the same reason — this is a
+        count of evidence found, never an assertion about evidence missing.
+        """
+        return await asyncio.to_thread(
+            _read_prior_escalations, output_dir / "escalations", attempt_id
+        )
+
+    async def _reuse_stored_outcome(
+        self, problem: Problem, stored: StoredAttempt, *, output_dir: Path
+    ) -> AttemptOutcome:
+        """The :class:`AttemptOutcome` a finished, on-disk attempt already earned.
+
+        Every field is read back from the artifacts that attempt wrote;
+        nothing here is synthesised. ``best_result`` is the checkpoint's
+        ``result`` — the runner writes ``result=best`` onto every checkpoint,
+        so the terminal one carries exactly what :meth:`run_attempt` would
+        have returned — and a ``None`` there is the honest "this attempt
+        produced no usable verification" that ``ScoredProblem.from_result``
+        floors. The escalations come from the request files themselves rather
+        than from the ids in the attempt log, because a count is only worth
+        having if each entry is a record that exists.
+
+        ``decisions`` stays empty, deliberately. The verdicts are on disk
+        beside the requests, but nothing downstream reads this field — the
+        round's human-gate load is ``len(escalations)`` — and decoding them
+        only to fill a shape would put values in a returned object that no
+        caller checks.
+        """
+        if stored.attempt is None:  # pragma: no cover — COMPLETE always carries one
+            raise ContractViolationError(
+                f"a completed attempt for {problem.id!r} carries no checkpoint to reuse"
+            )
+        escalations = await self._prior_escalations(
+            output_dir, attempt_id=stored.attempt.attempt_id
+        )
+        return AttemptOutcome(
+            problem=problem,
+            attempt=stored.attempt,
+            best_result=stored.attempt.result,
+            steps=stored.steps,
+            escalations=escalations,
+            decisions=(),
+            attempt_log_path=stored.attempt_log_path,
+        )
+
     # -- a whole round ------------------------------------------------------ #
 
     async def run_attempts(
@@ -1543,6 +2351,7 @@ class RoundRunner:
         config: RoundConfig,
         *,
         output_dir: Path,
+        resume: bool = True,
     ) -> tuple[AttemptOutcome, ...]:
         """Run every problem once, sequentially. No trajectory row is written.
 
@@ -1552,6 +2361,23 @@ class RoundRunner:
 
         Used directly by the noise-floor runner, whose seed runs are *not*
         rounds and must not enter ``trajectory.json``.
+
+        **Resume is the default, and it is a per-problem decision.** Before
+        spending an attempt on a problem this asks the store what is already in
+        ``output_dir`` for *this* run
+        (:meth:`~turing.research.loop.trajectory.TrajectoryStore.load_stored_attempt`,
+        which owns the completeness table). A finished attempt is reused
+        outright and costs nothing; an interrupted one is continued from its
+        checkpoint; one suspended on an operator decision re-enters that wait.
+        The compute this saves is the whole point — the sweep runs on a
+        subscription that closes unpredictably, so a restart is the normal
+        case, and RES-12 only made re-driving *safe*, never cheap.
+
+        ``resume=False`` drives every problem from scratch. It is the honest
+        way to re-measure a round rather than continue one, and it is what a
+        caller wants when the *scaffold* changed under a repeated ``run_id``
+        — a case no artifact on disk can detect, since identity is what
+        resume keys on.
 
         **One attempt's failure is contained to that attempt.** Everything
         inside :meth:`run_attempt` that is *not* the sanctioned reporting
@@ -1635,22 +2461,102 @@ class RoundRunner:
         purpose. A cancelled round must stop, not quietly re-label the
         cancellation as a per-problem harness failure and keep working
         through the corpus.
+
+        **One driver per results tree.** The whole loop runs under the
+        store's driver lock (:meth:`TrajectoryStore.driver_lock`): this is
+        the seam every entry point passes through — ``run_round`` and
+        ``NoiseFloorRunner.run`` both come here — so it is where a second
+        process over the same tree is refused. Without it the second process
+        reads the first's ``RUNNING`` checkpoint as *resumable*, drives the
+        same ``attempt_id`` in the same workspace, and rotates the live chain
+        into ``prior-N/``. The lock is re-entrant for the store object the
+        outer seams already hold it through.
         """
         if not corpus:
             raise ContractViolationError("a round with no problems measures nothing")
+        async with self._trajectory.driver_lock():
+            return await self._run_attempts_locked(
+                corpus, config, output_dir=output_dir, resume=resume
+            )
+
+    async def _run_attempts_locked(
+        self,
+        corpus: Sequence[Problem],
+        config: RoundConfig,
+        *,
+        output_dir: Path,
+        resume: bool,
+    ) -> tuple[AttemptOutcome, ...]:
         outcomes: list[AttemptOutcome] = []
         failures: list[AttemptFailure] = []
+        skipped: list[str] = []
+        resumed: list[str] = []
         self._attempt_failures = ()
+        self._skipped_problems = ()
+        self._resumed_problems = ()
+        identity = config.identity()
         for problem in corpus:
             # Minted here, not inside ``run_attempt``, so it outlives an
             # exception raised out of it and the close-out below can tell this
             # attempt's chain from a previous generation's — the one field
             # that can, when a re-drive repeats run_id, problem_id and seed.
+            # A resumed attempt keeps its own id instead: it *is* the same
+            # generation, and its rotated-aside chain names it. Minted before
+            # the resume probe so that a probe that raises still leaves the
+            # close-out an id to write under.
             attempt_id = _mint_attempt_id(config, problem)
             try:
+                # The probe is inside the containment, deliberately: it reads
+                # files this process did not write, and a read that raises —
+                # every path the store knows about now returns ABSENT, but the
+                # containment guards "it raised", not any listed cause — must
+                # cost this problem, not the round.
+                stored: StoredAttempt | None = None
+                if resume:
+                    stored = await self._trajectory.load_stored_attempt(
+                        problem.id,
+                        output_dir=output_dir,
+                        identity=identity,
+                        cap=_resolved_cap(problem, config),
+                    )
+                    if stored.is_complete:
+                        logger.info(
+                            "research.attempt.reused",
+                            problem_id=problem.id,
+                            run_id=config.run_id,
+                            round_index=config.round_index,
+                            reason=stored.reason,
+                            detail=(
+                                "a finished attempt for this run is already on disk; its "
+                                "outcome is reused and no compute is spent re-measuring it"
+                            ),
+                        )
+                        skipped.append(problem.id)
+                        outcomes.append(
+                            await self._reuse_stored_outcome(problem, stored, output_dir=output_dir)
+                        )
+                        continue
+                    if not stored.is_resumable:
+                        logger.debug(
+                            "research.attempt.driving_fresh",
+                            problem_id=problem.id,
+                            run_id=config.run_id,
+                            reason=stored.reason,
+                        )
+                        stored = None
+                    else:
+                        resumed.append(problem.id)
+                resume_from = None if stored is None else stored.attempt
+                if resume_from is not None:
+                    attempt_id = resume_from.attempt_id
                 outcomes.append(
                     await self.run_attempt(
-                        problem, config, output_dir=output_dir, attempt_id=attempt_id
+                        problem,
+                        config,
+                        output_dir=output_dir,
+                        attempt_id=attempt_id,
+                        resume=resume_from,
+                        prior_steps=() if stored is None else stored.steps,
                     )
                 )
             except Exception as exc:
@@ -1669,6 +2575,12 @@ class RoundRunner:
                 failures.append(
                     AttemptFailure(problem_id=problem.id, error=f"{type(exc).__name__}: {exc}")
                 )
+                if isinstance(exc, WorkspaceMissingError):
+                    # Refused before anything was written, and the attempt on
+                    # disk is intact and resumable once the workspace is back.
+                    # A close-out here would write a crashed summary beside a
+                    # PAUSED checkpoint — see the exception's docstring.
+                    continue
                 await self._close_out_crashed_attempt(
                     problem=problem,
                     config=config,
@@ -1679,6 +2591,8 @@ class RoundRunner:
         # Set before the refusal below so a caller inspecting the runner after
         # a total-loss raise can still see which problems were lost.
         self._attempt_failures = tuple(failures)
+        self._skipped_problems = tuple(skipped)
+        self._resumed_problems = tuple(resumed)
         if not outcomes:
             raise ContractViolationError(
                 f"every one of the {len(corpus)} attempt(s) failed; a round with no "
@@ -1967,6 +2881,10 @@ class RoundRunner:
             )
         return tuple(floors)
 
+    async def _already_finished(self, config: RoundConfig, *, resume: bool) -> RoundOutcome | None:
+        """:func:`find_finished_round` against this runner's store."""
+        return await find_finished_round(self._trajectory, config, resume=resume)
+
     async def run_round(
         self,
         corpus: Sequence[Problem],
@@ -1974,6 +2892,7 @@ class RoundRunner:
         *,
         parent: RoundRecord | None = None,
         noise_floor: NoiseFloorReport | None = None,
+        resume: bool = True,
     ) -> RoundOutcome:
         """Run the round, reduce it to cells, and append the trajectory row.
 
@@ -1985,13 +2904,88 @@ class RoundRunner:
         ``noise_floor`` must be a :class:`NoiseFloorReport` (eval set + engine
         bound). A bare sequence of floors has no provenance; a floor from
         anywhere would license every gain.
+
+        ``resume`` is forwarded to :meth:`run_attempts`, whose docstring owns
+        the per-problem decision. Two consequences belong here, though:
+
+        * ``cost.tokens`` is a sum over the whole round, reused attempts
+          included, because their checkpoints recorded what they spent. The
+          round's ``wall_clock_seconds`` is **not**: it is one clock over
+          *this* process, so a round finished across two processes reports the
+          machine time of the second one only. That is honest as far as it
+          goes and understates driving function #3's numerator; nothing on
+          disk records the wall clock of a process that was killed.
+        * The trajectory row is appended by whichever process finishes the
+          round, exactly once, and it is the *last* write of the round —
+          ``round.json`` lands after it, never before, so a refused append
+          cannot have already rewritten the record it refused to log.
+          ``append_round`` refuses a round index already in the file, so a
+          resumed round cannot double-log.
+
+        **A restart after the round finished is a no-op success — for the
+        identical measurement.** The operator procedure is "kill it and run
+        the identical command again", and a round that finished between the
+        two must not turn that procedure into a refusal — or, worse, into a
+        rewritten ``round.json`` followed by one. So before anything is
+        written this checks ``trajectory.json``: if the row for
+        ``config.round_index`` is already there, ``round-NN/round.json`` names
+        this ``run_id``, and the record's ``eval_set_hash``, ``engine`` and
+        ``config_digest`` all equal this config's, the record is decoded off
+        disk and returned with :attr:`RoundOutcome.already_finished` set — no
+        attempt is probed, no file touched. Anything else — the index taken
+        by another ``run_id``, the record missing, a coordinate that differs,
+        or ``resume=False`` on a finished round — is refused here, before any
+        write, with a message naming which; the full rule is
+        :meth:`_already_finished`.
+
+        **One driver per results tree.** Everything from ``ensure_layout`` to
+        the last write runs under :meth:`TrajectoryStore.driver_lock`; a
+        second driver over the same tree is refused with the holder's pid.
         """
+        if not corpus:
+            raise ContractViolationError("a round with no problems measures nothing")
+        # Bind first, then ask whether this measurement is already finished:
+        # the finished-round comparison is against the *bound* hash, and
+        # ``config.eval_set_hash`` may be empty ("derive it").
+        eval_set_hash = bind_eval_set_hash(
+            corpus, config.eval_set_hash, extra=config.eval_set_material
+        )
+        # The *bound* hash, not the promised one: it is written into every
+        # attempt checkpoint and is what stops a resumed round from adopting
+        # work measured over a different corpus. An empty string is not an
+        # identity.
+        bound_config = replace(config, eval_set_hash=eval_set_hash)
+        finished = await self._already_finished(bound_config, resume=resume)
+        if finished is not None:
+            # Nothing ran, so the per-invocation ledgers say so rather than
+            # carrying a previous call's values.
+            self._attempt_failures = ()
+            self._skipped_problems = ()
+            self._resumed_problems = ()
+            return finished
+        async with self._trajectory.driver_lock():
+            return await self._run_round_locked(
+                corpus,
+                bound_config,
+                parent=parent,
+                noise_floor=noise_floor,
+                resume=resume,
+            )
+
+    async def _run_round_locked(
+        self,
+        corpus: Sequence[Problem],
+        config: RoundConfig,
+        *,
+        parent: RoundRecord | None,
+        noise_floor: NoiseFloorReport | None,
+        resume: bool,
+    ) -> RoundOutcome:
+        """The body of :meth:`run_round`, under the driver lock, with ``config`` bound."""
+        eval_set_hash = config.eval_set_hash
         await self._trajectory.ensure_layout()
         output_dir = self._trajectory.round_dir(config.round_index)
         self._operator_wait_seconds = 0.0
-        if not corpus:
-            raise ContractViolationError("a round with no problems measures nothing")
-        eval_set_hash = bind_eval_set_hash(corpus, config.eval_set_hash)
         floors_seq = self._floors_from_report(eval_set_hash, config.engine, noise_floor)
         started = self._clock.monotonic()
         logger.info(
@@ -2014,7 +3008,7 @@ class RoundRunner:
                 ),
             )
 
-        outcomes = await self.run_attempts(corpus, config, output_dir=output_dir)
+        outcomes = await self.run_attempts(corpus, config, output_dir=output_dir, resume=resume)
         failures = self._attempt_failures
         if failures:
             logger.error(
@@ -2180,9 +3174,15 @@ class RoundRunner:
             gates=gates,
             verdict=verdict,
         )
-        await self._trajectory.write_round_record(
-            record, scored=scored, assessments=assessments, noise_floors=floors_seq
-        )
+        # Append first, record second. ``append_round`` is the write that can
+        # refuse (a round index already logged), and a refusal must find
+        # ``round.json`` exactly as the first process left it — cost,
+        # ``created_at_ms`` and all — not rewritten by the process that was
+        # then told no. The window between the two writes is the same size it
+        # was; only the order changed, and with it which artifact a kill in
+        # that window leaves behind: a row without a matching record, which
+        # ``_already_finished`` refuses loudly, rather than a record with no
+        # row, which looked finished to a reader of the round directory.
         row = await self._trajectory.append_round(
             record,
             assessments=assessments,
@@ -2192,6 +3192,14 @@ class RoundRunner:
             seed=config.seed,
             cap=config.default_cap,
             verify_every_step=config.verify_every_step,
+            config_digest=config.config_digest(),
+        )
+        await self._trajectory.write_round_record(
+            record,
+            scored=scored,
+            assessments=assessments,
+            noise_floors=floors_seq,
+            config_digest=config.config_digest(),
         )
         logger.info(
             "research.round.finished",

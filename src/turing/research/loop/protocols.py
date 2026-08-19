@@ -194,13 +194,23 @@ class WorkspaceProvider(Protocol):
 class EscalationChannel(Protocol):
     """Delivers an escalation to the operator and suspends until they decide."""
 
-    async def request_decision(self, request: EscalationRequest) -> EscalationDecision:
+    async def request_decision(
+        self, request: EscalationRequest, *, reopened: bool = False
+    ) -> EscalationDecision:
         """Push ``request`` to the operator and block until a decision arrives.
 
         Implementations must never invent a decision (a timeout that defaults
         to ``continue`` would silently erase a human-gate-load event, which is
         driving function #4), and must reject any reply carrying free-form
         advice.
+
+        ``reopened`` says the request was already published and pushed by a
+        previous process that died waiting; this call is a restart re-entering
+        the same wait. An implementation should look for the answer *before*
+        paging again and then keep whatever reminder cadence it has, rather
+        than treating every restart as a fresh page. The runner passes it
+        only when true, so an implementation with the one-argument signature
+        still satisfies the ordinary path.
         """
         ...
 

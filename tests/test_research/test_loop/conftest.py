@@ -287,10 +287,16 @@ class ScriptedEscalationChannel:
     def __init__(self, verdicts: Sequence[EscalationVerdict | EscalationDecision] | None = None):
         self._queue = list(verdicts or [EscalationVerdict.CONTINUE])
         self.requests: list[EscalationRequest] = []
+        #: ``(request_id, reopened)`` per call, so a test can assert that a
+        #: restart re-entered a wait rather than raising a fresh request.
+        self.calls: list[tuple[str, bool]] = []
 
-    async def request_decision(self, request: EscalationRequest) -> EscalationDecision:
+    async def request_decision(
+        self, request: EscalationRequest, *, reopened: bool = False
+    ) -> EscalationDecision:
         index = min(len(self.requests), len(self._queue) - 1)
         self.requests.append(request)
+        self.calls.append((request.request_id, reopened))
         item = self._queue[index]
         if isinstance(item, EscalationDecision):
             return EscalationDecision(
@@ -307,13 +313,21 @@ class ScriptedEscalationChannel:
 
 
 class NeverAnswersChannel:
-    """A channel that would suspend forever — used to prove the loop waits."""
+    """A channel that would suspend forever — used to prove the loop waits.
+
+    Takes ``reopened`` like every other channel, so a restart that re-enters
+    a wait on it is exercised with the same signature the runner uses.
+    """
 
     def __init__(self) -> None:
         self.requests: list[EscalationRequest] = []
+        self.calls: list[tuple[str, bool]] = []
 
-    async def request_decision(self, request: EscalationRequest) -> EscalationDecision:
+    async def request_decision(
+        self, request: EscalationRequest, *, reopened: bool = False
+    ) -> EscalationDecision:
         self.requests.append(request)
+        self.calls.append((request.request_id, reopened))
         raise AssertionError("should not be reached in tests that never answer")
 
 
