@@ -2283,3 +2283,456 @@ class TestTheReopenedKwargIsUniform:
         with pytest.raises(AssertionError):
             await channel.request_decision(request, reopened=True)
         assert channel.calls == [("e", True)]
+
+
+# --------------------------------------------------------------------------- #
+# Round-3 verifier caveats on RES-17: the stale-lock reclaim race, the
+# displaced noise-floor report, and the untested lock seams
+# --------------------------------------------------------------------------- #
+
+
+class TestTwoReclaimersOfOneStaleLock:
+    """Verifier A2: read → decide stale → unlink → create let two drivers both
+    acquire. Reclaim is now a rename, so exactly one of two racing reclaimers
+    holds the tree and the other is refused naming the winner's pid."""
+
+    def test_exactly_one_acquires_under_a_forced_interleaving(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import contextvars
+        import os
+        import threading
+
+        from turing.research.loop import trajectory as trajectory_module
+
+        store_a = TrajectoryStore(tmp_path / "results", "test-loop")
+        store_b = TrajectoryStore(tmp_path / "results", "test-loop")
+        store_a.loop_dir.mkdir(parents=True)
+        store_a.driver_lock_path.write_text(
+            json.dumps({"pid": 1, "started_at_ms": 1, "host": os.uname().nodename})
+        )
+        # Each thread is "a process": its own pid, and both alive; pid 1 is
+        # dead. A ContextVar rather than a threading.local because
+        # ``acquire_driver_lock`` runs ``_take`` via ``asyncio.to_thread``,
+        # which copies the context into the worker thread.
+        current_pid: contextvars.ContextVar[int] = contextvars.ContextVar("pid")
+        real_getpid = os.getpid
+        monkeypatch.setattr(os, "getpid", lambda: current_pid.get(real_getpid()))
+        monkeypatch.setattr(trajectory_module, "_pid_alive", lambda pid: pid in (4242, 4343))
+
+        b_read_the_stale_lock = threading.Event()
+        a_finished = threading.Event()
+        real_read = TrajectoryStore.read_driver_lock
+
+        def read_then_yield_to_a(self: TrajectoryStore) -> object:
+            holder = real_read(self)
+            if self is store_b and not b_read_the_stale_lock.is_set():
+                # B has read the stale lock and decided to reclaim it; A now
+                # runs its whole acquisition before B moves again.
+                b_read_the_stale_lock.set()
+                assert a_finished.wait(5)
+            return holder
+
+        monkeypatch.setattr(TrajectoryStore, "read_driver_lock", read_then_yield_to_a)
+        results: dict[str, str] = {}
+
+        def process(name: str, store: TrajectoryStore, pid: int) -> None:
+            current_pid.set(pid)
+            try:
+                asyncio.run(store.acquire_driver_lock())
+                results[name] = "acquired"
+            except ContractViolationError as exc:
+                results[name] = f"refused: {exc}"
+
+        thread_b = threading.Thread(target=process, args=("B", store_b, 4343))
+        thread_b.start()
+        assert b_read_the_stale_lock.wait(5)
+        thread_a = threading.Thread(target=process, args=("A", store_a, 4242))
+        thread_a.start()
+        thread_a.join(5)
+        a_finished.set()
+        thread_b.join(5)
+
+        assert results["A"] == "acquired"
+        assert results["B"].startswith("refused: "), results
+        assert "pid 4242" in results["B"]
+        assert json.loads(store_a.driver_lock_path.read_text())["pid"] == 4242
+        # The winner tidied its rename target and the reclaim mutex; the
+        # loser never renamed anything.
+        assert sorted(p.name for p in store_a.loop_dir.iterdir()) == [".driver.lock"]
+
+    async def test_a_leftover_reclaim_mutex_refuses_and_names_the_directory(
+        self, store: TrajectoryStore
+    ) -> None:
+        """A driver killed inside the reclaim leaves ``.driver.lock.reclaim``;
+        the next reclaimer waits briefly, then refuses with the remedy."""
+        import os
+        import subprocess
+
+        from turing.research.loop import trajectory as trajectory_module
+
+        store.loop_dir.mkdir(parents=True)
+        with subprocess.Popen(["true"]) as proc:
+            proc.wait()
+        store.driver_lock_path.write_text(
+            json.dumps({"pid": proc.pid, "started_at_ms": 1, "host": os.uname().nodename})
+        )
+        mutex = store.loop_dir / ".driver.lock.reclaim"
+        mutex.mkdir()
+        trajectory_module._RECLAIM_MUTEX_WAIT_SECONDS = 0.001
+        try:
+            with pytest.raises(ContractViolationError, match=r"\.driver\.lock\.reclaim exists"):
+                await store.acquire_driver_lock()
+        finally:
+            trajectory_module._RECLAIM_MUTEX_WAIT_SECONDS = 0.05
+        # Nothing was taken or moved.
+        assert json.loads(store.driver_lock_path.read_text())["pid"] == proc.pid
+        assert mutex.is_dir()
+
+    async def test_the_reclaim_renames_and_then_removes_the_stale_file(
+        self, store: TrajectoryStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The exact sequence: mutex, re-read, rename to ``.stale-<pid>``,
+        ``O_EXCL`` create, mutex dropped, stale file unlinked."""
+        import os
+        import subprocess
+
+        store.loop_dir.mkdir(parents=True)
+        with subprocess.Popen(["true"]) as proc:
+            proc.wait()
+        store.driver_lock_path.write_text(
+            json.dumps({"pid": proc.pid, "started_at_ms": 1, "host": os.uname().nodename})
+        )
+        mutex = store.loop_dir / ".driver.lock.reclaim"
+        seen: list[str] = []
+        real_rename = os.rename
+
+        def recording_rename(src: str | Path, dst: str | Path) -> None:
+            seen.append(f"rename -> {Path(dst).name}")
+            # Under the mutex, and the file being moved is the stale one.
+            assert mutex.is_dir()
+            assert json.loads(Path(src).read_text())["pid"] == proc.pid
+            real_rename(src, dst)
+            assert Path(dst).exists()
+            assert not store.driver_lock_path.exists()
+
+        monkeypatch.setattr(os, "rename", recording_rename)
+        async with store.driver_lock():
+            assert seen == [f"rename -> .driver.lock.stale-{os.getpid()}"]
+            assert json.loads(store.driver_lock_path.read_text())["pid"] == os.getpid()
+            assert not (store.loop_dir / f".driver.lock.stale-{os.getpid()}").exists()
+            assert not mutex.exists()
+        assert not store.driver_lock_path.exists()
+
+
+class TestTheDisplacedNoiseFloorReportIsPreserved:
+    """Verifier A3: ``--no-resume`` on the floor rewrote ``noise-floor.json`` in
+    place while the docs promised what it displaces is preserved."""
+
+    async def test_a_no_resume_re_drive_leaves_the_old_report_under_prior_1(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        cfg = _floor_config()
+        await NoiseFloorRunner(
+            make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+            store,
+        ).run(_corpus(2), cfg)
+        first = store.noise_floor_path.read_bytes()
+        # Same corpus hash, other scores: a genuinely different measurement.
+        other_scores = [make_problem(f"s{i}", scores=(float(i) * 5,)) for i in (1, 2)]
+        second = NoiseFloorRunner(
+            make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+            store,
+        )
+        await second.run(other_scores, cfg, resume=False)
+        prior = store.noise_floor_dir / "prior-1.json"
+        assert prior.read_bytes() == first
+        assert store.noise_floor_path.read_bytes() != first
+        assert json.loads(store.noise_floor_path.read_text())["seeds"] == [1, 2, 3]
+        # A third generation takes the next free number; the first stays put.
+        third = [make_problem(f"s{i}", scores=(float(i) * 9,)) for i in (1, 2)]
+        await NoiseFloorRunner(
+            make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+            store,
+        ).run(third, cfg, resume=False)
+        assert prior.read_bytes() == first
+        assert (store.noise_floor_dir / "prior-2.json").exists()
+
+    async def test_the_identical_rerun_still_rotates_nothing(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        cfg = _floor_config()
+        for _ in range(2):
+            await NoiseFloorRunner(
+                make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+                store,
+            ).run(_corpus(2), cfg)
+        assert not (store.noise_floor_dir / "prior-1.json").exists()
+
+
+class TestADifferentSeedSetAfterRoundZeroIsRefused:
+    """Verifier A14: the floor round 0 was judged against is not re-chosen."""
+
+    async def test_refused_before_any_seed_is_driven_once_a_round_has_run(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        corpus = _corpus(2)
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        report = await NoiseFloorRunner(runner, store).run(corpus, _floor_config(seeds=(1, 2, 3)))
+        await runner.run_round(corpus, make_config(seed=1), noise_floor=report)
+        floor_before = store.noise_floor_path.read_bytes()
+
+        solver = FakeSolver()
+        second = NoiseFloorRunner(
+            make_runner(solver=solver, store=store, workspaces=workspaces, clock=clock), store
+        )
+        with pytest.raises(ContractViolationError) as excinfo:
+            await second.run(corpus, _floor_config(seeds=(1, 8, 9)))
+        message = str(excinfo.value)
+        assert "round 0 already measured floors for seeds [1, 2, 3]" in message
+        assert "different seed set is a different measurement" in message
+        assert "new loop slug" in message
+        assert solver.calls == []
+        assert store.noise_floor_path.read_bytes() == floor_before
+        assert not (store.noise_floor_dir / "seed-8").exists()
+        assert not store.driver_lock_path.exists()
+
+    async def test_the_same_seed_set_after_a_round_is_still_the_no_op(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        corpus = _corpus(2)
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        report = await NoiseFloorRunner(runner, store).run(corpus, _floor_config())
+        await runner.run_round(corpus, make_config(seed=1), noise_floor=report)
+        second = NoiseFloorRunner(
+            make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+            store,
+        )
+        await second.run(corpus, _floor_config())
+        assert second.skipped_seeds == (1, 2, 3)
+
+    async def test_before_any_round_a_changed_seed_set_rotates_and_writes(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        corpus = _corpus(2)
+        await NoiseFloorRunner(
+            make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+            store,
+        ).run(corpus, _floor_config())
+        first = store.noise_floor_path.read_bytes()
+        await NoiseFloorRunner(
+            make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+            store,
+        ).run(corpus, _floor_config(seeds=(1, 2, 3, 4)))
+        assert json.loads(store.noise_floor_path.read_text())["seeds"] == [1, 2, 3, 4]
+        assert (store.noise_floor_dir / "prior-1.json").read_bytes() == first
+
+
+class TestMeasuredLateIsLoggedOnlyWhenMeasuring:
+    """The identical no-op re-run of a finished slug measures nothing late."""
+
+    @staticmethod
+    def _events(structlog_module: object) -> tuple[list[dict], object]:  # type: ignore[type-arg]
+        import structlog
+
+        events: list[dict] = []  # type: ignore[type-arg]
+
+        def capture(logger: object, method: str, event_dict: dict) -> dict:  # type: ignore[type-arg]
+            events.append(dict(event_dict))
+            return event_dict
+
+        structlog.configure(processors=[capture, structlog.processors.KeyValueRenderer()])
+        return events, structlog
+
+    async def test_the_no_op_rerun_does_not_warn_and_a_late_measurement_does(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        import structlog
+
+        corpus = _corpus(2)
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        report = await NoiseFloorRunner(runner, store).run(corpus, _floor_config())
+        await runner.run_round(corpus, make_config(seed=1), noise_floor=report)
+
+        events, _ = self._events(structlog)
+        try:
+            await NoiseFloorRunner(
+                make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+                store,
+            ).run(corpus, _floor_config())
+            assert "research.noise_floor.measured_late" not in [e.get("event") for e in events]
+            # Now a floor genuinely measured after the round: the file is gone
+            # and one seed's attempts with it, so a seed is driven.
+            store.noise_floor_path.unlink()
+            import shutil
+
+            shutil.rmtree(store.noise_floor_seed_dir(3))
+            events.clear()
+            await NoiseFloorRunner(
+                make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+                store,
+            ).run(corpus, _floor_config())
+            late = [e for e in events if e.get("event") == "research.noise_floor.measured_late"]
+            assert len(late) == 1
+            assert late[0]["seeds_to_drive"] == [3]
+        finally:
+            structlog.reset_defaults()
+
+
+class TestTheNoiseFloorRunnerRefusesASecondStoreObject:
+    """Verifier A5: with a second store the runner refused itself as another
+    driver (its own pid). The construction now names the actual mistake."""
+
+    def test_construction_refuses_and_names_the_remedy(
+        self, tmp_path: Path, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        store_a = TrajectoryStore(tmp_path / "results", "test-loop", clock=clock)
+        store_b = TrajectoryStore(tmp_path / "results", "test-loop", clock=clock)
+        runner = make_runner(solver=FakeSolver(), store=store_a, workspaces=workspaces, clock=clock)
+        with pytest.raises(ContractViolationError, match="same TrajectoryStore object"):
+            NoiseFloorRunner(runner, store_b)
+        NoiseFloorRunner(runner, runner.trajectory)  # the remedy
+
+
+class TestTheLockSeamsAndGuardsAreLoadBearing:
+    """Each of these kills a mutation the round-2 verifier found surviving."""
+
+    @staticmethod
+    def _held_by_someone(tmp_path: Path) -> bool:
+        probe = TrajectoryStore(tmp_path / "results", "test-loop")
+        try:
+            probe.refuse_if_driver_lock_live()
+        except ContractViolationError:
+            return True
+        return False
+
+    async def test_run_round_holds_the_lock_through_its_last_writes(
+        self,
+        store: TrajectoryStore,
+        workspaces: TempWorkspaceProvider,
+        clock: FakeClock,
+        tmp_path: Path,
+    ) -> None:
+        """``run_attempts`` takes and releases the lock itself; the round-end
+        ``append_round`` and ``write_round_record`` must still be under it."""
+        held_at: dict[str, bool] = {}
+        real_append = store.append_round
+        real_record = store.write_round_record
+
+        async def append(*args: object, **kwargs: object) -> object:
+            held_at["append_round"] = self._held_by_someone(tmp_path)
+            return await real_append(*args, **kwargs)  # type: ignore[arg-type]
+
+        async def record(*args: object, **kwargs: object) -> object:
+            held_at["write_round_record"] = self._held_by_someone(tmp_path)
+            return await real_record(*args, **kwargs)  # type: ignore[arg-type]
+
+        store.append_round = append  # type: ignore[method-assign]
+        store.write_round_record = record  # type: ignore[method-assign]
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        await runner.run_round(_corpus(2), make_config())
+        assert held_at == {"append_round": True, "write_round_record": True}
+        assert not store.driver_lock_path.exists()
+
+    async def test_the_noise_floor_runner_holds_the_lock_through_its_report_write(
+        self,
+        store: TrajectoryStore,
+        workspaces: TempWorkspaceProvider,
+        clock: FakeClock,
+        tmp_path: Path,
+    ) -> None:
+        held_at: dict[str, bool] = {}
+        real_write = store.write_noise_floor
+        real_list = store.list_completed_seeds
+
+        async def write(*args: object, **kwargs: object) -> object:
+            held_at["write_noise_floor"] = self._held_by_someone(tmp_path)
+            return await real_write(*args, **kwargs)  # type: ignore[arg-type]
+
+        async def listing(*args: object, **kwargs: object) -> object:
+            held_at["list_completed_seeds"] = self._held_by_someone(tmp_path)
+            return await real_list(*args, **kwargs)  # type: ignore[arg-type]
+
+        store.write_noise_floor = write  # type: ignore[method-assign]
+        store.list_completed_seeds = listing  # type: ignore[method-assign]
+        await NoiseFloorRunner(
+            make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock),
+            store,
+        ).run(_corpus(2), _floor_config())
+        assert held_at == {"list_completed_seeds": True, "write_noise_floor": True}
+        assert not store.driver_lock_path.exists()
+
+    async def test_release_leaves_a_lock_that_names_another_pid_alone(
+        self, store: TrajectoryStore
+    ) -> None:
+        """A reclaim by another process must not have its lock pulled from under it."""
+        import os
+
+        await store.acquire_driver_lock()
+        # Another process decided we were dead and reclaimed the tree.
+        theirs = {"pid": os.getpid() + 100_000, "started_at_ms": 5, "host": os.uname().nodename}
+        store.driver_lock_path.write_text(json.dumps(theirs))
+        await store.release_driver_lock()
+        assert json.loads(store.driver_lock_path.read_text()) == theirs
+        # And one on another host, even with our pid, is not ours either.
+        # (Re-entering the hold directly: the file now names another host,
+        # so ``acquire`` would refuse, and it is the drop that is under test.)
+        store.driver_lock_path.write_text(
+            json.dumps({"pid": os.getpid(), "started_at_ms": 5, "host": "elsewhere"})
+        )
+        store._driver_lock_depth = 1
+        await store.release_driver_lock()
+        assert json.loads(store.driver_lock_path.read_text())["host"] == "elsewhere"
+        # Our own lock does go.
+        store.driver_lock_path.unlink()
+        async with store.driver_lock():
+            assert json.loads(store.driver_lock_path.read_text())["pid"] == os.getpid()
+        assert not store.driver_lock_path.exists()
+
+    async def test_rotation_moves_files_and_leaves_a_squatting_directory(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Docs: 'Rotation moves files, not directories'. With a chain and a
+        log present the rotation runs; the directory at the checkpoint path
+        stays, the first checkpoint write raises, and the problem is lost."""
+        config = make_config()
+        output_dir = store.round_dir(0)
+        squatter = store.attempt_checkpoint_path("s1", output_dir=output_dir)
+        squatter.mkdir(parents=True)
+        (squatter / "junk").write_text("x")
+        chain = output_dir / "attempts" / "s1" / "metrics.jsonl"
+        chain.parent.mkdir(parents=True)
+        chain.write_text('{"kind":"header"}\n')
+        log = output_dir / "attempts" / "s1.json"
+        log.write_text("{}")
+
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        outcomes = await runner.run_attempts(
+            [make_problem("s1"), make_problem("s2")], config, output_dir=output_dir, resume=False
+        )
+        assert [o.problem.id for o in outcomes] == ["s2"]
+        assert [f.problem_id for f in runner.attempt_failures] == ["s1"]
+        assert squatter.is_dir()
+        assert (squatter / "junk").exists()
+        prior = output_dir / "attempts" / "s1" / "prior-1"
+        assert (prior / "metrics.jsonl").exists()
+        assert (prior / "attempt-log.json").exists()
+        assert not (prior / "checkpoint.json").exists()
+
+    async def test_a_lone_squatting_directory_creates_no_prior_generation(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """No chain, no log, a directory where the checkpoint goes: nothing to
+        rotate, so no ``prior-1/`` is minted for it."""
+        config = make_config()
+        output_dir = store.round_dir(0)
+        squatter = store.attempt_checkpoint_path("s1", output_dir=output_dir)
+        squatter.mkdir(parents=True)
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        outcomes = await runner.run_attempts(
+            [make_problem("s1"), make_problem("s2")], config, output_dir=output_dir, resume=False
+        )
+        assert [o.problem.id for o in outcomes] == ["s2"]
+        assert [f.problem_id for f in runner.attempt_failures] == ["s1"]
+        assert squatter.is_dir()
+        assert not (output_dir / "attempts" / "s1" / "prior-1").exists()

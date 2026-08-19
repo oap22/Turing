@@ -1268,6 +1268,16 @@ class RoundRunner:
         return self._clock
 
     @property
+    def trajectory(self) -> TrajectoryStore:
+        """The store this runner writes through — and holds the driver lock through.
+
+        Exposed so ``NoiseFloorRunner`` can refuse a *second* store object
+        over the same tree: the lock is re-entrant per store object, and a
+        second one reads the first's hold as another driver's.
+        """
+        return self._trajectory
+
+    @property
     def skipped_problems(self) -> tuple[str, ...]:
         """Problems the last :meth:`run_attempts` reused instead of re-driving.
 

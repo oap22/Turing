@@ -194,9 +194,19 @@ second process over the same `--loop-slug` is refused with the first's pid
 rather than resuming its live attempts as its own and rotating its metrics
 chain aside. A lock whose pid is no longer alive on this host is stale (the
 previous driver was killed) and is reclaimed with a
-`research.driver_lock.reclaimed` log line; a lock from another host cannot be
-probed and is treated as live. The dry run reads the lock and refuses on a
-live one, without taking it.
+`research.driver_lock.reclaimed` log line — by *renaming* it to
+`.driver.lock.stale-<pid>` rather than unlinking it, so that two drivers
+racing over one stale lock cannot both reclaim it: exactly one rename
+succeeds, the loser loops back to its `O_CREAT|O_EXCL`, finds the winner's
+fresh lock, and is refused naming the winner's pid (the `.stale-*` file is
+removed once the winner holds the tree). The dry run reads the lock and
+refuses on a live one, without taking it. Two known limits, both of which
+refuse rather than run: a lock from **another host** cannot be probed and is
+treated as live even if that host's driver is long dead — a permanent
+refusal until you remove `<results-root>/loop-<slug>/.driver.lock` by hand
+(the refusal names the file); and a stale lock whose pid the kernel has since
+**reused** for an unrelated process looks live and refuses the same way, with
+the same remedy.
 
 A round is: every problem in the corpus, one attempt each, scored, with the
 results written into a run directory. Round 0 uses the frozen scaffold and no
@@ -249,7 +259,7 @@ adopts a number this run did not measure under this exact configuration; it
 never overwrites a prior measurement — a re-drive lands in a new generation
 beside the old one; a finished round is returned as a no-op success ONLY for
 the identical measurement (same `eval_set_hash`, `engine`, `config_digest`,
-resume on) and refuses without writing otherwise; `--dry-run` performs every
+`seed`, resume on) and refuses without writing otherwise; `--dry-run` performs every
 validation the real run performs before its first write; one driver owns a
 results tree at a time.*
 
@@ -354,7 +364,18 @@ untouched: both key on `metrics.jsonl`, and `prior-N/` already held one.
 re-derived on every invocation, so the identical command arrives with the same
 report and a fresh timestamp; if the file on disk equals the new report in
 every field but `created_at_ms`, it is not rewritten and keeps its original
-timestamp (`research.noise_floor.unchanged`). Any real difference is written.
+timestamp (`research.noise_floor.unchanged`). Any real difference is written —
+and the report it displaces is moved to `noise-floor/prior-N.json` first
+(next free `N`, numbered like an attempt's `prior-N/`; `research.noise_floor.rotated`),
+byte for byte, so a `--no-resume` re-measurement of the floor leaves the
+earlier measurement's report beside the new one rather than under it. One
+difference is refused rather than written: once round 0 has run, a *different
+seed set* (`--seeds` not equal to the `seeds` in `noise-floor.json`) is
+refused before any seed is driven — *round 0 already measured floors for
+seeds […]; a different seed set is a different measurement — use a new loop
+slug* — because round 0's row was judged against the floor on disk. Before
+any round has run the floor is still being chosen and a changed seed set
+simply rotates the old report and writes the new one.
 
 ### What counts as complete
 

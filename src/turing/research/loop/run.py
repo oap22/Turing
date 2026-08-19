@@ -114,6 +114,7 @@ from turing.research.solver.config import SolverSettings
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from turing.research.backends.claude import BackendSettings, ClaudeBackend
     from turing.research.contracts import EscalationRequest, Problem
 
 logger = structlog.get_logger(__name__)
@@ -240,11 +241,44 @@ async def _drive(args: argparse.Namespace) -> int:
     # Imported here rather than at module scope: ``from_settings`` constructs
     # the Anthropic SDK client, and a ``--help`` or a refused preflight must
     # not need the SDK installed or a credential present.
-    from turing.research.backends.adapter import ProposalAdapter
-    from turing.research.backends.claude import BACKEND_NAME, BackendSettings, ClaudeBackend
+    from turing.research.backends.claude import BackendSettings, ClaudeBackend
 
     backend_settings = BackendSettings()
     backend = ClaudeBackend.from_settings(backend_settings)
+    # Every refusal from here on — the scaffold sha, ``--seeds 1``, duplicate
+    # seeds, the preflight, the missing ``--yes``, and anything past the
+    # gates — leaves through this ``finally``, so the SDK client built above
+    # is closed exactly once on every exit. Before this the ``try`` began at
+    # the preflight and a refusal raised earlier (``_scaffold_sha`` on a
+    # non-checkout, ``NoiseFloorConfig.__post_init__``) leaked the client.
+    try:
+        return await _drive_with_backend(
+            args,
+            settings=settings,
+            solver_settings=solver_settings,
+            adapter=adapter,
+            corpus=corpus,
+            backend=backend,
+            backend_settings=backend_settings,
+        )
+    finally:
+        await backend.aclose()
+
+
+async def _drive_with_backend(
+    args: argparse.Namespace,
+    *,
+    settings: ResearchLoopSettings,
+    solver_settings: SolverSettings,
+    adapter: SpeedupAdapter,
+    corpus: Sequence[Problem],
+    backend: ClaudeBackend,
+    backend_settings: BackendSettings,
+) -> int:
+    """Everything after the SDK client exists; the caller owns closing it."""
+    from turing.research.backends.adapter import ProposalAdapter
+    from turing.research.backends.claude import BACKEND_NAME
+
     engine = EngineIdentity(
         backend=BACKEND_NAME,
         orchestrator_model=backend_settings.orchestrator_model,
@@ -315,14 +349,10 @@ async def _drive(args: argparse.Namespace) -> int:
     #    whether it was the identical measurement. A finished round measured
     #    some other way is refused before a single seed is re-driven under
     #    the new configuration; an identical one is a no-op later.
-    try:
-        bind_eval_set_hash(corpus, eval_set_hash, extra=eval_set_material)
-        store.refuse_if_driver_lock_live()
-        if not args.noise_floor_only:
-            await find_finished_round(store, round_config, resume=args.resume)
-    except ContractViolationError:
-        await backend.aclose()
-        raise
+    bind_eval_set_hash(corpus, eval_set_hash, extra=eval_set_material)
+    store.refuse_if_driver_lock_live()
+    if not args.noise_floor_only:
+        await find_finished_round(store, round_config, resume=args.resume)
 
     sys.stdout.write(
         f"loop      {store.loop_dir}\n"
@@ -342,30 +372,24 @@ async def _drive(args: argparse.Namespace) -> int:
             "dry run: everything above assembled and validated; nothing was driven and "
             "nothing was written under the results root\n"
         )
-        await backend.aclose()
         return EXIT_OK
     if not args.yes:
-        await backend.aclose()
         raise ContractViolationError(
             "this run spends subscription compute; re-run with --yes to acknowledge that, "
             "or --dry-run to stop here (nothing was written)"
         )
 
-    # Past both gates. The backend is closed on every exit from here —
-    # refusal, interruption or success — so a refused run does not leak the
-    # SDK client it built in preflight.
-    try:
-        return await _drive_past_gates(
-            args,
-            settings=settings,
-            store=store,
-            solver=solver,
-            corpus=corpus,
-            floor_config=floor_config,
-            round_config=round_config,
-        )
-    finally:
-        await backend.aclose()
+    # Past both gates. The backend is closed by ``_drive``'s ``finally`` on
+    # every exit from here — refusal, interruption or success.
+    return await _drive_past_gates(
+        args,
+        settings=settings,
+        store=store,
+        solver=solver,
+        corpus=corpus,
+        floor_config=floor_config,
+        round_config=round_config,
+    )
 
 
 async def _drive_past_gates(

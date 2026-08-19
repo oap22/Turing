@@ -41,7 +41,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from contextlib import asynccontextmanager
+import time
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -113,6 +114,11 @@ NOISE_FLOOR_DIRNAME = "noise-floor"
 NOISE_FLOOR_FILENAME = "noise-floor.json"
 #: ``<loop-dir>/.driver.lock`` — one driver owns a results tree at a time.
 DRIVER_LOCK_FILENAME = ".driver.lock"
+#: How long a second reclaimer of one stale lock waits for the first to finish
+#: before refusing (``_RECLAIM_MUTEX_WAITS`` × ``_RECLAIM_MUTEX_WAIT_SECONDS``).
+#: A reclaim is three syscalls; a second is far more than it needs.
+_RECLAIM_MUTEX_WAITS = 20
+_RECLAIM_MUTEX_WAIT_SECONDS = 0.05
 
 
 @dataclass(frozen=True, slots=True)
@@ -807,6 +813,14 @@ def _write_json(path: Path, payload: Any) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def _next_prior_noise_floor(noise_floor_dir: Path) -> Path:
+    """``noise-floor/prior-N.json`` for the next free ``N``, from 1."""
+    suffix = 1
+    while (noise_floor_dir / f"prior-{suffix}.json").exists():
+        suffix += 1
+    return noise_floor_dir / f"prior-{suffix}.json"
+
+
 def _read_json(path: Path) -> Any | None:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -953,6 +967,34 @@ class TrajectoryStore:
         ``research.driver_lock.reclaimed`` log line; a live one refuses with
         the holder's pid. Re-entrant per store object (see ``__init__``).
 
+        **Reclaim runs under a mutex, and is a rename.** Two drivers racing
+        over one stale lock both read it and both decide it is stale; with a
+        bare ``unlink`` (or a bare ``rename``) the slower one then removes
+        whatever is at the path *now* — which, if the faster one has already
+        reclaimed and re-created, is the faster one's live lock — and both
+        end up holding the tree. POSIX has no "remove iff the content is
+        still X", so the reclaim is serialised: ``os.mkdir(<lock>.reclaim)``
+        is the atomic-exclusive mutex (a second reclaimer waits briefly, then
+        re-evaluates), and under it the lock is *re-read* and must still be
+        the holder judged stale; only then is it renamed to
+        ``<lock>.stale-<pid>``, the ``O_EXCL`` create performed, and the
+        mutex dropped. The loser's re-read finds the winner's fresh lock,
+        re-evaluates, and is refused naming the winner's pid. Rename rather
+        than unlink so a process killed after the reclaim leaves the file it
+        displaced beside its own; the ``.stale-<pid>`` file is inert (nothing
+        reads it) and is removed once the outcome is known, best-effort. A
+        mutex directory left behind by a driver killed inside the reclaim
+        (microseconds wide) refuses with the directory named — the safe
+        direction, and the remedy is in the message.
+
+        Two limits, both in the safe (refusing) direction. A lock naming a
+        pid on *another host* cannot be probed and is treated as live even
+        if that host's driver is long dead: it refuses forever, until the
+        operator removes ``<loop-dir>/.driver.lock`` by hand (the refusal
+        names the file). And a stale lock whose pid the kernel has since
+        reused for an unrelated process looks live and refuses the same way,
+        with the same remedy.
+
         The loop directory is created here if it does not exist, because the
         lock file lives in it and must land before any other write. That is
         the one write a refused ``--yes`` run may leave behind and it is by
@@ -966,45 +1008,98 @@ class TrajectoryStore:
         def _take() -> None:
             self.loop_dir.mkdir(parents=True, exist_ok=True)
             path = self.driver_lock_path
-            for _attempt in range(2):
-                try:
-                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-                except FileExistsError:
-                    holder = self.read_driver_lock()
-                    if holder is None:
-                        # Vanished between the failed create and the read —
-                        # the previous holder released. Try once more.
-                        continue
-                    if holder.is_alive():
-                        raise self._held_by(holder) from None
-                    logger.warning(
-                        "research.driver_lock.reclaimed",
-                        path=str(path),
-                        stale_pid=holder.pid,
-                        stale_started_at_ms=holder.started_at_ms,
-                        detail=(
-                            "the lock names a pid that is not alive on this host; the "
-                            "previous driver was killed without releasing it and this "
-                            "run takes over the results tree"
-                        ),
-                    )
-                    path.unlink(missing_ok=True)
-                    continue
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    json.dump(
-                        {
-                            "pid": os.getpid(),
-                            "started_at_ms": self._clock.now_ms(),
-                            "host": _hostname(),
-                        },
-                        handle,
-                    )
-                    handle.write("\n")
-                return
-            raise ContractViolationError(
-                f"could not take {path}: it kept reappearing between a failed create and "
-                "the next; another driver is racing for this results tree"
-            )
+            reclaim_mutex = path.with_name(f"{path.name}.reclaim")
+            reclaimed: Path | None = None
+            vanished = 0
+            mutex_waits = 0
+            try:
+                while True:
+                    try:
+                        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                    except FileExistsError:
+                        holder = self.read_driver_lock()
+                        if holder is None:
+                            # Vanished between the failed create and the read —
+                            # the previous holder released. Try again, but not
+                            # forever.
+                            vanished += 1
+                            if vanished > 2:
+                                raise ContractViolationError(
+                                    f"could not take {path}: it kept reappearing between a "
+                                    "failed create and the next; another driver is racing "
+                                    "for this results tree"
+                                ) from None
+                            continue
+                        if holder.is_alive():
+                            raise self._held_by(holder) from None
+                        # Stale. Reclaim under the reclaim mutex — see the
+                        # docstring for why a bare rename is not enough.
+                        try:
+                            os.mkdir(reclaim_mutex)
+                        except FileExistsError:
+                            mutex_waits += 1
+                            if mutex_waits > _RECLAIM_MUTEX_WAITS:
+                                raise ContractViolationError(
+                                    f"{reclaim_mutex} exists: another driver is reclaiming "
+                                    f"the stale {path} right now, or one was killed in the "
+                                    "middle of doing so. Wait a moment and re-run; if no "
+                                    "driver is running over this results tree, remove that "
+                                    "directory and re-run"
+                                ) from None
+                            time.sleep(_RECLAIM_MUTEX_WAIT_SECONDS)
+                            continue
+                        try:
+                            again = self.read_driver_lock()
+                            if again is None or (again.pid, again.started_at_ms, again.host) != (
+                                holder.pid,
+                                holder.started_at_ms,
+                                holder.host,
+                            ):
+                                # Not the file we judged stale any more:
+                                # released, or taken by a live driver in the
+                                # meantime. Re-evaluate from the top.
+                                continue
+                            stale = path.with_name(f"{path.name}.stale-{os.getpid()}")
+                            os.rename(path, stale)
+                            reclaimed = stale
+                            logger.warning(
+                                "research.driver_lock.reclaimed",
+                                path=str(path),
+                                stale_pid=holder.pid,
+                                stale_started_at_ms=holder.started_at_ms,
+                                detail=(
+                                    "the lock names a pid that is not alive on this host; "
+                                    "the previous driver was killed without releasing it "
+                                    "and this run takes over the results tree"
+                                ),
+                            )
+                            try:
+                                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                            except FileExistsError:
+                                # A newcomer landed between the rename and the
+                                # create. The top of the loop reads it and
+                                # refuses if it is live.
+                                continue
+                        finally:
+                            with suppress(OSError):
+                                os.rmdir(reclaim_mutex)
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        json.dump(
+                            {
+                                "pid": os.getpid(),
+                                "started_at_ms": self._clock.now_ms(),
+                                "host": _hostname(),
+                            },
+                            handle,
+                        )
+                        handle.write("\n")
+                    return
+            finally:
+                # The renamed-aside stale lock is inert; drop it whether this
+                # process took the tree or was refused after reclaiming.
+                if reclaimed is not None:
+                    with suppress(OSError):
+                        reclaimed.unlink()
 
         await asyncio.to_thread(_take)
         self._driver_lock_depth = 1
@@ -1644,8 +1739,15 @@ class TrajectoryStore:
         later than it was. So: if the file on disk decodes and equals the new
         payload in every field but ``created_at_ms``, it is left as it is,
         original timestamp included. Any other difference — a seed added, a
-        cell moved, a file that does not decode — is written over, because
-        the report in hand is the one this run measured.
+        cell moved, a file that does not decode — is written, because the
+        report in hand is the one this run measured — but **what it displaces
+        is preserved**: the file that was there is moved to
+        ``noise-floor/prior-N.json`` first (the next free ``N``, numbered the
+        way an attempt's ``prior-N/`` is), byte for byte. A ``--no-resume``
+        re-drive of the floor is a re-measurement, and the earlier report is
+        the earlier measurement's evidence; the same rule that keeps a
+        re-driven attempt's checkpoint out of the bin keeps this out of it.
+        Nothing reads ``prior-N.json`` — it is there for the operator.
         """
         path = self.noise_floor_path
         fresh = dict(payload)
@@ -1671,6 +1773,18 @@ class TrajectoryStore:
                         ),
                     )
                     return
+            if path.is_file():
+                prior = _next_prior_noise_floor(path.parent)
+                path.rename(prior)
+                logger.info(
+                    "research.noise_floor.rotated",
+                    src=str(path),
+                    dest=str(prior),
+                    detail=(
+                        "a different floor is about to be written; the report that was "
+                        "here is a prior measurement and is kept beside it, unchanged"
+                    ),
+                )
             _write_json(path, fresh)
 
         await asyncio.to_thread(_write_unless_same)

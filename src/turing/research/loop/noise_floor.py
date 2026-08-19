@@ -199,6 +199,20 @@ class NoiseFloorRunner:
     """Drives >=3 identical seed runs and reduces them to per-cell floors."""
 
     def __init__(self, runner: RoundRunner, trajectory: TrajectoryStore) -> None:
+        # The driver lock is re-entrant per *store object*: ``run`` takes it
+        # through ``trajectory`` and ``runner.run_attempts`` takes it again
+        # through the runner's own store. Hand this class a second store
+        # object over the same tree and the inner take reads the outer's
+        # lock as another driver's — its own pid — and refuses itself with a
+        # message blaming a driver that does not exist. Refuse the
+        # construction instead, naming the actual mistake.
+        if trajectory is not runner.trajectory:
+            raise ContractViolationError(
+                "NoiseFloorRunner must be built over the same TrajectoryStore object its "
+                "RoundRunner drives: the driver lock is re-entrant per store object, so a "
+                "second store over the same tree would refuse the runner's own hold as "
+                "another driver's (pid <own>). Pass runner.trajectory"
+            )
         self._runner = runner
         self._trajectory = trajectory
         self._skipped_seeds: tuple[int, ...] = ()
@@ -372,13 +386,27 @@ class NoiseFloorRunner:
         ``noise_floor_available``) are already built to handle. A partial
         artifact would be read as a measurement.
 
+        **A different seed set after round 0 is refused.** Round 0's row
+        embeds the floor it was judged against, and a floor is a yardstick
+        for the rounds that follow it, not a thing to be re-chosen once they
+        have run. So once ``trajectory.json`` has a round and
+        ``noise-floor.json`` names a seed set, a ``config.seeds`` that
+        differs from it is refused before any seed is driven — *round 0
+        already measured floors for seeds […]; a different seed set is a
+        different measurement — new slug*. Before any round has run the floor
+        is still being chosen and a changed seed set simply rotates the old
+        report to ``noise-floor/prior-N.json`` and writes the new one (see
+        :meth:`~turing.research.loop.trajectory.TrajectoryStore.write_noise_floor`).
+
         Raises:
             ContractViolationError: a seed lost one or more attempts, or —
                 from ``measure_noise_floor`` and :class:`NoiseFloorConfig` —
                 too few seeds or a cell missing from some seed; or another
                 driver holds this results tree (one driver per tree — the
                 whole measurement runs under
-                :meth:`~turing.research.loop.trajectory.TrajectoryStore.driver_lock`).
+                :meth:`~turing.research.loop.trajectory.TrajectoryStore.driver_lock`);
+                or a round has run and ``config.seeds`` is not the seed set
+                the floor on disk was measured with.
         """
         async with self._trajectory.driver_lock():
             return await self._run_locked(corpus, config, resume=resume)
@@ -392,15 +420,22 @@ class NoiseFloorRunner:
     ) -> NoiseFloorReport:
         await self._trajectory.ensure_layout()
         existing = await self._trajectory.load_trajectory()
-        if existing.get("rounds"):
-            logger.warning(
-                "research.noise_floor.measured_late",
-                rounds_already_logged=len(existing["rounds"]),
-                detail=(
-                    "the noise floor is supposed to precede round 0; measuring it after "
-                    "rounds have run makes those rounds interpretable only in hindsight"
-                ),
+        rounds_already_logged = len(existing.get("rounds") or ())
+        if rounds_already_logged:
+            floor_on_disk = await self._trajectory.load_noise_floor()
+            measured_seeds = (
+                tuple(int(seed) for seed in floor_on_disk.get("seeds", ()))
+                if floor_on_disk is not None
+                else None
             )
+            if measured_seeds is not None and measured_seeds != tuple(config.seeds):
+                raise ContractViolationError(
+                    f"round 0 already measured floors for seeds {list(measured_seeds)} "
+                    f"({self._trajectory.noise_floor_path}); this run asks for seeds "
+                    f"{list(config.seeds)}. A different seed set is a different "
+                    "measurement, and the rounds already logged were judged against the "
+                    "floor on disk — use a new loop slug"
+                )
         per_seed: dict[int, tuple[TypeScore, ...]] = {}
         escalations = 0
         eval_set_hash = bind_eval_set_hash(
@@ -427,6 +462,19 @@ class NoiseFloorRunner:
                 identities,
                 [problem.id for problem in corpus],
                 caps={problem.id: problem.default_cap or config.default_cap for problem in corpus},
+            )
+        # Warned only when a floor is actually about to be *measured* — some
+        # seed will be driven. The identical no-op re-run of a finished slug
+        # re-derives every seed from disk and measures nothing late.
+        if rounds_already_logged and set(config.seeds) - set(already_measured):
+            logger.warning(
+                "research.noise_floor.measured_late",
+                rounds_already_logged=rounds_already_logged,
+                seeds_to_drive=sorted(set(config.seeds) - set(already_measured)),
+                detail=(
+                    "the noise floor is supposed to precede round 0; measuring it after "
+                    "rounds have run makes those rounds interpretable only in hindsight"
+                ),
             )
         for seed in config.seeds:
             seed_config = seed_configs[seed]

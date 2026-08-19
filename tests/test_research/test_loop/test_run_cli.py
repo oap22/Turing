@@ -219,6 +219,54 @@ class TestDryRunAndYes:
         assert code == run_cli.EXIT_REFUSED
         assert "seeds must be distinct" in capsys.readouterr().err
 
+    @pytest.mark.parametrize(
+        ("extra", "expected"),
+        [
+            (("--seeds", "1", "--dry-run"), f"at least {MIN_NOISE_FLOOR_SEEDS} seeds"),
+            (("--seeds", "1", "1", "2", "--dry-run"), "seeds must be distinct"),
+            (("--seeds", "1", "--yes"), f"at least {MIN_NOISE_FLOOR_SEEDS} seeds"),
+        ],
+    )
+    def test_a_refusal_before_the_preflight_still_closes_the_backend(
+        self,
+        faked_driver: Path,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        extra: tuple[str, ...],
+        expected: str,
+    ) -> None:
+        """Round-3 verifier: ``NoiseFloorConfig.__post_init__`` refused *before*
+        the ``try`` that closed the SDK client, so ``--seeds 1`` built one and
+        never closed it. Every refusal after construction now leaves through
+        one ``finally``: constructed 1, closed 1."""
+        code = run_cli.main(_args(tmp_path, *extra))
+        assert code == run_cli.EXIT_REFUSED
+        assert expected in capsys.readouterr().err
+        assert not faked_driver.exists()
+        assert _FakeBackend.constructed == 1
+        assert _FakeBackend.closed == 1
+
+    def test_a_scaffold_sha_refusal_closes_the_backend(
+        self,
+        faked_driver: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """``_scaffold_sha`` runs after the client is built; its refusal must
+        close the client too."""
+
+        def refuse(repo: Path) -> str:
+            raise ContractViolationError(f"{repo} is not a git checkout (fake)")
+
+        monkeypatch.setattr(run_cli, "_scaffold_sha", refuse)
+        code = run_cli.main(_args(tmp_path, "--dry-run"))
+        assert code == run_cli.EXIT_REFUSED
+        assert "not a git checkout" in capsys.readouterr().err
+        assert not faked_driver.exists()
+        assert _FakeBackend.constructed == 1
+        assert _FakeBackend.closed == 1
+
     def test_a_real_run_without_yes_refuses_after_preflight_and_writes_nothing(
         self, faked_driver: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -412,6 +460,50 @@ class TestTheDriverEndToEnd:
         err = capsys.readouterr().err
         assert code == run_cli.EXIT_REFUSED
         assert "--no-resume cannot re-measure into a finished index" in err
+
+    def test_no_resume_against_a_finished_round_is_refused_before_the_floor_is_driven(
+        self,
+        faked_driver: Path,
+        fake_runners: list[RoundRunner],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Round-3 verifier: the preflight's ``find_finished_round(...,
+        resume=args.resume)`` had no ``--no-resume`` test — with ``resume=True``
+        there, ``run_round`` still refused, but only *after* the floor had been
+        re-driven under ``--no-resume`` (three seeds of compute). The refusal
+        must land in the preflight: no floor runner call, no seed re-driven,
+        the tree untouched, the backend closed."""
+        assert run_cli.main(_args(tmp_path, "--yes")) == run_cli.EXIT_OK
+        capsys.readouterr()
+        before = sorted(
+            (p.relative_to(faked_driver), p.stat().st_mtime_ns)
+            for p in faked_driver.rglob("*")
+            if p.is_file()
+        )
+        _RecordingFloorRunner.calls = []
+        monkeypatch.setattr(run_cli, "NoiseFloorRunner", _RecordingFloorRunner)
+        code = run_cli.main(_args(tmp_path, "--yes", "--no-resume"))
+        err = capsys.readouterr().err
+        assert code == run_cli.EXIT_REFUSED
+        assert "--no-resume cannot re-measure into a finished index" in err
+        assert _RecordingFloorRunner.calls == []
+        # Only the first run built runners (floor and round); the refusal
+        # built none.
+        assert len(fake_runners) == 2
+        after = sorted(
+            (p.relative_to(faked_driver), p.stat().st_mtime_ns)
+            for p in faked_driver.rglob("*")
+            if p.is_file()
+        )
+        assert after == before
+        assert _FakeBackend.closed == 2
+        # The dry run refuses the same way, before anything.
+        code = run_cli.main(_args(tmp_path, "--dry-run", "--no-resume"))
+        assert code == run_cli.EXIT_REFUSED
+        assert "--no-resume cannot re-measure into a finished index" in capsys.readouterr().err
+        assert _RecordingFloorRunner.calls == []
 
 
 class TestOneDriverPerResultsTree:
