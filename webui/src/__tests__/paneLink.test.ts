@@ -121,6 +121,17 @@ describe("the channel", () => {
     expect(cb).not.toHaveBeenCalled();
   });
 
+  it("reports how many subscribers heard the publish — zero when none did", () => {
+    // The return is what lets the flywheel link tell "delivered" from
+    // "landed nowhere" instead of the two being identical silence.
+    expect(publishMetricsTarget(R0)).toBe(0);
+    const unsub = subscribeMetricsTarget(() => {});
+    subscribeMetricsTarget(() => {});
+    expect(publishMetricsTarget(R0)).toBe(2);
+    unsub();
+    expect(publishMetricsTarget(R0)).toBe(1);
+  });
+
   it("keeps delivering to siblings when one subscriber throws", () => {
     const seen: RoundTarget[] = [];
     subscribeMetricsTarget(() => {

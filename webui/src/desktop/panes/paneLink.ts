@@ -21,9 +21,13 @@
 // name) plus its round index. It maps to every live run of that round: each
 // `<loop>/round-NN/attempts/<problem-id>/metrics.jsonl` on disk, where
 // `<problem-id>` may itself be nested (`cuda/matmul-speedup`). Rotated
-// `prior-N/` chains and dot-named staging directories are excluded, mirroring
-// `RoundRunner._viewer_runs` — a superseded generation must not be charted as
-// if the click asked for it. The active series is deliberately left alone: the
+// `prior-N/` chains and dot-named directories are excluded — at least as
+// strict as `RoundRunner._viewer_runs`, with two deliberate tightenings: ANY
+// dot-named final directory is excluded (the Python side names only its one
+// `.rotating` staging dir), and a bare `attempts/metrics.jsonl` with no problem-id
+// segment is rejected (the Python `**` glob would accept it) — a superseded
+// generation must not be charted as if the click asked for it. The active
+// series is deliberately left alone: the
 // click chooses *which runs*, and the operator's series tab keeps meaning what
 // it meant. A round with no run files (yet) resolves to nothing; the caller
 // keeps its current chart and the request stays pending, so metrics landing
@@ -63,10 +67,14 @@ const PRIOR_DIR = /^prior-\d+$/;
  * `relPath` is a `metrics.jsonl` path relative to the results root; its run id
  * (the containing directory, per `runIdOf`) must sit at
  * `<loop>/round-NN/attempts/…` and its final segment must be neither a
- * rotated `prior-N` chain nor a dot-named staging directory — the same two
- * exclusions `RoundRunner._viewer_runs` makes when it emits `.viewer.json`,
- * for the same reason: those directories hold a superseded or uncommitted
- * generation, not a run of this round.
+ * rotated `prior-N` chain nor a dot-named directory — at least as strict as
+ * the exclusions `RoundRunner._viewer_runs` makes when it emits
+ * `.viewer.json`, for the same reason: those directories hold a superseded
+ * or uncommitted generation, not a run of this round. Two deliberate
+ * tightenings over the Python side: any leading-dot final segment is
+ * excluded, not just its one `.rotating` staging name; and the
+ * `segments.length < 4` guard rejects `attempts/metrics.jsonl` with no
+ * problem-id segment at all, which its `**` glob would accept.
  */
 export function matchesRound(relPath: string, target: RoundTarget): boolean {
   const segments = runIdOf(relPath).split("/");
@@ -104,23 +112,36 @@ export function resolveRunRequest(req: RunRequest, relPaths: readonly string[]):
 // panes mounted right now — a click is a momentary gesture, so it is
 // deliberately NOT replayed to a metrics pane opened later, which would apply
 // a stale gesture the operator has long moved past. With no metrics pane
-// mounted anywhere in the layout, a click simply lands nowhere.
+// mounted anywhere in the layout, a click lands nowhere — so the publish
+// returns how many panes heard it, and the flywheel link shows "no metrics
+// pane" when that is zero rather than letting a dead click and a delivered
+// one be identical pixels.
 
 type Listener = (target: RoundTarget) => void;
 
 const listeners = new Set<Listener>();
 
-/** Flywheel side: announce the round the operator asked metrics to show. */
-export function publishMetricsTarget(target: RoundTarget): void {
+/**
+ * Flywheel side: announce the round the operator asked metrics to show.
+ *
+ * Returns how many subscribers heard it. Zero means no metrics pane is
+ * mounted anywhere: the click landed nowhere, and the caller must say so —
+ * a delivered gesture and a dead one must not be identical silence. (A
+ * subscriber that throws still counts as having heard it: the request
+ * reached a mounted pane, whatever that pane then did with it.)
+ */
+export function publishMetricsTarget(target: RoundTarget): number {
   // Snapshot, so a listener unsubscribing during dispatch cannot skip a
   // sibling — same rule as the event bus in tauri.ts.
-  for (const cb of [...listeners]) {
+  const snapshot = [...listeners];
+  for (const cb of snapshot) {
     try {
       cb(target);
     } catch {
       // A pane's render bug is not the channel's fault; siblings still hear.
     }
   }
+  return snapshot.length;
 }
 
 /** Metrics side: hear clicks while mounted. Returns the unsubscribe. */

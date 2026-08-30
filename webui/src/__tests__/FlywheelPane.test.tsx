@@ -366,6 +366,38 @@ describe("FlywheelPane round detail — per-problem rows", () => {
     expect(seen).toEqual([{ loop: "loop-probe", round: 1 }]);
   });
 
+  it("publishes from the wheel view's expanded detail too", async () => {
+    const seen: RoundTarget[] = [];
+    subscribeMetricsTarget((t) => seen.push(t));
+    seed();
+    await openRound(1);
+    // The expanded round survives the view switch; the wheel branch renders
+    // the detail (and its [metrics] link) through its own wiring, which is
+    // what this test pins — a wheel-side no-op handler must not survive.
+    fireEvent.click(screen.getByRole("button", { name: "[wheel]" }));
+    fireEvent.click(screen.getByRole("button", { name: "[metrics]" }));
+    expect(seen).toEqual([{ loop: "loop-probe", round: 1 }]);
+  });
+
+  it("acknowledges delivery inline, and says so when no metrics pane is listening", async () => {
+    seed();
+    await openRound(1);
+    // Nothing rendered before the click: the hint is transient feedback, not
+    // a permanent fixture of the row.
+    expect(screen.queryByTestId("metrics-link-hint")).toBeNull();
+
+    // No subscriber anywhere (no metrics pane mounted): silence would make a
+    // dead click and a delivered one identical pixels.
+    fireEvent.click(screen.getByRole("button", { name: "[metrics]" }));
+    expect(screen.getByTestId("metrics-link-hint")).toHaveTextContent("no metrics pane");
+
+    // A metrics pane mounts (subscribes); the next click reads as delivered.
+    const unsub = subscribeMetricsTarget(() => {});
+    fireEvent.click(screen.getByRole("button", { name: "[metrics]" }));
+    expect(screen.getByTestId("metrics-link-hint")).toHaveTextContent("→ metrics");
+    unsub();
+  });
+
   it("marks an unscored problem instead of showing a measured-looking zero", async () => {
     seed();
     files.set(

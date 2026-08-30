@@ -979,6 +979,16 @@ describe("MetricsPane — flywheel round clicks vs .viewer.json (#390 item 3)", 
     // The runs, not the series: the operator's tab choice is not the click's
     // to change.
     expect(selectedRunLabels()).not.toContain("auto (newest)");
+
+    // And the click stayed in-process: the app never writes `.viewer.json`
+    // (or anything else) to express it — the file is the agent → app
+    // direction only. Every command this pane ever issued is a read.
+    for (const [cmd, args] of invMock.mock.calls) {
+      expect(["fs_watch", "fs_list", "fs_tail", "fs_read_text"]).toContain(cmd);
+      if ((args as Record<string, unknown> | undefined)?.rel === ".viewer.json") {
+        expect(cmd).toBe("fs_read_text");
+      }
+    }
   });
 
   it("lets a later .viewer.json change supersede the click", async () => {
@@ -1037,6 +1047,104 @@ describe("MetricsPane — flywheel round clicks vs .viewer.json (#390 item 3)", 
     emitViewerChange();
     await act(async () => {});
     expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort());
+  });
+
+  it("honours a click on a round whose first metrics file lands only after mount", async () => {
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(runOptions().length).toBe(RUN_FILES.length + 1));
+
+    // Round 2 is live but its solver has not taken its first step: no
+    // `metrics.jsonl` exists yet. This is the flagship case — the [metrics]
+    // link is deliberately offered on rounds with no round.json yet.
+    clickRound(2);
+    await act(async () => {});
+    expect(selectedRunLabels()).toEqual(["auto (newest)"]);
+
+    // The solver's first append creates the file; the watcher reports it.
+    // The run list was walked once at mount, so honouring the click now
+    // requires the pane to notice a run file it has never listed.
+    const newRun = `${LOOP}/round-02/attempts/fresh-problem/metrics.jsonl`;
+    contents.set(newRun, chain(1, 0.05, 1.2, "r2fresh"));
+    emitFsChange(newRun);
+
+    await waitFor(() =>
+      expect(selectedRunLabels()).toEqual([`${LOOP}/round-02/attempts/fresh-problem`]),
+    );
+  });
+
+  it("auto-follows a run file created after mount", async () => {
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(runOptions().length).toBe(RUN_FILES.length + 1));
+    // Default selection is `auto`: the pane charts the newest listed run.
+    await waitFor(() =>
+      expect(screen.getByTestId("metrics-eta")).toHaveTextContent(`${R1}/cuda/matmul-speedup`),
+    );
+
+    // A new round's first run file lands — newest mtime, so `fs_list` would
+    // report it first. Auto-follow must move to it without a remount.
+    const newRun = `${LOOP}/round-02/attempts/fresh-problem/metrics.jsonl`;
+    contents = new Map([[newRun, chain(2, 0.05, 1.2, "r2fresh")], ...contents]);
+    emitFsChange(newRun);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("metrics-eta")).toHaveTextContent(
+        `${LOOP}/round-02/attempts/fresh-problem`,
+      ),
+    );
+  });
+
+  it("lets a click during an in-flight .viewer.json read win over that read (last action wins)", async () => {
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(runOptions().length).toBe(RUN_FILES.length + 1));
+
+    // An agent saves the file and the read is slow — RoundRunner rewrites
+    // `.viewer.json` at every round boundary, which is exactly when an
+    // operator is looking at the flywheel and clicking.
+    viewerJson = JSON.stringify({ runs: [`${R1}/flat-baseline`] });
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const base = invMock.getMockImplementation()!;
+    invMock.mockImplementation(async (cmd: string, args: Record<string, unknown> = {}) => {
+      if (cmd === "fs_read_text" && args.rel === ".viewer.json") await held;
+      return base(cmd, args);
+    });
+    emitViewerChange();
+
+    // The operator clicks a round while that read is still in flight — the
+    // click is the LATER action.
+    clickRound(0);
+    await waitFor(() => expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort()));
+
+    // The stale read resolves. It must not clobber the click.
+    release();
+    await act(async () => {});
+    await act(async () => {});
+    expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort());
+  });
+
+  it("clears a pending round click when the operator uses the listbox themselves", async () => {
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(runOptions().length).toBe(RUN_FILES.length + 1));
+
+    // Round 2 has no files yet, so the click stays pending.
+    clickRound(2);
+    await act(async () => {});
+    expect(selectedRunLabels()).toEqual(["auto (newest)"]);
+
+    // The operator picks a run by hand. That is now the last action.
+    const flat = runOptions().find((o) => o.textContent === `${R1}/flat-baseline`)!;
+    act(() => flat.click());
+    await waitFor(() => expect(selectedRunLabels()).toContain(`${R1}/flat-baseline`));
+
+    // Round 2's first file lands later. The superseded click must not fire
+    // now and rearrange a chart the operator chose by hand.
+    const newRun = `${LOOP}/round-02/attempts/fresh-problem/metrics.jsonl`;
+    contents.set(newRun, chain(1, 0.05, 1.2, "r2fresh"));
+    emitFsChange(newRun);
+    await waitFor(() => expect(runOptions().length).toBe(RUN_FILES.length + 2));
+    expect(selectedRunLabels().sort()).toEqual(
+      ["auto (newest)", `${R1}/flat-baseline`].sort(),
+    );
   });
 });
 

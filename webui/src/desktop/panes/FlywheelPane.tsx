@@ -214,21 +214,47 @@ function ProblemRow({
   );
 }
 
+/** What the last `[metrics]` click came to: it reached a mounted metrics
+ * pane, or there was none anywhere to hear it. Rendered transiently beside
+ * the link — the two outcomes were otherwise identical pixels, and "nothing
+ * happened" must be readable as such rather than mistaken for success. */
+interface MetricsHint {
+  delivered: boolean;
+}
+
 /** The `[metrics]` cross-pane link: point the metrics pane at this round's
  * runs (see paneLink.ts for the mapping and the last-action-wins rule). An
  * explicit affordance rather than the row click doing double duty — the row
  * click's job is expand-in-place, and silently re-aiming another pane on
  * every expansion would make *reading* a round rearrange the workspace. */
-function MetricsLink({ onShowMetrics }: { onShowMetrics: () => void }) {
+function MetricsLink({
+  onShowMetrics,
+  hint,
+}: {
+  onShowMetrics: () => void;
+  hint: MetricsHint | null;
+}) {
   return (
-    <button
-      type="button"
-      onClick={onShowMetrics}
-      title="show this round's runs in the metrics pane"
-      className="text-term-dim underline-offset-2 hover:text-term-fg hover:underline"
-    >
-      [metrics]
-    </button>
+    <>
+      <button
+        type="button"
+        onClick={onShowMetrics}
+        title="show this round's runs in the metrics pane"
+        className="text-term-dim underline-offset-2 hover:text-term-fg hover:underline"
+      >
+        [metrics]
+      </button>
+      {hint && (
+        <span
+          data-testid="metrics-link-hint"
+          // Amber for "landed nowhere", same as the metrics pane's own
+          // attention states — not an accusation, just "look again".
+          className={hint.delivered ? "text-term-dim" : "text-amber-400"}
+        >
+          {hint.delivered ? "→ metrics" : "no metrics pane"}
+        </span>
+      )}
+    </>
   );
 }
 
@@ -240,6 +266,7 @@ function RoundDetail({
   reason,
   onOpen,
   onShowMetrics,
+  metricsHint,
 }: {
   record: RoundRecord | null;
   parent: RoundRecord | null;
@@ -247,6 +274,7 @@ function RoundDetail({
   reason: "loading" | "ok" | "missing" | "unparseable";
   onOpen: () => void;
   onShowMetrics: () => void;
+  metricsHint: MetricsHint | null;
 }) {
   if (!record) {
     // "Not written yet" and "there but unreadable" are different situations
@@ -264,7 +292,7 @@ function RoundDetail({
         {/* The metrics link needs only the loop and index, and a round whose
             round.json has not landed yet is exactly the one being watched
             live — hiding the link here would hide it when it is most wanted. */}
-        <MetricsLink onShowMetrics={onShowMetrics} />
+        <MetricsLink onShowMetrics={onShowMetrics} hint={metricsHint} />
       </div>
     );
   }
@@ -465,7 +493,7 @@ function RoundDetail({
         >
           [open round dir]
         </button>
-        <MetricsLink onShowMetrics={onShowMetrics} />
+        <MetricsLink onShowMetrics={onShowMetrics} hint={metricsHint} />
       </div>
     </div>
   );
@@ -712,13 +740,45 @@ export default function FlywheelPane() {
     setOpenRound((prev) => (prev === index ? null : index));
   }
 
+  // The outcome of the last [metrics] click, shown transiently beside the
+  // link it answers (keyed by round, so it cannot render beside some other
+  // round's link). Cleared on a timer: it is an acknowledgment, not a status.
+  const [metricsHint, setMetricsHint] = useState<
+    ({ round: number } & MetricsHint) | null
+  >(null);
+  const metricsHintTimer = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (metricsHintTimer.current !== null) {
+        window.clearTimeout(metricsHintTimer.current);
+      }
+    },
+    [],
+  );
+
   // The `[metrics]` link in the expanded detail: hand the round to whatever
   // metrics pane is mounted (paneLink.ts). Fired from the affordance, never
   // from the expand click itself — expanding a round to read it must not
-  // re-aim another pane as a side effect.
+  // re-aim another pane as a side effect. The publish reports how many panes
+  // heard it; zero means the click landed nowhere, and saying so beside the
+  // link is what keeps a dead click from impersonating a delivered one.
   function showMetrics(index: number) {
     if (!selected) return;
-    publishMetricsTarget({ loop: selected, round: index });
+    const heard = publishMetricsTarget({ loop: selected, round: index });
+    setMetricsHint({ round: index, delivered: heard > 0 });
+    if (metricsHintTimer.current !== null) {
+      window.clearTimeout(metricsHintTimer.current);
+    }
+    metricsHintTimer.current = window.setTimeout(() => {
+      metricsHintTimer.current = null;
+      setMetricsHint(null);
+    }, 2500);
+  }
+
+  /** The hint for THIS round's link, or nothing — a hint must never render
+   * beside a link it does not answer. */
+  function metricsHintFor(index: number): MetricsHint | null {
+    return metricsHint && metricsHint.round === index ? metricsHint : null;
   }
 
   // Only hand the detail view a record that is stamped with the loop and
@@ -864,6 +924,7 @@ export default function FlywheelPane() {
                   {...detailFor(openRound)}
                   onOpen={openRoundDir}
                   onShowMetrics={() => showMetrics(openRound)}
+                  metricsHint={metricsHintFor(openRound)}
                 />
               </div>
             )}
@@ -898,6 +959,7 @@ export default function FlywheelPane() {
                       {...detailFor(r.index)}
                       onOpen={openRoundDir}
                       onShowMetrics={() => showMetrics(r.index)}
+                      metricsHint={metricsHintFor(r.index)}
                     />
                   )}
                 </li>

@@ -256,31 +256,60 @@ export default function MetricsPane() {
     localStorage.setItem(SERIES_STORAGE_KEY, name);
   }
 
+  // The listed run files, mirrored into a ref so the mount-once `fs-change`
+  // handler can ask "have I listed this path?" without re-subscribing on
+  // every list change.
+  const runFilesRef = useRef<Entry[]>([]);
+  // Debounce handle for watcher-triggered run-list refreshes: one burst of
+  // create events (a round starting several attempts at once) is one walk.
+  const runListTimer = useRef<number | null>(null);
+
+  /** Walk the results root and replace the run list with what is there NOW.
+   * Called at mount and again whenever the watcher reports a run file this
+   * pane has never listed — `fs_list` runs once per refresh, not once per
+   * pane lifetime, or a `metrics.jsonl` created after mount (a live round's
+   * first solver step — the case the [metrics] link exists for) would never
+   * enter `runFiles`, never be auto-followed, and never satisfy a pending
+   * request. */
+  async function refreshRunList() {
+    const entries = await inv<Entry[]>("fs_list", {
+      root: RESULTS_ROOT,
+      rel: "",
+      // `json` used to be listed too, purely so `metrics.json` could be
+      // offered as a run; it never was one. Every other `.json` in the tree
+      // (`round.json`, `trajectory.json`, `metrics.chain.json`) was listed
+      // and discarded, so dropping the extension just stops walking them.
+      exts: ["jsonl"],
+    });
+    // `fs_list` is newest-mtime-first and `runFiles[0]` is what auto-follow
+    // charts, so this filter is also what guarantees auto-follow lands on a
+    // file that can have points at all — a rotated `prior-N/metrics.jsonl`
+    // is still a real chain and stays listed, just never emitted into
+    // `.viewer.json`'s `runs`.
+    const files = entries.filter((e) => isChartRunFile(e.rel_path));
+    runFilesRef.current = files;
+    setRunFiles(files);
+  }
+
+  function scheduleRunListRefresh() {
+    if (runListTimer.current !== null) return;
+    runListTimer.current = window.setTimeout(() => {
+      runListTimer.current = null;
+      void refreshRunList();
+    }, 50);
+  }
+
   useEffect(() => {
     let cancelled = false;
     async function load() {
       await inv("fs_watch", { root: RESULTS_ROOT, rel: "" });
-      const entries = await inv<Entry[]>("fs_list", {
-        root: RESULTS_ROOT,
-        rel: "",
-        // `json` used to be listed too, purely so `metrics.json` could be
-        // offered as a run; it never was one. Every other `.json` in the tree
-        // (`round.json`, `trajectory.json`, `metrics.chain.json`) was listed
-        // and discarded, so dropping the extension just stops walking them.
-        exts: ["jsonl"],
-      });
-      if (cancelled) return;
-      // `fs_list` is newest-mtime-first and `runFiles[0]` is what auto-follow
-      // charts, so this filter is also what guarantees auto-follow lands on a
-      // file that can have points at all — a rotated `prior-N/metrics.jsonl`
-      // is still a real chain and stays listed, just never emitted into
-      // `.viewer.json`'s `runs`.
-      setRunFiles(entries.filter((e) => isChartRunFile(e.rel_path)));
+      if (!cancelled) await refreshRunList();
     }
     void load();
     return () => {
       cancelled = true;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /**
@@ -518,6 +547,14 @@ export default function MetricsPane() {
   // own click in the listbox.
   const runsHonoredFor = useRef<RunRequest | null>(null);
   const seriesHonoredFor = useRef<ViewerFile | null>(null);
+  // Monotonic stamp over every action that speaks for the run slot: a click,
+  // a listbox selection, and the START of each `.viewer.json` read. The read
+  // captures the stamp before its await and writes the slot only if nothing
+  // newer happened meanwhile — without this, a click landing during an
+  // in-flight read (RoundRunner rewrites `.viewer.json` at every round
+  // boundary, exactly when operators click) was evicted when the stale read
+  // resolved, violating "last action wins" through mere latency.
+  const deliverySeq = useRef(0);
 
   useEffect(() => {
     if (!runRequest || runsHonoredFor.current === runRequest) return;
@@ -541,9 +578,23 @@ export default function MetricsPane() {
   // panes hear it; the subscription lives exactly as long as the pane.
   useEffect(() => {
     return subscribeMetricsTarget((target) => {
+      // A click is delivered synchronously, so it claims the stamp and the
+      // slot in one step — any older read still in flight is now stale.
+      deliverySeq.current += 1;
       setRunRequest({ source: "flywheel", target });
     });
   }, []);
+
+  /** The operator's own listbox action. It is itself a "last action": it
+   * clears the pending slot, so a round clicked earlier — whose files land
+   * later — cannot fire then and rearrange a chart the operator has since
+   * chosen by hand; and it bumps the delivery stamp, so an in-flight
+   * `.viewer.json` read cannot resolve over it either. */
+  function selectRuns(next: string[]) {
+    deliverySeq.current += 1;
+    setRunRequest(null);
+    setSelected(next);
+  }
 
   useEffect(() => {
     const series = viewerRequest?.series;
@@ -555,6 +606,11 @@ export default function MetricsPane() {
   }, [viewerRequest, seriesNames]);
 
   async function loadViewerFile() {
+    // Claimed BEFORE the await: the delivery is the file change that
+    // triggered this read, not the read resolving. A click (or a newer read)
+    // that lands while `fs_read_text` is in flight bumps the stamp past this
+    // one, and the stale resolution below must not touch the run slot.
+    const seq = ++deliverySeq.current;
     try {
       const text = await inv<string>("fs_read_text", { root: RESULTS_ROOT, rel: VIEWER_FILE_REL });
       const parsed = parseViewerFile(text);
@@ -565,8 +621,9 @@ export default function MetricsPane() {
       // The runs half competes with flywheel clicks for the one request slot
       // — this delivery supersedes any click before it, and the next click
       // supersedes this delivery. A file without a usable `runs` key asks
-      // nothing about runs and must not evict a click that did.
-      if (parsed.runs && parsed.runs.length > 0) {
+      // nothing about runs and must not evict a click that did — and a read
+      // that has been superseded mid-flight must not evict anything at all.
+      if (parsed.runs && parsed.runs.length > 0 && seq === deliverySeq.current) {
         setRunRequest({ source: "viewer", runs: parsed.runs });
       }
     } catch {
@@ -606,6 +663,18 @@ export default function MetricsPane() {
         void loadVerdict(payload.rel_path);
         return;
       }
+      // A run file this pane has never listed: it was created after the
+      // mount-time walk — a live round's first solver step, exactly the run
+      // an operator clicks [metrics] on. Without a re-list it would never
+      // enter `runFiles`: auto-follow would sit on an older run and a
+      // pending request naming it would stay unhonoured forever.
+      if (
+        isChartRunFile(payload.rel_path) &&
+        !runFilesRef.current.some((e) => e.rel_path === payload.rel_path)
+      ) {
+        scheduleRunListRefresh();
+        return;
+      }
       // The loop writes `metrics.verdict.json` once the attempt ends, i.e.
       // while this pane is already open on the run — so the badge has to
       // arrive on a watcher event, not only on mount.
@@ -620,6 +689,10 @@ export default function MetricsPane() {
     return () => {
       cancelled = true;
       sub.unsubscribe();
+      if (runListTimer.current !== null) {
+        window.clearTimeout(runListTimer.current);
+        runListTimer.current = null;
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -675,7 +748,7 @@ export default function MetricsPane() {
             listbox instead of a native control CSS can't fully reach. Same
             `string[]` contract and "auto" sentinel as before, just built from
             toggleable rows. */}
-        <RunMultiSelect runFiles={runFiles} selected={selected} onChange={setSelected} />
+        <RunMultiSelect runFiles={runFiles} selected={selected} onChange={selectRuns} />
         {/* One badge per charted run, each naming its own run in the tooltip.
             A single badge over a multi-run overlay would attribute one run's
             verdict to another — the same lie the ETA strip's run label exists
