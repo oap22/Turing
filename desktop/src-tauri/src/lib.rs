@@ -4,6 +4,8 @@ mod gateway;
 mod pty;
 mod window;
 
+// The native menu bar is macOS-only; on Linux the window ships without one.
+#[cfg(target_os = "macos")]
 use tauri::menu::{MenuBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::Manager;
 
