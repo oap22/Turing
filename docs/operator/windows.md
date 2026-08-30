@@ -15,7 +15,8 @@ not locally on macOS/Linux:
    It contains `turing_<version>_x64-setup.exe` (NSIS).
 2. Run the installer. It installs **per-user** (`installMode:
    "currentUser"`) — no admin prompt, files land under
-   `%LOCALAPPDATA%\Programs`, and it registers a normal per-user
+   `%LOCALAPPDATA%\turing` (Tauri's NSIS template installs to
+   `$LOCALAPPDATA\<productName>`), and it registers a normal per-user
    uninstaller.
 3. If WebView2 is missing (stock Windows 11 has it; some Server/LTSC images
    don't), the installer downloads the Evergreen WebView2 bootstrapper
@@ -82,7 +83,9 @@ POSIX (`TURING_…` prefix), or per-session via
 - **Shutdown signals** — the Proactor event loop (the Windows default) has
   no `add_signal_handler`; Turing falls back to `signal.signal` so Ctrl+C
   shuts down gracefully instead of crashing at startup
-  (`turing.oscompat.install_signal_handlers`).
+  (`turing.oscompat.install_signal_handlers`). Ctrl+Break is handled the
+  same way as Ctrl+C (graceful shutdown, not a force-quit chord); if
+  shutdown ever hangs, kill the process via Task Manager or `taskkill`.
 - **Shell tool runs PowerShell** — `powershell.exe -NoProfile
   -NonInteractive -Command <cmd>`, not cmd.exe. It is a plain
   pipe-connected subprocess, **not a ConPTY**: there is no pseudo-console,
@@ -91,9 +94,13 @@ POSIX (`TURING_…` prefix), or per-session via
   commands. (The desktop app's built-in terminal panes are a different
   code path: `portable-pty` uses ConPTY on Windows and is fully
   interactive.)
-- **No console flashing** — every subprocess Turing spawns on Windows sets
-  `CREATE_NO_WINDOW`, so tools don't pop console windows when the runtime
-  is started without one.
+- **No console flashing (agent tools)** — the subprocesses the agent's
+  tools spawn (the shell tool and the network tool's `ping`) set
+  `CREATE_NO_WINDOW` on Windows, so those tools don't pop console windows
+  when the runtime is started without one. Auxiliary entry points that run
+  as their own processes — the vault CLI (`vault/cli.py`), research lanes,
+  the capability gate — do not set the flag yet, so Task Scheduler users
+  of the vault CLI may see brief console flashes.
 - **`ping`** — the network tool uses `-n`/`-w` (Windows spelling) instead
   of `-c`/`-W`.
 - **Sandbox** — bubblewrap does not exist on Windows. With
@@ -117,6 +124,11 @@ $env:TURING_DB_PATH = "$env:APPDATA\turing\turing.db"
 
 The `%APPDATA%` convention is applied automatically only where Turing owns
 the location outright: the desktop shell's config file (table above).
+
+The filesystem tool's write allowlist defaults to POSIX paths
+(`["/tmp", "/home/turing/data"]`, which Windows resolves as `C:\tmp` etc.);
+Windows operators should set `TURING_ALLOWED_WRITE_PATHS` explicitly, e.g.
+`TURING_ALLOWED_WRITE_PATHS=["C:/Users/owen/turing-data"]`.
 
 ## Run at login: Task Scheduler, not a service
 

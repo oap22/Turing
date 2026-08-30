@@ -8,6 +8,7 @@ sites used before this module existed.
 
 from __future__ import annotations
 
+import contextlib
 import signal
 import subprocess
 import sys
@@ -86,7 +87,15 @@ def install_signal_handlers(
     except NotImplementedError:
 
         def _sync_handler(_signum: int, _frame: Any) -> None:
-            loop.call_soon_threadsafe(handler)
+            # The registration outlives the loop (signal.signal is
+            # process-global): a Ctrl+C after asyncio.run() returns must be
+            # a no-op, not a RuntimeError("Event loop is closed") crash.
+            if loop.is_closed():
+                return
+            # Suppress the race where the loop closes between the check
+            # and the call.
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(handler)
 
         # SIGTERM exists on Windows but is effectively never delivered;
         # registering it is harmless and keeps the set symmetric. SIGBREAK

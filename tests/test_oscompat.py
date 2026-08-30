@@ -7,6 +7,7 @@ host.
 
 from __future__ import annotations
 
+import asyncio
 import signal
 import sys
 from typing import Any
@@ -84,6 +85,9 @@ class _FakeLoop:
     def call_soon_threadsafe(self, cb: Any) -> None:
         self.soon.append(cb)
 
+    def is_closed(self) -> bool:
+        return False
+
 
 class TestInstallSignalHandlers:
     def test_posix_uses_loop_handlers(self):
@@ -105,16 +109,43 @@ class TestInstallSignalHandlers:
             "signal",
             lambda sig, h: registered.__setitem__(sig, h),
         )
+        # SIGBREAK only exists on a real Windows host — fake it so the test
+        # fails if the SIGBREAK registration is ever dropped.
+        monkeypatch.setattr(signal, "SIGBREAK", 99, raising=False)
 
         fired: list[bool] = []
         mechanism = oscompat.install_signal_handlers(loop, lambda: fired.append(True))  # type: ignore[arg-type]
         assert mechanism == "signal"
-        # SIGINT and SIGTERM always exist; SIGBREAK only on real Windows.
         assert signal.SIGINT in registered
         assert signal.SIGTERM in registered
+        assert 99 in registered  # the faked SIGBREAK
 
         # The sync handler trampolines onto the loop, then runs the handler.
         registered[signal.SIGINT](signal.SIGINT, None)
         assert len(loop.soon) == 1
         loop.soon[0]()
         assert fired == [True]
+
+    def test_fallback_handler_is_noop_after_loop_close(self, monkeypatch: pytest.MonkeyPatch):
+        """A late signal (second Ctrl+C after asyncio.run returns) must not
+        crash with RuntimeError('Event loop is closed')."""
+        registered: dict[Any, Any] = {}
+        monkeypatch.setattr(
+            oscompat.signal,
+            "signal",
+            lambda sig, h: registered.__setitem__(sig, h),
+        )
+
+        def _no_loop_signals(sig: Any, h: Any) -> None:
+            raise NotImplementedError
+
+        loop = asyncio.new_event_loop()
+        monkeypatch.setattr(loop, "add_signal_handler", _no_loop_signals)
+        try:
+            mechanism = oscompat.install_signal_handlers(loop, lambda: None)
+            assert mechanism == "signal"
+        finally:
+            loop.close()
+
+        # Must be a silent no-op, not an exception.
+        registered[signal.SIGINT](signal.SIGINT, None)

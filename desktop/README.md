@@ -112,7 +112,8 @@ Built by CI only (the `desktop-windows` job on `windows-latest`, issue
 `tauri.conf.json` configures:
 
 - **NSIS, per-user** (`installMode: "currentUser"`): no admin prompt,
-  installs under `%LOCALAPPDATA%\Programs`, per-user uninstaller. An MSI
+  installs under `%LOCALAPPDATA%\turing` (Tauri's NSIS template uses
+  `$LOCALAPPDATA\<productName>`), per-user uninstaller. An MSI
   is available on demand via `--bundles msi` (WiX); nothing else changes.
 - **WebView2** via the Evergreen `downloadBootstrapper` (silent), for
   images that don't ship it.

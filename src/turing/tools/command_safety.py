@@ -36,6 +36,31 @@ DENY_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"wget.*\|\s*(?:bash|sh)\b", re.IGNORECASE),  # wget … | sh
     re.compile(r"\b(?:shutdown|reboot|halt|poweroff)\b", re.IGNORECASE),  # power
     re.compile(r"\b(?:userdel|useradd|passwd)\b", re.IGNORECASE),  # user mgmt
+    # ── Windows / PowerShell spellings (issue #399) ──────────────────────
+    # The deny check runs before the platform branch in the shell tool, so
+    # these apply on every platform — intended: a PowerShell-native
+    # catastrophe pasted into a POSIX shell is still nothing we should run.
+    # PowerShell is case-insensitive, so IGNORECASE is load-bearing here.
+    re.compile(r"\b(?:Stop|Restart)-Computer\b", re.IGNORECASE),  # power
+    # Remove-Item -Recurse -Force <drive root> (flags/path in any order);
+    # a bare drive-root token is `C:\`, `C:/`, or `C:` at a token boundary.
+    re.compile(
+        r"\bRemove-Item\b(?=.*\s-Recurse\b)(?=.*\s-Force\b)(?=.*\s[A-Za-z]:[\\/]?(?:\s|$))",
+        re.IGNORECASE,
+    ),
+    # cmd.exe drive-root wipes: rd /s /q C:\  and  del /f /s /q C:\
+    re.compile(r"\brd\s+(?:/[sq]\s+){2}[A-Za-z]:[\\/]?(?:\s|$)", re.IGNORECASE),
+    re.compile(r"\bdel\s+(?:/[fsq]\s+){2,}[A-Za-z]:[\\/]?(?:\s|$)", re.IGNORECASE),
+    # disk/volume destruction (mkfs analogues)
+    re.compile(r"\b(?:Format-Volume|Clear-Disk|Initialize-Disk)\b", re.IGNORECASE),
+    # download-pipe-execute: iwr/irm … | iex (curl | sh analogue). Requires
+    # the download cmdlet *and* the pipe, so `Get-Command iex` or a file
+    # literally named `iex` never matches — same tradeoff as curl|sh above.
+    re.compile(
+        r"\b(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b"
+        r".*\|\s*(?:iex|Invoke-Expression)\b",
+        re.IGNORECASE,
+    ),
 ]
 
 
