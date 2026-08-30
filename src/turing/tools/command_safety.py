@@ -25,6 +25,14 @@ import shlex
 # is the union of the former ``shell.py`` and ``safety.py`` lists; a match is
 # a denial, not a confirmation prompt. It is a pre-filter, not a boundary —
 # the parse-based classifier below is what actually gates approvals.
+
+# A bare drive-root token at a token boundary: ``C:\``, ``C:/``, or ``C:``,
+# optionally with a trailing ``*`` / ``*.*`` wildcard after the slash
+# (``del /s /q C:\*`` wipes the drive just as surely as ``C:\``). A
+# subdirectory path (``C:\temp\*``) never matches — the token must end at
+# the root.
+_DRIVE_ROOT = r"[A-Za-z]:(?:[\\/]\*(?:\.\*)?|[\\/]?)(?=\s|$)"
+
 DENY_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"rm\s+-rf\s+/(?!\w)", re.IGNORECASE),  # rm -rf /
     re.compile(r"mkfs", re.IGNORECASE),  # format a filesystem
@@ -42,15 +50,26 @@ DENY_PATTERNS: list[re.Pattern[str]] = [
     # catastrophe pasted into a POSIX shell is still nothing we should run.
     # PowerShell is case-insensitive, so IGNORECASE is load-bearing here.
     re.compile(r"\b(?:Stop|Restart)-Computer\b", re.IGNORECASE),  # power
-    # Remove-Item -Recurse -Force <drive root> (flags/path in any order);
-    # a bare drive-root token is `C:\`, `C:/`, or `C:` at a token boundary.
+    # Remove-Item (or any of its built-in PowerShell aliases: rm, ri, rd,
+    # rmdir, del, erase) -Recurse -Force <drive root>, flags/path in any
+    # order. The -Recurse/-Force lookaheads keep POSIX `rm` out of this
+    # pattern: `rm -rf /` is caught by the first pattern above, and
+    # `rm -rf ./build` matches neither.
     re.compile(
-        r"\bRemove-Item\b(?=.*\s-Recurse\b)(?=.*\s-Force\b)(?=.*\s[A-Za-z]:[\\/]?(?:\s|$))",
+        r"\b(?:Remove-Item|rm|ri|rd|rmdir|del|erase)\b"
+        r"(?=.*\s-Recurse\b)(?=.*\s-Force\b)(?=.*\s" + _DRIVE_ROOT + r")",
         re.IGNORECASE,
     ),
-    # cmd.exe drive-root wipes: rd /s /q C:\  and  del /f /s /q C:\
-    re.compile(r"\brd\s+(?:/[sq]\s+){2}[A-Za-z]:[\\/]?(?:\s|$)", re.IGNORECASE),
-    re.compile(r"\bdel\s+(?:/[fsq]\s+){2,}[A-Za-z]:[\\/]?(?:\s|$)", re.IGNORECASE),
+    # cmd.exe drive-root wipes, flags before or after the path:
+    # rd|rmdir /s /q C:\  and  del with two of /f /s /q plus C:\ (or C:\*).
+    re.compile(
+        r"\b(?:rd|rmdir)\b(?=.*\s/s\b)(?=.*\s/q\b)(?=.*\s" + _DRIVE_ROOT + r")",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bdel\b(?=(?:.*\s/[fsq]\b){2})(?=.*\s" + _DRIVE_ROOT + r")",
+        re.IGNORECASE,
+    ),
     # disk/volume destruction (mkfs analogues)
     re.compile(r"\b(?:Format-Volume|Clear-Disk|Initialize-Disk)\b", re.IGNORECASE),
     # download-pipe-execute: iwr/irm … | iex (curl | sh analogue). Requires

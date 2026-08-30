@@ -222,6 +222,21 @@ class TestDenylist:
             "remove-item -recurse -force c:/",
             "rd /s /q C:\\",
             "del /f /s /q D:\\",
+            # PowerShell built-in aliases of Remove-Item (round 2, finding 1).
+            "rm C:\\ -Recurse -Force",
+            "ri C:\\ -Recurse -Force",
+            "rd C:\\ -Recurse -Force",
+            "rmdir C:\\ -Recurse -Force",
+            "del C:\\ -Recurse -Force",
+            "erase C:\\ -Recurse -Force",
+            # cmd wildcard forms of a drive-root wipe (finding 2).
+            "del /s /q /f C:\\*",
+            "del /s /q C:\\*.*",
+            # cmd `rmdir` synonym of `rd` (finding 3).
+            "rmdir /s /q C:\\",
+            # cmd flags after the path (finding 4).
+            "del C:\\ /s /q",
+            "rd C:\\ /s /q",
             "Format-Volume -DriveLetter C",
             "Clear-Disk -Number 0 -RemoveData",
             "Initialize-Disk -Number 0",
@@ -255,6 +270,14 @@ class TestDenylist:
             "rd /s /q .\\build",
             "del /f /s /q build\\*",
             "iwr http://example.com/readme.txt -OutFile readme.txt",
+            # Round-2 near-misses: the alias alternation must not leak into
+            # POSIX spellings or subdirectory deletes.
+            "rm -rf ./build",
+            "git rm -rf old/",
+            "rm C:\\temp\\build -Recurse -Force",
+            "del build.log",
+            "rmdir emptydir",
+            "del /s /q C:\\temp\\*",  # subdirectory wildcard, not drive root
         ],
     )
     def test_windows_near_misses_not_denied(self, command: str) -> None:
