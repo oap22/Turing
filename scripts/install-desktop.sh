@@ -51,6 +51,30 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+# Resolve the XDG data dir per the Base Directory spec: use $XDG_DATA_HOME only
+# when it is set AND absolute — an empty or relative value must be ignored
+# (same rule as config.rs::xdg_config_dir). A function so tests/scripts can
+# exercise the shipped logic (tests/scripts/test_install_desktop_helpers.sh).
+xdg_data_home() {
+    if [[ "${XDG_DATA_HOME:-}" == /* ]]; then
+        printf '%s\n' "${XDG_DATA_HOME}"
+    else
+        printf '%s\n' "${HOME}/.local/share"
+    fi
+}
+
+# pgrep/pkill -f match an UNANCHORED extended regex against the whole command
+# line, so a bare path would also hit `tail -f .../turing.AppImage.log` or an
+# editor with the path in argv (and `.` in ".AppImage" is a wildcard). Escape
+# every ERE metacharacter in the path and anchor it as the first argv word so
+# only the AppImage process itself can match.
+ere_escape() {
+    printf '%s' "$1" | sed -e 's/[][\\.^$*+?(){}|]/\\&/g'
+}
+appimage_pattern() {
+    printf '^%s( |$)\n' "$(ere_escape "$1")"
+}
+
 # --- Linux ------------------------------------------------------------------
 # Everything is per-user, XDG-shaped, and needs no sudo:
 #   AppImage -> ~/.local/bin/turing.AppImage
@@ -61,7 +85,8 @@ install_linux() {
     local appimage_dir="${REPO_ROOT}/desktop/src-tauri/target/release/bundle/appimage"
     local bin_dir="${HOME}/.local/bin"
     local dest="${bin_dir}/turing.AppImage"
-    local data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
+    local data_home
+    data_home="$(xdg_data_home)"
     local build_started_at=""
 
     # --- build (same stale-bundle guards as the macOS path below) -----------
@@ -110,14 +135,19 @@ install_linux() {
 
     # --- quit a running instance (skipped under --in-place, same rationale
     # as macOS: the in-app update flow runs this script from inside the app) --
-    if [[ "${IN_PLACE}" -eq 0 ]] && pgrep -f "${dest}" >/dev/null 2>&1; then
+    # The pattern is escaped + argv0-anchored (see appimage_pattern above) so
+    # a `tail -f` on the app's log, or an editor with the path in its argv,
+    # never gets SIGTERMed by the pkill below.
+    local dest_re
+    dest_re="$(appimage_pattern "${dest}")"
+    if [[ "${IN_PLACE}" -eq 0 ]] && pgrep -f "${dest_re}" >/dev/null 2>&1; then
         echo "==> stopping the running app"
-        pkill -TERM -f "${dest}" 2>/dev/null || true
+        pkill -TERM -f "${dest_re}" 2>/dev/null || true
         for _ in $(seq 1 20); do
-            pgrep -f "${dest}" >/dev/null 2>&1 || break
+            pgrep -f "${dest_re}" >/dev/null 2>&1 || break
             sleep 0.5
         done
-        if pgrep -f "${dest}" >/dev/null 2>&1; then
+        if pgrep -f "${dest_re}" >/dev/null 2>&1; then
             echo "install-desktop: turing is still running and would not quit." >&2
             echo "  Quit it yourself and rerun with --no-build." >&2
             exit 1

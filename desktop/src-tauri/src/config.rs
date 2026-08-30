@@ -276,6 +276,26 @@ mod tests {
         }
     }
 
+    // Regression for the actual Linux wiring, not just the pure helper: the
+    // non-macOS config_dir() must READ $XDG_CONFIG_HOME — the xdg_config_dir
+    // tests above and the suffix assertion below would all stay green if the
+    // env::var_os line were deleted. Runs in the desktop-linux CI job; not
+    // compiled on macOS, where config_dir() is pinned to ~/.config.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn config_path_honors_custom_absolute_xdg_config_home() {
+        // Env mutation is safe here: this is the only test touching
+        // XDG_CONFIG_HOME, and the concurrent config_path test asserts a
+        // suffix that holds whichever value is in effect.
+        std::env::set_var("XDG_CONFIG_HOME", "/custom/xdg");
+        let path = config_path().expect("resolvable config path");
+        std::env::remove_var("XDG_CONFIG_HOME");
+        assert_eq!(
+            path,
+            PathBuf::from("/custom/xdg/turing-desktop/config.json")
+        );
+    }
+
     #[test]
     fn token_redaction_shape() {
         let cfg = AppConfig {

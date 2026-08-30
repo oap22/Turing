@@ -236,13 +236,14 @@ dedicated hardware stay in `deploy/` alongside it.
 
 ## Config
 
-Optional overlay at `~/.config/turing-desktop/config.json` (on Windows:
-`%APPDATA%\turing-desktop\config.json`) — any key may be omitted to keep
-the default; a missing file or parse error silently falls back to defaults
-(nothing is ever written by the app). `roots`, when present, replaces the
-default root list wholesale.
+Optional overlay at `<config dir>/turing-desktop/config.json` (per-platform
+base directory below) — any key may be omitted to keep the default; a
+missing file or parse error silently falls back to defaults (nothing is ever
+written by the app). `roots`, when present, replaces the default root list
+wholesale.
 
-On macOS the path is literally `~/.config/turing-desktop/config.json`
+On Windows, the path is `%APPDATA%\turing-desktop\config.json`. On macOS it
+is literally `~/.config/turing-desktop/config.json`
 (deliberately not `~/Library/Application Support` — it predates the Linux
 port and is scripted against). On Linux the base directory honors
 `$XDG_CONFIG_HOME` (see [Linux](#linux)).
@@ -773,7 +774,8 @@ terminal pane.
   backoff quietly, and HTTP calls surface a synthetic 599.
 - **Vault pane / `vault-vim` runner errors** — the vault path
   (`~/Owen's Awesome Vault`) is machine-specific; fix it in
-  `~/.config/turing-desktop/config.json`.
+  `${XDG_CONFIG_HOME:-~/.config}/turing-desktop/config.json` (on macOS the
+  path is literally `~/.config/...` — see [Config](#config)).
 - **A `results`/`claude-sessions`/`codex-sessions` root that doesn't exist
   on this machine** — the panes that watch it just error on use; it's not
   fatal to the rest of the shell.
