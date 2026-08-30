@@ -8,7 +8,7 @@
 // first, which is the ordering the auto-follow defect depended on.
 
 import { createElement } from "react";
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { invMock, fsChangeHandlers } = vi.hoisted(() => ({
@@ -30,6 +30,9 @@ vi.mock("../desktop/tauri", () => ({
 }));
 
 import MetricsPane from "../desktop/panes/MetricsPane";
+// Not mocked: publishing here reaches the pane through the same module the
+// flywheel pane's [metrics] link publishes through.
+import { __resetPaneLinkForTests, publishMetricsTarget } from "../desktop/panes/paneLink";
 
 const LOOP = "loop-probe";
 const R0 = `${LOOP}/round-00/attempts`;
@@ -196,7 +199,26 @@ function selectedRunLabels(): string[] {
     .map((o) => o.textContent ?? "");
 }
 
+// This vitest/jsdom/Node combination doesn't provide a working `localStorage`
+// out of the box (jsdom 29 defers to the platform's Web Storage, which Node
+// gates behind `--localstorage-file`) — stub a minimal in-memory one per
+// test, the same way theme.test.ts does and for the same reason.
+function memoryStorage(): Storage {
+  const store = new Map<string, string>();
+  return {
+    getItem: (k: string) => store.get(k) ?? null,
+    setItem: (k: string, v: string) => void store.set(k, v),
+    removeItem: (k: string) => void store.delete(k),
+    clear: () => store.clear(),
+    key: (i: number) => Array.from(store.keys())[i] ?? null,
+    get length() {
+      return store.size;
+    },
+  } as Storage;
+}
+
 beforeEach(() => {
+  vi.stubGlobal("localStorage", memoryStorage());
   viewerJson = null;
   contents = new Map(TREE);
   verdictFiles.clear();
@@ -204,7 +226,6 @@ beforeEach(() => {
   fsChangeHandlers.length = 0;
   invMock.mockReset();
   installFs();
-  localStorage.clear();
 });
 
 /**
@@ -240,6 +261,8 @@ function badge(): HTMLElement {
 
 afterEach(() => {
   cleanup();
+  __resetPaneLinkForTests();
+  vi.unstubAllGlobals();
 });
 
 // jsdom has no ResizeObserver and Chart's `useSize` constructs one on mount.
@@ -924,6 +947,96 @@ describe("MetricsPane — the bytes at the end of the file", () => {
     emitFsChange(RUN_FILE);
     await waitFor(() => expect(badge()).toHaveAttribute("data-state", "stale"));
     expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 2");
+  });
+});
+
+describe("MetricsPane — flywheel round clicks vs .viewer.json (#390 item 3)", () => {
+  // What the flywheel's [metrics] link publishes for a round of `loop-probe`,
+  // and the run selection that round must resolve to: every live attempt of
+  // the round — the nested problem id included — and never the rotated
+  // `prior-1` chain, which is a superseded generation the click did not ask
+  // for. The precedence rule under test is "last action wins": the pane holds
+  // one request slot, so a click, a `.viewer.json` delivery, and a second
+  // click each replace whatever held the slot before them.
+  const ROUND_0_RUNS = [`${R0}/cuda/matmul-speedup`, `${R0}/bad-instrument`];
+
+  function clickRound(round: number) {
+    act(() => publishMetricsTarget({ loop: LOOP, round }));
+  }
+
+  /** The watcher reporting a `.viewer.json` save, exactly as the pane hears it. */
+  function emitViewerChange() {
+    for (const handler of fsChangeHandlers) handler({ root: "results", rel_path: ".viewer.json" });
+  }
+
+  it("applies a round click as the run selection", async () => {
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(runOptions().length).toBe(RUN_FILES.length + 1));
+
+    clickRound(0);
+    await waitFor(() => expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort()));
+    expect(selectedRunLabels()).not.toContain(`${R0}/cuda/matmul-speedup/prior-1`);
+    // The runs, not the series: the operator's tab choice is not the click's
+    // to change.
+    expect(selectedRunLabels()).not.toContain("auto (newest)");
+  });
+
+  it("lets a later .viewer.json change supersede the click", async () => {
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(runOptions().length).toBe(RUN_FILES.length + 1));
+    clickRound(0);
+    await waitFor(() => expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort()));
+
+    // An agent writes the file after the click. The agent channel is a later
+    // action, so it wins — the app never wrote the file, so nothing the click
+    // did can have stomped what the agent said.
+    viewerJson = JSON.stringify({ runs: [`${R1}/flat-baseline`] });
+    emitViewerChange();
+    await waitFor(() => expect(selectedRunLabels()).toEqual([`${R1}/flat-baseline`]));
+  });
+
+  it("lets a second click supersede the .viewer.json request again", async () => {
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(runOptions().length).toBe(RUN_FILES.length + 1));
+    clickRound(0);
+    await waitFor(() => expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort()));
+    viewerJson = JSON.stringify({ runs: [`${R1}/flat-baseline`] });
+    emitViewerChange();
+    await waitFor(() => expect(selectedRunLabels()).toEqual([`${R1}/flat-baseline`]));
+
+    clickRound(1);
+    await waitFor(() =>
+      expect(selectedRunLabels().sort()).toEqual(
+        [`${R1}/cuda/matmul-speedup`, `${R1}/flat-baseline`].sort(),
+      ),
+    );
+  });
+
+  it("degrades an unmappable round to keeping the current chart, not to a blank pane", async () => {
+    viewerJson = JSON.stringify({ runs: [`${R1}/flat-baseline`] });
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(selectedRunLabels()).toEqual([`${R1}/flat-baseline`]));
+
+    // A round with no metrics on this machine. Nothing matches, so nothing is
+    // honoured: the selection, the series tabs, and the chart all stay.
+    clickRound(42);
+    await act(async () => {});
+    expect(selectedRunLabels()).toEqual([`${R1}/flat-baseline`]);
+    expect(screen.getByRole("button", { name: "progress" })).toBeInTheDocument();
+    expect(screen.queryByText("no metrics yet")).toBeNull();
+  });
+
+  it("does not let a .viewer.json delivery without runs evict a click", async () => {
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(runOptions().length).toBe(RUN_FILES.length + 1));
+    clickRound(0);
+    await waitFor(() => expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort()));
+
+    // A titles-only save asks nothing about runs; the click's selection stays.
+    viewerJson = JSON.stringify({ titles: { progress: "progress toward target" } });
+    emitViewerChange();
+    await act(async () => {});
+    expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort());
   });
 });
 

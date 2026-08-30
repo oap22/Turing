@@ -9,6 +9,9 @@
 // must not be built from a display label). Watches `.viewer.json` too, so a
 // coding agent can point the pane at a specific series/run set — see
 // desktop/README.md's "Agent-driven viewing" section for the file format.
+// The flywheel pane can point it too, via an in-app click event rather than
+// the file (paneLink.ts) — the two share one request slot, so whichever
+// spoke last wins, and this pane never writes `.viewer.json` back.
 //
 // **The contract this pane keeps.** A run's chart is built only from bytes of
 // ONE file generation, applied in order: `fs_tail` reports the chunk's start
@@ -43,7 +46,6 @@ import {
   chainDigestOfLastLine,
   etaOf,
   isChartRunFile,
-  matchesViewerRuns,
   parseMetricsText,
   parseVerdictFile,
   parseViewerFile,
@@ -56,6 +58,7 @@ import {
   type RunVerdict,
   type ViewerFile,
 } from "./metrics";
+import { resolveRunRequest, subscribeMetricsTarget, type RunRequest } from "./paneLink";
 
 interface Entry {
   rel_path: string;
@@ -502,24 +505,45 @@ export default function MetricsPane() {
   // half of why `runs` looked inert. Holding the request and honouring it when
   // what it names shows up is what makes the file actually control the pane.
   const [viewerRequest, setViewerRequest] = useState<ViewerFile | null>(null);
+  // The single pending run request — from `.viewer.json` OR from a flywheel
+  // round click (see paneLink.ts). ONE slot on purpose: whichever source set
+  // it last is the one that gets honoured, so "last action wins" is the shape
+  // of the state rather than a comparison of timestamps. An unhonoured older
+  // request that gets replaced is thereby superseded and can never fire late.
+  const [runRequest, setRunRequest] = useState<RunRequest | null>(null);
   // Which request each half has already been honoured for, by object identity
-  // (`parseViewerFile` returns a fresh object per read). "Once per delivery"
-  // rather than "whenever the deps change": a series re-applied every time a
-  // run discovers a new key would silently undo the operator's own tab click.
-  const runsHonoredFor = useRef<ViewerFile | null>(null);
+  // (every delivery — viewer read or click — is a fresh object). "Once per
+  // delivery" rather than "whenever the deps change": a selection re-applied
+  // every time a run discovers a new key would silently undo the operator's
+  // own click in the listbox.
+  const runsHonoredFor = useRef<RunRequest | null>(null);
   const seriesHonoredFor = useRef<ViewerFile | null>(null);
 
   useEffect(() => {
-    const runs = viewerRequest?.runs;
-    if (!runs || runs.length === 0 || runsHonoredFor.current === viewerRequest) return;
-    const matched = runFiles.filter((f) => matchesViewerRuns(f.rel_path, runs)).map((f) => f.rel_path);
-    // A total miss is "the runs this file names aren't on this machine (yet)",
-    // not "show nothing" — leave the operator's current selection alone and
-    // stay unhonoured so a later run list can still satisfy it.
+    if (!runRequest || runsHonoredFor.current === runRequest) return;
+    const matched = resolveRunRequest(
+      runRequest,
+      runFiles.map((f) => f.rel_path),
+    );
+    // A total miss is "nothing on this machine satisfies it (yet)" — a round
+    // clicked before its first attempt has written a line, or a `.viewer.json`
+    // naming runs that are not here. Not "show nothing": leave the operator's
+    // current selection alone and stay unhonoured, so a later run list can
+    // still satisfy it (and a newer request can still replace it).
     if (matched.length === 0) return;
-    runsHonoredFor.current = viewerRequest;
+    runsHonoredFor.current = runRequest;
     setSelected(matched);
-  }, [viewerRequest, runFiles]);
+  }, [runRequest, runFiles]);
+
+  // Flywheel → metrics: a `[metrics]` click in an expanded round lands here as
+  // the pane's next run request, replacing whatever `.viewer.json` last asked
+  // for — and being replaced in turn by the file's next change. Only mounted
+  // panes hear it; the subscription lives exactly as long as the pane.
+  useEffect(() => {
+    return subscribeMetricsTarget((target) => {
+      setRunRequest({ source: "flywheel", target });
+    });
+  }, []);
 
   useEffect(() => {
     const series = viewerRequest?.series;
@@ -538,6 +562,13 @@ export default function MetricsPane() {
       // Titles need nothing else to exist, so they apply immediately.
       setTitles(parsed.titles ?? {});
       setViewerRequest(parsed);
+      // The runs half competes with flywheel clicks for the one request slot
+      // — this delivery supersedes any click before it, and the next click
+      // supersedes this delivery. A file without a usable `runs` key asks
+      // nothing about runs and must not evict a click that did.
+      if (parsed.runs && parsed.runs.length > 0) {
+        setRunRequest({ source: "viewer", runs: parsed.runs });
+      }
     } catch {
       // No viewer file (or unreadable) — nothing to apply, not an error.
     }

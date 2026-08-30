@@ -6,7 +6,10 @@
 // stays the default because the pane's preset is a third of a workspace
 // column; the `wheel`, which makes the loop metaphor real and reads
 // accumulating rounds as momentum; and `raw`. Clicking a round in either view
-// expands the full `round-NN/round.json` artifact underneath it.
+// expands the full `round-NN/round.json` artifact underneath it, and the
+// expanded detail carries a `[metrics]` link that points the metrics pane at
+// that round's runs (paneLink.ts — an in-app event, never `.viewer.json`,
+// which is the agent's channel and the app must not write).
 
 import {
   Fragment,
@@ -30,6 +33,7 @@ import {
   type RoundSummary,
 } from "./roundRecord";
 import { wheelGeometry } from "./wheel";
+import { publishMetricsTarget } from "./paneLink";
 
 interface Entry {
   rel_path: string;
@@ -210,6 +214,24 @@ function ProblemRow({
   );
 }
 
+/** The `[metrics]` cross-pane link: point the metrics pane at this round's
+ * runs (see paneLink.ts for the mapping and the last-action-wins rule). An
+ * explicit affordance rather than the row click doing double duty — the row
+ * click's job is expand-in-place, and silently re-aiming another pane on
+ * every expansion would make *reading* a round rearrange the workspace. */
+function MetricsLink({ onShowMetrics }: { onShowMetrics: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onShowMetrics}
+      title="show this round's runs in the metrics pane"
+      className="text-term-dim underline-offset-2 hover:text-term-fg hover:underline"
+    >
+      [metrics]
+    </button>
+  );
+}
+
 /** The full round artifact, expanded under the round the user clicked. */
 function RoundDetail({
   record,
@@ -217,12 +239,14 @@ function RoundDetail({
   summary,
   reason,
   onOpen,
+  onShowMetrics,
 }: {
   record: RoundRecord | null;
   parent: RoundRecord | null;
   summary: RoundSummary | null;
   reason: "loading" | "ok" | "missing" | "unparseable";
   onOpen: () => void;
+  onShowMetrics: () => void;
 }) {
   if (!record) {
     // "Not written yet" and "there but unreadable" are different situations
@@ -235,8 +259,12 @@ function RoundDetail({
           ? "round.json is present but could not be read"
           : "no round.json for this round yet";
     return (
-      <div className="border-l border-term-edge py-1 pl-3 text-[11px] text-term-dim">
-        {message}
+      <div className="flex flex-wrap gap-x-3 border-l border-term-edge py-1 pl-3 text-[11px] text-term-dim">
+        <span>{message}</span>
+        {/* The metrics link needs only the loop and index, and a round whose
+            round.json has not landed yet is exactly the one being watched
+            live — hiding the link here would hide it when it is most wanted. */}
+        <MetricsLink onShowMetrics={onShowMetrics} />
       </div>
     );
   }
@@ -429,13 +457,16 @@ function RoundDetail({
 
       {record.verdict && <div className="text-term-dim">{record.verdict}</div>}
 
-      <button
-        type="button"
-        onClick={onOpen}
-        className="text-term-dim underline-offset-2 hover:text-term-fg hover:underline"
-      >
-        [open round dir]
-      </button>
+      <div className="flex flex-wrap gap-x-3">
+        <button
+          type="button"
+          onClick={onOpen}
+          className="text-term-dim underline-offset-2 hover:text-term-fg hover:underline"
+        >
+          [open round dir]
+        </button>
+        <MetricsLink onShowMetrics={onShowMetrics} />
+      </div>
     </div>
   );
 }
@@ -681,6 +712,15 @@ export default function FlywheelPane() {
     setOpenRound((prev) => (prev === index ? null : index));
   }
 
+  // The `[metrics]` link in the expanded detail: hand the round to whatever
+  // metrics pane is mounted (paneLink.ts). Fired from the affordance, never
+  // from the expand click itself — expanding a round to read it must not
+  // re-aim another pane as a side effect.
+  function showMetrics(index: number) {
+    if (!selected) return;
+    publishMetricsTarget({ loop: selected, round: index });
+  }
+
   // Only hand the detail view a record that is stamped with the loop and
   // round it is being rendered under. Anything else is a leftover from a
   // previous selection whose read has not landed yet, and showing it would
@@ -820,7 +860,11 @@ export default function FlywheelPane() {
             </div>
             {openRound !== null && (
               <div className="max-h-[50%] shrink-0 overflow-auto border-t border-term-edge pt-1">
-                <RoundDetail {...detailFor(openRound)} onOpen={openRoundDir} />
+                <RoundDetail
+                  {...detailFor(openRound)}
+                  onOpen={openRoundDir}
+                  onShowMetrics={() => showMetrics(openRound)}
+                />
               </div>
             )}
           </div>
@@ -853,6 +897,7 @@ export default function FlywheelPane() {
                     <RoundDetail
                       {...detailFor(r.index)}
                       onOpen={openRoundDir}
+                      onShowMetrics={() => showMetrics(r.index)}
                     />
                   )}
                 </li>

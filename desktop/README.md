@@ -465,6 +465,34 @@ ignored silently — the pane just keeps showing whatever it already had. A
 half-finished hand edit therefore degrades to "show less", never to a blank
 pane.
 
+### The flywheel's `[metrics]` link, and how it coexists with `.viewer.json`
+
+The flywheel pane can point the metrics pane too. Clicking a round expands
+its detail in place, exactly as before; the expanded detail carries a
+`[metrics]` link (next to `[open round dir]`, and also on a round whose
+`round.json` hasn't landed yet — that's the round most worth watching live).
+Clicking it selects **every live run of that round** in the metrics pane:
+each `<loop>/round-NN/attempts/<problem-id>/metrics.jsonl` on disk, nested
+problem ids included, excluding rotated `prior-N/` chains — the same
+exclusion the loop makes when it emits `.viewer.json`, because a superseded
+generation is not a run of the round. The active series tab is left alone:
+the link chooses *which runs*, and your series choice keeps meaning what it
+meant.
+
+If the round has no metrics on this machine (yet), nothing changes — the
+metrics pane keeps its current chart, and the request is honoured later if
+that round's first `metrics.jsonl` appears. No blank panes either way.
+
+**Coexistence rule: last action wins, and the app never writes
+`.viewer.json`.** The file is the agent → app direction only; if the app
+wrote it to express a click it would stomp what an agent said and feed its
+own watcher. So the click travels as an in-app event, and the metrics pane
+holds exactly one pending request, whichever source it came from: a
+`[metrics]` click replaces what `.viewer.json` last asked for, the file's
+next change replaces the click, and a second click replaces that again. An
+agent that never competes with a click sees exactly the behaviour described
+above, unchanged.
+
 ## Agent-driven pane control
 
 The same idea one level up: `.layout.json`, also in the results root, says

@@ -49,6 +49,14 @@ vi.mock("../desktop/tauri", () => ({
   subscribe: () => ({ unsubscribe: () => {}, ready: Promise.resolve() }),
 }));
 
+// Not mocked: the pane publishes through the real module, and these tests
+// listen on the same one — which is exactly how MetricsPane hears it.
+import {
+  __resetPaneLinkForTests,
+  subscribeMetricsTarget,
+  type RoundTarget,
+} from "../desktop/panes/paneLink";
+
 const EVAL_HASH = "6b7ba0521382b111502a03724c87df78d0c2598cd03c1663556d58f9790b4ebf";
 
 /** Round 1 of the real run: it lost an attempt but kept its eval set. */
@@ -230,6 +238,7 @@ async function openRound(index: number) {
 afterEach(() => {
   cleanup();
   files.clear();
+  __resetPaneLinkForTests();
 });
 
 describe("FlywheelPane round detail — comparability", () => {
@@ -319,6 +328,42 @@ describe("FlywheelPane round detail — per-problem rows", () => {
     expect(
       screen.getByText("↳ speedup/practice · cuda/matmul-speedup"),
     ).toBeInTheDocument();
+  });
+
+  it("publishes the loop and round when [metrics] is clicked, and only then (#390 item 3)", async () => {
+    const seen: RoundTarget[] = [];
+    subscribeMetricsTarget((t) => seen.push(t));
+    seed();
+    await openRound(1);
+    // Expanding the round is a read, not a cross-pane gesture: nothing has
+    // been published yet. Re-aiming the metrics pane takes the explicit link.
+    expect(seen).toEqual([]);
+
+    fireEvent.click(screen.getByRole("button", { name: "[metrics]" }));
+    expect(seen).toEqual([{ loop: "loop-probe", round: 1 }]);
+    // The detail is still expanded — the link must not collapse what the
+    // operator is reading.
+    expect(screen.getByText("NOT comparable to parent")).toBeInTheDocument();
+  });
+
+  it("offers [metrics] even before round.json lands — the live round is the one being watched", async () => {
+    const seen: RoundTarget[] = [];
+    subscribeMetricsTarget((t) => seen.push(t));
+    seed(["loop-probe/round-01/round.json"]);
+    const { default: FlywheelPane } = await import("../desktop/panes/FlywheelPane");
+    render(<FlywheelPane />);
+    const row = await waitFor(() => {
+      const found = screen
+        .getAllByRole("button")
+        .find((b) => b.textContent?.startsWith("01"));
+      if (!found) throw new Error("round 01 row not rendered");
+      return found;
+    });
+    fireEvent.click(row);
+    await screen.findByText("no round.json for this round yet");
+
+    fireEvent.click(screen.getByRole("button", { name: "[metrics]" }));
+    expect(seen).toEqual([{ loop: "loop-probe", round: 1 }]);
   });
 
   it("marks an unscored problem instead of showing a measured-looking zero", async () => {
