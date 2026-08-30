@@ -1148,6 +1148,56 @@ describe("MetricsPane — flywheel round clicks vs .viewer.json (#390 item 3)", 
   });
 });
 
+describe("MetricsPane — concurrent run-list walks", () => {
+  it("discards a stale walk that resolves after a newer one, instead of regressing the list", async () => {
+    render(createElement(MetricsPane));
+    await waitFor(() => expect(runOptions().length).toBe(RUN_FILES.length + 1));
+
+    // Hold the NEXT fs_list open, snapshotting its result at call time — a
+    // slow walk answers with what the directory held when it started, not
+    // with what it holds when the response finally lands.
+    const base = invMock.getMockImplementation()!;
+    let releaseStale: (() => void) | null = null;
+    let heldOne = false;
+    invMock.mockImplementation(async (cmd: string, args: Record<string, unknown> = {}) => {
+      if (cmd === "fs_list" && !heldOne) {
+        heldOne = true;
+        const snapshot = await base(cmd, args);
+        await new Promise<void>((r) => (releaseStale = r));
+        return snapshot;
+      }
+      return base(cmd, args);
+    });
+
+    // Walk 1: run file X lands; the watcher re-walks; the response hangs
+    // holding a snapshot that contains X but not Y.
+    const runX = `${LOOP}/round-02/attempts/problem-x/metrics.jsonl`;
+    contents.set(runX, chain(1, 0.05, 1.2, "r2x"));
+    emitFsChange(runX);
+    await waitFor(() => expect(releaseStale).not.toBeNull());
+
+    // Walk 2: run file Y lands while walk 1 is still in flight; this walk
+    // resolves immediately and the list now names both new files.
+    const runY = `${LOOP}/round-02/attempts/problem-y/metrics.jsonl`;
+    contents.set(runY, chain(1, 0.05, 1.3, "r2y"));
+    emitFsChange(runY);
+    await waitFor(() =>
+      expect(runOptions().map((o) => o.textContent)).toContain(
+        `${LOOP}/round-02/attempts/problem-y`,
+      ),
+    );
+
+    // Walk 1 resolves LAST, carrying its stale snapshot. Applying it would
+    // transiently drop the newest run from the list (and from auto-follow's
+    // and a pending [metrics] click's view of the world).
+    await act(async () => releaseStale!());
+    await act(async () => {});
+    const labels = runOptions().map((o) => o.textContent);
+    expect(labels).toContain(`${LOOP}/round-02/attempts/problem-y`);
+    expect(labels).toContain(`${LOOP}/round-02/attempts/problem-x`);
+  });
+});
+
 describe("MetricsPane — a missed run event must not pin the badge amber", () => {
   it("catches up on the run when the loop's final verdict lands", async () => {
     viewerJson = JSON.stringify({ runs: [RUN] });

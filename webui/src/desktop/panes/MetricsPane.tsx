@@ -263,6 +263,13 @@ export default function MetricsPane() {
   // Debounce handle for watcher-triggered run-list refreshes: one burst of
   // create events (a round starting several attempts at once) is one walk.
   const runListTimer = useRef<number | null>(null);
+  // Monotonic walk sequence (the reloadSeq pattern FlywheelPane uses): two
+  // walks can be in flight at once — the mount walk plus a watcher-triggered
+  // one, or two watcher bursts more than the debounce apart — and `fs_list`
+  // gives no ordering guarantee. A walk answers with what the directory held
+  // when it STARTED, so the earlier walk's snapshot resolving last would
+  // overwrite the newer list and transiently drop the newest run file.
+  const runListSeq = useRef(0);
 
   /** Walk the results root and replace the run list with what is there NOW.
    * Called at mount and again whenever the watcher reports a run file this
@@ -272,6 +279,7 @@ export default function MetricsPane() {
    * enter `runFiles`, never be auto-followed, and never satisfy a pending
    * request. */
   async function refreshRunList() {
+    const seq = ++runListSeq.current;
     const entries = await inv<Entry[]>("fs_list", {
       root: RESULTS_ROOT,
       rel: "",
@@ -281,6 +289,10 @@ export default function MetricsPane() {
       // and discarded, so dropping the extension just stops walking them.
       exts: ["jsonl"],
     });
+    // A newer walk started while this one was in flight: its snapshot, not
+    // this one, describes the directory now. Applying this one anyway would
+    // regress the list to a stale snapshot.
+    if (runListSeq.current !== seq) return;
     // `fs_list` is newest-mtime-first and `runFiles[0]` is what auto-follow
     // charts, so this filter is also what guarantees auto-follow lands on a
     // file that can have points at all — a rotated `prior-N/metrics.jsonl`

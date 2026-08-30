@@ -22,7 +22,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 const files = new Map<string, string>();
 let listing: Array<{
@@ -56,6 +56,12 @@ import {
   subscribeMetricsTarget,
   type RoundTarget,
 } from "../desktop/panes/paneLink";
+
+// jsdom has no layout engine and so no scrollIntoView; the Select popup's
+// keep-the-cursor-visible effect calls it on open (same stub as Home.test).
+beforeAll(() => {
+  Element.prototype.scrollIntoView = vi.fn();
+});
 
 const EVAL_HASH = "6b7ba0521382b111502a03724c87df78d0c2598cd03c1663556d58f9790b4ebf";
 
@@ -396,6 +402,50 @@ describe("FlywheelPane round detail — per-problem rows", () => {
     fireEvent.click(screen.getByRole("button", { name: "[metrics]" }));
     expect(screen.getByTestId("metrics-link-hint")).toHaveTextContent("→ metrics");
     unsub();
+  });
+
+  it("does not render one loop's hint beside another loop's round of the same index", async () => {
+    // Two loops, each with a round 1. The hint answers a click on loop-probe;
+    // switching loops inside its 2.5 s window and expanding the OTHER loop's
+    // round 1 must not show it there — it would read as feedback about a
+    // click on loop-second that never happened.
+    seed();
+    files.set("loop-second/trajectory.json", JSON.stringify(TRAJECTORY));
+    listing = [
+      {
+        rel_path: "loop-probe/trajectory.json",
+        is_dir: false,
+        size: 1,
+        mtime_ms: 2,
+      },
+      {
+        rel_path: "loop-second/trajectory.json",
+        is_dir: false,
+        size: 1,
+        mtime_ms: 1,
+      },
+    ];
+    await openRound(1); // newest loop, loop-probe, is selected
+    fireEvent.click(screen.getByRole("button", { name: "[metrics]" }));
+    expect(screen.getByTestId("metrics-link-hint")).toBeInTheDocument();
+
+    // Switch the loop dropdown to loop-second (within the hint window).
+    fireEvent.click(screen.getByRole("button", { name: /^loop: / }));
+    fireEvent.click(screen.getByRole("option", { name: "loop-second" }));
+
+    // Expand loop-second's round 1. Its detail (loop-second has no round
+    // artifacts in this tree, so the "no round.json" branch) carries its own
+    // [metrics] link — with no hint, because nobody clicked THIS one.
+    const row = await waitFor(() => {
+      const found = screen
+        .getAllByRole("button")
+        .find((b) => b.textContent?.startsWith("01"));
+      if (!found) throw new Error("round 01 row not rendered");
+      return found;
+    });
+    fireEvent.click(row);
+    await screen.findByText("no round.json for this round yet");
+    expect(screen.queryByTestId("metrics-link-hint")).toBeNull();
   });
 
   it("marks an unscored problem instead of showing a measured-looking zero", async () => {

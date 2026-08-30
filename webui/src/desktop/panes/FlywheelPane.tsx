@@ -741,10 +741,12 @@ export default function FlywheelPane() {
   }
 
   // The outcome of the last [metrics] click, shown transiently beside the
-  // link it answers (keyed by round, so it cannot render beside some other
-  // round's link). Cleared on a timer: it is an acknowledgment, not a status.
+  // link it answers (keyed by loop AND round: round index alone is shared
+  // across loops, and switching the dropdown inside the hint window would
+  // render one loop's acknowledgment beside another loop's link). Cleared on
+  // a timer: it is an acknowledgment, not a status.
   const [metricsHint, setMetricsHint] = useState<
-    ({ round: number } & MetricsHint) | null
+    ({ loop: string; round: number } & MetricsHint) | null
   >(null);
   const metricsHintTimer = useRef<number | null>(null);
   useEffect(
@@ -765,7 +767,7 @@ export default function FlywheelPane() {
   function showMetrics(index: number) {
     if (!selected) return;
     const heard = publishMetricsTarget({ loop: selected, round: index });
-    setMetricsHint({ round: index, delivered: heard > 0 });
+    setMetricsHint({ loop: selected, round: index, delivered: heard > 0 });
     if (metricsHintTimer.current !== null) {
       window.clearTimeout(metricsHintTimer.current);
     }
@@ -776,9 +778,14 @@ export default function FlywheelPane() {
   }
 
   /** The hint for THIS round's link, or nothing — a hint must never render
-   * beside a link it does not answer. */
+   * beside a link it does not answer, another loop's same-numbered round
+   * included. */
   function metricsHintFor(index: number): MetricsHint | null {
-    return metricsHint && metricsHint.round === index ? metricsHint : null;
+    return metricsHint &&
+      metricsHint.loop === selected &&
+      metricsHint.round === index
+      ? metricsHint
+      : null;
   }
 
   // Only hand the detail view a record that is stamped with the loop and

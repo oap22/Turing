@@ -478,9 +478,10 @@ directories — at least as strict as the exclusions the loop makes when it
 emits `.viewer.json` (the app additionally excludes *any* dot-named final
 directory, not just the loop's `.rotating` staging name, and rejects a run
 file sitting directly under `attempts/` with no problem-id segment), because
-a superseded generation is not a run of the round. The active series tab is
-left alone: the link chooses *which runs*, and your series choice keeps
-meaning what it meant.
+a superseded generation is not a run of the round. The selection is taken
+when the click is honoured — attempts that appear later are picked up by
+re-clicking the round. The active series tab is left alone: the link chooses
+*which runs*, and your series choice keeps meaning what it meant.
 
 The click acknowledges itself right beside the link, briefly: `→ metrics`
 when a mounted metrics pane received it, `no metrics pane` when none was
