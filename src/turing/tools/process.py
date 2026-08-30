@@ -10,6 +10,7 @@ from typing import Any
 import psutil
 import structlog
 
+from turing import oscompat
 from turing.tools.base import RiskLevel, Tool, ToolResult
 
 logger = structlog.get_logger("turing.tools.process")
@@ -183,11 +184,21 @@ class ProcessTool(Tool):
             return ToolResult(success=False, output="", error="No PID provided")
 
         signal_name = kwargs.get("signal_name", "SIGTERM")
-        sig = getattr(signal, signal_name, signal.SIGTERM)
 
         proc = psutil.Process(int(pid))
         proc_name = proc.name()
-        proc.send_signal(sig)
+        if oscompat.is_windows():
+            # POSIX signal numbers do not exist on Windows (psutil's
+            # send_signal only accepts SIGTERM / CTRL_*_EVENT there). Map to
+            # the two things Windows can actually do: forceful kill
+            # (TerminateProcess) for SIGKILL, graceful terminate otherwise.
+            if signal_name == "SIGKILL":
+                proc.kill()
+            else:
+                proc.terminate()
+        else:
+            sig = getattr(signal, signal_name, signal.SIGTERM)
+            proc.send_signal(sig)
 
         logger.warning("process_killed", pid=pid, signal=signal_name, name=proc_name)
         return ToolResult(
@@ -199,6 +210,21 @@ class ProcessTool(Tool):
         """Manage a systemd service (start, stop, restart, status)."""
         service_name = kwargs.get("service_name", "")
         service_action = kwargs.get("service_action", "")
+
+        if oscompat.is_windows():
+            # systemd does not exist on Windows and Turing deliberately ships
+            # no Windows Service wrapper (issue #399) — degrade with a clear
+            # pointer instead of a confusing "systemctl not found".
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    "Service management via systemctl is not available on "
+                    "Windows. Use Task Scheduler (schtasks.exe) or the "
+                    "Services console (services.msc) manually — see "
+                    "docs/operator/windows.md."
+                ),
+            )
 
         if not service_name:
             return ToolResult(success=False, output="", error="No service name provided")

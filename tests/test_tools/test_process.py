@@ -10,6 +10,7 @@ host's service manager.
 from __future__ import annotations
 
 import signal
+import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import psutil
@@ -358,6 +359,55 @@ class TestManageService:
                     action="manage_service", service_name=name, service_action="status"
                 )
             assert result.success is True
+
+
+# ---------------------------------------------------------------------------
+# Windows degradation (issue #399)
+# ---------------------------------------------------------------------------
+
+
+class TestWindowsBehavior:
+    """Windows branches, exercised via a monkeypatched platform."""
+
+    async def test_manage_service_degrades_with_clear_error(
+        self, process_tool: ProcessTool, monkeypatch: pytest.MonkeyPatch
+    ):
+        """systemctl does not exist on Windows: no subprocess is spawned and
+        the error points at Task Scheduler instead."""
+        monkeypatch.setattr(sys, "platform", "win32")
+        with _patch_subprocess(0) as p:
+            result = await process_tool.execute(
+                action="manage_service", service_name="nginx", service_action="start"
+            )
+        assert result.success is False
+        assert "not available on Windows" in result.error
+        assert "Task Scheduler" in result.error
+        p.assert_not_awaited()
+
+    async def test_kill_process_sigterm_maps_to_terminate(
+        self, process_tool: ProcessTool, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(sys, "platform", "win32")
+        proc = _fake_process(pid=99, name="victim")
+        with patch("turing.tools.process.psutil.Process", return_value=proc):
+            result = await process_tool.execute(action="kill_process", pid=99)
+        assert result.success is True
+        proc.terminate.assert_called_once_with()
+        proc.send_signal.assert_not_called()
+        proc.kill.assert_not_called()
+
+    async def test_kill_process_sigkill_maps_to_kill(
+        self, process_tool: ProcessTool, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(sys, "platform", "win32")
+        proc = _fake_process(pid=99)
+        with patch("turing.tools.process.psutil.Process", return_value=proc):
+            result = await process_tool.execute(
+                action="kill_process", pid=99, signal_name="SIGKILL"
+            )
+        assert result.success is True
+        proc.kill.assert_called_once_with()
+        proc.send_signal.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

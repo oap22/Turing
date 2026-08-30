@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 import httpx
 import structlog
 
+from turing import oscompat
 from turing.tools.base import RiskLevel, Tool, ToolResult
 
 logger = structlog.get_logger("turing.tools.network")
@@ -185,15 +186,13 @@ class NetworkTool(Tool):
             return ToolResult(success=False, output="", error=f"Invalid host '{host}'")
 
         try:
+            # Flag spelling differs per platform (`-c/-W` POSIX, `-n/-w` ms
+            # on Windows); creationflags is 0 (a no-op) off Windows.
             process = await asyncio.create_subprocess_exec(
-                "ping",
-                "-c",
-                str(count),
-                "-W",
-                str(DEFAULT_TIMEOUT),
-                safe_host,
+                *oscompat.ping_argv(safe_host, count, DEFAULT_TIMEOUT),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                creationflags=oscompat.subprocess_creation_flags(),
             )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 process.communicate(),

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+import sys
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -236,3 +237,68 @@ class TestToolProperties:
         assert params["type"] == "object"
         assert "command" in params["properties"]
         assert "command" in params["required"]
+
+
+class TestWindowsExecution:
+    """Windows branch (issue #399), exercised via a monkeypatched platform."""
+
+    async def test_runs_under_powershell_with_no_window(
+        self, shell_tool: ShellTool, monkeypatch: pytest.MonkeyPatch
+    ):
+        """On Windows the command runs via PowerShell exec (not cmd.exe via
+        create_subprocess_shell) with CREATE_NO_WINDOW set."""
+        monkeypatch.setattr(sys, "platform", "win32")
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"ok", b""))
+        with (
+            patch(
+                "turing.tools.shell.asyncio.create_subprocess_exec",
+                new=AsyncMock(return_value=proc),
+            ) as exec_mock,
+            patch("turing.tools.shell.asyncio.create_subprocess_shell") as shell_mock,
+        ):
+            result = await shell_tool.execute(command="Get-ChildItem")
+        assert result.success is True
+        shell_mock.assert_not_called()
+        argv = exec_mock.await_args.args
+        assert argv[0] == "powershell.exe"
+        assert argv[-2:] == ("-Command", "Get-ChildItem")
+        assert exec_mock.await_args.kwargs["creationflags"] == 0x08000000
+
+    async def test_posix_still_uses_subprocess_shell(
+        self, shell_tool: ShellTool, monkeypatch: pytest.MonkeyPatch
+    ):
+        """POSIX behavior is unchanged: create_subprocess_shell, no exec."""
+        monkeypatch.setattr(sys, "platform", "linux")
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"ok", b""))
+        with (
+            patch(
+                "turing.tools.shell.asyncio.create_subprocess_shell",
+                new=AsyncMock(return_value=proc),
+            ) as shell_mock,
+            patch("turing.tools.shell.asyncio.create_subprocess_exec") as exec_mock,
+        ):
+            result = await shell_tool.execute(command="echo ok")
+        assert result.success is True
+        exec_mock.assert_not_called()
+        assert shell_mock.await_args.args[0] == "echo ok"
+
+    async def test_sandbox_fails_closed_with_windows_message(
+        self, sandboxed_shell_tool: ShellTool, monkeypatch: pytest.MonkeyPatch
+    ):
+        """sandbox_enabled on Windows fails closed with an honest message
+        (there is no bubblewrap to install)."""
+        monkeypatch.setattr(sys, "platform", "win32")
+        result = await sandboxed_shell_tool.execute(command="echo test")
+        assert result.success is False
+        assert "not available on Windows" in result.error
+        assert "TURING_SANDBOX_ENABLED" in result.error
+
+    async def test_description_names_powershell_on_windows(
+        self, shell_tool: ShellTool, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert "PowerShell" in shell_tool.description

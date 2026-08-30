@@ -80,6 +80,17 @@ pub fn default_config() -> AppConfig {
     }
 }
 
+// On Windows the overlay lives under %APPDATA% (FOLDERID_RoamingAppData),
+// the per-user roaming-config convention — `dirs::config_dir()` resolves it.
+#[cfg(windows)]
+fn config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|c| c.join("turing-desktop").join("config.json"))
+}
+
+// Everywhere else this stays *literally* ~/.config/turing-desktop —
+// deliberately not `dirs::config_dir()`, which on macOS would move it to
+// ~/Library/Application Support and silently orphan existing configs.
+#[cfg(not(windows))]
 fn config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".config/turing-desktop/config.json"))
 }
@@ -170,6 +181,29 @@ mod tests {
         assert_eq!(cfg.gateway_token, "secret");
         assert_eq!(cfg.roots.len(), 1);
         assert_eq!(cfg.roots[0].id, "a");
+    }
+
+    // The config overlay's location is a per-platform contract: literally
+    // ~/.config/turing-desktop on POSIX (macOS included — NOT Application
+    // Support), %APPDATA%\turing-desktop on Windows. Both cfg branches are
+    // asserted so whichever platform runs the tests checks its own contract.
+    #[test]
+    fn config_path_follows_platform_convention() {
+        let path = config_path().expect("config path resolves");
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        assert!(normalized.ends_with("turing-desktop/config.json"));
+        #[cfg(not(windows))]
+        {
+            let home = dirs::home_dir().expect("home dir");
+            assert_eq!(path, home.join(".config/turing-desktop/config.json"));
+        }
+        #[cfg(windows)]
+        {
+            let cfg_dir = dirs::config_dir().expect("config dir");
+            assert_eq!(path, cfg_dir.join("turing-desktop").join("config.json"));
+            // dirs::config_dir() on Windows is Roaming AppData, not ~/.config.
+            assert!(!normalized.contains("/.config/"));
+        }
     }
 
     #[test]
