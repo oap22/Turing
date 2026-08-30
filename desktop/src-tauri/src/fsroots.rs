@@ -496,11 +496,17 @@ mod tests {
         // offset == len: caught up, not restarted; nothing to read.
         let at_end = tail_impl(&path, 4).unwrap();
         assert!(!at_end.restarted);
-        assert_eq!((at_end.start, at_end.offset, at_end.data.as_str()), (4, 4, ""));
+        assert_eq!(
+            (at_end.start, at_end.offset, at_end.data.as_str()),
+            (4, 4, "")
+        );
         // offset == len + 1: one past the end is a shorter file — restart.
         let past = tail_impl(&path, 5).unwrap();
         assert!(past.restarted);
-        assert_eq!((past.start, past.offset, past.data.as_str()), (0, 4, "abc\n"));
+        assert_eq!(
+            (past.start, past.offset, past.data.as_str()),
+            (0, 4, "abc\n")
+        );
     }
 
     #[test]

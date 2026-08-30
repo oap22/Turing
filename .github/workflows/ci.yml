@@ -186,10 +186,11 @@ jobs:
       - name: Detect desktop changes
         id: diff
         shell: bash
+        working-directory: .
         run: |
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "desktop=true" >> "$GITHUB_OUTPUT"
-          elif git diff --name-only "${{ github.event.pull_request.base.sha }}...HEAD" | grep -qE '^(desktop/|webui/)'; then
+          elif git diff --name-only "${{ github.event.pull_request.base.sha }}...HEAD" | grep -qE '^(desktop/|webui/|\.github/workflows/ci\.yml)'; then
             echo "desktop=true" >> "$GITHUB_OUTPUT"
           else
             echo "desktop=false" >> "$GITHUB_OUTPUT"
@@ -233,4 +234,103 @@ jobs:
         with:
           name: turing-desktop-windows-nsis
           path: desktop/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  desktop-linux:
+    # The Tauri desktop shell (desktop/), Linux packaging lane (issue #400):
+    # fmt, clippy-as-errors, unit tests, then real Linux bundles
+    # (AppImage/deb/rpm). `bundle.targets` in tauri.conf.json stays the macOS
+    # pair ["app", "dmg"]; Linux bundles are requested per-invocation via
+    # `--bundles appimage,deb,rpm` so a plain macOS build never attempts them.
+    # On PRs the heavy steps run only when desktop/, webui/ (frontendDist), or
+    # this workflow changed (Actions-minutes budget, issue #356); the job
+    # itself still reports success, so it stays safe as a required check.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop/src-tauri
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect desktop changes
+        id: diff
+        working-directory: .
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "desktop=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "${{ github.event.pull_request.base.sha }}...HEAD" | grep -qE '^(desktop/|webui/|\.github/workflows/ci\.yml)'; then
+            echo "desktop=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "desktop=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: System dependencies (Tauri v2 Linux prerequisites)
+        if: steps.diff.outputs.desktop == 'true'
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf rpm
+
+      - name: Set up Node
+        if: steps.diff.outputs.desktop == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            webui/package-lock.json
+            desktop/package-lock.json
+
+      - name: Build webui (frontendDist, embedded at compile time)
+        if: steps.diff.outputs.desktop == 'true'
+        working-directory: webui
+        run: |
+          npm ci --legacy-peer-deps
+          npm run build
+
+      - name: Toolchain
+        if: steps.diff.outputs.desktop == 'true'
+        run: |
+          rustup component add rustfmt clippy
+          cargo --version
+
+      - name: Cargo cache
+        if: steps.diff.outputs.desktop == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Format check
+        if: steps.diff.outputs.desktop == 'true'
+        run: cargo fmt --check
+
+      - name: Clippy (deny warnings)
+        if: steps.diff.outputs.desktop == 'true'
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        if: steps.diff.outputs.desktop == 'true'
+        run: cargo test
+
+      - name: Build Linux bundles (AppImage/deb/rpm)
+        if: steps.diff.outputs.desktop == 'true'
+        working-directory: desktop
+        run: |
+          npm ci
+          npm run build -- --bundles appimage,deb,rpm
+
+      - name: Upload bundles
+        if: steps.diff.outputs.desktop == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: turing-desktop-linux-bundles
+          path: |
+            desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+            desktop/src-tauri/target/release/bundle/deb/*.deb
+            desktop/src-tauri/target/release/bundle/rpm/*.rpm
           if-no-files-found: error

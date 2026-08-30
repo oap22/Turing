@@ -87,12 +87,43 @@ fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|c| c.join("turing-desktop").join("config.json"))
 }
 
-// Everywhere else this stays *literally* ~/.config/turing-desktop —
-// deliberately not `dirs::config_dir()`, which on macOS would move it to
-// ~/Library/Application Support and silently orphan existing configs.
+// Resolve the base config directory per platform.
+//
+// macOS deliberately stays `~/.config` (NOT `~/Library/Application Support`,
+// which is what `dirs::config_dir()` would return): the path is documented,
+// scripted against, and part of the existing install's contract.
+#[cfg(target_os = "macos")]
+fn config_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".config"))
+}
+
+// Linux (and other unix) honors the XDG Base Directory spec:
+// `$XDG_CONFIG_HOME` when set to an absolute path, else `~/.config`.
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn config_dir() -> Option<PathBuf> {
+    xdg_config_dir(std::env::var_os("XDG_CONFIG_HOME"), dirs::home_dir())
+}
+
+// Pure XDG resolution, split out so it is unit-testable on any host. The spec
+// says an empty or relative `$XDG_CONFIG_HOME` "should be ignored", so both
+// fall back to `~/.config`.
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
+fn xdg_config_dir(xdg: Option<std::ffi::OsString>, home: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(dir) = xdg {
+        let dir = PathBuf::from(dir);
+        if dir.is_absolute() {
+            return Some(dir);
+        }
+    }
+    home.map(|h| h.join(".config"))
+}
+
+// Everywhere outside Windows, the overlay remains under turing-desktop.
+// macOS preserves its literal ~/.config contract; Linux and other Unix hosts
+// resolve the base with the XDG rule above.
 #[cfg(not(windows))]
 fn config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".config/turing-desktop/config.json"))
+    config_dir().map(|d| d.join("turing-desktop/config.json"))
 }
 
 pub fn load() -> AppConfig {
@@ -183,26 +214,65 @@ mod tests {
         assert_eq!(cfg.roots[0].id, "a");
     }
 
-    // The config overlay's location is a per-platform contract: literally
-    // ~/.config/turing-desktop on POSIX (macOS included — NOT Application
-    // Support), %APPDATA%\turing-desktop on Windows. Both cfg branches are
-    // asserted so whichever platform runs the tests checks its own contract.
+    // The config overlay's location is a per-platform contract: macOS keeps
+    // the literal ~/.config path, Linux may honor XDG_CONFIG_HOME, and Windows
+    // uses %APPDATA%\turing-desktop.
     #[test]
     fn config_path_follows_platform_convention() {
         let path = config_path().expect("config path resolves");
-        let normalized = path.to_string_lossy().replace('\\', "/");
-        assert!(normalized.ends_with("turing-desktop/config.json"));
-        #[cfg(not(windows))]
+        assert!(path.ends_with("turing-desktop/config.json"));
+        #[cfg(target_os = "macos")]
         {
             let home = dirs::home_dir().expect("home dir");
             assert_eq!(path, home.join(".config/turing-desktop/config.json"));
         }
         #[cfg(windows)]
         {
+            let normalized = path.to_string_lossy().replace('\\', "/");
             let cfg_dir = dirs::config_dir().expect("config dir");
             assert_eq!(path, cfg_dir.join("turing-desktop").join("config.json"));
             // dirs::config_dir() on Windows is Roaming AppData, not ~/.config.
             assert!(!normalized.contains("/.config/"));
+        }
+    }
+
+    #[test]
+    fn xdg_config_dir_prefers_absolute_xdg_config_home() {
+        let got = xdg_config_dir(
+            Some(std::ffi::OsString::from("/custom/xdg")),
+            Some(PathBuf::from("/home/o")),
+        );
+        assert_eq!(got, Some(PathBuf::from("/custom/xdg")));
+    }
+
+    #[test]
+    fn xdg_config_dir_ignores_empty_and_relative_values() {
+        // Per the XDG Base Directory spec, empty or relative values are
+        // ignored and the ~/.config default applies.
+        let home = Some(PathBuf::from("/home/o"));
+        for bad in ["", "relative/path"] {
+            let got = xdg_config_dir(Some(std::ffi::OsString::from(bad)), home.clone());
+            assert_eq!(got, Some(PathBuf::from("/home/o/.config")));
+        }
+    }
+
+    #[test]
+    fn xdg_config_dir_falls_back_to_home_dot_config() {
+        let got = xdg_config_dir(None, Some(PathBuf::from("/home/o")));
+        assert_eq!(got, Some(PathBuf::from("/home/o/.config")));
+        assert_eq!(xdg_config_dir(None, None), None);
+    }
+
+    // The full path always ends the same way on every platform; on macOS the
+    // base is literally ~/.config regardless of any XDG variable.
+    #[test]
+    fn config_path_is_under_turing_desktop() {
+        let path = config_path().expect("home dir in test env");
+        assert!(path.ends_with("turing-desktop/config.json"));
+        #[cfg(target_os = "macos")]
+        {
+            let home = dirs::home_dir().unwrap();
+            assert_eq!(path, home.join(".config/turing-desktop/config.json"));
         }
     }
 
