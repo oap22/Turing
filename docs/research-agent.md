@@ -760,7 +760,9 @@ stopping rule after seeing the round it would have stopped is not settling it.
 
 This is loop 1. **Loop 2 — the self-editing loop — is out of scope**, and so is
 everything that exists only to make loop 2 safe. The seams are left where loop 2
-attaches; nothing in loop 1 calls them.
+attaches; nothing in loop 1 calls them. (The smaller **RSI workstation loop** —
+one problem, one sandbox, one frozen verifier — does have a scaffold self-edit
+step, rollback and a cheat detector of its own; see `docs/rsi-loop.md`.)
 
 | Not built | Why it is not built yet | What it blocks |
 |---|---|---|

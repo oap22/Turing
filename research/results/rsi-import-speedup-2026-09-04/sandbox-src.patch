@@ -1,0 +1,889 @@
+diff --git a/src/turing/research/loop/__init__.py b/src/turing/research/loop/__init__.py
+index dbddb2b..8a3334c 100644
+--- a/src/turing/research/loop/__init__.py
++++ b/src/turing/research/loop/__init__.py
+@@ -40,70 +40,78 @@ this package does not claim it is.
+ 
+ from __future__ import annotations
+ 
+-from turing.research.loop.escalation import (
+-    FileDropDecisionInbox,
+-    NtfyEscalationNotifier,
+-    OperatorEscalationChannel,
+-    OperatorEscalationGate,
+-    build_operator_channel,
+-)
+-from turing.research.loop.metrics import (
+-    DEFAULT_SCORE_FLOORS,
+-    MIN_NOISE_FLOOR_SEEDS,
+-    Cell,
+-    CostBasis,
+-    NoiseFloor,
+-    NoiseFloorStatistic,
+-    SaturationAssessment,
+-    SaturationVerdict,
+-    ScoredProblem,
+-    assess_saturation,
+-    build_type_scores,
+-    compute_deltas,
+-    cost_per_unit_gain,
+-    floors_by_cell,
+-    measure_noise_floor,
+-    round_verdict,
+-)
+-from turing.research.loop.noise_floor import (
+-    NoiseFloorConfig,
+-    NoiseFloorReport,
+-    NoiseFloorRunner,
+-)
+-from turing.research.loop.protocols import (
+-    Clock,
+-    EscalationChannel,
+-    Solver,
+-    SolverStep,
+-    SolverTask,
+-    SystemClock,
+-    WorkspaceProvider,
+-)
+-from turing.research.loop.runner import (
+-    AttemptOutcome,
+-    PassCriterion,
+-    RoundConfig,
+-    RoundOutcome,
+-    RoundRunner,
+-)
+-from turing.research.loop.self_edit_seam import (
+-    SelfEditInputs,
+-    SelfEditStep,
+-    collect_self_edit_inputs,
+-)
+-from turing.research.loop.settings import ResearchLoopSettings
+-from turing.research.loop.solver_bridge import SolverBridge
+-from turing.research.loop.trajectory import (
+-    TRAJECTORY_SCHEMA_VERSION,
+-    AttemptDisposition,
+-    AttemptLog,
+-    RunIdentity,
+-    StepLog,
+-    StoredAttempt,
+-    TrajectoryStore,
+-    cell_key,
+-)
+-from turing.research.loop.workspace import CopyTreeWorkspaceProvider
++from typing import TYPE_CHECKING, Any
++
++if TYPE_CHECKING:
++    # Import-time cost only matters for `python -c "import turing.research.loop.run"`;
++    # type checkers and IDEs still see the real names via this block. Runtime
++    # resolution goes through __getattr__ below, one submodule at a time, on
++    # first access — see plots.py's _matplotlib_objects() for the same idea
++    # applied to a single heavy dependency instead of a whole package.
++    from turing.research.loop.escalation import (
++        FileDropDecisionInbox,
++        NtfyEscalationNotifier,
++        OperatorEscalationChannel,
++        OperatorEscalationGate,
++        build_operator_channel,
++    )
++    from turing.research.loop.metrics import (
++        DEFAULT_SCORE_FLOORS,
++        MIN_NOISE_FLOOR_SEEDS,
++        Cell,
++        CostBasis,
++        NoiseFloor,
++        NoiseFloorStatistic,
++        SaturationAssessment,
++        SaturationVerdict,
++        ScoredProblem,
++        assess_saturation,
++        build_type_scores,
++        compute_deltas,
++        cost_per_unit_gain,
++        floors_by_cell,
++        measure_noise_floor,
++        round_verdict,
++    )
++    from turing.research.loop.noise_floor import (
++        NoiseFloorConfig,
++        NoiseFloorReport,
++        NoiseFloorRunner,
++    )
++    from turing.research.loop.protocols import (
++        Clock,
++        EscalationChannel,
++        Solver,
++        SolverStep,
++        SolverTask,
++        SystemClock,
++        WorkspaceProvider,
++    )
++    from turing.research.loop.runner import (
++        AttemptOutcome,
++        PassCriterion,
++        RoundConfig,
++        RoundOutcome,
++        RoundRunner,
++    )
++    from turing.research.loop.self_edit_seam import (
++        SelfEditInputs,
++        SelfEditStep,
++        collect_self_edit_inputs,
++    )
++    from turing.research.loop.settings import ResearchLoopSettings
++    from turing.research.loop.solver_bridge import SolverBridge
++    from turing.research.loop.trajectory import (
++        TRAJECTORY_SCHEMA_VERSION,
++        AttemptDisposition,
++        AttemptLog,
++        RunIdentity,
++        StepLog,
++        StoredAttempt,
++        TrajectoryStore,
++        cell_key,
++    )
++    from turing.research.loop.workspace import CopyTreeWorkspaceProvider
+ 
+ __all__ = [
+     "DEFAULT_SCORE_FLOORS",
+@@ -157,3 +165,81 @@ __all__ = [
+     "measure_noise_floor",
+     "round_verdict",
+ ]
++
++_SUBMODULE_BY_NAME: dict[str, str] = {
++    "FileDropDecisionInbox": "escalation",
++    "NtfyEscalationNotifier": "escalation",
++    "OperatorEscalationChannel": "escalation",
++    "OperatorEscalationGate": "escalation",
++    "build_operator_channel": "escalation",
++    "DEFAULT_SCORE_FLOORS": "metrics",
++    "MIN_NOISE_FLOOR_SEEDS": "metrics",
++    "Cell": "metrics",
++    "CostBasis": "metrics",
++    "NoiseFloor": "metrics",
++    "NoiseFloorStatistic": "metrics",
++    "SaturationAssessment": "metrics",
++    "SaturationVerdict": "metrics",
++    "ScoredProblem": "metrics",
++    "assess_saturation": "metrics",
++    "build_type_scores": "metrics",
++    "compute_deltas": "metrics",
++    "cost_per_unit_gain": "metrics",
++    "floors_by_cell": "metrics",
++    "measure_noise_floor": "metrics",
++    "round_verdict": "metrics",
++    "NoiseFloorConfig": "noise_floor",
++    "NoiseFloorReport": "noise_floor",
++    "NoiseFloorRunner": "noise_floor",
++    "Clock": "protocols",
++    "EscalationChannel": "protocols",
++    "Solver": "protocols",
++    "SolverStep": "protocols",
++    "SolverTask": "protocols",
++    "SystemClock": "protocols",
++    "WorkspaceProvider": "protocols",
++    "AttemptOutcome": "runner",
++    "PassCriterion": "runner",
++    "RoundConfig": "runner",
++    "RoundOutcome": "runner",
++    "RoundRunner": "runner",
++    "SelfEditInputs": "self_edit_seam",
++    "SelfEditStep": "self_edit_seam",
++    "collect_self_edit_inputs": "self_edit_seam",
++    "ResearchLoopSettings": "settings",
++    "SolverBridge": "solver_bridge",
++    "TRAJECTORY_SCHEMA_VERSION": "trajectory",
++    "AttemptDisposition": "trajectory",
++    "AttemptLog": "trajectory",
++    "RunIdentity": "trajectory",
++    "StepLog": "trajectory",
++    "StoredAttempt": "trajectory",
++    "TrajectoryStore": "trajectory",
++    "cell_key": "trajectory",
++    "CopyTreeWorkspaceProvider": "workspace",
++}
++
++
++def __getattr__(name: str) -> Any:
++    """Resolve a public name by importing its defining submodule on first use.
++
++    Keeps every name in ``__all__`` importable from ``turing.research.loop``
++    (``from turing.research.loop import RoundRunner`` still works) without
++    paying for all ten submodules — several of them pulling in pydantic,
++    pydantic_settings or the solver package — just to import
++    ``turing.research.loop.run``, which reaches the few it actually needs
++    through their own submodule paths instead of through this package.
++    """
++    submodule_name = _SUBMODULE_BY_NAME.get(name)
++    if submodule_name is None:
++        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
++    import importlib
++
++    submodule = importlib.import_module(f"{__name__}.{submodule_name}")
++    value = getattr(submodule, name)
++    globals()[name] = value
++    return value
++
++
++def __dir__() -> list[str]:
++    return sorted(set(globals()) | set(__all__))
+diff --git a/src/turing/research/loop/escalation.py b/src/turing/research/loop/escalation.py
+index f0df3f2..a2da423 100644
+--- a/src/turing/research/loop/escalation.py
++++ b/src/turing/research/loop/escalation.py
+@@ -49,7 +49,6 @@ from turing.research.contracts import (
+     EscalationVerdict,
+ )
+ from turing.research.loop.protocols import SystemClock
+-from turing.research.loop.settings import ResearchLoopSettings
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Awaitable, Callable
+@@ -58,6 +57,7 @@ if TYPE_CHECKING:
+     from turing.coordinator.alerts.ntfy_client import NtfyAlertClient
+     from turing.research.contracts import EscalationRequest
+     from turing.research.loop.protocols import Clock
++    from turing.research.loop.settings import ResearchLoopSettings
+ 
+ logger = structlog.get_logger(__name__)
+ 
+@@ -465,6 +465,7 @@ def build_operator_channel(
+     must never resolve into a default verdict.
+     """
+     from turing.coordinator.alerts.ntfy_client import NtfyAlertClient
++    from turing.research.loop.settings import ResearchLoopSettings
+ 
+     resolved = settings or ResearchLoopSettings()
+     notifier = NtfyEscalationNotifier(
+diff --git a/src/turing/research/loop/plots.py b/src/turing/research/loop/plots.py
+index d66f9de..e6b3f15 100644
+--- a/src/turing/research/loop/plots.py
++++ b/src/turing/research/loop/plots.py
+@@ -42,29 +42,15 @@ from __future__ import annotations
+ import asyncio
+ from typing import TYPE_CHECKING, Any
+ 
+-import matplotlib
+-
+-matplotlib.use("Agg")
+-# Text as SVG <text> elements, not vector paths — the round plot's cell labels
+-# ("speedup/practice") must be greppable strings in the file, not shapes with
+-# no string content. Matplotlib's default ("path") would make that
+-# unverifiable and would make every SVG larger for no benefit here.
+-matplotlib.rcParams["svg.fonttype"] = "none"
+-# Without a fixed salt, matplotlib derives every clip-path/marker id in the
+-# SVG from Python's ``id(obj)`` — a memory address that differs between
+-# interpreter runs even for byte-identical input. That alone would break the
+-# determinism this module is held to, independently of the ``Date`` metadata.
+-# A fixed salt makes those ids a hash of content instead.
+-matplotlib.rcParams["svg.hashsalt"] = "turing-research-loop-plots"
+-
+-import structlog  # noqa: E402
+-from matplotlib.backends.backend_agg import FigureCanvasAgg  # noqa: E402
+-from matplotlib.figure import Figure  # noqa: E402
++import structlog
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Mapping, Sequence
+     from pathlib import Path
+ 
++    from matplotlib.backends.backend_agg import FigureCanvasAgg
++    from matplotlib.figure import Figure
++
+ logger = structlog.get_logger(__name__)
+ 
+ __all__ = ["PLOT_FILENAMES", "render_attempt_plots", "render_round_plot"]
+@@ -74,6 +60,46 @@ ROUND_PLOT_FILENAME = "scores.svg"
+ 
+ _SAVEFIG_KWARGS: dict[str, Any] = {"format": "svg", "metadata": {"Date": None}}
+ 
++_matplotlib_objects_cache: tuple[type[Any], type[Any]] | None = None
++
++
++def _matplotlib_objects() -> tuple[type[Figure], type[FigureCanvasAgg]]:
++    """Import matplotlib on first actual plot render, not at module import time.
++
++    ``--dry-run``, ``--list`` and preflight never call a render function, so
++    the ~0.3s matplotlib import (and its C-extension backend init) should
++    never happen on those paths. The three ordering rules from the module
++    docstring still hold here: the backend is selected, and the SVG rcParams
++    set, before the first import of ``matplotlib.figure`` or
++    ``matplotlib.backends.backend_agg`` — same order as before, just deferred
++    to the first call instead of pinned to import time.
++    """
++    global _matplotlib_objects_cache
++    if _matplotlib_objects_cache is None:
++        import matplotlib
++
++        matplotlib.use("Agg")
++        # Text as SVG <text> elements, not vector paths — the round plot's
++        # cell labels ("speedup/practice") must be greppable strings in the
++        # file, not shapes with no string content. Matplotlib's default
++        # ("path") would make that unverifiable and would make every SVG
++        # larger for no benefit here.
++        matplotlib.rcParams["svg.fonttype"] = "none"
++        # Without a fixed salt, matplotlib derives every clip-path/marker id
++        # in the SVG from Python's ``id(obj)`` — a memory address that
++        # differs between interpreter runs even for byte-identical input.
++        # That alone would break the determinism this module is held to,
++        # independently of the ``Date`` metadata. A fixed salt makes those
++        # ids a hash of content instead.
++        matplotlib.rcParams["svg.hashsalt"] = "turing-research-loop-plots"
++
++        from matplotlib.backends.backend_agg import FigureCanvasAgg
++        from matplotlib.figure import Figure
++
++        _matplotlib_objects_cache = (Figure, FigureCanvasAgg)
++
++    return _matplotlib_objects_cache
++
+ 
+ def _numeric_series(
+     points: Sequence[Mapping[str, float]], key: str
+@@ -109,8 +135,9 @@ def _render_progress_plot(
+         )
+         return None
+ 
+-    fig = Figure()
+-    canvas = FigureCanvasAgg(fig)
++    figure_cls, canvas_cls = _matplotlib_objects()
++    fig = figure_cls()
++    canvas = canvas_cls(fig)
+     ax = fig.add_subplot(111)
+     ax.set_title(f"{directory.name} — progress")
+     ax.set_xlabel("step")
+@@ -149,8 +176,9 @@ def _render_cap_plot(directory: Path, points: Sequence[Mapping[str, float]]) ->
+         )
+         return None
+ 
+-    fig = Figure()
+-    canvas = FigureCanvasAgg(fig)
++    figure_cls, canvas_cls = _matplotlib_objects()
++    fig = figure_cls()
++    canvas = canvas_cls(fig)
+     ax = fig.add_subplot(111)
+     ax.set_title(f"{directory.name} — cap consumption")
+     ax.set_xlabel("step")
+@@ -261,8 +289,9 @@ def _render_round_plot_sync(directory: Path, cells: Sequence[Mapping[str, object
+     # not a runtime guarantee.
+     means = [float(cell["mean_score"]) for cell in cells]  # type: ignore[arg-type]
+ 
+-    fig = Figure()
+-    canvas = FigureCanvasAgg(fig)
++    figure_cls, canvas_cls = _matplotlib_objects()
++    fig = figure_cls()
++    canvas = canvas_cls(fig)
+     ax = fig.add_subplot(111)
+     ax.set_title(f"{directory.name} — scores")
+     ax.set_xlabel("cell")
+diff --git a/src/turing/research/loop/run.py b/src/turing/research/loop/run.py
+index fdfd65e..9d7f142 100644
+--- a/src/turing/research/loop/run.py
++++ b/src/turing/research/loop/run.py
+@@ -102,20 +102,20 @@ from turing.research.contracts import ContractViolationError, EngineIdentity
+ from turing.research.loop.escalation import build_operator_channel
+ from turing.research.loop.noise_floor import NoiseFloorConfig, NoiseFloorRunner
+ from turing.research.loop.runner import RoundConfig, RoundRunner, find_finished_round
+-from turing.research.loop.settings import ResearchLoopSettings
+ from turing.research.loop.solver_bridge import SolverBridge
+ from turing.research.loop.trajectory import TrajectoryStore
+ from turing.research.loop.workspace import CopyTreeWorkspaceProvider
+ from turing.research.problems.adapter import bind_eval_set_hash, fingerprint_corpus
+ from turing.research.problems.speedup import SpeedupAdapter
+ from turing.research.solver import InMemoryCheckpointStore, Solver, WorkspaceManager
+-from turing.research.solver.config import SolverSettings
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Sequence
+ 
+     from turing.research.backends.claude import BackendSettings, ClaudeBackend
+     from turing.research.contracts import EscalationRequest, Problem
++    from turing.research.loop.settings import ResearchLoopSettings
++    from turing.research.solver.config import SolverSettings
+ 
+ logger = structlog.get_logger(__name__)
+ 
+@@ -219,6 +219,9 @@ def _build_runner(
+ 
+ 
+ async def _drive(args: argparse.Namespace) -> int:
++    from turing.research.loop.settings import ResearchLoopSettings
++    from turing.research.solver.config import SolverSettings
++
+     settings = ResearchLoopSettings()
+     solver_settings = SolverSettings()
+ 
+diff --git a/src/turing/research/loop/workspace.py b/src/turing/research/loop/workspace.py
+index 57f3cf2..d925cf6 100644
+--- a/src/turing/research/loop/workspace.py
++++ b/src/turing/research/loop/workspace.py
+@@ -18,7 +18,6 @@ directory is fresh.
+ from __future__ import annotations
+ 
+ import asyncio
+-import shutil
+ from typing import TYPE_CHECKING
+ 
+ import structlog
+@@ -63,6 +62,8 @@ class CopyTreeWorkspaceProvider:
+         return target
+ 
+     def _copy(self, template: Path, target: Path, excludes: tuple[str, ...] = ()) -> None:
++        import shutil
++
+         if target.exists():
+             if not self._clean_existing:
+                 raise ContractViolationError(
+diff --git a/src/turing/research/problems/__init__.py b/src/turing/research/problems/__init__.py
+index cbe3d93..f360f74 100644
+--- a/src/turing/research/problems/__init__.py
++++ b/src/turing/research/problems/__init__.py
+@@ -36,64 +36,74 @@ undecided_loopholes` keeps the unanswered policy questions visible.
+ 
+ from __future__ import annotations
+ 
+-from turing.research.problems.adapter import (
+-    AdapterRegistry,
+-    ProblemAdapter,
+-    WorkspaceMaterialisationError,
+-    bind_eval_set_hash,
+-    fingerprint_corpus,
+-)
+-from turing.research.problems.catalog import (
+-    DEFAULT_MAESTRO_REPO,
+-    DEFAULT_SPLITS,
+-    DEFAULT_TURING_REPO,
+-    MEASURED_AT,
+-    MEASURED_ON,
+-    speedup_specs,
+-)
+-from turing.research.problems.kaggle import (
+-    KAGGLE_CORPUS_SIZE,
+-    KAGGLE_SELECTION_CRITERION,
+-    KaggleAdapter,
+-)
+-from turing.research.problems.process import (
+-    CommandResult,
+-    CommandRunner,
+-    SubprocessCommandRunner,
+-    count_passing_tests,
+-    render_argv,
+-    run_command,
+-)
+-from turing.research.problems.spec import (
+-    ASSUMED_RELATIVE_SPREAD,
+-    DEFAULT_WORKSPACE_EXCLUDES,
+-    CorrectnessGate,
+-    GateCommand,
+-    Loophole,
+-    LoopholeRuling,
+-    OutputComparison,
+-    SpeedupProblemSpec,
+-    SpreadProvenance,
+-    TimingSpec,
+-)
+-from turing.research.problems.speedup import (
+-    HARNESS_FAILURE_KEY,
+-    SpeedupAdapter,
+-    SpeedupVerifier,
+-)
+-from turing.research.problems.timing import (
+-    MINIMUM_NOISE_BAND,
+-    SpeedupMeasurement,
+-    TimingHarness,
+-    TimingMeasurement,
+-    relative_spread,
+-)
+-from turing.research.problems.tolerance import (
+-    ComparisonOutcome,
+-    Tolerance,
+-    ToleranceMode,
+-    compare,
+-)
++from typing import TYPE_CHECKING, Any
++
++if TYPE_CHECKING:
++    # See turing/research/loop/__init__.py for why this package resolves its
++    # public names lazily instead of importing every submodule up front:
++    # importing this package (a step Python always takes before importing any
++    # submodule of it, e.g. turing.research.problems.adapter) would otherwise
++    # force turing.research.problems.kaggle to load unconditionally even
++    # though nothing on the speedup path — the corpus this package's own
++    # __all__ is overwhelmingly about — touches it.
++    from turing.research.problems.adapter import (
++        AdapterRegistry,
++        ProblemAdapter,
++        WorkspaceMaterialisationError,
++        bind_eval_set_hash,
++        fingerprint_corpus,
++    )
++    from turing.research.problems.catalog import (
++        DEFAULT_MAESTRO_REPO,
++        DEFAULT_SPLITS,
++        DEFAULT_TURING_REPO,
++        MEASURED_AT,
++        MEASURED_ON,
++        speedup_specs,
++    )
++    from turing.research.problems.kaggle import (
++        KAGGLE_CORPUS_SIZE,
++        KAGGLE_SELECTION_CRITERION,
++        KaggleAdapter,
++    )
++    from turing.research.problems.process import (
++        CommandResult,
++        CommandRunner,
++        SubprocessCommandRunner,
++        count_passing_tests,
++        render_argv,
++        run_command,
++    )
++    from turing.research.problems.spec import (
++        ASSUMED_RELATIVE_SPREAD,
++        DEFAULT_WORKSPACE_EXCLUDES,
++        CorrectnessGate,
++        GateCommand,
++        Loophole,
++        LoopholeRuling,
++        OutputComparison,
++        SpeedupProblemSpec,
++        SpreadProvenance,
++        TimingSpec,
++    )
++    from turing.research.problems.speedup import (
++        HARNESS_FAILURE_KEY,
++        SpeedupAdapter,
++        SpeedupVerifier,
++    )
++    from turing.research.problems.timing import (
++        MINIMUM_NOISE_BAND,
++        SpeedupMeasurement,
++        TimingHarness,
++        TimingMeasurement,
++        relative_spread,
++    )
++    from turing.research.problems.tolerance import (
++        ComparisonOutcome,
++        Tolerance,
++        ToleranceMode,
++        compare,
++    )
+ 
+ __all__ = [
+     "ASSUMED_RELATIVE_SPREAD",
+@@ -139,3 +149,71 @@ __all__ = [
+     "run_command",
+     "speedup_specs",
+ ]
++
++_SUBMODULE_BY_NAME: dict[str, str] = {
++    "AdapterRegistry": "adapter",
++    "ProblemAdapter": "adapter",
++    "WorkspaceMaterialisationError": "adapter",
++    "bind_eval_set_hash": "adapter",
++    "fingerprint_corpus": "adapter",
++    "DEFAULT_MAESTRO_REPO": "catalog",
++    "DEFAULT_SPLITS": "catalog",
++    "DEFAULT_TURING_REPO": "catalog",
++    "MEASURED_AT": "catalog",
++    "MEASURED_ON": "catalog",
++    "speedup_specs": "catalog",
++    "KAGGLE_CORPUS_SIZE": "kaggle",
++    "KAGGLE_SELECTION_CRITERION": "kaggle",
++    "KaggleAdapter": "kaggle",
++    "CommandResult": "process",
++    "CommandRunner": "process",
++    "SubprocessCommandRunner": "process",
++    "count_passing_tests": "process",
++    "render_argv": "process",
++    "run_command": "process",
++    "ASSUMED_RELATIVE_SPREAD": "spec",
++    "DEFAULT_WORKSPACE_EXCLUDES": "spec",
++    "CorrectnessGate": "spec",
++    "GateCommand": "spec",
++    "Loophole": "spec",
++    "LoopholeRuling": "spec",
++    "OutputComparison": "spec",
++    "SpeedupProblemSpec": "spec",
++    "SpreadProvenance": "spec",
++    "TimingSpec": "spec",
++    "HARNESS_FAILURE_KEY": "speedup",
++    "SpeedupAdapter": "speedup",
++    "SpeedupVerifier": "speedup",
++    "MINIMUM_NOISE_BAND": "timing",
++    "SpeedupMeasurement": "timing",
++    "TimingHarness": "timing",
++    "TimingMeasurement": "timing",
++    "relative_spread": "timing",
++    "ComparisonOutcome": "tolerance",
++    "Tolerance": "tolerance",
++    "ToleranceMode": "tolerance",
++    "compare": "tolerance",
++}
++
++
++def __getattr__(name: str) -> Any:
++    """Resolve a public name by importing its defining submodule on first use.
++
++    Keeps every name in ``__all__`` importable from ``turing.research.problems``
++    without paying for all eight submodules — including ``kaggle``, which
++    nothing on the speedup path touches — just to import this package, which
++    Python always does before importing any submodule of it.
++    """
++    submodule_name = _SUBMODULE_BY_NAME.get(name)
++    if submodule_name is None:
++        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
++    import importlib
++
++    submodule = importlib.import_module(f"{__name__}.{submodule_name}")
++    value = getattr(submodule, name)
++    globals()[name] = value
++    return value
++
++
++def __dir__() -> list[str]:
++    return sorted(set(globals()) | set(__all__))
+diff --git a/src/turing/research/problems/speedup.py b/src/turing/research/problems/speedup.py
+index 063e41f..08ed990 100644
+--- a/src/turing/research/problems/speedup.py
++++ b/src/turing/research/problems/speedup.py
+@@ -35,7 +35,6 @@ from __future__ import annotations
+ 
+ import asyncio
+ import json
+-import shutil
+ import sys
+ from dataclasses import dataclass, field
+ from typing import TYPE_CHECKING, Any
+@@ -484,6 +483,8 @@ class SpeedupAdapter:
+         and the tests that restate the floors — those are how the eval set
+         would otherwise leak into the write surface.
+         """
++        import shutil
++
+         spec = self.spec_for(problem.id)
+         source = spec.source_root
+         if not source.is_dir():
+diff --git a/src/turing/research/solver/__init__.py b/src/turing/research/solver/__init__.py
+index d1203a4..eaae1cc 100644
+--- a/src/turing/research/solver/__init__.py
++++ b/src/turing/research/solver/__init__.py
+@@ -31,49 +31,58 @@ dropped held-out results from it.
+ 
+ from __future__ import annotations
+ 
+-from turing.research.solver.checkpoints import (
+-    InMemoryCheckpointStore,
+-    SqliteCheckpointStore,
+-    attempt_from_json,
+-    attempt_to_json,
+-    escalation_from_json,
+-    escalation_to_json,
+-    iteration_from_json,
+-    iteration_to_json,
+-)
+-from turing.research.solver.config import SolverSettings
+-from turing.research.solver.errors import (
+-    CheckpointError,
+-    ProposalError,
+-    SolverError,
+-    WorkspaceEscapeError,
+-    WorkspaceTemplateError,
+-)
+-from turing.research.solver.models import (
+-    CommandOutcome,
+-    FileEdit,
+-    IterationPhase,
+-    IterationRecord,
+-    IterationSummary,
+-    ProgressSummary,
+-    Proposal,
+-    ProposalContext,
+-    SolverOutcome,
+-    SolverPolicy,
+-    better_result,
+-    summarise_progress,
+-)
+-from turing.research.solver.protocols import (
+-    CheckpointStore,
+-    Clock,
+-    CommandRunner,
+-    EscalationChannel,
+-    ProposalBackend,
+-    ResumableBackend,
+-    SystemClock,
+-)
+-from turing.research.solver.solver import Solver
+-from turing.research.solver.workspace import Workspace, WorkspaceManager
++from typing import TYPE_CHECKING, Any
++
++if TYPE_CHECKING:
++    # See turing/research/loop/__init__.py for why this package resolves its
++    # public names lazily instead of importing every submodule up front:
++    # SolverSettings alone (turing.research.solver.config) pulls in pydantic
++    # and pydantic_settings, which most importers of this package — anything
++    # that only needs Solver, the checkpoint stores or the models — never
++    # touch.
++    from turing.research.solver.checkpoints import (
++        InMemoryCheckpointStore,
++        SqliteCheckpointStore,
++        attempt_from_json,
++        attempt_to_json,
++        escalation_from_json,
++        escalation_to_json,
++        iteration_from_json,
++        iteration_to_json,
++    )
++    from turing.research.solver.config import SolverSettings
++    from turing.research.solver.errors import (
++        CheckpointError,
++        ProposalError,
++        SolverError,
++        WorkspaceEscapeError,
++        WorkspaceTemplateError,
++    )
++    from turing.research.solver.models import (
++        CommandOutcome,
++        FileEdit,
++        IterationPhase,
++        IterationRecord,
++        IterationSummary,
++        ProgressSummary,
++        Proposal,
++        ProposalContext,
++        SolverOutcome,
++        SolverPolicy,
++        better_result,
++        summarise_progress,
++    )
++    from turing.research.solver.protocols import (
++        CheckpointStore,
++        Clock,
++        CommandRunner,
++        EscalationChannel,
++        ProposalBackend,
++        ResumableBackend,
++        SystemClock,
++    )
++    from turing.research.solver.solver import Solver
++    from turing.research.solver.workspace import Workspace, WorkspaceManager
+ 
+ __all__ = [
+     "CheckpointError",
+@@ -113,3 +122,65 @@ __all__ = [
+     "iteration_to_json",
+     "summarise_progress",
+ ]
++
++_SUBMODULE_BY_NAME: dict[str, str] = {
++    "InMemoryCheckpointStore": "checkpoints",
++    "SqliteCheckpointStore": "checkpoints",
++    "attempt_from_json": "checkpoints",
++    "attempt_to_json": "checkpoints",
++    "escalation_from_json": "checkpoints",
++    "escalation_to_json": "checkpoints",
++    "iteration_from_json": "checkpoints",
++    "iteration_to_json": "checkpoints",
++    "SolverSettings": "config",
++    "CheckpointError": "errors",
++    "ProposalError": "errors",
++    "SolverError": "errors",
++    "WorkspaceEscapeError": "errors",
++    "WorkspaceTemplateError": "errors",
++    "CommandOutcome": "models",
++    "FileEdit": "models",
++    "IterationPhase": "models",
++    "IterationRecord": "models",
++    "IterationSummary": "models",
++    "ProgressSummary": "models",
++    "Proposal": "models",
++    "ProposalContext": "models",
++    "SolverOutcome": "models",
++    "SolverPolicy": "models",
++    "better_result": "models",
++    "summarise_progress": "models",
++    "CheckpointStore": "protocols",
++    "Clock": "protocols",
++    "CommandRunner": "protocols",
++    "EscalationChannel": "protocols",
++    "ProposalBackend": "protocols",
++    "ResumableBackend": "protocols",
++    "SystemClock": "protocols",
++    "Solver": "solver",
++    "Workspace": "workspace",
++    "WorkspaceManager": "workspace",
++}
++
++
++def __getattr__(name: str) -> Any:
++    """Resolve a public name by importing its defining submodule on first use.
++
++    Keeps every name in ``__all__`` importable from ``turing.research.solver``
++    without paying for all six submodules — including ``config``, which pulls
++    in pydantic and pydantic_settings for ``SolverSettings`` — just to import
++    this package, which most importers only need for a handful of names.
++    """
++    submodule_name = _SUBMODULE_BY_NAME.get(name)
++    if submodule_name is None:
++        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
++    import importlib
++
++    submodule = importlib.import_module(f"{__name__}.{submodule_name}")
++    value = getattr(submodule, name)
++    globals()[name] = value
++    return value
++
++
++def __dir__() -> list[str]:
++    return sorted(set(globals()) | set(__all__))
+diff --git a/src/turing/research/solver/checkpoints.py b/src/turing/research/solver/checkpoints.py
+index b8f3bca..592fc9b 100644
+--- a/src/turing/research/solver/checkpoints.py
++++ b/src/turing/research/solver/checkpoints.py
+@@ -25,7 +25,6 @@ import json
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any
+ 
+-import aiosqlite
+ import structlog
+ 
+ from turing.research.contracts import (
+@@ -49,6 +48,8 @@ from turing.research.solver.models import (
+ if TYPE_CHECKING:
+     from types import TracebackType
+ 
++    import aiosqlite
++
+ __all__ = [
+     "InMemoryCheckpointStore",
+     "SqliteCheckpointStore",
+@@ -420,6 +421,8 @@ class SqliteCheckpointStore:
+     async def open(self) -> SqliteCheckpointStore:
+         if self._db is not None:
+             return self
++        import aiosqlite
++
+         if self._db_path != ":memory:":
+             Path(self._db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+         self._db = await aiosqlite.connect(self._db_path)
+diff --git a/src/turing/research/solver/workspace.py b/src/turing/research/solver/workspace.py
+index 27af6de..f31aa85 100644
+--- a/src/turing/research/solver/workspace.py
++++ b/src/turing/research/solver/workspace.py
+@@ -23,7 +23,6 @@ from __future__ import annotations
+ 
+ import asyncio
+ import os
+-import shutil
+ import uuid
+ from dataclasses import dataclass
+ from pathlib import Path
+@@ -204,6 +203,8 @@ def _has_contents(path: Path) -> bool:
+ 
+ 
+ def _copy_template(template: Path, target: Path, excludes: tuple[str, ...] = ()) -> None:
++    import shutil
++
+     target.parent.mkdir(parents=True, exist_ok=True)
+     # ``symlinks=True`` keeps a link as a link rather than copying whatever it
+     # points at into the workspace. Combined with ``Workspace.resolve``, a

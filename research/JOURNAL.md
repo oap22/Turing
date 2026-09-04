@@ -21,6 +21,108 @@ first run is how real priors start accumulating.
 
 ---
 
+## 2026-09-04 — First live RSI workstation run: import-speedup, 4 rounds, one self-edit, 4.77× measured
+
+**This is the first entry in this program that carries measured numbers.** It
+is a run of the *RSI workstation loop* (`python -m turing.research.rsi`, new in
+PR #413), not of the loop-1 corpus runner — so it is not the noise floor the
+header above promises, and nothing here is a round-0 solve rate. One problem,
+one sandbox, one frozen verifier, one trajectory. **One trajectory is an
+anecdote** (ADR 0011, Consequences); read the numbers as a smoke test of the
+loop's machinery, not as evidence about self-improvement.
+
+### Hypothesis
+A frozen-verifier loop can drive an agent to a real, measured speedup on a
+problem sourced from this repo (ADR 0011 §11: speedup problems come from the
+operator's own code), and the loop's guardrails — verifier lock, taxonomy,
+cheat detector, scaffold self-edit, rollback — behave sensibly on a live run.
+Plain-language version: *can the loop make the agent faster at importing the
+research CLI without breaking anything, and do the safety checks fire when
+they should and stay quiet when they should?*
+
+The problem: `import turing.research.loop.run` cost ~0.57 s, most of it
+matplotlib pulled in eagerly through `plots`. Unsolved on `main` at commit
+`5febc2a`.
+
+### Configuration
+- Engine: `claude -p` (Claude Code CLI 2.1.260) in a Linux session container,
+  running as root with `IS_SANDBOX=1` (the CLI refuses `bypassPermissions` as
+  root otherwise).
+- Sandbox: clone of `main@5febc2a` at `~/turing-workspace/rsi-import-speedup`.
+- Verifier (frozen, sha256-locked, `research/results/rsi-import-speedup-2026-09-04/verify.sh`):
+  gate = `tests/test_research/test_loop` green against the sandbox `src/`;
+  score = median import wall-time of a pristine reference clone ÷ median of the
+  sandbox, 7 interleaved pairs so machine load hits both equally. Higher is
+  better; 1.0 = no change. Reference-vs-itself scored 0.98 before the run, so
+  the measurement noise is ~2%.
+- Rounds: 4 · self-edit every 2 rounds · self-edit budget 1 · noise floor auto
+  (population stdev of prior scores) · round cap 1800 s · verifier cap 900 s.
+- Artifacts: `research/results/rsi-import-speedup-2026-09-04/` (trajectory,
+  metrics, taxonomy, verifier lock, final `SCAFFOLD.md`, the agent's
+  `NOTES.md`, and the sandbox `src/` diff as a patch).
+
+### Results
+
+| Round | Measured score | Categories | Engine wall | What the agent changed |
+|---|---|---|---|---|
+| 1 | 2.64× | `cheat_detected` → **void** | 11.7 min | matplotlib deferred to first render in `plots.py` |
+| 2 | 4.39× | — | 19.6 min | PEP 562 lazy re-exports in `loop/` and `solver/` `__init__`; pydantic-settings deferred |
+| 3 | 4.58× | — | 28.6 min | same for `problems/`; `shutil` deferred in three modules |
+| — | self-edit kept, `SCAFFOLD.md` +96 lines, sha `cea62be` | | 1.2 min | distilled "what worked" + a rule to prove a floor before claiming one |
+| 4 | 4.77× | — | 14.4 min | `aiosqlite` deferred in `solver/checkpoints.py` |
+
+Every round passed the frozen gate (640 tests, 1 skip). The verifier took
+~116 s each time. Best measured score **4.77×** (0.57 s → ~0.12 s). No
+rollback: round 4's 4.77 is above the pre-edit best of 4.58 by ~0.19, about
+twice the population stdev of the two prior scores (0.094).
+
+**Round 1 is the finding that matters.** The agent's own run of the verifier
+reported 2.63; the loop re-measured 2.6427; the cheat detector, built to a
+1e-6 relative tolerance, voided a passing round and stopped the loop. That
+tolerance was wrong for a wall-clock verifier — two honest runs never agree to
+six decimals — and the agent had been *told* it may run the verifier itself.
+Fixed in the same PR: the check now fires only when a self-report *exceeds*
+the measured score by more than 5%; under-reporting never fires. The measured
+score was, and remains, the only one recorded. The void round stays in the
+trajectory as written.
+
+**What the self-edit did, honestly.** Round 4 ran under the edited scaffold
+and scored highest, but it also landed a new code change, so the +0.19 is
+attributable to the code, not the scaffold. One round after one self-edit
+says nothing about whether the scaffold edit helped; that would need the
+practice/held-out split and the noise floor this loop does not have. The
+edit itself reads well — it distilled the three working techniques and added
+"positively confirm a floor with grep before claiming it", which the agent
+then followed in round 4 — but "reads well" is not a measurement.
+
+### Falsification
+Refuting results, checked: a verifier failure on any round (none), a
+tampered lock (none — sha re-checked before and after every round), a
+sandbox escape or unexpected results write (none), a self-edit touching
+anything but `SCAFFOLD.md` (none — `git status` after the step showed only
+that file), a rollback (none — none was warranted by the rule). The one
+guardrail that *did* fire, fired wrongly, and the fix is above. Not checked:
+whether the 4.77× survives on the operator's Mac (the reference and sandbox
+were both measured in the same Linux container).
+
+### Estimate vs actual
+| | Estimate | Actual |
+|---|---|---|
+| Wall-clock, 4 rounds | ~60 min | 79 min of loop time (17:08–18:27 UTC) plus one restart after the round-1 void |
+| Subscription consumption | not estimated | not metered by this loop; four `claude -p` rounds of 12–29 min each plus a 70 s self-edit |
+| Solve rate | expected ≥1.5× on round 1 | every round passed; 2.64× → 4.77× |
+
+### Next
+- The sandbox patch (10 files, +470/−196) is a real improvement to `main` but
+  is **not** merged by PR #413: it is agent-authored, touches package
+  `__init__` re-exports, and deserves its own review. It is archived as
+  `sandbox-src.patch` in the results directory.
+- This loop still lacks what would make a scaffold-gain claim meaningful: a
+  held-out problem and a measured noise floor. Those are loop-1 items and this
+  entry does not move them.
+
+---
+
 ## 2026-08-12 — Adversarial review of the loop-1 scaffolding; three loop-1 blockers found in "done" prerequisites
 
 **This is a correction entry, not an experiment.** It amends the entry below it —
