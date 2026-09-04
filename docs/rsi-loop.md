@@ -43,6 +43,12 @@ statement that **the loop measures the score, not the agent** — runs
 in the sandbox with a wall-clock cap, then runs the verifier, then runs the
 cheat detector, then appends one line to `trajectory.json`.
 
+Running as **root** (an agent container, not a Mac), the CLI refuses
+`bypassPermissions` outright and the round ends as `engine_error` in under a
+second. The CLI lifts that guard when `IS_SANDBOX=1` is in its environment; set
+it only where the process really is inside a disposable container. The first
+live run (`research/JOURNAL.md`, 2026-09-04) hit exactly this.
+
 The trajectory line keeps the bash script's four keys first
 (`round`, `started`, `ended`, `exit`) and adds `score`, `passed`, `categories`,
 `scaffold_sha`, `void`, `agent_reported_score`, `verifier_wall_seconds`. Lines

@@ -1,0 +1,80 @@
+344acf0 2026-09-04 18:25:12 +0000 rsi: defer aiosqlite import in solver checkpoints module
+cea62be 2026-09-04 18:12:51 +0000 rsi: self-edit after round 3
+e3c4cae 2026-09-04 18:07:37 +0000 rsi: defer shutil imports and lazily resolve problems package re-exports
+d1575c5 2026-09-04 17:40:56 +0000 rsi: lazily resolve loop/solver package re-exports, defer pydantic_settings
+f2c1af1 2026-09-04 17:18:23 +0000 rsi: defer matplotlib import in research.loop.plots to first render
+fbee35b 2026-09-04 17:08:02 +0000 rsi: lock verifier and seed scaffold
+eb2c3a3 2026-09-04 17:07:53 +0000 rsi: frozen verifier for import-speedup
+5febc2a 2026-08-29 22:40:13 -0500 Flywheel rounds link to the metrics pane over an in-app channel (#411)
+1957d58 2026-08-18 20:38:10 -0500 Give RoundRunner a resume story and a production driver (RES-17) (#409)
+b45d849 2026-08-16 12:00:00 -0500 Show the chain verdict where the numbers are read (RES-18) (#408)
+ee4f594 2026-08-16 01:27:04 -0500 Make metrics rotation atomic as a set and self-healing (RES-19) (#407)
+bead98a 2026-08-16 01:10:21 -0500 Let a verifier declare its own score floor (RES-15) (#406)
+ca938f4 2026-08-16 00:13:46 -0500 Merge branch 'main' into claude/pr-adversarial-review-79z13w-contracts
+0513a5d 2026-08-16 03:10:32 +0000 feat(research): validate problem ids and score scales where they are declared
+7f91a8c 2026-08-16 02:28:11 +0000 fix(desktop): make the panes read what the loop actually writes
+a49a382 2026-08-16 00:26:24 +0000 fix(research): close the close-out's identity blind spot at its source
+d79d16c 2026-08-16 00:00:38 +0000 fix(research): refuse a delta against a lossy baseline, and never adopt another generation's chain
+6dcffb4 2026-08-15 23:23:09 +0000 fix(research): stop the verifier failing a round it is watching run
+87f86eb 2026-08-15 22:56:44 +0000 docs(research): correct claims the containment fixes falsified
+8d7c053 2026-08-15 22:33:31 +0000 fix(research): refuse round deltas when a contained attempt loss shifts the corpus
+0eed3fc 2026-08-15 21:52:52 +0000 fix(research): stop the reporting layer failing honest runs and losing rounds
+2cecb94 2026-08-14 21:03:56 -0500 Emit the Loop 1 research-results reporting contract (RES-12)
+68d55c4 2026-08-13 22:56:06 -0500 fix(desktop): make the one-time layout reseed durable and RSI-safe
+49da8a6 2026-08-13 22:48:23 -0500 Merge branch 'claude/reconnecting-indicator-c460b3'
+1782715 2026-08-13 22:48:16 -0500 fix(desktop): only show the gateway badge when a live socket drops
+6c7883d 2026-08-13 22:44:14 -0500 feat(desktop): open maximized, and push the three-workspace preset onto saved workstations
+b5e8fdf 2026-08-13 22:32:28 -0500 Merge branch 'main' into claude/turing-config-pane-layout-1f2373
+450f167 2026-08-13 22:25:30 -0500 Merge branch 'claude/dropdown-styling-832fb4'
+5203363 2026-08-13 22:25:20 -0500 feat(desktop): themed dropdowns + fix panes laid out against a phantom viewport
+7842866 2026-08-13 22:24:32 -0500 fix(desktop): drop the unreachable ⌘K clear-terminal binding
+bd0a5ca 2026-08-13 22:23:27 -0500 feat(desktop): three seeded workspaces, the rest added with ⌘N
+45b631f 2026-08-13 21:57:33 -0500 fix(deps): clear the open Dependabot advisories
+7ee3720 2026-08-13 21:51:01 -0500 fix(desktop): scale up the home-screen wordmark
+011b028 2026-08-13 21:26:08 -0500 feat(desktop): RSI workstations — a sandboxed agent loop as a second kind of workstation (#396)
+495d00d 2026-08-13 21:17:14 -0500 docs: extract multi-agent workflow rules into a portable skill
+c37faff 2026-08-13 21:16:54 -0500 feat(desktop): in-app update from the home screen (#398)
+7fb612d 2026-08-13 23:41:00 +0000 Merge origin/main into claude/bug-fixes-cloud-migration-ou27wp
+078bc67 2026-08-13 23:36:44 +0000 fix: close out the last three review notes
+e8b9762 2026-08-13 23:31:20 +0000 fix(desktop): act on the second and third adversarial reviews
+2f3e52b 2026-08-13 18:20:47 -0500 fix(ci): let mypy target the interpreter it runs under
+0ddcb89 2026-08-13 18:13:31 -0500 chore: ignore stray uv.lock
+e267c60 2026-08-13 23:12:48 +0000 feat(desktop): flywheel round detail and the wheel view (#390)
+0ed800f 2026-08-13 23:10:11 +0000 fix(desktop): make .layout.json re-apply a true no-op, and uncrashable
+f095b8c 2026-08-13 18:05:38 -0500 feat(desktop): a home page for workstations
+e66e417 2026-08-13 22:58:13 +0000 feat(desktop): agent-driven pane control via .layout.json (#388)
+6933eb4 2026-08-13 19:53:22 +0000 fix(desktop): map the flywheel timeline to the schema the loop writes (#390)
+78c6db6 2026-08-13 19:49:28 +0000 fix(tests): stop the gateway entrypoint tests leaking aiosqlite handles (#384)
+fe836b7 2026-08-13 19:38:51 +0000 fix(desktop): images pane keeps the image you chose (#391, #389)
+1fa45f5 2026-08-13 13:59:17 -0500 chore: drop the GitNexus integration
+b13593c 2026-08-13 13:59:17 -0500 feat(desktop): one-command reinstall into /Applications
+1310274 2026-08-13 13:59:03 -0500 feat(desktop): named, saved layout sessions
+24e0ed9 2026-08-13 13:59:03 -0500 feat(desktop): tiling gaps, and a focus ring that follows the theme
+7d5c6bf 2026-08-13 13:58:48 -0500 feat(desktop): move the results root out of the repo
+2fe300a 2026-08-13 13:18:13 -0500 feat(desktop): package as a signed .app with a real icon (#385)
+cc6edcd 2026-08-13 13:03:01 -0500 feat(desktop): Tauri tiling shell — terminals, live metrics, agent viewer, omarchy themes (#383)
+69254e6 2026-08-13 09:58:22 -0500 feat(research): scaffold the autonomous research-agent loop (#380) (#381)
+2c300fe 2026-06-10 11:19:29 +0000 CLAUDE.md: document remote-container gotchas (#363)
+b72024d 2026-06-10 11:15:59 +0000 Align TUI wire model with gateway frames; default web_fetch allowlist with Google Scholar (#362)
+4e422e5 2026-06-10 04:12:45 -0700 Bench cycle: two-cycle software-only flywheel run with seam invariants (#361)
+b3ff8bb 2026-06-10 04:12:33 -0700 feat(webui): segment the dashboard into tabbed views (Queue / Chat / Observability) (#359)
+3e8f4f8 2026-06-09 18:28:37 -0500 Add multi-contributor/multi-agent workflow: conventions, CODEOWNERS, CI reshape + sequence guards (#357)
+9a39e24 2026-06-09 16:34:38 -0500 Add scripts/dev/demo_gateway.py - the seeded local-preview gateway the README documents
+a07a4fc 2026-06-09 13:55:06 -0700 Sign mesh presence: route heartbeat/leave through SignedTransport (#354)
+1996d94 2026-06-09 13:37:19 -0700 Bind verified signing keys to the claimed sender_id in SignedTransport (#353)
+d280a39 2026-06-09 13:33:52 -0700 Make the plugin allow-list fail-closed by default (#352)
+46251a5 2026-06-09 20:06:34 +0000 ci: retry flaky nats image pre-pull with backoff (#351)
+52bc04b 2026-06-09 19:48:20 +0000 Overhaul TUI and webui with shared minimalist computer theme (#350)
+e21a72c 2026-06-09 19:48:08 +0000 Security hardening + CI gaps: SSRF guard, log redaction, ping count validation, webui tests in CI, worktree-pinned pytest (#349)
+f6d479a 2026-06-09 19:44:03 +0000 chore(deps-dev): bump vitest from 4.1.7 to 4.1.8 in /webui (#344)
+5cdfb24 2026-06-09 19:38:52 +0000 Improve UI accessibility and rendering (#332)
+3665470 2026-06-09 19:38:44 +0000 chore(deps): bump react and @types/react in /webui (#342)
+bf63516 2026-06-09 19:31:53 +0000 chore(deps): update aiosqlite requirement from >=0.20 to >=0.22.1 (#340)
+49191b5 2026-06-09 19:31:47 +0000 chore(deps): update anthropic requirement from >=0.102.0 to >=0.107.0 (#339)
+44a4ce0 2026-06-09 19:29:46 +0000 security: fix SSRF, secret-read, replay, CSWSH, redaction, and DoS issues (#345)
+03b5969 2026-06-09 19:28:10 +0000 chore(deps): bump react-dom and @types/react-dom in /webui (#343)
+02cf1ad 2026-06-09 19:27:28 +0000 chore(deps-dev): bump vite from 8.0.14 to 8.0.16 in /webui (#341)
+e5e6a65 2026-06-09 19:26:36 +0000 chore(deps): update structlog requirement from >=25.5.0 to >=26.1.0 (#338)
+52a52e2 2026-06-09 19:26:28 +0000 chore(deps): update ollama requirement from >=0.4 to >=0.6.2 (#337)
+eb2615c 2026-06-09 19:26:22 +0000 chore(deps): update nats-py requirement from >=2.14.0 to >=2.15.0 (#336)
+ceb4788 2026-06-05 23:32:28 +0000 docs(context): record the flywheel/webui frontier projection seam (#329)
