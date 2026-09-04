@@ -31,49 +31,58 @@ dropped held-out results from it.
 
 from __future__ import annotations
 
-from turing.research.solver.checkpoints import (
-    InMemoryCheckpointStore,
-    SqliteCheckpointStore,
-    attempt_from_json,
-    attempt_to_json,
-    escalation_from_json,
-    escalation_to_json,
-    iteration_from_json,
-    iteration_to_json,
-)
-from turing.research.solver.config import SolverSettings
-from turing.research.solver.errors import (
-    CheckpointError,
-    ProposalError,
-    SolverError,
-    WorkspaceEscapeError,
-    WorkspaceTemplateError,
-)
-from turing.research.solver.models import (
-    CommandOutcome,
-    FileEdit,
-    IterationPhase,
-    IterationRecord,
-    IterationSummary,
-    ProgressSummary,
-    Proposal,
-    ProposalContext,
-    SolverOutcome,
-    SolverPolicy,
-    better_result,
-    summarise_progress,
-)
-from turing.research.solver.protocols import (
-    CheckpointStore,
-    Clock,
-    CommandRunner,
-    EscalationChannel,
-    ProposalBackend,
-    ResumableBackend,
-    SystemClock,
-)
-from turing.research.solver.solver import Solver
-from turing.research.solver.workspace import Workspace, WorkspaceManager
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    # See turing/research/loop/__init__.py for why this package resolves its
+    # public names lazily instead of importing every submodule up front:
+    # SolverSettings alone (turing.research.solver.config) pulls in pydantic
+    # and pydantic_settings, which most importers of this package — anything
+    # that only needs Solver, the checkpoint stores or the models — never
+    # touch.
+    from turing.research.solver.checkpoints import (
+        InMemoryCheckpointStore,
+        SqliteCheckpointStore,
+        attempt_from_json,
+        attempt_to_json,
+        escalation_from_json,
+        escalation_to_json,
+        iteration_from_json,
+        iteration_to_json,
+    )
+    from turing.research.solver.config import SolverSettings
+    from turing.research.solver.errors import (
+        CheckpointError,
+        ProposalError,
+        SolverError,
+        WorkspaceEscapeError,
+        WorkspaceTemplateError,
+    )
+    from turing.research.solver.models import (
+        CommandOutcome,
+        FileEdit,
+        IterationPhase,
+        IterationRecord,
+        IterationSummary,
+        ProgressSummary,
+        Proposal,
+        ProposalContext,
+        SolverOutcome,
+        SolverPolicy,
+        better_result,
+        summarise_progress,
+    )
+    from turing.research.solver.protocols import (
+        CheckpointStore,
+        Clock,
+        CommandRunner,
+        EscalationChannel,
+        ProposalBackend,
+        ResumableBackend,
+        SystemClock,
+    )
+    from turing.research.solver.solver import Solver
+    from turing.research.solver.workspace import Workspace, WorkspaceManager
 
 __all__ = [
     "CheckpointError",
@@ -113,3 +122,65 @@ __all__ = [
     "iteration_to_json",
     "summarise_progress",
 ]
+
+_SUBMODULE_BY_NAME: dict[str, str] = {
+    "InMemoryCheckpointStore": "checkpoints",
+    "SqliteCheckpointStore": "checkpoints",
+    "attempt_from_json": "checkpoints",
+    "attempt_to_json": "checkpoints",
+    "escalation_from_json": "checkpoints",
+    "escalation_to_json": "checkpoints",
+    "iteration_from_json": "checkpoints",
+    "iteration_to_json": "checkpoints",
+    "SolverSettings": "config",
+    "CheckpointError": "errors",
+    "ProposalError": "errors",
+    "SolverError": "errors",
+    "WorkspaceEscapeError": "errors",
+    "WorkspaceTemplateError": "errors",
+    "CommandOutcome": "models",
+    "FileEdit": "models",
+    "IterationPhase": "models",
+    "IterationRecord": "models",
+    "IterationSummary": "models",
+    "ProgressSummary": "models",
+    "Proposal": "models",
+    "ProposalContext": "models",
+    "SolverOutcome": "models",
+    "SolverPolicy": "models",
+    "better_result": "models",
+    "summarise_progress": "models",
+    "CheckpointStore": "protocols",
+    "Clock": "protocols",
+    "CommandRunner": "protocols",
+    "EscalationChannel": "protocols",
+    "ProposalBackend": "protocols",
+    "ResumableBackend": "protocols",
+    "SystemClock": "protocols",
+    "Solver": "solver",
+    "Workspace": "workspace",
+    "WorkspaceManager": "workspace",
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve a public name by importing its defining submodule on first use.
+
+    Keeps every name in ``__all__`` importable from ``turing.research.solver``
+    without paying for all six submodules — including ``config``, which pulls
+    in pydantic and pydantic_settings for ``SolverSettings`` — just to import
+    this package, which most importers only need for a handful of names.
+    """
+    submodule_name = _SUBMODULE_BY_NAME.get(name)
+    if submodule_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+
+    submodule = importlib.import_module(f"{__name__}.{submodule_name}")
+    value = getattr(submodule, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))

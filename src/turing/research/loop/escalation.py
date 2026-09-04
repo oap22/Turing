@@ -49,7 +49,6 @@ from turing.research.contracts import (
     EscalationVerdict,
 )
 from turing.research.loop.protocols import SystemClock
-from turing.research.loop.settings import ResearchLoopSettings
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -58,6 +57,7 @@ if TYPE_CHECKING:
     from turing.coordinator.alerts.ntfy_client import NtfyAlertClient
     from turing.research.contracts import EscalationRequest
     from turing.research.loop.protocols import Clock
+    from turing.research.loop.settings import ResearchLoopSettings
 
 logger = structlog.get_logger(__name__)
 
@@ -465,6 +465,7 @@ def build_operator_channel(
     must never resolve into a default verdict.
     """
     from turing.coordinator.alerts.ntfy_client import NtfyAlertClient
+    from turing.research.loop.settings import ResearchLoopSettings
 
     resolved = settings or ResearchLoopSettings()
     notifier = NtfyEscalationNotifier(

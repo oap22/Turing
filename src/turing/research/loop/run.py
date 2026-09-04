@@ -102,20 +102,20 @@ from turing.research.contracts import ContractViolationError, EngineIdentity
 from turing.research.loop.escalation import build_operator_channel
 from turing.research.loop.noise_floor import NoiseFloorConfig, NoiseFloorRunner
 from turing.research.loop.runner import RoundConfig, RoundRunner, find_finished_round
-from turing.research.loop.settings import ResearchLoopSettings
 from turing.research.loop.solver_bridge import SolverBridge
 from turing.research.loop.trajectory import TrajectoryStore
 from turing.research.loop.workspace import CopyTreeWorkspaceProvider
 from turing.research.problems.adapter import bind_eval_set_hash, fingerprint_corpus
 from turing.research.problems.speedup import SpeedupAdapter
 from turing.research.solver import InMemoryCheckpointStore, Solver, WorkspaceManager
-from turing.research.solver.config import SolverSettings
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from turing.research.backends.claude import BackendSettings, ClaudeBackend
     from turing.research.contracts import EscalationRequest, Problem
+    from turing.research.loop.settings import ResearchLoopSettings
+    from turing.research.solver.config import SolverSettings
 
 logger = structlog.get_logger(__name__)
 
@@ -219,6 +219,9 @@ def _build_runner(
 
 
 async def _drive(args: argparse.Namespace) -> int:
+    from turing.research.loop.settings import ResearchLoopSettings
+    from turing.research.solver.config import SolverSettings
+
     settings = ResearchLoopSettings()
     solver_settings = SolverSettings()
 

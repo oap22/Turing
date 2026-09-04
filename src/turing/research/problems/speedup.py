@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shutil
 import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -484,6 +483,8 @@ class SpeedupAdapter:
         and the tests that restate the floors — those are how the eval set
         would otherwise leak into the write surface.
         """
+        import shutil
+
         spec = self.spec_for(problem.id)
         source = spec.source_root
         if not source.is_dir():

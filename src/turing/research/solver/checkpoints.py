@@ -25,7 +25,6 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import aiosqlite
 import structlog
 
 from turing.research.contracts import (
@@ -48,6 +47,8 @@ from turing.research.solver.models import (
 
 if TYPE_CHECKING:
     from types import TracebackType
+
+    import aiosqlite
 
 __all__ = [
     "InMemoryCheckpointStore",
@@ -420,6 +421,8 @@ class SqliteCheckpointStore:
     async def open(self) -> SqliteCheckpointStore:
         if self._db is not None:
             return self
+        import aiosqlite
+
         if self._db_path != ":memory:":
             Path(self._db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self._db_path)
