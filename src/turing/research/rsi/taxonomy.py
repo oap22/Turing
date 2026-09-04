@@ -25,6 +25,10 @@ What it does not do:
   merges its categories in.
 * It does not decide whether the loop stops. That is the loop's job, driven
   by the categories this module returns.
+* It does not track ``best_score`` itself. The loop supplies it from numeric
+  scores only, so the "a later pass on a pass/fail-only problem is
+  ``NO_PROGRESS``" rule in :func:`classify_round` is unreachable in the
+  running loop unless a numeric score was measured earlier.
 """
 
 from __future__ import annotations

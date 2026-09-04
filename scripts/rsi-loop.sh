@@ -17,6 +17,29 @@
 # `scripts/setup-research-sandbox.sh` and ADR 0011 §8 for the stronger
 # boundary (a dedicated `turing` OS user) this script deliberately does not
 # implement.
+#
+# Two engines behind one flag set. With only the original flags, on a slug
+# that has never been locked, this script runs the bash loop below,
+# unchanged. It execs the Python engine, `python -m turing.research.rsi`,
+# forwarding every flag, when any of these holds:
+#   * `--verifier <cmd>` is given (a first run of the Python engine);
+#   * `TURING_RSI_ENGINE=python` is set;
+#   * the slug's sandbox already holds VERIFIER.json — the marker that this
+#     slug is a verified loop. The desktop's argv (no --verifier) therefore
+#     resumes a locked slug on the Python engine instead of silently
+#     downgrading to the unverified bash loop, whose `wc -l` numbering would
+#     also skip over the engine's event lines.
+# Same sandbox and results layout, plus a frozen verifier that measures each
+# round, a frozen failure taxonomy, a scaffold self-edit step with rollback,
+# and a cheat detector. See docs/rsi-loop.md. `--verifier-file`,
+# `--self-edit-every`, `--self-edit-budget` and `--noise-floor` belong to
+# that engine and are refused without it. The Python engine needs
+# `--verifier` on a first run: `TURING_RSI_ENGINE=python` alone on a fresh
+# slug exits 2.
+#
+# Interpreter: `.venv/bin/python` under the repo when present, else
+# `TURING_RSI_PYTHON` if set, else `python3` with the repo's `src/` on
+# PYTHONPATH (src layout; a bare `python3` cannot import `turing` otherwise).
 
 set -euo pipefail
 
@@ -29,6 +52,17 @@ usage: rsi-loop.sh --slug <slug> --results-root <dir> [--problem <text>] [--roun
   --problem <text>       required on first run (ignored on resume; PROBLEM.md wins)
   --rounds <n>           default 10; 0 means unlimited
   --dry-run              print the resolved plan and exit without touching disk
+
+Python engine (python -m turing.research.rsi; selected by --verifier, by TURING_RSI_ENGINE=python,
+or automatically when ~/turing-workspace/rsi-<slug>/VERIFIER.json already exists):
+  --verifier <cmd>       frozen verifier command, run from the sandbox after every round;
+                         required on the first run, locked into VERIFIER.json
+  --verifier-file <rel>  sandbox file whose sha256 joins the lock; repeatable. Only the
+                         command's FIRST token is pinned automatically, so
+                         --verifier 'python grade.py' needs --verifier-file grade.py
+  --self-edit-every <n>  let the agent rewrite SCAFFOLD.md every n rounds (default 3; 0 disables)
+  --self-edit-budget <n> max self-edits per invocation (default 3)
+  --noise-floor <x>      rollback noise floor override (default: stdev of prior scores)
 EOF
 }
 
@@ -37,6 +71,8 @@ RESULTS_ROOT=""
 PROBLEM=""
 ROUNDS=10
 DRY_RUN=0
+VERIFIER=""
+PY_ONLY_ARGS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -59,6 +95,14 @@ while [[ $# -gt 0 ]]; do
     --dry-run)
       DRY_RUN=1
       shift
+      ;;
+    --verifier)
+      VERIFIER="${2:-}"
+      shift 2
+      ;;
+    --verifier-file|--self-edit-every|--self-edit-budget|--noise-floor)
+      PY_ONLY_ARGS+=("$1" "${2:-}")
+      shift 2
       ;;
     *)
       echo "error: unknown flag: $1" >&2
@@ -90,13 +134,51 @@ if [[ ! "$ROUNDS" =~ ^[0-9]+$ ]]; then
 fi
 
 # The desktop passes an already-expanded absolute path, but hand runs may
-# pass a literal `~`; bash does not tilde-expand a value that arrived through
-# a variable, so expand it ourselves.
+# pass a literal `~` or a relative path; bash does not tilde-expand a value
+# that arrived through a variable, so expand it ourselves, and anchor a
+# relative path to the invocation cwd *before* either engine sees it — the
+# Python engine is exec'd from wherever we are, and a results dir must not
+# move with the process's cwd.
 if [[ "$RESULTS_ROOT" == "~"* ]]; then
   RESULTS_ROOT="${HOME}${RESULTS_ROOT:1}"
 fi
+if [[ "$RESULTS_ROOT" != /* ]]; then
+  RESULTS_ROOT="$PWD/$RESULTS_ROOT"
+fi
 
 SANDBOX="$HOME/turing-workspace/rsi-$SLUG"
+
+# Bridge to the Python engine. Everything below this block is the original
+# bash loop and runs only when nothing selected the Python engine: no
+# --verifier, no TURING_RSI_ENGINE=python, and no VERIFIER.json in the
+# sandbox. The desktop's argv contract sees no change on an unlocked slug.
+if [[ -n "$VERIFIER" || "${TURING_RSI_ENGINE:-}" == "python" || -f "$SANDBOX/VERIFIER.json" ]]; then
+  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  if [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then
+    PYTHON="$REPO_ROOT/.venv/bin/python"
+  elif [[ -n "${TURING_RSI_PYTHON:-}" ]]; then
+    PYTHON="$TURING_RSI_PYTHON"
+  else
+    PYTHON="python3"
+    export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+  fi
+  PY_ARGS=(--slug "$SLUG" --results-root "$RESULTS_ROOT" --rounds "$ROUNDS")
+  [[ -n "$PROBLEM" ]] && PY_ARGS+=(--problem "$PROBLEM")
+  [[ -n "$VERIFIER" ]] && PY_ARGS+=(--verifier "$VERIFIER")
+  [[ "$DRY_RUN" -eq 1 ]] && PY_ARGS+=(--dry-run)
+  if [[ ${#PY_ONLY_ARGS[@]} -gt 0 ]]; then
+    PY_ARGS+=("${PY_ONLY_ARGS[@]}")
+  fi
+  # No `cd`: the interpreter above can import `turing` from anywhere, and
+  # staying put keeps the process cwd honest for anything else relative.
+  exec "$PYTHON" -m turing.research.rsi "${PY_ARGS[@]}"
+fi
+if [[ ${#PY_ONLY_ARGS[@]} -gt 0 ]]; then
+  echo "error: ${PY_ONLY_ARGS[0]} requires the Python engine (pass --verifier or set TURING_RSI_ENGINE=python)" >&2
+  usage
+  exit 2
+fi
+
 RESULTS="$RESULTS_ROOT/loop-rsi-$SLUG"
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
