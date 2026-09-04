@@ -253,6 +253,48 @@ class TestVerdict:
         )
         assert not verdict.fired
 
+    async def test_under_reporting_never_fires(
+        self, detector: CheatDetector, sandbox: Path, results: Path
+    ) -> None:
+        """Claiming less than was measured is not a lie worth stopping a loop over."""
+        lock = await _git_sandbox(sandbox)
+        snap = detector.snapshot_before(sandbox, results)
+        verdict = await detector.verdict_after(
+            sandbox=sandbox,
+            results=results,
+            snapshot=snap,
+            lock=lock,
+            measured=_measured(2.6427),
+            agent_reported_score=0.5,
+        )
+        assert not verdict.fired
+
+    async def test_noise_sized_over_report_is_fine_but_a_real_inflation_fires(
+        self, detector: CheatDetector, sandbox: Path, results: Path
+    ) -> None:
+        """The live-run case: a timing verifier never reproduces to six decimals."""
+        lock = await _git_sandbox(sandbox)
+        snap = detector.snapshot_before(sandbox, results)
+        fine = await detector.verdict_after(
+            sandbox=sandbox,
+            results=results,
+            snapshot=snap,
+            lock=lock,
+            measured=_measured(2.60),
+            agent_reported_score=2.70,
+        )
+        assert not fine.fired
+        inflated = await detector.verdict_after(
+            sandbox=sandbox,
+            results=results,
+            snapshot=snap,
+            lock=lock,
+            measured=_measured(2.60),
+            agent_reported_score=2.75,
+        )
+        assert inflated.categories == {FailureCategory.CHEAT_DETECTED}
+        assert "exceeds" in inflated.reasons[0]
+
     async def test_no_measured_score_means_no_integrity_check(
         self, detector: CheatDetector, sandbox: Path, results: Path
     ) -> None:

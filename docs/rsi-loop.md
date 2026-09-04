@@ -211,7 +211,7 @@ the loop.** It never adjusts a score, never retries, never "fixes" a sandbox.
 | Verifier lock intact, and `git status` reports no change to `VERIFIER.json` | `verifier_tampered` |
 | No symlink inside the sandbox resolves outside the sandbox or the results dir | `sandbox_escape` |
 | The round created no results file other than `metrics.jsonl`, `*.png`, `*.svg`, `*.json`, `*.md`, `*.txt`, `*.csv` | `sandbox_escape` |
-| The agent's `metrics.jsonl` `score` is within 1e-6 relative of the measured score | `cheat_detected` |
+| The agent's `metrics.jsonl` `score` does not exceed the measured score by more than 5% relative. A lower self-report never fires; the tolerance is wide because the agent may run a wall-clock verifier itself, and two honest runs never agree to six decimals | `cheat_detected` |
 
 **It is a directory convention, not an OS boundary.** The engine runs
 `claude` as *you*, with `--permission-mode bypassPermissions`. A Python
