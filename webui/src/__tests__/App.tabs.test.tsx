@@ -95,10 +95,11 @@ describe("App — tabbed views", () => {
     expect(window.location.hash).toBe("#chat");
   });
 
-  it("hotkeys 1/2/3 switch views", () => {
+  it("hotkeys 1/2/3 switch views", async () => {
     render(<App />);
     fireEvent.keyDown(window, { key: "3" });
-    expect(screen.getByTestId("observability-view")).toBeInTheDocument();
+    // The observability view is code-split (lazy), so it lands a tick later.
+    expect(await screen.findByTestId("observability-view")).toBeInTheDocument();
     expect(window.location.hash).toBe("#obs");
     fireEvent.keyDown(window, { key: "1" });
     expect(screen.getByTestId("queue-pane")).toBeInTheDocument();

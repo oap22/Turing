@@ -1,5 +1,7 @@
 import {
+  lazy,
   memo,
+  Suspense,
   useCallback,
   useEffect,
   useMemo,
@@ -26,7 +28,11 @@ import DesktopShell, { type Surface } from "./desktop/DesktopShell";
 import { gatewayFetch } from "./desktop/gateway";
 import { isTauri } from "./desktop/tauri";
 import { emptyState, markStale, reduce, type Frame } from "./graph/reducer";
-import ObservabilityView from "./ObservabilityView";
+// Code-split: the observability view pulls in reactflow, the heaviest
+// dependency in the tree, and is one launcher-only surface among many.
+// Loading it on first use keeps the Home screen and the first terminal off
+// the critical path of that parse.
+const ObservabilityView = lazy(() => import("./ObservabilityView"));
 import QueuePane from "./queue/QueuePane";
 import {
   applyQueueFrame,
@@ -426,13 +432,15 @@ export default function App() {
             </section>
           )}
           {tab === "obs" && (
-            <ObservabilityView
-              graphState={visibleState}
-              highlightedEdge={highlightedEdge}
-              specsRows={specsRows}
-              liveTrace={liveTrace}
-              onTraceSelect={onTraceSelect}
-            />
+            <Suspense fallback={null}>
+              <ObservabilityView
+                graphState={visibleState}
+                highlightedEdge={highlightedEdge}
+                specsRows={specsRows}
+                liveTrace={liveTrace}
+                onTraceSelect={onTraceSelect}
+              />
+            </Suspense>
           )}
         </div>
         {showDebug && (

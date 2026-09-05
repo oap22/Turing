@@ -45,12 +45,41 @@ def _consume_tool_name(
 class OllamaProvider(LLMProvider):
     """LLM provider backed by a local Ollama instance."""
 
-    def __init__(self, host: str = "http://localhost:11434", model: str = "gemma3:1b") -> None:
+    def __init__(
+        self,
+        host: str = "http://localhost:11434",
+        model: str = "gemma3:1b",
+        *,
+        keep_alive: str | None = None,
+        num_ctx: int | None = None,
+    ) -> None:
         import ollama
 
         self._client = ollama.AsyncClient(host=host, timeout=_TIMEOUT_SECONDS)
         self._model = model
         self._host = host
+        # Sent with every request. Ollama's default unloads the model after
+        # 5 idle minutes, and reloading a multi-GB model on a Pi/Jetson costs
+        # seconds — longer than most answers take to generate.
+        self._keep_alive = keep_alive
+        self._num_ctx = num_ctx
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    @property
+    def host(self) -> str:
+        return self._host
+
+    def _options(self, max_tokens: int, temperature: float) -> dict[str, Any]:
+        options: dict[str, Any] = {"num_predict": max_tokens, "temperature": temperature}
+        if self._num_ctx is not None:
+            options["num_ctx"] = self._num_ctx
+        return options
+
+    def _request_extras(self) -> dict[str, Any]:
+        return {"keep_alive": self._keep_alive} if self._keep_alive is not None else {}
 
     # ── public interface ────────────────────────────────────────────────
 
@@ -68,10 +97,8 @@ class OllamaProvider(LLMProvider):
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": api_messages,
-            "options": {
-                "num_predict": max_tokens,
-                "temperature": temperature,
-            },
+            "options": self._options(max_tokens, temperature),
+            **self._request_extras(),
         }
 
         # Ollama has limited tool support — only some models handle it.
@@ -104,10 +131,8 @@ class OllamaProvider(LLMProvider):
                 model=self._model,
                 messages=api_messages,
                 stream=True,
-                options={
-                    "num_predict": max_tokens,
-                    "temperature": temperature,
-                },
+                options=self._options(max_tokens, temperature),
+                **self._request_extras(),
             )
             async for chunk in response_stream:
                 content = chunk.get("message", {}).get("content", "")
@@ -116,6 +141,47 @@ class OllamaProvider(LLMProvider):
         except Exception:
             logger.error("ollama_stream_failed", model=self._model, exc_info=True)
             raise
+
+    async def list_models(self) -> list[str]:
+        """Names of the models this Ollama has pulled (``/api/tags``).
+
+        Advertised over mesh presence so peers can route to us for models
+        they lack, and used by :class:`turing.llm.pool.PeerModelPool` to
+        decide whether the configured model is served locally at all.
+        """
+        result = await self._client.list()
+        raw = (
+            result.get("models", []) if isinstance(result, dict) else getattr(result, "models", [])
+        )
+        names: list[str] = []
+        for entry in raw or []:
+            name = (
+                entry.get("model") or entry.get("name")
+                if isinstance(entry, dict)
+                else getattr(entry, "model", None) or getattr(entry, "name", None)
+            )
+            if name:
+                names.append(str(name))
+        return names
+
+    async def warmup(self) -> bool:
+        """Load the model into memory ahead of the first real request.
+
+        An empty-prompt ``generate`` is Ollama's documented way to preload a
+        model; combined with ``keep_alive`` it means the first user turn
+        after boot pays no multi-second load. Failures are logged, never
+        raised — a missing model surfaces on the first real call with a
+        proper error, and the router falls back to cloud.
+        """
+        try:
+            await self._client.generate(model=self._model, prompt="", **self._request_extras())
+        except Exception:
+            logger.warning(
+                "ollama_warmup_failed", model=self._model, host=self._host, exc_info=True
+            )
+            return False
+        logger.info("ollama_warmed", model=self._model, host=self._host)
+        return True
 
     async def health_check(self) -> bool:
         """Check Ollama connectivity by listing available models."""

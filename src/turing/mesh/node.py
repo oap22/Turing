@@ -53,6 +53,11 @@ class PeerInfo:
     # Per-peer live specs (CPU%, temperature, ...). ``None`` for peers
     # running an older build that pre-dates the specs panel slice.
     specs: NodeSpecs | None = None
+    # Models the peer's Ollama has pulled, and the URL it serves them on
+    # (``None`` when the peer does not advertise one — then nobody routes
+    # local-tier requests to it). See ``turing.llm.pool``.
+    models: list[str] = field(default_factory=list)
+    ollama_host: str | None = None
 
     @property
     def is_stale(self) -> bool:
@@ -82,6 +87,9 @@ class MeshNode:
         # so the gateway's ``/peers`` self-row reports current values without
         # a second sample. ``None`` before the first heartbeat.
         self._self_specs: NodeSpecs | None = None
+        # What this node advertises for peer model routing (see PeerInfo).
+        self.ollama_host: str | None = getattr(config, "ollama_advertise_host", None) or None
+        self.self_models: list[str] = []
 
     @property
     def node_name(self) -> str:

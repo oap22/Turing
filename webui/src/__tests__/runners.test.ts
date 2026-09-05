@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   __resetResultsRootForTests,
+  AGENT_SANDBOX,
   RESULTS_ROOT_TOKEN,
   resolveRunner,
   resultsRoot,
@@ -27,9 +28,35 @@ describe("RUNNERS", () => {
     }
   });
 
-  it("uses every group present in the runner table (the spec's table has no 'research' entries, only verify/remote/docs)", () => {
+  it("uses every group present in the runner table (the spec's table has no 'research' entries, only agents/verify/remote/docs)", () => {
     const groups = new Set(RUNNERS.map((r) => r.group));
-    expect(groups).toEqual(new Set(["verify", "remote", "docs"]));
+    expect(groups).toEqual(new Set(["agents", "verify", "remote", "docs"]));
+  });
+
+  // The agent runners exist to stop permission prompts, so each must carry
+  // the results-root grant — and only the sandbox one may skip prompts, and
+  // only from inside its sandbox directory, never from a checkout.
+  it("grants claude runners the results root and confines prompt-skipping to the sandbox", () => {
+    for (const id of ["claude", "claude-continue", "claude-sandbox"]) {
+      const runner = RUNNERS.find((r) => r.id === id);
+      expect(runner, id).toBeDefined();
+      expect(runner?.command, id).toContain(`--add-dir ${RESULTS_ROOT_TOKEN}`);
+      expect(runner?.group, id).toBe("agents");
+    }
+    for (const r of RUNNERS) {
+      if (r.command.includes("--dangerously-skip-permissions")) {
+        expect(r.id).toBe("claude-sandbox");
+        expect(r.command).toContain(`cd ${AGENT_SANDBOX} &&`);
+        expect(r.cwd).not.toContain("Turing");
+      }
+    }
+  });
+
+  it("substitutes the results root into the claude runners", async () => {
+    const runner = RUNNERS.find((r) => r.id === "claude")!;
+    const resolved = await resolveRunner(runner);
+    expect(resolved.command).not.toContain(RESULTS_ROOT_TOKEN);
+    expect(resolved.command).toMatch(/--add-dir \S+research-results/);
   });
 
   // Both remote streamers carry placeholders, so they must be pre-typed for

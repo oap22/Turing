@@ -120,10 +120,16 @@ class SafetyGate:
                     risk_level="high",
                 )
 
-        # Step 2: Process tool deny for kill/manage actions.
+        # Step 2: Process tool deny for kill/manage actions. The operator
+        # auto-approve flag applies here as well as in step 4, so it is one
+        # switch and not a half-switch that still stalls process management.
         if tool_name == "process":
             action = arguments.get("action", "")
-            if action in ("kill_process", "manage_service") and not self._is_admin(user_id):
+            if (
+                action in ("kill_process", "manage_service")
+                and not self._is_admin(user_id)
+                and not self._auto_approve_high_risk()
+            ):
                 return SafetyCheckResult(
                     decision=SafetyDecision.NEEDS_CONFIRMATION,
                     reason=f"Action '{action}' requires admin confirmation",
@@ -140,6 +146,12 @@ class SafetyGate:
                 return SafetyCheckResult(
                     decision=SafetyDecision.APPROVED,
                     reason="Approved: user is admin",
+                    risk_level=risk_level,
+                )
+            if self._auto_approve_high_risk():
+                return SafetyCheckResult(
+                    decision=SafetyDecision.APPROVED,
+                    reason="Approved: safety_auto_approve_high_risk is set",
                     risk_level=risk_level,
                 )
             return SafetyCheckResult(
@@ -192,6 +204,16 @@ class SafetyGate:
 
         # Default: treat unknown tools as high risk.
         return "high"
+
+    def _auto_approve_high_risk(self) -> bool:
+        """Operator opt-in that turns NEEDS_CONFIRMATION into APPROVED.
+
+        Reached only *after* the deny-list and the admin check, so a denied
+        command stays denied whatever this flag says.
+        """
+        # `is True`, not truthiness: tests hand this gate a MagicMock config,
+        # and an auto-created attribute must read as "off", never "on".
+        return getattr(self.config, "safety_auto_approve_high_risk", False) is True
 
     def _is_admin(self, user_id: str) -> bool:
         """Check whether the user is an admin.

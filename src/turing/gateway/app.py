@@ -155,6 +155,8 @@ def create_app(
                 # this request if the local process weren't running. The
                 # SPA needs a uniform schema, so we still surface the field.
                 "stale": False,
+                "models": list(getattr(mesh_node, "self_models", []) or []),
+                "ollama_host": getattr(mesh_node, "ollama_host", None),
             }
         ]
         if mesh_node is not None:
@@ -169,6 +171,8 @@ def create_app(
                         "last_seen": peer.last_seen,
                         "specs": peer_specs.to_dict() if peer_specs is not None else None,
                         "stale": is_specs_stale(peer),
+                        "models": list(getattr(peer, "models", []) or []),
+                        "ollama_host": getattr(peer, "ollama_host", None),
                     }
                 )
         return {"peers": result, "count": len(result)}

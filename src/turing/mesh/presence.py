@@ -37,6 +37,8 @@ from turing.transport.envelope import MeshMessage
 from turing.transport.signed_transport import SignedTransport, UntrustedSenderError
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from turing.coordinator.alerts.dispatcher import AlertDispatcher
 
 logger = structlog.get_logger("turing.mesh.presence")
@@ -58,7 +60,15 @@ DEFAULT_HEARTBEAT_MIN_INTERVAL = 1.0
 # envelopes (issue #348). v2 added the ``specs`` block (#215). Unsigned v1/v2
 # nodes are no longer interoperable — their frames fail envelope decoding and
 # are dropped (fail-closed; mixed fleets must upgrade together).
+# The ``models`` / ``ollama_host`` fields (peer model routing) are additive
+# and optional, so they ride v3 unchanged: a v3 node without them simply
+# advertises no models.
 SCHEMA_VERSION = 3
+
+# The pulled-model list changes when an operator runs `ollama pull`, not
+# every 10 s; re-asking Ollama on every heartbeat would be pointless load
+# on the node that can least afford it.
+MODEL_SAMPLE_INTERVAL = 60.0
 
 
 class PresenceService:
@@ -89,6 +99,10 @@ class PresenceService:
         # Running count of frames the transport rejected (bad signature,
         # untrusted/unbound sender, replay, garbage bytes).
         self._rejected_count = 0
+        # Optional async sampler of this node's pulled models (the local
+        # Ollama provider's ``list_models``), cached between samples.
+        self._model_sampler: Callable[[], Awaitable[list[str]]] | None = None
+        self._models_sampled_at: float | None = None
 
     @property
     def is_running(self) -> bool:
@@ -107,6 +121,32 @@ class PresenceService:
         attached here rather than passed to ``__init__``.
         """
         self._alert_dispatcher = dispatcher
+
+    def set_model_sampler(self, sampler: Callable[[], Awaitable[list[str]]] | None) -> None:
+        """Late-bind the pulled-model sampler advertised in heartbeats."""
+        self._model_sampler = sampler
+        self._models_sampled_at = None
+
+    async def _sample_self_models(self) -> list[str]:
+        """Refresh ``node.self_models`` at most every ``MODEL_SAMPLE_INTERVAL``.
+
+        A sampler failure keeps the last known list: a transient Ollama
+        hiccup must not make peers believe our models vanished.
+        """
+        if self._model_sampler is None:
+            return self._node.self_models
+        now = time.monotonic()
+        if (
+            self._models_sampled_at is not None
+            and (now - self._models_sampled_at) < MODEL_SAMPLE_INTERVAL
+        ):
+            return self._node.self_models
+        try:
+            self._node.self_models = sorted(set(await self._model_sampler()))
+        except Exception:
+            logger.warning("presence_model_sample_failed", exc_info=True)
+        self._models_sampled_at = now
+        return self._node.self_models
 
     async def start(self) -> None:
         if self._running:
@@ -230,6 +270,7 @@ class PresenceService:
         # Mirror self-specs onto the MeshNode so the gateway's ``/peers``
         # self-row reflects live values without a second sample.
         self._node.self_specs = specs
+        models = await self._sample_self_models()
         payload: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "node_id": self._node.node_id,
@@ -237,6 +278,8 @@ class PresenceService:
             "capabilities": self._node.capabilities,
             "ts_ms": int(time.time() * 1000),
             "specs": specs.to_dict() if specs is not None else None,
+            "models": models,
+            "ollama_host": self._node.ollama_host,
         }
         await self._transport.publish(self._envelope(HEARTBEAT_SUBJECT, payload))
 
@@ -300,11 +343,21 @@ class PresenceService:
                 parsed_specs = None
         else:
             parsed_specs = None
+        raw_models = msg.get("models")
+        models = (
+            [str(m) for m in raw_models if isinstance(m, str)]
+            if isinstance(raw_models, list)
+            else []
+        )
+        raw_host = msg.get("ollama_host")
+        ollama_host = raw_host if isinstance(raw_host, str) and raw_host else None
         peer = PeerInfo(
             node_id=sender_id,
             name=str(msg.get("node_name", sender_id)),
             capabilities=list(msg.get("capabilities", []) or []),
             specs=parsed_specs,
+            models=models,
+            ollama_host=ollama_host,
         )
         self._node.add_peer(peer)
         if self._alert_dispatcher is not None:

@@ -18,8 +18,14 @@ if TYPE_CHECKING:
     from turing.coordinator.alerts.dispatcher import AlertDispatcher
     from turing.gateway.ring_buffer import RingBuffer
     from turing.gateway.telemetry_sink import TelemetrySink
+    from turing.llm.base import LLMProvider
 
 logger = structlog.get_logger("turing")
+
+# Fire-and-forget startup tasks (model warm-up). asyncio only holds a weak
+# reference to a task, so anything not anchored here can be collected before
+# it finishes.
+_background_tasks: set[asyncio.Task[None]] = set()
 
 
 async def _run(config: TuringConfig) -> None:
@@ -49,8 +55,47 @@ async def _run(config: TuringConfig) -> None:
     from turing.llm.router import LLMRouter, warn_if_local_only_disables_tools
 
     cloud_provider = ClaudeProvider(api_key=config.anthropic_api_key, model=config.anthropic_model)
-    local_provider = OllamaProvider(host=config.ollama_host, model=config.ollama_model)
+    local_provider = OllamaProvider(
+        host=config.ollama_host,
+        model=config.ollama_model,
+        keep_alive=config.ollama_keep_alive,
+        num_ctx=config.ollama_num_ctx,
+    )
     classifier = ComplexityClassifier()
+
+    # The local tier the router sees. With mesh + peer models enabled it is a
+    # pool that can borrow a peer's Ollama for a model this node lacks; the
+    # peer table is attached once the mesh is up (step 6).
+    from turing.llm.pool import PeerModelPool
+
+    local_tier: LLMProvider = local_provider
+    peer_pool: PeerModelPool | None = None
+    if config.mesh_enabled and config.llm_peer_models_enabled:
+        peer_pool = PeerModelPool(
+            local_provider,
+            model=config.ollama_model,
+            provider_factory=lambda host, model: OllamaProvider(
+                host=host,
+                model=model,
+                keep_alive=config.ollama_keep_alive,
+                num_ctx=config.ollama_num_ctx,
+            ),
+        )
+        local_tier = peer_pool
+
+    async def _warm_local_tier() -> None:
+        # Off the critical path: the bot can take its first message while
+        # the model loads, and a cold Ollama just means that first local
+        # turn is slower than the ones after it.
+        if peer_pool is not None:
+            await peer_pool.refresh_local_models()
+        if config.ollama_warmup:
+            await local_provider.warmup()
+
+    warm_task = asyncio.create_task(_warm_local_tier(), name="ollama-warmup")
+    # Keep a reference so the task is not garbage-collected mid-flight.
+    _background_tasks.add(warm_task)
+    warm_task.add_done_callback(_background_tasks.discard)
 
     # Map config routing mode to router's expected values
     from typing import Literal, cast
@@ -62,7 +107,7 @@ async def _run(config: TuringConfig) -> None:
     )
     llm_router = LLMRouter(
         cloud_provider,
-        local_provider,
+        local_tier,
         classifier,
         routing_mode,
         local_tools_enabled=config.ollama_tools_enabled,
@@ -162,6 +207,10 @@ async def _run(config: TuringConfig) -> None:
                     now_ms=lambda: int(_mesh_time.time() * 1000),
                 )
                 presence = PresenceService(mesh_node, presence_transport)
+                presence.set_model_sampler(local_provider.list_models)
+                if peer_pool is not None:
+                    live_node = mesh_node
+                    peer_pool.attach_peers(lambda: live_node.peers.values())
                 await presence.start()
                 logger.info("mesh.started", node=config.node_name)
             except Exception as exc:

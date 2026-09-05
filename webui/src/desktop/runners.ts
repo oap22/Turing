@@ -17,7 +17,7 @@ export interface Runner {
   label: string;
   command: string;
   cwd?: string;
-  group: "verify" | "research" | "remote" | "docs";
+  group: "verify" | "research" | "remote" | "docs" | "agents";
   autorun: boolean;
 }
 
@@ -57,7 +57,55 @@ export function substituteResultsRoot(command: string, root: string): string {
 // there is no Tauri runtime (tests, browser) or the command fails.
 const DEFAULT_RESULTS_ROOT = "~/research-results";
 
+// Where the no-prompts agent runner works. A throwaway directory outside every
+// checkout, so skipping permission prompts is scoped to somewhere an agent can
+// do no lasting harm; `scripts/rsi-loop.sh` uses the same parent.
+export const AGENT_SANDBOX = "~/turing-workspace";
+
 export const RUNNERS: readonly Runner[] = [
+  // ── agents ────────────────────────────────────────────────────────────
+  // Coding agents launched straight into a pane, with the filesystem access
+  // they actually need granted up front so the session does not stall on
+  // permission prompts. Inside the repo, `.claude/settings.json` (checked
+  // in) pre-approves the project's own build/test/lint commands and
+  // `--add-dir` lets the agent read and write the results root the metrics
+  // and images panes watch. Nothing here bypasses prompts for the repo
+  // itself; only the sandbox runner does, and only inside `AGENT_SANDBOX`.
+  {
+    id: "claude",
+    label: "claude (repo)",
+    command: `claude --add-dir ${RESULTS_ROOT_TOKEN}`,
+    cwd: REPO,
+    group: "agents",
+    autorun: true,
+  },
+  {
+    id: "claude-continue",
+    label: "claude (repo, continue last)",
+    command: `claude --continue --add-dir ${RESULTS_ROOT_TOKEN}`,
+    cwd: REPO,
+    group: "agents",
+    autorun: true,
+  },
+  {
+    id: "claude-sandbox",
+    label: "claude (sandbox, no prompts)",
+    // The sandbox may not exist yet and `pty_spawn` refuses a missing cwd,
+    // so create it from a cwd that always exists.
+    command: `mkdir -p ${AGENT_SANDBOX} && cd ${AGENT_SANDBOX} && claude --dangerously-skip-permissions --add-dir ${RESULTS_ROOT_TOKEN}`,
+    cwd: "~",
+    group: "agents",
+    autorun: true,
+  },
+  {
+    id: "codex",
+    label: "codex (repo)",
+    command: "codex",
+    cwd: REPO,
+    group: "agents",
+    autorun: true,
+  },
+  // ── verify ────────────────────────────────────────────────────────────
   {
     id: "pytest",
     label: "pytest",

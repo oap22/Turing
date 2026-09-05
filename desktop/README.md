@@ -31,6 +31,59 @@ npm ci
 npm run dev     # = `tauri dev`; boots the webui Vite dev server, then the window
 ```
 
+## Download (no toolchain)
+
+Pushing a `desktop-v*` tag runs `.github/workflows/desktop-release.yml`,
+which builds the Apple Silicon `.dmg` and attaches it (plus a `.sha256`) to
+a GitHub Release. Install is drag-to-Applications. The bundle is ad-hoc
+signed and not notarized, so the first launch of a downloaded copy needs a
+one-time right-click → Open (Gatekeeper quarantine). A `workflow_dispatch`
+run builds the same artifact without publishing a release.
+
+```bash
+git tag desktop-v0.1.1 && git push origin desktop-v0.1.1
+```
+
+## Agents in panes
+
+The launcher (⌘P) has an **agents** group that opens a coding agent straight
+into a terminal pane with the filesystem access it needs already granted:
+
+| runner | what it does |
+|---|---|
+| `claude (repo)` | `claude --add-dir <results root>` in the Turing checkout. The agent can read and write `~/research-results` (the directory the metrics/images panes watch) without a per-file prompt. |
+| `claude (repo, continue last)` | Same, resuming the previous session. |
+| `claude (sandbox, no prompts)` | `claude --dangerously-skip-permissions` inside `~/turing-workspace` — a throwaway directory outside every checkout, the same parent `scripts/rsi-loop.sh` uses. No prompts at all, no access to your repos beyond what you paste in. |
+| `codex (repo)` | Codex CLI in the checkout. |
+
+To stop the repo runner from asking before every `pytest` / `ruff` / `git
+commit`, give the checkout a project permission profile at
+`.claude/settings.json` (the directory is gitignored, so it stays yours).
+A profile that covers the project's own tooling without granting anything
+destructive looks like this:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Read", "Edit", "Write", "Glob", "Grep",
+      "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git add:*)",
+      "Bash(git commit:*)", "Bash(git checkout:*)", "Bash(git switch:*)", "Bash(git push:*)",
+      "Bash(gh pr view:*)", "Bash(gh pr checks:*)", "Bash(gh pr create:*)",
+      "Bash(pytest:*)", "Bash(.venv/bin/pytest:*)", "Bash(ruff:*)", "Bash(mypy:*)",
+      "Bash(npm run:*)", "Bash(npm test:*)", "Bash(npx vitest:*)",
+      "Bash(cargo build:*)", "Bash(cargo test:*)", "Bash(cargo clippy:*)",
+      "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(grep:*)", "Bash(rg:*)"
+    ],
+    "deny": ["Bash(git push --force:*)", "Bash(rm -rf:*)", "Bash(sudo:*)"]
+  }
+}
+```
+
+Terminal output from an agent is coalesced on the Rust side (`pty.rs`): a
+burst of small reads becomes a handful of IPC events per frame instead of
+one per line, which is what keeps a streaming transcript from stuttering.
+
 ## Updating the installed app
 
 **From inside the app:** press `u` on the home screen (⌘0). That runs

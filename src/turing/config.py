@@ -98,6 +98,41 @@ class TuringConfig(BaseSettings):
         description="Fixed agent identity used by the native mailbox tool",
     )
 
+    ollama_keep_alive: str | None = Field(
+        default="30m",
+        description="How long Ollama keeps the model resident after a request "
+        "(Ollama keep_alive syntax: '30m', '1h', '-1' = forever, '0' = unload "
+        "at once; unset = Ollama's own 5m default). On Pi/Jetson-class hardware "
+        "reloading a model between conversational turns is the dominant "
+        "local-path latency, so the default pins it for half an hour.",
+    )
+    ollama_num_ctx: int | None = Field(
+        default=None,
+        description="Context window in tokens passed to Ollama as num_ctx; unset "
+        "keeps the model's own default",
+    )
+    ollama_warmup: bool = Field(
+        default=True,
+        description="Load the local model into memory at startup (in the "
+        "background) so the first local turn is not a cold start",
+    )
+    ollama_advertise_host: str | None = Field(
+        default=None,
+        description="URL peers should use to reach THIS node's Ollama, e.g. "
+        "http://jetson-1:11434. Advertised in mesh presence heartbeats so "
+        "other nodes can route local-tier requests here for models they have "
+        "not pulled. Unset = never advertised, peers never target this node. "
+        "Ollama must listen on a LAN-reachable interface for this to work "
+        "(OLLAMA_HOST=0.0.0.0 in its service environment; "
+        "scripts/fleet-models.sh --expose does that).",
+    )
+    llm_peer_models_enabled: bool = Field(
+        default=True,
+        description="When mesh is enabled, let the local tier borrow a peer's "
+        "Ollama for the configured model if this node has not pulled it "
+        "(turing.llm.pool). Off = the local tier is always this node.",
+    )
+
     # ── LLM routing ─────────────────────────────────────────────────────
     llm_routing_mode: Literal["local", "cloud", "auto"] = Field(
         default="auto",
@@ -170,6 +205,16 @@ class TuringConfig(BaseSettings):
     )
 
     # ── Sandbox / security ───────────────────────────────────────────────
+    safety_auto_approve_high_risk: bool = Field(
+        default=False,
+        description="Approve HIGH-risk tool calls for every user, not only "
+        "admin_user_ids. The shell deny-list still applies and everything is "
+        "still audit-logged. The interactive confirmation surface was retired "
+        "with ADR 0010, so without this (or an admin id) a NEEDS_CONFIRMATION "
+        "outcome is a hard deny — on a single-operator node that is just a "
+        "worse UX for the same trust decision. Env: "
+        "TURING_SAFETY_AUTO_APPROVE_HIGH_RISK.",
+    )
     sandbox_enabled: bool = Field(default=True, description="Enable bubblewrap sandbox for tools")
     sandbox_timeout: int = Field(default=30, description="Sandbox execution timeout in seconds")
     allowed_write_paths: list[str] = Field(
