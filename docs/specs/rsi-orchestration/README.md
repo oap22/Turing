@@ -1,7 +1,7 @@
 # RSI for Turing orchestration
 
 Owner: oap22. Tracking: #419. Baseline: main `94f1e1f` (2026-09-05).
-Implementation model: GPT-5.6 Luna, xhigh reasoning. Status: S01/S02 reviewed and dispatched; S03 follow-on design.
+Implementation model: GPT-5.6 Luna, xhigh reasoning. Status: S01/S02/S04 reviewed and dispatched; S03 follow-on design.
 
 The goal is reliable completion per unit cost, not more agents, more rounds,
 or higher self-reported scores. Existing RSI can edit SCAFFOLD.md, but a best
@@ -17,10 +17,11 @@ is explicitly unwired. Do not silently join these two systems.
    regression tests. This changes real agent orchestration.
 2. S02: repair pass/fail RSI progress accounting, including restart behavior.
    This makes the feedback given to self-edit honest without changing policy.
-3. S03: specify a controlled orchestration evaluation and promotion workflow.
+3. S04: bound engine/verifier output and make overflow an explicit failure.
+4. S03: specify a controlled orchestration evaluation and promotion workflow.
    Implement the first two before adding new autonomous mutation surfaces.
 
-S01 and S02 own disjoint files and may be implemented concurrently. S03 is a
+S01, S02 and S04 own disjoint code files and may be implemented concurrently. S03 is a
 follow-on design, not permission to launch paid model experiments or promote
 untested candidates. No automatic merge/deployment. Every implementation PR
 states its review tier and references its issue. No edits to active #415's

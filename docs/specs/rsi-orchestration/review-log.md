@@ -38,3 +38,20 @@ ready for Luna implementation, no outstanding findings.
 
 S01 dispatched to GPT-5.6 Luna xhigh under #421; S02 under #422, each in its
 own baseline worktree. Implementation/code review results follow separately.
+
+## S04 specification iteration
+
+Code inspection found unbounded subprocess output buffers in engine._pump.
+Added a third bounded implementation slice (#424).
+
+- Concurrency/lifecycle review accepted with one correction: bound retained
+  per-stream payload, and account separately for immutable copies, bytearray
+  slack and caller Unicode allocations instead of claiming a two-cap RSS bound.
+- Test-honesty review found final-length checks could pass after an oversized
+  append and later truncation. Added real-capture high-water instrumentation.
+- Test-honesty review found timeout-first caller branches could mask overflow
+  discovered during cleanup. Added the combined-condition test and explicit
+  engine/verifier mapping checks.
+- Fresh verifier re-read the corrections and real engine/verifier paths:
+  ready for Luna implementation, no outstanding findings. Dispatched #424
+  to a third Luna xhigh worker in its own worktree.
