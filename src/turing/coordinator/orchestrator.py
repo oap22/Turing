@@ -92,10 +92,76 @@ class _LiveDAG:
 
     @classmethod
     def from_dag(cls, dag: DAG) -> _LiveDAG:
+        subtasks = list(dag.subtasks)
+        cls._validate_graph(subtasks)
         return cls(
             task_id=dag.task_id,
-            subtasks={s.id: s for s in dag.subtasks},
+            subtasks={s.id: s for s in subtasks},
         )
+
+    @staticmethod
+    def _validate_graph(subtasks: list[Subtask]) -> None:
+        """Validate graph invariants that must also hold after splicing.
+
+        The planner schema validates a DAG or a fragment in isolation.  A
+        live graph needs the same checks after fragment IDs and edges are
+        combined, and must additionally reject duplicate output URIs because
+        outputs are addressed by URI at runtime.
+        """
+        ids = [subtask.id for subtask in subtasks]
+        if len(ids) != len(set(ids)):
+            raise ValueError("subtask ids must be unique in the live graph")
+        id_set = set(ids)
+
+        output_to_id: dict[str, str] = {}
+        for subtask in subtasks:
+            previous = output_to_id.get(subtask.output_key)
+            if previous is not None:
+                raise ValueError(
+                    f"duplicate output_key {subtask.output_key!r} for subtasks "
+                    f"{previous!r} and {subtask.id!r}"
+                )
+            output_to_id[subtask.output_key] = subtask.id
+
+        for subtask in subtasks:
+            for dep in subtask.depends_on:
+                if dep not in id_set:
+                    raise ValueError(f"subtask {subtask.id!r} depends_on unknown subtask {dep!r}")
+
+        graph = {subtask.id: list(subtask.depends_on) for subtask in subtasks}
+        white, gray, black = 0, 1, 2
+        colour = {subtask_id: white for subtask_id in graph}
+
+        def visit(node: str) -> None:
+            colour[node] = gray
+            for dependency in graph[node]:
+                if colour[dependency] == gray:
+                    raise ValueError(f"cycle detected involving {node!r} -> {dependency!r}")
+                if colour[dependency] == white:
+                    visit(dependency)
+            colour[node] = black
+
+        for subtask_id in graph:
+            if colour[subtask_id] == white:
+                visit(subtask_id)
+
+        for subtask in subtasks:
+            allowed_uris = {
+                output_to_id_uri
+                for output_to_id_uri, owner in output_to_id.items()
+                if owner in subtask.depends_on
+            }
+            for key, uri in subtask.inputs.items():
+                if uri not in output_to_id:
+                    raise ValueError(
+                        f"subtask {subtask.id!r} inputs[{key!r}] references "
+                        f"unknown output_key {uri!r}"
+                    )
+                if uri not in allowed_uris:
+                    raise ValueError(
+                        f"subtask {subtask.id!r} inputs[{key!r}] references {uri!r} "
+                        "but does not declare its producer in depends_on"
+                    )
 
     def leaves(self) -> list[str]:
         consumed: set[str] = set()
@@ -112,30 +178,73 @@ class _LiveDAG:
         """Splice a NEEDS_SUBTASK fragment into the DAG.
 
         New subtasks are added; ``rejoin_target`` (the subtask that asked
-        for help) gains ``depends_on`` edges to the fragment's
-        ``rejoin_after`` ids so it won't run again until the fragment
-        completes.
+        for help) gains ``depends_on`` edges to the fragment's designated
+        ``rejoin_after`` ids so it won't run again until those nodes
+        complete. Other fragment nodes may continue independently.
         """
-        new_ids: list[str] = []
-        for sub in fragment.subtasks:
-            if sub.id in self.subtasks:
+        if rejoin_target not in self.subtasks:
+            raise ValueError(f"NEEDS_SUBTASK rejoin target {rejoin_target!r} is unknown")
+
+        fragment_subtasks = list(fragment.subtasks)
+        if not fragment_subtasks:
+            raise ValueError("NEEDS_SUBTASK fragment must contain at least one subtask")
+        existing_ids = set(self.subtasks)
+        proposed_ids: set[str] = set()
+        for sub in fragment_subtasks:
+            if sub.id in existing_ids:
                 raise ValueError(
                     f"NEEDS_SUBTASK fragment id {sub.id!r} collides with existing subtask"
                 )
-            self.subtasks[sub.id] = sub
-            new_ids.append(sub.id)
+            if sub.id in proposed_ids:
+                raise ValueError(f"duplicate NEEDS_SUBTASK fragment id {sub.id!r}")
+            proposed_ids.add(sub.id)
+
+        existing_output_keys = {sub.output_key for sub in self.subtasks.values()}
+        proposed_output_keys: set[str] = set()
+        for sub in fragment_subtasks:
+            if sub.output_key in existing_output_keys:
+                raise ValueError(
+                    f"NEEDS_SUBTASK fragment output_key {sub.output_key!r} "
+                    "collides with existing subtask"
+                )
+            if sub.output_key in proposed_output_keys:
+                raise ValueError(f"duplicate NEEDS_SUBTASK fragment output_key {sub.output_key!r}")
+            proposed_output_keys.add(sub.output_key)
 
         target = self.subtasks[rejoin_target]
+        fragment_by_id = {sub.id: sub for sub in fragment_subtasks}
+        for sid in fragment.rejoin_after:
+            rejoin_node = fragment_by_id.get(sid)
+            if rejoin_node is None:
+                raise ValueError(f"NEEDS_SUBTASK rejoin_after id {sid!r} is not in the fragment")
+            existing_uri = target.inputs.get(sid)
+            if existing_uri is not None and existing_uri != rejoin_node.output_key:
+                raise ValueError(
+                    f"NEEDS_SUBTASK rejoin id {sid!r} collides with parent input "
+                    f"mapped to {existing_uri!r}"
+                )
+
         merged_deps = list(dict.fromkeys([*target.depends_on, *fragment.rejoin_after]))
         # Auto-wire each rejoin_after producer's output into the parent's
         # inputs so the resumed worker sees the fragment's results.
         merged_inputs = dict(target.inputs)
         for sid in fragment.rejoin_after:
-            merged_inputs.setdefault(sid, self.subtasks[sid].output_key)
-        self.subtasks[rejoin_target] = target.model_copy(
+            merged_inputs.setdefault(sid, fragment_by_id[sid].output_key)
+        resumed_target = target.model_copy(
             update={"depends_on": merged_deps, "inputs": merged_inputs}
         )
-        return new_ids
+
+        # Validate every edge against the combined proposed graph before
+        # changing the live mapping.  This makes late failures atomic.
+        proposed_subtasks = [
+            resumed_target if sub.id == rejoin_target else sub for sub in self.subtasks.values()
+        ]
+        proposed_subtasks.extend(fragment_subtasks)
+        self._validate_graph(proposed_subtasks)
+
+        self.subtasks.update({sub.id: sub for sub in fragment_subtasks})
+        self.subtasks[rejoin_target] = resumed_target
+        return [sub.id for sub in fragment_subtasks]
 
 
 class DAGOrchestrator:
@@ -175,6 +284,7 @@ class DAGOrchestrator:
         live = _LiveDAG.from_dag(dag)
         outputs: dict[str, str] = {}
         completed: set[str] = set()
+        in_flight: dict[str, asyncio.Task[str | object]] = {}
 
         # Record the planner's own episode first — small but real lineage.
         self._store.record(
@@ -197,59 +307,98 @@ class DAGOrchestrator:
             )
         )
 
-        # Iterate in waves: every subtask whose deps are all completed runs
-        # concurrently. Loop continues if NEEDS_SUBTASK adds new subtasks.
-        while True:
-            ready = [
-                live.subtasks[sid]
-                for sid in live.subtasks
-                if sid not in completed
-                and all(d in completed for d in live.subtasks[sid].depends_on)
-            ]
-            if not ready:
-                break
+        try:
+            # A node becomes runnable as soon as its own dependencies finish;
+            # unrelated work remains in flight while newly-ready nodes start.
+            while len(completed) < len(live.subtasks):
+                ready = [
+                    live.subtasks[sid]
+                    for sid in live.subtasks
+                    if sid not in completed
+                    and sid not in in_flight
+                    and all(dep in completed for dep in live.subtasks[sid].depends_on)
+                ]
+                for subtask in ready:
+                    in_flight[subtask.id] = asyncio.create_task(
+                        self._run_one(
+                            subtask,
+                            outputs,
+                            live,
+                            registry,
+                        )
+                    )
 
-            results = await asyncio.gather(
-                *(self._run_one(s, outputs, live, registry) for s in ready),
-                return_exceptions=True,
+                if not in_flight:
+                    unresolved = [sid for sid in live.subtasks if sid not in completed]
+                    raise RuntimeError(
+                        "DAG stalled with unresolved subtasks: " + ", ".join(unresolved)
+                    )
+
+                done, _ = await asyncio.wait(
+                    tuple(in_flight.values()), return_when=asyncio.FIRST_COMPLETED
+                )
+                # Include tasks that completed in the same event-loop turn as
+                # the FIRST_COMPLETED wakeup, then process the batch in live
+                # graph insertion order.
+                done.update(task for task in in_flight.values() if task.done())
+                done_ids = [sid for sid in live.subtasks if in_flight.get(sid) in done]
+                failures: list[BaseException] = []
+                for sid in done_ids:
+                    task = in_flight.pop(sid)
+                    try:
+                        result = task.result()
+                    except BaseException as exc:
+                        # Calling result() consumes every error in the batch;
+                        # the first graph-ordered failure is raised below.
+                        failures.append(exc)
+                        continue
+
+                    subtask = live.subtasks[sid]
+                    if result is _NEEDS_SUBTASK_DEFERRED:
+                        # The parent is deliberately left incomplete.  Its
+                        # fragment dependencies are discovered on the next
+                        # iteration, while unrelated in-flight work continues.
+                        continue
+                    outputs[subtask.output_key] = str(result)
+                    completed.add(sid)
+
+                if failures:
+                    raise failures[0]
+
+            leaf_outputs = {sid: outputs[live.subtasks[sid].output_key] for sid in live.leaves()}
+
+            synth_started = self._now_ms()
+            synth_out = await self._synth.synthesize(
+                user_prompt=user_prompt,
+                leaf_outputs=leaf_outputs,
             )
-            for st, res in zip(ready, results, strict=True):
-                if isinstance(res, BaseException):
-                    raise res
-                if res is _NEEDS_SUBTASK_DEFERRED:
-                    # st was deferred — its dependencies (the new fragment
-                    # subtasks) need to run first.
-                    continue
-                outputs[st.output_key] = str(res)
-                completed.add(st.id)
-
-        leaf_outputs = {sid: outputs[live.subtasks[sid].output_key] for sid in live.leaves()}
-
-        synth_started = self._now_ms()
-        synth_out = await self._synth.synthesize(
-            user_prompt=user_prompt,
-            leaf_outputs=leaf_outputs,
-        )
-        self._store.record(
-            Episode(
-                task_id=live.task_id,
-                subtask_id="st_synthesis",
-                worker_id="synthesizer",
-                specialty="synthesis",
-                model_version="",
-                adapter_version="",
-                input_text=user_prompt,
-                trajectory=tuple(leaf_outputs.keys()),
-                output_text=synth_out.output_text,
-                success=True,
-                latency_ms=self._now_ms() - synth_started,
-                tokens_used=synth_out.tokens_used,
-                outcome=SubtaskState.COMPLETED,
-                critic_score=0.0,
-                recorded_at_ms=self._now_ms(),
+            self._store.record(
+                Episode(
+                    task_id=live.task_id,
+                    subtask_id="st_synthesis",
+                    worker_id="synthesizer",
+                    specialty="synthesis",
+                    model_version="",
+                    adapter_version="",
+                    input_text=user_prompt,
+                    trajectory=tuple(leaf_outputs.keys()),
+                    output_text=synth_out.output_text,
+                    success=True,
+                    latency_ms=self._now_ms() - synth_started,
+                    tokens_used=synth_out.tokens_used,
+                    outcome=SubtaskState.COMPLETED,
+                    critic_score=0.0,
+                    recorded_at_ms=self._now_ms(),
+                )
             )
-        )
-        return synth_out.output_text
+            return synth_out.output_text
+        finally:
+            remaining = list(in_flight.values())
+            if remaining:
+                for task in remaining:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*remaining, return_exceptions=True)
 
     async def _run_one(
         self,
