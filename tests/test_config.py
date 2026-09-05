@@ -135,6 +135,21 @@ class TestEnvOverrides:
         assert cfg.agent_mailbox_workflow == "workflow-1"
         assert cfg.agent_mailbox_agent == "local-agent"
 
+    def test_native_mailbox_memory_sentinel_is_rejected(self) -> None:
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "TURING_AGENT_MAILBOX_DB": ":memory:",
+                    "TURING_AGENT_MAILBOX_WORKFLOW": "workflow-1",
+                    "TURING_AGENT_MAILBOX_AGENT": "local-agent",
+                },
+                clear=True,
+            ),
+            pytest.raises(ValueError, match="durable file"),
+        ):
+            TuringConfig(_env_file=None)  # type: ignore[call-arg]
+
     def test_native_mailbox_partial_override_is_rejected(self, tmp_path: Path) -> None:
         with (
             patch.dict(

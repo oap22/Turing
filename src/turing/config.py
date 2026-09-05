@@ -280,7 +280,9 @@ class TuringConfig(BaseSettings):
     @field_validator("agent_mailbox_db", mode="before")
     @classmethod
     def _empty_agent_mailbox_db_is_unset(cls, v: object) -> object:
-        """Treat an explicitly blank env value as an unset optional path."""
+        """Reject the SQLite memory sentinel before resolving a durable path."""
+        if isinstance(v, (str, Path)) and str(v) == ":memory:":
+            raise ValueError("agent mailbox requires a durable file, not :memory:")
         return None if v == "" else v
 
     @field_validator("embedding_model_path", mode="after")
