@@ -82,14 +82,33 @@ MIN_NOISE_FLOOR_SEEDS = 3
 #: What an *unscored* problem contributes to its cell. Dropping unscored
 #: problems instead would bias every cell upward by exactly the problems that
 #: went worst (survivorship), so a floor is required; there is no universal
-#: one, so it is per score scale and the caller must extend this map for any
-#: scale it introduces.
+#: one, so it is per score scale.
 #:
 #: The floor is the **worst grade the scale actually emits**, not a "did
 #: nothing" midpoint. Speedup ``1.0`` means unchanged — a successful
 #: measurement — and a failed correctness gate scores ``0.0``. Flooring an
 #: abandon at ``1.0`` would let the operator raise the primary score by
 #: refusing to finish hopeless problems.
+#:
+#: This map covers the two scales the loop ships with; it is deliberately
+#: **not** the only place a floor can come from. A problem scored on a scale
+#: this map does not know (loss, throughput, anything else an operator's
+#: verifier invents) declares its own floor on
+#: :attr:`~turing.research.contracts.Verifier.score_floor` instead of forcing
+#: every corpus author to extend a shared module-level table for a scale only
+#: their problem uses. :meth:`ScoredProblem.from_result` resolves the two in a
+#: fixed order — **the round's ``score_floors`` table wins, then the
+#: problem's own declared floor, then refuse**:
+#:
+#: 1. ``score_floors`` (this map, or :class:`~turing.research.loop.runner.RoundConfig`'s
+#:    override of it) is checked first, because it is the operator's own
+#:    table for *this round* and an explicit round-level choice should not be
+#:    silently shadowed by whatever a verifier happened to declare.
+#: 2. :attr:`~turing.research.contracts.Verifier.score_floor` is checked
+#:    second — the problem's own declaration, used only when the round did
+#:    not already have an answer for that scale.
+#: 3. Neither: :class:`~turing.research.contracts.ContractViolationError`,
+#:    exactly as when no floor existed at all.
 DEFAULT_SCORE_FLOORS: Mapping[str, float] = MappingProxyType(
     {
         SCORE_SCALE_SPEEDUP: 0.0,  # failed gate; worse than an unchanged baseline
@@ -157,7 +176,19 @@ class ScoredProblem:
         *,
         score_floors: Mapping[str, float] | None = None,
     ) -> ScoredProblem:
-        """Build a cell contribution, flooring an unscored problem."""
+        """Build a cell contribution, flooring an unscored problem.
+
+        The floor for a scale with no usable verification is resolved in a
+        fixed order — see :data:`DEFAULT_SCORE_FLOORS` for the reasoning:
+
+        1. ``score_floors`` (the round's table; :data:`DEFAULT_SCORE_FLOORS`
+           when the caller passes none) — an operator-level override, checked
+           first so it can shadow a problem's own declaration.
+        2. ``problem.verifier.score_floor`` — the problem's own declared
+           floor, used only when the round's table has no entry for this
+           scale.
+        3. Neither: :class:`~turing.research.contracts.ContractViolationError`.
+        """
         scale = problem.verifier.score_scale
         if result is not None and not result.harness_failed:
             return cls(
@@ -170,7 +201,11 @@ class ScoredProblem:
                 scored=True,
             )
         floors = DEFAULT_SCORE_FLOORS if score_floors is None else score_floors
-        if scale not in floors:
+        if scale in floors:
+            floor_value = floors[scale]
+        elif problem.verifier.score_floor is not None:
+            floor_value = problem.verifier.score_floor
+        else:
             raise ContractViolationError(
                 f"problem {problem.id!r} produced no verification and score scale "
                 f"{scale!r} has no declared floor; dropping it would bias the "
@@ -181,7 +216,7 @@ class ScoredProblem:
             problem_id=problem.id,
             problem_type=problem.problem_type,
             split=problem.split,
-            score=floors[scale],
+            score=floor_value,
             passed_correctness=False,
             score_scale=scale,
             scored=False,
@@ -194,9 +229,16 @@ def build_type_scores(scored: Sequence[ScoredProblem]) -> tuple[TypeScore, ...]:
     Returns one :class:`TypeScore` per cell, ordered by type then split so the
     trajectory is byte-stable across runs. **There is no corpus-wide return
     value and there must never be one.**
+
+    A cell's mean is only a number if every score in it is on the same scale,
+    so a cell that mixes ``score_scale`` values is refused outright. Widening
+    which scales exist (declared floors, RES-15) must never make two of them
+    poolable — flooring a ``val_loss`` problem beside a ``speedup`` problem
+    would average seconds with losses and call it a score.
     """
     buckets: dict[Cell, dict[str, float]] = {}
     passes: dict[Cell, int] = {}
+    scales: dict[Cell, tuple[str, str]] = {}
     for item in scored:
         cell = (item.problem_type, item.split)
         bucket = buckets.setdefault(cell, {})
@@ -204,6 +246,13 @@ def build_type_scores(scored: Sequence[ScoredProblem]) -> tuple[TypeScore, ...]:
             raise ContractViolationError(
                 f"problem {item.problem_id!r} scored twice in one round; each problem "
                 "contributes to its cell exactly once"
+            )
+        first = scales.setdefault(cell, (item.problem_id, item.score_scale))
+        if first[1] != item.score_scale:
+            raise ContractViolationError(
+                f"cell {cell[0].value}/{cell[1].value} mixes score scales: problem "
+                f"{first[0]!r} scores on {first[1]!r} but {item.problem_id!r} scores on "
+                f"{item.score_scale!r}; scores on different scales are never averaged"
             )
         bucket[item.problem_id] = item.score
         passes[cell] = passes.get(cell, 0) + (1 if item.passed_correctness else 0)

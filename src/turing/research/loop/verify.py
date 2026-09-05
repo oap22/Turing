@@ -91,6 +91,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from turing.research.loop.integrity import (
+    STAGING_DIR_NAME as _STAGING_DIR_NAME,
+)
+from turing.research.loop.integrity import (
     ChainState,
     ReconcileState,
     reconcile_summary,
@@ -111,6 +114,7 @@ __all__ = [
     "RunVerdict",
     "build_parser",
     "find_runs",
+    "format_run_verdict",
     "main",
     "verify_run",
 ]
@@ -187,8 +191,34 @@ def find_runs(root: Path) -> list[Path]:
     like pointing it at a whole results root — the caller does not need to
     know which kind of directory it was handed. Sorted for a deterministic
     report across runs of this tool.
+
+    **Skips every candidate under a** :data:`~turing.research.loop.runner._STAGING_DIR_NAME`
+    **directory.** ``runner._rotate_stale_metrics`` builds a rotation's
+    destination inside ``attempts/<problem-id>/.rotating/`` before committing
+    it, in one rename, to a numbered ``prior-N/``; a crash in that window can
+    leave a real, honest ``metrics.jsonl`` sitting there with no summary
+    beside it, because the commit that would give it one never landed. That
+    directory is a rotation in progress, not a run — reporting it as one used
+    to make an otherwise complete, verified attempt look INCOMPLETE (or, with
+    a genuinely broken leftover, FAILED) on the strength of a file nobody
+    but ``_rotate_stale_metrics`` was ever meant to read, and that the very
+    next attempt into this directory heals on its own. The check is by path
+    *segment*, not prefix, so a legitimate ``prior-N/`` — which this walk
+    must keep finding — is never caught by it.
+
+    The narrow corollary: if the crash landed on the final rename and the
+    staged run was the *only* run under ``root``, this returns nothing and
+    the CLI reports ``no metrics.jsonl found`` (exit 1) until the next
+    attempt into that directory heals it. That is a "nothing checked" report,
+    not a clean one, and it is honest about which.
     """
-    return sorted({path.parent for path in root.rglob("metrics.jsonl")})
+    return sorted(
+        {
+            path.parent
+            for path in root.rglob("metrics.jsonl")
+            if _STAGING_DIR_NAME not in path.relative_to(root).parts
+        }
+    )
 
 
 def _combine(chain: ChainVerdict, reconcile: ReconcileVerdict) -> RunState:
@@ -252,6 +282,21 @@ async def _verify_all(root: Path) -> list[RunVerdict]:
             )
         ]
     return list(await asyncio.gather(*(verify_run(directory) for directory in run_dirs)))
+
+
+def format_run_verdict(verdict: RunVerdict) -> str:
+    """One human-readable line for one run — exactly what this CLI prints.
+
+    Public because it is not only this CLI's output any more: the loop stamps
+    a machine-readable verdict beside every attempt's summary
+    (:func:`turing.research.loop.results.write_attempt_verdict`) so the
+    desktop's metrics pane can show whether the curve it is drawing verifies,
+    and the human sentence in that file has to be *this* sentence. A second
+    formatter would drift, and the two would eventually describe the same
+    verdict differently — the operator reading the badge and the operator
+    reading the terminal must not be told different stories.
+    """
+    return _format_human(verdict)
 
 
 def _format_human(verdict: RunVerdict) -> str:

@@ -49,7 +49,7 @@ by number (Q7, Q11, Q12 in particular).
   are **architectural inference, not measurement**; the design must not depend on
   either until this is run. Not a loop-1 blocker — the agreed engine is Claude
   only, with no local model in the loop.
-- [ ] **Q15** — The frozen error taxonomy for round summaries. — raised
+- [x] **Q15** — The frozen error taxonomy for round summaries. — raised
   2026-08-12, **closes before round 0**, not before the first self-edit. The
   brief states both gates (its Prerequisites list files it under loop 2; its
   § The self-edit step calls it design homework that "must exist before round 0
@@ -58,7 +58,10 @@ by number (Q7, Q11, Q12 in particular).
   self-edit reads, so if they were categorised ad hoc, round 0 and round 1 are
   not comparable — the exact defect the design-homework note exists to prevent,
   and unfixable afterwards without re-running round 0. ADR 0011 §2 adopts the
-  stricter reading; the disagreement itself is logged below as **R4**.
+  stricter reading; the disagreement itself is logged below as **R4**. Closed
+  for the RSI workstation loop by `src/turing/research/rsi/taxonomy.py` (a
+  closed nine-member enum, digest-checked in `taxonomy.json` on every run);
+  the loop-1 runner's `self_edit_seam` taxonomy slot is still unwired.
 
 ## Raised in the brief outside the table
 

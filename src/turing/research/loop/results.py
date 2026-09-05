@@ -40,9 +40,20 @@ from typing import TYPE_CHECKING
 
 import structlog
 
-from turing.research.contracts import AttemptState, ContractViolationError
+from turing.research.contracts import (
+    CORE_METRICS_FIELDS,
+    DIAGNOSTIC_KEY_PREFIX,
+    RESERVED_METRICS_FIELDS,
+    AttemptState,
+    ContractViolationError,
+)
 from turing.research.loop import integrity
 from turing.research.loop.protocols import SystemClock
+from turing.research.loop.verify import (
+    HONESTY_LINE,
+    format_run_verdict,
+    verify_run,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -53,6 +64,7 @@ logger = structlog.get_logger(__name__)
 
 __all__ = [
     "AGENT_DIAGNOSTICS_RELPATH",
+    "METRICS_VERDICT_FILENAME",
     "RESERVED_FIELDS",
     "MetricsLine",
     "MetricsWriter",
@@ -62,9 +74,20 @@ __all__ = [
     "read_metrics_points",
     "usable_target",
     "write_attempt_summary",
+    "write_attempt_verdict",
     "write_round_summary",
     "write_viewer_config",
 ]
+
+#: Where :func:`write_attempt_verdict` records what ``verify`` said about this
+#: directory, for a reader that cannot run ``verify`` itself — the desktop's
+#: metrics pane. Deliberately **not** ``metrics.json``-adjacent in meaning: it
+#: is not part of the hash chain, not reconciled against the log, and not a
+#: run in its own right (``verify.find_runs`` keys on ``metrics.jsonl``). It is
+#: a *report about* the other files, which is why nothing that checks them
+#: reads it, and why re-running ``verify`` after it lands returns exactly what
+#: it returned before.
+METRICS_VERDICT_FILENAME = "metrics.verdict.json"
 
 
 #: Keys the desktop's chart series builder treats as axis/meta rather than a
@@ -74,7 +97,14 @@ __all__ = [
 #: rejects it loudly instead, at the point the line is built, rather than
 #: leaving a gap in the chart that only an operator staring at the pane would
 #: ever notice.
-RESERVED_FIELDS: frozenset[str] = frozenset({"step", "total_steps", "ts"})
+#:
+#: Defined in ``contracts.py`` and re-exported here under the name this
+#: module has always published. ``contracts`` is the one module both this one
+#: and ``integrity`` can import, and ``contracts`` needs the set itself to
+#: refuse a colliding ``score_scale`` where the scale is *declared* — so the
+#: list lives there and nothing hand-copies it. See
+#: :data:`turing.research.contracts.RESERVED_METRICS_FIELDS`.
+RESERVED_FIELDS: frozenset[str] = RESERVED_METRICS_FIELDS
 
 
 # --------------------------------------------------------------------------- #
@@ -298,30 +328,15 @@ class ProgressTracker:
 
 
 #: The keys :meth:`MetricsLine.to_json` always emits itself (beyond
-#: :data:`RESERVED_FIELDS`), in the order they are written. A caller-supplied
-#: ``metrics`` entry sharing one of these names would silently overwrite a
-#: core field — or, read the other way, a core field would silently clobber
-#: the caller's score — so it is rejected instead.
-_CORE_EMITTED_KEYS: frozenset[str] = frozenset(
-    {
-        "outcome_code",
-        "correctness_pass",
-        "tokens_used",
-        "tokens_cap",
-        "steps_cap",
-        "consumed_steps",
-        "wall_clock_s",
-        "wall_clock_cap_s",
-        "cap_extensions",
-        "step_wall_clock_s",
-        "verify_wall_clock_s",
-        "step_tokens",
-        "made_progress",
-        "progress",
-    }
-)
+#: :data:`RESERVED_FIELDS`). A caller-supplied ``metrics`` entry sharing one
+#: of these names would silently overwrite a core field — or, read the other
+#: way, a core field would silently clobber the caller's score — so it is
+#: rejected instead. Defined in ``contracts.py`` for the reason given on
+#: :data:`RESERVED_FIELDS` above; the emission *order* is the one this
+#: module's :meth:`MetricsLine.to_json` writes, and lives there.
+_CORE_EMITTED_KEYS: frozenset[str] = CORE_METRICS_FIELDS
 
-_DIAG_PREFIX = "diag_"
+_DIAG_PREFIX = DIAGNOSTIC_KEY_PREFIX
 
 
 @dataclass(frozen=True, slots=True)
@@ -411,12 +426,19 @@ class MetricsLine:
         strictly: a reserved-field collision, a core-key collision, an empty
         key, a ``diag_``-prefixed key, or a non-finite / non-numeric / bool
         value all raise :class:`~turing.research.contracts.ContractViolationError`
-        naming the offending key. This is reachable in production, not
-        theoretical: the runner names the metrics key after the problem's own
-        ``score_scale``, which is free-form per ``contracts.py``, so a problem
-        declaring a scale of ``"progress"`` or ``"step"`` must fail loudly at
-        its first emitted line rather than quietly clobbering an axis or a
-        core field.
+        naming the offending key.
+
+        The runner's own metrics key can no longer trip the *key* checks: it
+        names the key after the problem's ``score_scale``, and
+        ``contracts._reject_unusable_score_scale`` refuses a colliding, empty
+        or ``diag_``-prefixed scale where the verifier declares it, so a
+        corpus with a bad scale fails before the round starts rather than
+        losing an attempt at its first verification. These checks stay, and
+        stay strict, for the same reason the key list is now a single shared
+        one: they are the definition of what a metrics key may be, they hold
+        for any caller that assembles ``metrics`` from something other than a
+        verifier's declared scale, and a colliding scale arriving here would
+        mean the two had drifted apart. Keep them in step.
 
         ``diagnostics`` is the agent's own notebook and is validated
         leniently: a bad entry there — non-numeric, ``bool``, non-finite, an
@@ -583,6 +605,26 @@ class MetricsWriter:
     chain and is not refused; those are exactly the states a fresh attempt
     directory is in.
 
+    **The same refusal fires on a non-empty sidecar even with no log.**
+    ``runner._rotate_stale_metrics`` moves the whole trio aside as one atomic
+    set, but the *window* the crash lands in (a hard kill, a full disk,
+    ``SIGKILL`` mid-rotation) can still leave this directory holding a real
+    ``metrics.chain.json`` with no ``metrics.jsonl`` beside it — the residual
+    a startup self-heal has not yet reached. That sidecar carries a real
+    chain head and a real header naming a *different* attempt; a writer that
+    only checked ``metrics.jsonl`` would see "missing" here, treat this as a
+    fresh directory, and start appending — advancing the chain from *this*
+    attempt's seed while the sidecar still claims the previous attempt's
+    header, or getting silently overwritten by this attempt's own first
+    append before anyone could tell the two apart. Either way the evidence
+    that a rotation was left half-done disappears, which is strictly worse
+    than refusing: the caller is expected to finish healing the leftover
+    rotation (see :func:`~turing.research.loop.runner._rotate_stale_metrics`)
+    before constructing a writer here, not to have this class paper over it.
+    A **missing or empty** sidecar is not refused, for the same reason a
+    missing or empty ``metrics.jsonl`` is not: both are exactly the states a
+    fresh attempt directory is in.
+
     This constructor deliberately does **not** resume the prior chain from
     the sidecar. The header carries this attempt's own ``attempt_id`` and
     ``started_at_ms``, distinct from whatever produced the existing file;
@@ -601,15 +643,20 @@ class MetricsWriter:
         header: Mapping[str, object],
         clock: Clock | None = None,
     ) -> None:
-        if path.exists() and path.stat().st_size > 0:
+        sidecar_path = path.parent / integrity.CHAIN_SIDECAR_FILENAME
+        jsonl_present = path.exists() and path.stat().st_size > 0
+        sidecar_present = sidecar_path.exists() and sidecar_path.stat().st_size > 0
+        if jsonl_present or sidecar_present:
+            present = path.name if jsonl_present else sidecar_path.name
             raise ContractViolationError(
-                f"{path} already exists and is not empty; a MetricsWriter must start "
-                "from a fresh chain, not splice new lines onto one seeded by a different "
-                "attempt — rotate the existing metrics.jsonl (and its metrics.chain.json "
-                "sidecar) aside before constructing a new writer over this path"
+                f"{path.parent} already holds a non-empty {present!r}; a MetricsWriter "
+                "must start from a fresh chain, not splice new lines onto one seeded by "
+                "a different attempt, and not write beside a sidecar that names one — "
+                "rotate the existing metrics.jsonl and its metrics.chain.json sidecar "
+                "aside (as a matched pair) before constructing a new writer over this path"
             )
         self._path = path
-        self._sidecar_path = path.parent / integrity.CHAIN_SIDECAR_FILENAME
+        self._sidecar_path = sidecar_path
         self._header = dict(header)
         # Held only so this writer's constructor shape matches its neighbours
         # (``TrajectoryStore``) and so tests can inject a deterministic clock.
@@ -935,7 +982,112 @@ async def write_attempt_summary(
     }
     path = directory / "metrics.json"
     await asyncio.to_thread(_write_summary_json, path, payload)
+
+    # After the summary, never before: `verify_run` reconciles `metrics.json`
+    # against the log, so a check run one line earlier would report every
+    # honest attempt as INCOMPLETE ("summary is missing") forever.
+    #
+    # Guarded, because this is reporting *about* reporting. The summary is
+    # already on disk and the caller's plots still have to be drawn; a verdict
+    # that could not be produced must degrade to "no verdict file", which the
+    # pane shows as `unverified`, rather than take the emission block down
+    # with it.
+    try:
+        await write_attempt_verdict(directory)
+    except Exception:
+        logger.exception("research.results.verdict_failed", directory=str(directory))
+
     return path
+
+
+async def write_attempt_verdict(directory: Path, *, checked_by: str = "loop") -> Path | None:
+    """Record what ``verify`` says about ``directory``, for a reader that cannot run it.
+
+    The desktop's metrics pane reads files out of the results root; it has no
+    Python, so it cannot recompute a hash chain and has never had any way to
+    tell an operator whether the curve on screen verifies. This writes the
+    answer down at the one moment it is cheap and unambiguous — the attempt is
+    over, nothing is appending — and the pane reads it (see
+    ``webui/src/desktop/panes/metrics.ts``, ``parseVerdictFile``).
+
+    **Not a second verifier.** Every field comes from
+    :func:`~turing.research.loop.verify.verify_run` and
+    :func:`~turing.research.loop.verify.format_run_verdict`, the same two
+    functions ``python -m turing.research.loop.verify`` calls. A reimplemented
+    check here would eventually disagree with the CLI, and an operator holding
+    a green badge and a red terminal would have no way to decide which to
+    believe.
+
+    **A directory with no ``metrics.jsonl`` gets no verdict at all** and this
+    returns ``None``, *removing* any verdict already sitting there. That the
+    directory is not a run is why no verdict is written: ``verify.find_runs``
+    keys on that file, and stamping ``failed`` ("metrics.chain.json is
+    missing") on a non-run would manufacture a finding about a run that does
+    not exist — the cries-wolf failure
+    :mod:`turing.research.loop.integrity` exists to avoid, arriving by a new
+    route. But *returning* without touching the directory only avoids that for
+    a directory that was empty to begin with. A verdict left over from an
+    earlier generation of the same path — the log rotated aside, or removed,
+    without the verdict going with it — would go on describing a log that is
+    not there, and the pane would show a green badge over bytes nobody checked:
+    the same overclaim arriving from the other direction. A verdict must never
+    outlive the log it describes, so the early return deletes it.
+
+    ``lines_checked`` is the field the badge turns on: the pane compares it
+    against the number of lines it parsed itself, and shows ``stale`` when
+    they differ, because a verdict about 40 lines says nothing about the 41st.
+    ``chain_head`` is the sidecar's recorded final digest, copied through for
+    an operator correlating two reports of the same run; it is absent when the
+    sidecar cannot be read, which is itself one of the states ``verify``
+    reports. ``note`` carries
+    :data:`~turing.research.loop.verify.HONESTY_LINE` verbatim, for the same
+    reason the CLI prints it on every invocation: a bare ``"state": "ok"``
+    would be read as proof of authenticity that no chain in this program can
+    provide.
+
+    The verdict file is **not** part of anything it reports on — see
+    :data:`METRICS_VERDICT_FILENAME`. It is rewritten wholesale on every call
+    that has a log to describe, and removed on every call that does not, so no
+    call ever leaves an older verdict standing beside a newer log — or beside
+    no log at all.
+    """
+    if not (directory / "metrics.jsonl").exists():
+        await asyncio.to_thread((directory / METRICS_VERDICT_FILENAME).unlink, missing_ok=True)
+        return None
+
+    verdict = await verify_run(directory)
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "state": verdict.state.value,
+        "lines_checked": 0 if verdict.chain is None else verdict.chain.lines_checked,
+        "checked_at_ms": SystemClock().now_ms(),
+        "checked_by": checked_by,
+        "chain_head": await asyncio.to_thread(_read_chain_head, directory),
+        "detail": format_run_verdict(verdict),
+        "note": HONESTY_LINE,
+    }
+    path = directory / METRICS_VERDICT_FILENAME
+    await asyncio.to_thread(_write_summary_json, path, payload)
+    return path
+
+
+def _read_chain_head(directory: Path) -> str | None:
+    """The sidecar's recorded final digest, or ``None`` if it cannot be read.
+
+    Read rather than recomputed on purpose: this is a *label* for correlating
+    two reports about the same run, not evidence. Whether the recorded head is
+    the one the log actually produces is exactly the question
+    :func:`~turing.research.loop.integrity.verify_metrics_chain` already
+    answered above, and its answer is the ``state`` field.
+    """
+    try:
+        raw = json.loads((directory / integrity.CHAIN_SIDECAR_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(raw, dict) and isinstance(raw.get("final"), str):
+        final: str = raw["final"]
+        return final
+    return None
 
 
 async def write_round_summary(

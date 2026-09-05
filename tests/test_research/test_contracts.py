@@ -17,6 +17,7 @@ to erode:
 from __future__ import annotations
 
 import dataclasses
+import re
 from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,12 @@ from typing import Any
 import pytest
 
 from turing.research.contracts import (
+    CORE_METRICS_FIELDS,
     HARNESS_FAILURE_KEY,
+    RESERVED_METRICS_FIELDS,
+    RESERVED_METRICS_KEYS,
+    SCORE_SCALE_LEADERBOARD_PERCENTILE,
+    SCORE_SCALE_SPEEDUP,
     TERMINAL_ATTEMPT_STATES,
     Attempt,
     AttemptState,
@@ -79,11 +85,11 @@ class StubVerifier(Verifier):
 
 
 def make_verifier(problem_id: str = "speedup-claim-scorer", **kwargs: Any) -> StubVerifier:
+    kwargs.setdefault("score_scale", "speedup_ratio")
     return StubVerifier(
         verifier_id=f"{problem_id}-v1",
         problem_id=problem_id,
         description="stub verifier",
-        score_scale="speedup_ratio",
         **kwargs,
     )
 
@@ -364,6 +370,238 @@ class TestVerificationResult:
                 passed_correctness=True,
                 score_scale="speedup_ratio",
             )
+
+
+# --------------------------------------------------------------------------- #
+# score_scale — free-form, but it still has to survive as a metrics key
+# --------------------------------------------------------------------------- #
+
+
+class TestScoreScaleIsRefusedWhereItIsDeclared:
+    """The runner names the emitted metrics key after ``score_scale``.
+
+    A scale that cannot be a metrics key — one of the axis/meta fields the
+    desktop excludes, one of the core per-step fields every line already
+    carries, an empty string, or the agent's ``diag_`` prefix — used to raise
+    from ``MetricsLine.to_json`` at the attempt's *first verification*: after
+    the workspace was copied, after the solver ran, one problem at a time,
+    forever, because the scale is a property of the problem and every re-drive
+    reproduces it.
+
+    All of those are refused here instead, where the scale is declared, so a
+    corpus carrying one cannot be built and no compute is spent on it. The
+    names matter: ``progress`` is a natural scale for a problem graded on
+    fraction-of-target, ``step`` for one graded on step count, ``tokens_used``
+    for one graded on token efficiency. Nothing about them looks wrong when an
+    operator writes them down, which is exactly why the refusal has to be
+    loud and early.
+    """
+
+    @pytest.mark.parametrize("scale", sorted(RESERVED_METRICS_KEYS))
+    def test_every_reserved_key_is_refused_as_a_verifier_scale(self, scale: str) -> None:
+        with pytest.raises(ContractViolationError) as caught:
+            make_verifier(score_scale=scale)
+        message = str(caught.value)
+        assert repr(scale) in message
+        assert ("axis/meta" in message) is (scale in RESERVED_METRICS_FIELDS)
+        assert ("core field" in message) is (scale in CORE_METRICS_FIELDS)
+
+    @pytest.mark.parametrize("scale", sorted(RESERVED_METRICS_KEYS))
+    def test_every_reserved_key_is_refused_on_a_verification_result(self, scale: str) -> None:
+        with pytest.raises(ContractViolationError, match="score_scale"):
+            VerificationResult(
+                problem_id="p",
+                verifier_id="v",
+                score=1.0,
+                passed_correctness=True,
+                score_scale=scale,
+            )
+
+    def test_an_empty_scale_is_refused(self) -> None:
+        with pytest.raises(ContractViolationError, match="empty score_scale"):
+            make_verifier(score_scale="")
+
+    def test_a_diagnostics_prefixed_scale_is_refused(self) -> None:
+        with pytest.raises(ContractViolationError, match="diag_"):
+            make_verifier(score_scale="diag_speedup")
+
+    def test_a_non_string_scale_is_refused(self) -> None:
+        with pytest.raises(ContractViolationError, match="plain str"):
+            make_verifier(score_scale=1.0)
+
+    @pytest.mark.parametrize(
+        "scale",
+        [
+            SCORE_SCALE_SPEEDUP,
+            SCORE_SCALE_LEADERBOARD_PERCENTILE,
+            "val_loss",
+            "auc",
+            "progress_toward_target",
+            "steps_to_solution",
+        ],
+    )
+    def test_the_conventional_and_ordinary_scales_are_still_accepted(self, scale: str) -> None:
+        """The rule must not have quietly become a whitelist.
+
+        ``score_scale`` is still free-form: anything that can be a metrics key
+        is still a legal scale, including names that merely *contain* a
+        reserved one.
+        """
+        verifier = make_verifier(score_scale=scale)
+        assert verifier.score_scale == scale
+
+    def test_a_scale_cannot_be_smuggled_in_by_replacing_it_later(self) -> None:
+        """``dataclasses.replace`` re-runs ``__post_init__``.
+
+        This is the route the loop's own tests used to build a colliding
+        problem, and it is the route a corpus builder would take.
+        """
+        verifier = make_verifier()
+        with pytest.raises(ContractViolationError, match="progress"):
+            dataclasses.replace(verifier, score_scale="progress")
+
+
+# --------------------------------------------------------------------------- #
+# score_floor — a problem's own declared floor (RES-15)
+# --------------------------------------------------------------------------- #
+
+
+class TestScoreFloorIsDeclaredOnTheVerifier:
+    """A problem on a scale ``DEFAULT_SCORE_FLOORS`` doesn't know can still
+    declare its own floor, alongside the scale, on the verifier.
+    """
+
+    def test_undeclared_floor_defaults_to_none(self) -> None:
+        verifier = make_verifier()
+        assert verifier.score_floor is None
+
+    def test_a_declared_floor_is_kept(self) -> None:
+        verifier = make_verifier(score_scale="val_loss", score_floor=1e9)
+        assert verifier.score_floor == pytest.approx(1e9)
+
+    def test_a_declared_floor_of_zero_is_kept_not_treated_as_falsy(self) -> None:
+        verifier = make_verifier(score_scale="val_loss", score_floor=0.0)
+        assert verifier.score_floor == 0.0
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_a_non_finite_floor_is_refused(self, bad: float) -> None:
+        with pytest.raises(ContractViolationError, match="not finite"):
+            make_verifier(score_scale="val_loss", score_floor=bad)
+
+    def test_a_non_numeric_floor_is_refused(self) -> None:
+        with pytest.raises(ContractViolationError, match="not a plain number"):
+            make_verifier(score_scale="val_loss", score_floor="worst")  # type: ignore[arg-type]
+
+    def test_a_bool_floor_is_refused(self) -> None:
+        """``bool`` is a subclass of ``int`` in Python; refused explicitly."""
+        with pytest.raises(ContractViolationError, match="not a plain number"):
+            make_verifier(score_scale="val_loss", score_floor=True)  # type: ignore[arg-type]
+
+    def test_a_scale_cannot_smuggle_a_bad_floor_in_by_replacing_it_later(self) -> None:
+        verifier = make_verifier(score_scale="val_loss", score_floor=1.0)
+        with pytest.raises(ContractViolationError, match="not finite"):
+            dataclasses.replace(verifier, score_floor=float("nan"))
+
+
+# --------------------------------------------------------------------------- #
+# problem.id — a path component, validated as one (RES-16)
+# --------------------------------------------------------------------------- #
+
+
+class TestProblemIdIsAPathComponent:
+    """``problem.id`` is written straight into the results tree.
+
+    ``output_dir/attempts/<id>/`` holds the metrics trio and the plots;
+    ``attempts/<id>.json`` and ``checkpoints/<id>.json`` are files named after
+    it. Nothing validated it, so an id could escape the results root, collide
+    with a directory the runner mints itself, or land somewhere the desktop's
+    walk will not look — and every one of those failures surfaces far from the
+    corpus definition that caused it, or (worse) not at all.
+    """
+
+    @pytest.mark.parametrize(
+        "problem_id",
+        [
+            "speedup-01-claim-scorer",
+            "cuda/matmul-speedup",
+            "kaggle/tabular/titanic",
+            "a",
+            "prior-1-regression",  # only an exact ``prior-<digits>`` is the namespace
+            "not-prior-1/leaf",  # ``prior-N`` anywhere but the final segment is fine
+            "x" * 128,
+        ],
+    )
+    def test_legal_ids_are_accepted_and_round_trip_unchanged(self, problem_id: str) -> None:
+        problem = Problem(
+            id=problem_id,
+            problem_type=ProblemType.SPEEDUP,
+            goal="go faster",
+            workspace_template=Path("/tmp/templates/x"),
+            verifier=make_verifier(problem_id),
+            split=Split.PRACTICE,
+        )
+        assert problem.id == problem_id
+
+    @pytest.mark.parametrize(
+        ("problem_id", "expected"),
+        [
+            ("", "non-empty"),
+            ("../escape", "'..' segment"),
+            ("cuda/../../etc", "'..' segment"),
+            ("/absolute/id", "absolute path"),
+            ("trailing/", "empty path segment"),
+            ("double//segment", "empty path segment"),
+            ("cuda/ /matmul", "whitespace-only"),
+            ("\\t/matmul", "backslash"),  # a literal backslash, not a tab
+            ("C:/corpus", "colon"),
+            ("\\\\server\\share", "backslash"),
+            (".hidden", "'.'-prefixed segment"),
+            ("cuda/.hidden/matmul", "'.'-prefixed segment"),
+            ("./relative", "'.'-prefixed segment"),
+            ("cuda/prior-1", "rotation namespace"),
+            ("prior-12", "rotation namespace"),
+            ("a/b/c/d/e", "path segments"),
+            ("x" * 129, "characters"),
+        ],
+    )
+    def test_each_unsafe_shape_is_refused_with_its_own_reason(
+        self, problem_id: str, expected: str
+    ) -> None:
+        with pytest.raises(ContractViolationError) as caught:
+            make_problem(problem_id)
+        assert expected in str(caught.value)
+
+    @pytest.mark.parametrize("bad", ["nul\x00byte", "bell\x07", "line\nbreak", "del\x7f"])
+    def test_control_characters_are_refused(self, bad: str) -> None:
+        with pytest.raises(ContractViolationError, match="control character"):
+            make_problem(bad)
+
+    def test_a_non_string_id_is_refused(self) -> None:
+        with pytest.raises(ContractViolationError, match="plain str"):
+            Problem(
+                id=7,  # type: ignore[arg-type]
+                problem_type=ProblemType.SPEEDUP,
+                goal="go faster",
+                workspace_template=Path("/tmp/templates/x"),
+                verifier=make_verifier(),
+                split=Split.PRACTICE,
+            )
+
+    def test_the_refusal_names_the_consumer_that_motivates_the_rule(self) -> None:
+        """An operator who trips one of these must learn *why*.
+
+        Each of these rules exists because of one specific downstream reader,
+        and a message that only said "invalid id" would send the operator
+        looking for a naming convention that does not exist.
+        """
+        with pytest.raises(ContractViolationError, match=re.escape("fsroots.rs")):
+            make_problem(".hidden")
+        with pytest.raises(ContractViolationError, match="_viewer_runs"):
+            make_problem("prior-3")
+        with pytest.raises(ContractViolationError, match="MAX_DEPTH"):
+            make_problem("a/b/c/d/e")
+        with pytest.raises(ContractViolationError, match="results root"):
+            make_problem("../etc")
 
 
 # --------------------------------------------------------------------------- #

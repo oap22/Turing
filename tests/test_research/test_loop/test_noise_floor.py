@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import json
 from typing import TYPE_CHECKING
 
@@ -19,6 +18,7 @@ from .conftest import (
     ENGINE,
     FakeSolver,
     TempWorkspaceProvider,
+    WorkspacesRefusingOneProblem,
     make_config,
     make_problem,
     make_runner,
@@ -71,21 +71,6 @@ class OneSeedFlakyWorkspaces(TempWorkspaceProvider):
             self.refusals += 1
             raise OSError("workspace template unreadable")
         return await super().materialise(problem, attempt_id=attempt_id)
-
-
-def problem_with_scale(problem_id: str, scale: str) -> Problem:
-    """A problem whose verifier reports a colliding ``score_scale``.
-
-    Stands in for the *deterministic* loss. ``score_scale`` is free-form by
-    design and names the metrics key holding the raw score, so a scale
-    colliding with a reserved key is refused by
-    ``results._validate_scored_metric`` at that problem's first verification —
-    identically on every seed, because it is a property of the problem.
-    """
-    problem = make_problem(problem_id)
-    return dataclasses.replace(
-        problem, verifier=dataclasses.replace(problem.verifier, score_scale=scale)
-    )
 
 
 class SeedSensitiveSolver(FakeSolver):
@@ -287,21 +272,22 @@ class TestASeedThatLostAnAttemptIsRefused:
         assert (await store.load_trajectory())["rounds"] == []
 
     async def test_a_deterministic_loss_is_refused_too_not_just_a_flaky_one(
-        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+        self, store: TrajectoryStore, tmp_path: Path, clock: FakeClock
     ) -> None:
         """The tempting exemption, closed deliberately.
 
-        A colliding ``score_scale`` is a property of the problem, so every seed
-        loses it identically and the floor is at least internally consistent —
-        just measured over a narrower corpus than advertised. It is still
-        refused. The runner cannot tell deterministic from transient at the
-        point of failure (that is only knowable after the other seeds have run
-        and lost the same problem, which is the compute the fail-fast exists to
-        save), and a floor measured over one problem is not the yardstick for
-        rounds measured over two. Dropping a broken problem belongs in the
-        corpus, where it moves ``eval_set_hash``.
+        An unreadable workspace template is a property of the problem, so
+        every seed loses it identically and the floor is at least internally
+        consistent — just measured over a narrower corpus than advertised. It
+        is still refused. The runner cannot tell deterministic from transient
+        at the point of failure (that is only knowable after the other seeds
+        have run and lost the same problem, which is the compute the fail-fast
+        exists to save), and a floor measured over one problem is not the
+        yardstick for rounds measured over two. Dropping a broken problem
+        belongs in the corpus, where it moves ``eval_set_hash``.
         """
-        corpus = [make_problem("speed-1", scores=(2.0,)), problem_with_scale("bad", "progress")]
+        corpus = [make_problem("speed-1", scores=(2.0,)), make_problem("bad")]
+        workspaces = WorkspacesRefusingOneProblem(tmp_path / "workspaces", problem_ids=["bad"])
         runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
 
         with pytest.raises(ContractViolationError, match="seed 1") as caught:
@@ -311,7 +297,7 @@ class TestASeedThatLostAnAttemptIsRefused:
         assert not store.noise_floor_path.exists()
 
     async def test_a_seed_that_loses_every_attempt_still_names_the_seed(
-        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+        self, store: TrajectoryStore, tmp_path: Path, clock: FakeClock
     ) -> None:
         """``run_attempts`` refuses a total loss on its own — but blind to the seed.
 
@@ -321,7 +307,10 @@ class TestASeedThatLostAnAttemptIsRefused:
         message; ``attempt_failures`` is populated before that raise precisely
         so this caller can still list the problems.
         """
-        corpus = [problem_with_scale("bad-1", "progress"), problem_with_scale("bad-2", "ts")]
+        corpus = [make_problem("bad-1"), make_problem("bad-2")]
+        workspaces = WorkspacesRefusingOneProblem(
+            tmp_path / "workspaces", problem_ids=["bad-1", "bad-2"]
+        )
         runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
 
         with pytest.raises(ContractViolationError) as caught:

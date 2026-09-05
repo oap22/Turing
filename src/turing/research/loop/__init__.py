@@ -40,72 +40,84 @@ this package does not claim it is.
 
 from __future__ import annotations
 
-from turing.research.loop.escalation import (
-    FileDropDecisionInbox,
-    NtfyEscalationNotifier,
-    OperatorEscalationChannel,
-    OperatorEscalationGate,
-    build_operator_channel,
-)
-from turing.research.loop.metrics import (
-    DEFAULT_SCORE_FLOORS,
-    MIN_NOISE_FLOOR_SEEDS,
-    Cell,
-    CostBasis,
-    NoiseFloor,
-    NoiseFloorStatistic,
-    SaturationAssessment,
-    SaturationVerdict,
-    ScoredProblem,
-    assess_saturation,
-    build_type_scores,
-    compute_deltas,
-    cost_per_unit_gain,
-    floors_by_cell,
-    measure_noise_floor,
-    round_verdict,
-)
-from turing.research.loop.noise_floor import (
-    NoiseFloorConfig,
-    NoiseFloorReport,
-    NoiseFloorRunner,
-)
-from turing.research.loop.protocols import (
-    Clock,
-    EscalationChannel,
-    Solver,
-    SolverStep,
-    SolverTask,
-    SystemClock,
-    WorkspaceProvider,
-)
-from turing.research.loop.runner import (
-    AttemptOutcome,
-    PassCriterion,
-    RoundConfig,
-    RoundOutcome,
-    RoundRunner,
-)
-from turing.research.loop.self_edit_seam import (
-    SelfEditInputs,
-    SelfEditStep,
-    collect_self_edit_inputs,
-)
-from turing.research.loop.settings import ResearchLoopSettings
-from turing.research.loop.solver_bridge import SolverBridge
-from turing.research.loop.trajectory import (
-    TRAJECTORY_SCHEMA_VERSION,
-    AttemptLog,
-    StepLog,
-    TrajectoryStore,
-    cell_key,
-)
-from turing.research.loop.workspace import CopyTreeWorkspaceProvider
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    # Import-time cost only matters for `python -c "import turing.research.loop.run"`;
+    # type checkers and IDEs still see the real names via this block. Runtime
+    # resolution goes through __getattr__ below, one submodule at a time, on
+    # first access — see plots.py's _matplotlib_objects() for the same idea
+    # applied to a single heavy dependency instead of a whole package.
+    from turing.research.loop.escalation import (
+        FileDropDecisionInbox,
+        NtfyEscalationNotifier,
+        OperatorEscalationChannel,
+        OperatorEscalationGate,
+        build_operator_channel,
+    )
+    from turing.research.loop.metrics import (
+        DEFAULT_SCORE_FLOORS,
+        MIN_NOISE_FLOOR_SEEDS,
+        Cell,
+        CostBasis,
+        NoiseFloor,
+        NoiseFloorStatistic,
+        SaturationAssessment,
+        SaturationVerdict,
+        ScoredProblem,
+        assess_saturation,
+        build_type_scores,
+        compute_deltas,
+        cost_per_unit_gain,
+        floors_by_cell,
+        measure_noise_floor,
+        round_verdict,
+    )
+    from turing.research.loop.noise_floor import (
+        NoiseFloorConfig,
+        NoiseFloorReport,
+        NoiseFloorRunner,
+    )
+    from turing.research.loop.protocols import (
+        Clock,
+        EscalationChannel,
+        Solver,
+        SolverStep,
+        SolverTask,
+        SystemClock,
+        WorkspaceProvider,
+    )
+    from turing.research.loop.runner import (
+        AttemptOutcome,
+        PassCriterion,
+        RoundConfig,
+        RoundOutcome,
+        RoundRunner,
+    )
+    from turing.research.loop.self_edit_seam import (
+        SelfEditInputs,
+        SelfEditStep,
+        collect_self_edit_inputs,
+    )
+    from turing.research.loop.settings import ResearchLoopSettings
+    from turing.research.loop.solver_bridge import SolverBridge
+    from turing.research.loop.trajectory import (
+        TRAJECTORY_SCHEMA_VERSION,
+        AttemptDisposition,
+        AttemptLog,
+        RunIdentity,
+        StepLog,
+        StoredAttempt,
+        TrajectoryStore,
+        cell_key,
+    )
+    from turing.research.loop.workspace import CopyTreeWorkspaceProvider
 
 __all__ = [
     "DEFAULT_SCORE_FLOORS",
     "MIN_NOISE_FLOOR_SEEDS",
     "TRAJECTORY_SCHEMA_VERSION",
+    "AttemptDisposition",
     "AttemptLog",
     "AttemptOutcome",
     "Cell",
@@ -127,6 +139,7 @@ __all__ = [
     "RoundConfig",
     "RoundOutcome",
     "RoundRunner",
+    "RunIdentity",
     "SaturationAssessment",
     "SaturationVerdict",
     "ScoredProblem",
@@ -137,6 +150,7 @@ __all__ = [
     "SolverStep",
     "SolverTask",
     "StepLog",
+    "StoredAttempt",
     "SystemClock",
     "TrajectoryStore",
     "WorkspaceProvider",
@@ -151,3 +165,81 @@ __all__ = [
     "measure_noise_floor",
     "round_verdict",
 ]
+
+_SUBMODULE_BY_NAME: dict[str, str] = {
+    "FileDropDecisionInbox": "escalation",
+    "NtfyEscalationNotifier": "escalation",
+    "OperatorEscalationChannel": "escalation",
+    "OperatorEscalationGate": "escalation",
+    "build_operator_channel": "escalation",
+    "DEFAULT_SCORE_FLOORS": "metrics",
+    "MIN_NOISE_FLOOR_SEEDS": "metrics",
+    "Cell": "metrics",
+    "CostBasis": "metrics",
+    "NoiseFloor": "metrics",
+    "NoiseFloorStatistic": "metrics",
+    "SaturationAssessment": "metrics",
+    "SaturationVerdict": "metrics",
+    "ScoredProblem": "metrics",
+    "assess_saturation": "metrics",
+    "build_type_scores": "metrics",
+    "compute_deltas": "metrics",
+    "cost_per_unit_gain": "metrics",
+    "floors_by_cell": "metrics",
+    "measure_noise_floor": "metrics",
+    "round_verdict": "metrics",
+    "NoiseFloorConfig": "noise_floor",
+    "NoiseFloorReport": "noise_floor",
+    "NoiseFloorRunner": "noise_floor",
+    "Clock": "protocols",
+    "EscalationChannel": "protocols",
+    "Solver": "protocols",
+    "SolverStep": "protocols",
+    "SolverTask": "protocols",
+    "SystemClock": "protocols",
+    "WorkspaceProvider": "protocols",
+    "AttemptOutcome": "runner",
+    "PassCriterion": "runner",
+    "RoundConfig": "runner",
+    "RoundOutcome": "runner",
+    "RoundRunner": "runner",
+    "SelfEditInputs": "self_edit_seam",
+    "SelfEditStep": "self_edit_seam",
+    "collect_self_edit_inputs": "self_edit_seam",
+    "ResearchLoopSettings": "settings",
+    "SolverBridge": "solver_bridge",
+    "TRAJECTORY_SCHEMA_VERSION": "trajectory",
+    "AttemptDisposition": "trajectory",
+    "AttemptLog": "trajectory",
+    "RunIdentity": "trajectory",
+    "StepLog": "trajectory",
+    "StoredAttempt": "trajectory",
+    "TrajectoryStore": "trajectory",
+    "cell_key": "trajectory",
+    "CopyTreeWorkspaceProvider": "workspace",
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve a public name by importing its defining submodule on first use.
+
+    Keeps every name in ``__all__`` importable from ``turing.research.loop``
+    (``from turing.research.loop import RoundRunner`` still works) without
+    paying for all ten submodules — several of them pulling in pydantic,
+    pydantic_settings or the solver package — just to import
+    ``turing.research.loop.run``, which reaches the few it actually needs
+    through their own submodule paths instead of through this package.
+    """
+    submodule_name = _SUBMODULE_BY_NAME.get(name)
+    if submodule_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+
+    submodule = importlib.import_module(f"{__name__}.{submodule_name}")
+    value = getattr(submodule, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))

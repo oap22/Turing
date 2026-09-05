@@ -22,7 +22,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 const files = new Map<string, string>();
 let listing: Array<{
@@ -48,6 +48,20 @@ vi.mock("../desktop/tauri", () => ({
   },
   subscribe: () => ({ unsubscribe: () => {}, ready: Promise.resolve() }),
 }));
+
+// Not mocked: the pane publishes through the real module, and these tests
+// listen on the same one — which is exactly how MetricsPane hears it.
+import {
+  __resetPaneLinkForTests,
+  subscribeMetricsTarget,
+  type RoundTarget,
+} from "../desktop/panes/paneLink";
+
+// jsdom has no layout engine and so no scrollIntoView; the Select popup's
+// keep-the-cursor-visible effect calls it on open (same stub as Home.test).
+beforeAll(() => {
+  Element.prototype.scrollIntoView = vi.fn();
+});
 
 const EVAL_HASH = "6b7ba0521382b111502a03724c87df78d0c2598cd03c1663556d58f9790b4ebf";
 
@@ -230,6 +244,7 @@ async function openRound(index: number) {
 afterEach(() => {
   cleanup();
   files.clear();
+  __resetPaneLinkForTests();
 });
 
 describe("FlywheelPane round detail — comparability", () => {
@@ -319,6 +334,118 @@ describe("FlywheelPane round detail — per-problem rows", () => {
     expect(
       screen.getByText("↳ speedup/practice · cuda/matmul-speedup"),
     ).toBeInTheDocument();
+  });
+
+  it("publishes the loop and round when [metrics] is clicked, and only then (#390 item 3)", async () => {
+    const seen: RoundTarget[] = [];
+    subscribeMetricsTarget((t) => seen.push(t));
+    seed();
+    await openRound(1);
+    // Expanding the round is a read, not a cross-pane gesture: nothing has
+    // been published yet. Re-aiming the metrics pane takes the explicit link.
+    expect(seen).toEqual([]);
+
+    fireEvent.click(screen.getByRole("button", { name: "[metrics]" }));
+    expect(seen).toEqual([{ loop: "loop-probe", round: 1 }]);
+    // The detail is still expanded — the link must not collapse what the
+    // operator is reading.
+    expect(screen.getByText("NOT comparable to parent")).toBeInTheDocument();
+  });
+
+  it("offers [metrics] even before round.json lands — the live round is the one being watched", async () => {
+    const seen: RoundTarget[] = [];
+    subscribeMetricsTarget((t) => seen.push(t));
+    seed(["loop-probe/round-01/round.json"]);
+    const { default: FlywheelPane } = await import("../desktop/panes/FlywheelPane");
+    render(<FlywheelPane />);
+    const row = await waitFor(() => {
+      const found = screen
+        .getAllByRole("button")
+        .find((b) => b.textContent?.startsWith("01"));
+      if (!found) throw new Error("round 01 row not rendered");
+      return found;
+    });
+    fireEvent.click(row);
+    await screen.findByText("no round.json for this round yet");
+
+    fireEvent.click(screen.getByRole("button", { name: "[metrics]" }));
+    expect(seen).toEqual([{ loop: "loop-probe", round: 1 }]);
+  });
+
+  it("publishes from the wheel view's expanded detail too", async () => {
+    const seen: RoundTarget[] = [];
+    subscribeMetricsTarget((t) => seen.push(t));
+    seed();
+    await openRound(1);
+    // The expanded round survives the view switch; the wheel branch renders
+    // the detail (and its [metrics] link) through its own wiring, which is
+    // what this test pins — a wheel-side no-op handler must not survive.
+    fireEvent.click(screen.getByRole("button", { name: "[wheel]" }));
+    fireEvent.click(screen.getByRole("button", { name: "[metrics]" }));
+    expect(seen).toEqual([{ loop: "loop-probe", round: 1 }]);
+  });
+
+  it("acknowledges delivery inline, and says so when no metrics pane is listening", async () => {
+    seed();
+    await openRound(1);
+    // Nothing rendered before the click: the hint is transient feedback, not
+    // a permanent fixture of the row.
+    expect(screen.queryByTestId("metrics-link-hint")).toBeNull();
+
+    // No subscriber anywhere (no metrics pane mounted): silence would make a
+    // dead click and a delivered one identical pixels.
+    fireEvent.click(screen.getByRole("button", { name: "[metrics]" }));
+    expect(screen.getByTestId("metrics-link-hint")).toHaveTextContent("no metrics pane");
+
+    // A metrics pane mounts (subscribes); the next click reads as delivered.
+    const unsub = subscribeMetricsTarget(() => {});
+    fireEvent.click(screen.getByRole("button", { name: "[metrics]" }));
+    expect(screen.getByTestId("metrics-link-hint")).toHaveTextContent("→ metrics");
+    unsub();
+  });
+
+  it("does not render one loop's hint beside another loop's round of the same index", async () => {
+    // Two loops, each with a round 1. The hint answers a click on loop-probe;
+    // switching loops inside its 2.5 s window and expanding the OTHER loop's
+    // round 1 must not show it there — it would read as feedback about a
+    // click on loop-second that never happened.
+    seed();
+    files.set("loop-second/trajectory.json", JSON.stringify(TRAJECTORY));
+    listing = [
+      {
+        rel_path: "loop-probe/trajectory.json",
+        is_dir: false,
+        size: 1,
+        mtime_ms: 2,
+      },
+      {
+        rel_path: "loop-second/trajectory.json",
+        is_dir: false,
+        size: 1,
+        mtime_ms: 1,
+      },
+    ];
+    await openRound(1); // newest loop, loop-probe, is selected
+    fireEvent.click(screen.getByRole("button", { name: "[metrics]" }));
+    expect(screen.getByTestId("metrics-link-hint")).toBeInTheDocument();
+
+    // Switch the loop dropdown to loop-second (within the hint window).
+    fireEvent.click(screen.getByRole("button", { name: /^loop: / }));
+    fireEvent.click(screen.getByRole("option", { name: "loop-second" }));
+
+    // Expand loop-second's round 1. Its detail (loop-second has no round
+    // artifacts in this tree, so the "no round.json" branch) carries its own
+    // [metrics] link — with no hint, because nobody clicked THIS one.
+    const row = await waitFor(() => {
+      const found = screen
+        .getAllByRole("button")
+        .find((b) => b.textContent?.startsWith("01"));
+      if (!found) throw new Error("round 01 row not rendered");
+      return found;
+    });
+    fireEvent.click(row);
+    await screen.findByText("no round.json for this round yet");
+    expect(screen.queryByTestId("metrics-link-hint")).toBeNull();
   });
 
   it("marks an unscored problem instead of showing a measured-looking zero", async () => {

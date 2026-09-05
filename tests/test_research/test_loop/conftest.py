@@ -117,8 +117,10 @@ def make_problem(
     harness_failure: bool = False,
     template: Path | None = None,
     default_cap: Cap | None = None,
+    score_scale: str | None = None,
+    score_floor: float | None = None,
 ) -> Problem:
-    scale = (
+    scale = score_scale or (
         SCORE_SCALE_SPEEDUP
         if problem_type is ProblemType.SPEEDUP
         else SCORE_SCALE_LEADERBOARD_PERCENTILE
@@ -132,6 +134,7 @@ def make_problem(
         correctness=tuple(correctness),
         raises=raises,
         harness_failure=harness_failure,
+        score_floor=score_floor,
     )
     return Problem(
         id=problem_id,
@@ -173,6 +176,61 @@ class ExplodingSolver:
         raise RuntimeError("backend unavailable")
 
 
+#: A step whose self-reported token count is not a finite number.
+#:
+#: ``SolverStep.tokens`` is self-reported — "only the backend can know them"
+#: (``protocols.py``) — and is checked for sign, not for finiteness, so a
+#: backend whose usage accounting returns an infinity or a NaN produces this
+#: object with nothing refusing it. The runner charges it to
+#: ``attempt.consumed``, and the next thing it does is checkpoint the attempt:
+#: ``trajectory._write_json`` serialises with ``allow_nan=False`` — a
+#: deliberate refusal, because "Python emits bare ``NaN``/``Infinity``, which
+#: is not JSON: every other reader rejects the file outright" — so the write
+#: raises ``ValueError`` out of ``run_attempt`` and lands in ``run_attempts``'
+#: per-attempt containment.
+#:
+#: That makes it the way a test drives a contained attempt crash at a chosen
+#: *step*, and so on a chosen side of the attempt's first metrics append: put
+#: it first in a script and nothing is ever written; put it later and the
+#: attempt dies with an intact chain already on disk. A solver *exception*
+#: cannot do either — ``run_attempt`` catches those and escalates — and a
+#: workspace failure can only do the first.
+#:
+#: It replaced a colliding ``score_scale`` in this role. That scale used to be
+#: the canonical trigger, and it is now refused where the verifier declares
+#: it, so such a problem can no longer be constructed at all.
+UNACCOUNTABLE_STEP = SolverStep(
+    tokens=float("inf"),  # type: ignore[arg-type]
+    note="backend usage accounting returned a non-finite token count",
+)
+
+
+class PerProblemSolver:
+    """Runs a script for one named problem; every other problem gets plain work.
+
+    :class:`FakeSolver` walks one script across the whole round, so a test
+    that needs exactly one problem to misbehave has to reason about corpus
+    order to line the script up. This keys on ``task.id`` instead, which is
+    both simpler and closer to what it stands for: a failure that is a
+    property of the *problem* and therefore reproduces on every seed and
+    every re-drive, not one that depends on where in the corpus it sits.
+    """
+
+    def __init__(self, problem_id: str, script: Sequence[SolverStep]) -> None:
+        self.problem_id = problem_id
+        self._script = list(script)
+        self._seen = 0
+        self.calls: list[tuple[str, int]] = []
+
+    async def step(self, task: SolverTask, attempt: Attempt) -> SolverStep:
+        self.calls.append((task.id, attempt.step_index))
+        if task.id != self.problem_id:
+            return SolverStep(tokens=10, note="work")
+        index = min(self._seen, len(self._script) - 1)
+        self._seen += 1
+        return self._script[index]
+
+
 # --------------------------------------------------------------------------- #
 # Workspaces and escalation
 # --------------------------------------------------------------------------- #
@@ -192,6 +250,34 @@ class TempWorkspaceProvider:
         return path
 
 
+class WorkspacesRefusingOneProblem(TempWorkspaceProvider):
+    """Refuses one problem's workspace, on every seed and every round.
+
+    Stands in for a *deterministic* per-problem loss: a workspace template
+    that was pruned, evicted, or hit a full disk — the exact I/O
+    ``runner.py`` names when it explains why a crash can land between
+    materialisation and rotation. Materialisation is the earliest thing
+    :meth:`RoundRunner.run_attempt` does, so this is the way to drive a
+    contained crash *before* the attempt's first metrics append: nothing is
+    written, and the directory is not a run at all.
+
+    Keyed on ``problem.id`` rather than on the attempt id, so the loss is a
+    property of the problem — identical on every seed and every re-drive —
+    which is what makes it usable as the noise floor's deterministic case.
+    """
+
+    def __init__(self, root: Path, *, problem_ids: Sequence[str]) -> None:
+        super().__init__(root)
+        self.refused = list(problem_ids)
+        self.refusals = 0
+
+    async def materialise(self, problem: Problem, *, attempt_id: str) -> Path:
+        if problem.id in self.refused:
+            self.refusals += 1
+            raise OSError(f"workspace template for {problem.id} is unreadable")
+        return await super().materialise(problem, attempt_id=attempt_id)
+
+
 class ScriptedEscalationChannel:
     """Replies with a queued decision; the last one repeats.
 
@@ -201,10 +287,16 @@ class ScriptedEscalationChannel:
     def __init__(self, verdicts: Sequence[EscalationVerdict | EscalationDecision] | None = None):
         self._queue = list(verdicts or [EscalationVerdict.CONTINUE])
         self.requests: list[EscalationRequest] = []
+        #: ``(request_id, reopened)`` per call, so a test can assert that a
+        #: restart re-entered a wait rather than raising a fresh request.
+        self.calls: list[tuple[str, bool]] = []
 
-    async def request_decision(self, request: EscalationRequest) -> EscalationDecision:
+    async def request_decision(
+        self, request: EscalationRequest, *, reopened: bool = False
+    ) -> EscalationDecision:
         index = min(len(self.requests), len(self._queue) - 1)
         self.requests.append(request)
+        self.calls.append((request.request_id, reopened))
         item = self._queue[index]
         if isinstance(item, EscalationDecision):
             return EscalationDecision(
@@ -221,13 +313,21 @@ class ScriptedEscalationChannel:
 
 
 class NeverAnswersChannel:
-    """A channel that would suspend forever — used to prove the loop waits."""
+    """A channel that would suspend forever — used to prove the loop waits.
+
+    Takes ``reopened`` like every other channel, so a restart that re-enters
+    a wait on it is exercised with the same signature the runner uses.
+    """
 
     def __init__(self) -> None:
         self.requests: list[EscalationRequest] = []
+        self.calls: list[tuple[str, bool]] = []
 
-    async def request_decision(self, request: EscalationRequest) -> EscalationDecision:
+    async def request_decision(
+        self, request: EscalationRequest, *, reopened: bool = False
+    ) -> EscalationDecision:
         self.requests.append(request)
+        self.calls.append((request.request_id, reopened))
         raise AssertionError("should not be reached in tests that never answer")
 
 

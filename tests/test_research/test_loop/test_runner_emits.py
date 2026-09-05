@@ -40,20 +40,27 @@ from turing.research.loop.integrity import (
 from turing.research.loop.metrics import SaturationVerdict
 from turing.research.loop.noise_floor import NoiseFloorConfig, NoiseFloorRunner
 from turing.research.loop.protocols import SolverStep
-from turing.research.loop.results import Outcome
+from turing.research.loop.results import METRICS_VERDICT_FILENAME, Outcome
+from turing.research.loop.results import MetricsWriter as results_MetricsWriter
+from turing.research.loop.results import _validate_scored_metric as results_validate
 from turing.research.loop.runner import PassCriterion
 
 from .conftest import (
     DEFAULT_CAP,
     ENGINE,
+    UNACCOUNTABLE_STEP,
     ExplodingSolver,
     FakeSolver,
+    PerProblemSolver,
     ScriptedEscalationChannel,
     TempWorkspaceProvider,
+    WorkspacesRefusingOneProblem,
     make_config,
     make_problem,
     make_runner,
 )
+from .test_results import _header as results_header
+from .test_results import _line as results_line
 from .test_runner import floors_for
 
 if TYPE_CHECKING:
@@ -109,23 +116,6 @@ class _CancellingSolver:
     async def step(self, task: SolverTask, attempt: Attempt) -> object:
         self.calls += 1
         raise asyncio.CancelledError
-
-
-def _problem_with_scale(problem_id: str, scale: str) -> Problem:
-    """A problem whose verifier reports a colliding ``score_scale``.
-
-    ``score_scale`` is free-form by design (``contracts.py``: "Free-form by
-    design — each problem scores on its own scale"), and the runner names the
-    metrics key holding the raw score after it. ``conftest.make_problem``
-    derives the scale from the problem *type*, so it can only ever produce the
-    two conventional spellings; this rebuilds the same problem around a scale
-    an operator could plausibly and legitimately choose, and that
-    ``results._validate_scored_metric`` then refuses.
-    """
-    problem = make_problem(problem_id)
-    return dataclasses.replace(
-        problem, verifier=dataclasses.replace(problem.verifier, score_scale=scale)
-    )
 
 
 def _read_lines(path: Path) -> list[dict[str, object]]:
@@ -588,10 +578,21 @@ class TestRoundEmission:
 # --------------------------------------------------------------------------- #
 
 
-def test_plots_module_selected_the_agg_backend() -> None:
-    """Cheap guard: importing turing.research.loop.runner must not have pulled
-    in a GUI backend via some other import path.
+async def test_plots_module_selected_the_agg_backend(tmp_path: Path) -> None:
+    """Cheap guard: the first real render must leave matplotlib on the Agg
+    backend, not a GUI one reached via some other import path.
+
+    ``plots`` no longer imports matplotlib at module scope — it defers the
+    import (and the ``matplotlib.use("Agg")`` call) to the first render — so
+    this test triggers a render itself rather than relying on an earlier test
+    in the session having done so. It must hold when run in isolation.
     """
+    points = (
+        {"step": 1, "progress": 0.0, "score": 1.0, "tokens_used": 10, "wall_clock_s": 1.0},
+        {"step": 2, "progress": 1.0, "score": 2.0, "tokens_used": 20, "wall_clock_s": 2.0},
+    )
+    await plots_module.render_attempt_plots(tmp_path, points, forcing_series="score", target=2.0)
+
     import matplotlib
 
     assert matplotlib.get_backend().lower() == "agg"
@@ -694,6 +695,98 @@ class TestIntegrityAgainstARealRun:
         rotated_reconcile_verdict = await reconcile_summary(rotated_dir)
         assert rotated_reconcile_verdict.ok is True, rotated_reconcile_verdict.mismatches
 
+    async def test_a_crash_between_rotation_renames_heals_on_the_next_entry(
+        self,
+        store: TrajectoryStore,
+        workspaces: TempWorkspaceProvider,
+        clock: FakeClock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """RES-19: the rotation *set* has to be atomic, not just each rename.
+
+        ``_rotate_stale_metrics`` used to move the trio (and plots) aside with
+        three-plus sequential ``Path.rename`` calls straight into a
+        pre-existing ``prior-N/``. Each individual rename is atomic; a process
+        killed between two of them left ``prior-N/`` holding, say, a log with
+        no chain sidecar (fails verification on its own) while the *live*
+        ``metrics_dir`` kept a stale sidecar with no log — a half-rotated
+        state ``MetricsWriter``'s old refusal (``metrics.jsonl`` only) did not
+        catch, so the next drive wrote a fresh chain beside that orphaned
+        sidecar and **both** generations then failed verification on
+        completely honest data.
+
+        This drives one real attempt to build an honest trio-plus-plots (real
+        ``MetricsWriter``, real ``RoundRunner``, not hand-built), monkeypatches
+        ``Path.rename`` to raise right after the first file lands, and asserts
+        that a *second*, unpatched call to ``_rotate_stale_metrics`` heals the
+        interrupted rotation: nothing from the trio/plots is left directly in
+        ``metrics_dir``, exactly one ``prior-N/`` exists holding every file
+        that was ever present, and that directory still verifies clean.
+        """
+        from pathlib import Path as _Path
+
+        from turing.research.loop.runner import _ROTATED_NAMES, _rotate_stale_metrics
+
+        problem = make_problem("s1", scores=(1.0, 5.0))
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        config = make_config(pass_criteria={"s1": PassCriterion(min_score=2.0)})
+        output_dir = store.round_dir(0)
+        outcome = await runner.run_attempt(problem, config, output_dir=output_dir)
+        assert outcome.attempt.state is AttemptState.PASSED
+
+        metrics_dir = output_dir / "attempts" / "s1"
+        present_before = [name for name in _ROTATED_NAMES if (metrics_dir / name).exists()]
+        # The fixture is only meaningful if there is a real trio *and* both
+        # plots to move -- otherwise this would not exercise a multi-rename
+        # rotation at all.
+        assert set(present_before) == set(_ROTATED_NAMES)
+        contents_before = {name: (metrics_dir / name).read_bytes() for name in present_before}
+
+        real_rename = _Path.rename
+        call_count = {"n": 0}
+
+        def flaky_rename(self: _Path, target: object) -> object:
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise OSError("simulated crash mid-rotation")
+            return real_rename(self, target)
+
+        monkeypatch.setattr(_Path, "rename", flaky_rename)
+
+        with pytest.raises(OSError, match="simulated crash mid-rotation"):
+            _rotate_stale_metrics(metrics_dir)
+
+        # Exactly one rename landed before the injected crash: the trio/plots
+        # are now split between metrics_dir and the (dot-prefixed, hidden)
+        # staging directory rotation left behind.
+        assert call_count["n"] == 2
+
+        # A second call -- unpatched calls still raise on n==2, but that value
+        # is already spent, so every rename this call makes succeeds -- heals
+        # the interrupted rotation.
+        _rotate_stale_metrics(metrics_dir)
+
+        # (a) Nothing from the trio/plots sits directly in metrics_dir.
+        for name in _ROTATED_NAMES:
+            assert not (metrics_dir / name).exists(), f"{name} was left in metrics_dir"
+
+        # (b) Exactly one prior-N/ exists, holding every file that was ever
+        # present, byte for byte.
+        rotated_dirs = sorted(p for p in metrics_dir.iterdir() if p.is_dir())
+        assert len(rotated_dirs) == 1, f"expected one rotated-aside dir, got {rotated_dirs}"
+        prior_dir = rotated_dirs[0]
+        assert prior_dir.name == "prior-1"
+        for name, data in contents_before.items():
+            assert (prior_dir / name).read_bytes() == data, f"{name} is not byte-identical"
+
+        # (c) The healed prior-N/ still verifies clean for the honest chain.
+        chain_verdict = await verify_metrics_chain(prior_dir)
+        assert chain_verdict.ok is True, chain_verdict.reason
+        reconcile_verdict = await reconcile_summary(prior_dir)
+        assert reconcile_verdict.ok is True, reconcile_verdict.mismatches
+        run_verdict = await verify_cli.verify_run(prior_dir)
+        assert run_verdict.state is verify_cli.RunState.OK
+
     async def test_chain_and_reconcile_are_both_ok_when_the_solver_raises_with_accounted_tokens(
         self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
     ) -> None:
@@ -788,6 +881,183 @@ class TestIntegrityAgainstARealRun:
         assert chain_verdict.ok is True, chain_verdict.reason
         reconcile_verdict = await reconcile_summary(metrics_dir)
         assert reconcile_verdict.ok is True, reconcile_verdict.mismatches
+
+
+# --------------------------------------------------------------------------- #
+# RES-19 adversarial review — ``.rotating/`` is a rotation in progress, never
+# a run, and its presence as anything other than a directory is a loud, named
+# error.
+# --------------------------------------------------------------------------- #
+
+
+class TestStagingDirectoryNeverReportsAsARun:
+    """``_STAGING_DIR_NAME`` (``.rotating``) must stay invisible to every code
+    path that discovers runs by walking the results tree, and a foreign
+    non-directory sitting at that name must fail loudly rather than silently
+    or with a bare ``FileExistsError``.
+    """
+
+    async def test_find_runs_skips_a_staging_directory_beside_a_live_run(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """A partially staged trio must not make an honest, finished run look
+        broken.
+
+        ``run-a/metrics.jsonl`` here is a real, complete attempt (trio plus
+        summary, verifies OK). ``run-a/.rotating/metrics.jsonl`` stands in for
+        the leftover a crash mid-rotation leaves behind: a real chain, honest
+        as far as it goes, but with no summary beside it because rotation
+        never got to commit it. Before the fix, ``find_runs``'s
+        ``rglob("metrics.jsonl")`` walk reports the staging directory as a
+        second run, and that second, summary-less "run" drags the whole
+        root's verdict down to INCOMPLETE even though nothing here is
+        actually wrong.
+        """
+        from turing.research.loop.runner import _STAGING_DIR_NAME
+
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        config = make_config(pass_criteria={"s1": PassCriterion(min_score=2.0)})
+        outcome = await runner.run_attempt(
+            make_problem("s1", scores=(1.0, 5.0)), config, output_dir=store.round_dir(0)
+        )
+        assert outcome.attempt.state is AttemptState.PASSED
+
+        run_dir = store.round_dir(0) / "attempts" / "s1"
+        assert (await verify_cli.verify_run(run_dir)).state is verify_cli.RunState.OK
+
+        staging_dir = run_dir / _STAGING_DIR_NAME
+        leftover = results_MetricsWriter(
+            staging_dir / "metrics.jsonl",
+            header=results_header(attempt_id="stale-generation", problem_id="s1"),
+        )
+        await leftover.append(results_line())
+
+        attempts_root = run_dir.parent
+        assert verify_cli.find_runs(attempts_root) == [run_dir]
+
+        exit_code = await _verify_exit_code(attempts_root)
+        assert exit_code == verify_cli.EXIT_OK
+
+    async def test_viewer_runs_omits_a_staging_directory(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """``.viewer.json`` must not leak ``.rotating`` into the desktop's run
+        list either -- the comment above ``_PRIOR_DIR_PATTERN`` already
+        promises this filter keeps the staging directory invisible.
+        """
+        from turing.research.loop.runner import _STAGING_DIR_NAME
+
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        await runner.run_round([make_problem("s1")], make_config())
+
+        run_dir = store.round_dir(0) / "attempts" / "s1"
+        staging_dir = run_dir / _STAGING_DIR_NAME
+        leftover = results_MetricsWriter(
+            staging_dir / "metrics.jsonl",
+            header=results_header(attempt_id="stale-generation", problem_id="s1"),
+        )
+        await leftover.append(results_line())
+
+        viewer_runs = runner._viewer_runs()
+        assert viewer_runs == ["loop-test-loop/round-00/attempts/s1"]
+        assert not any(_STAGING_DIR_NAME in entry for entry in viewer_runs)
+
+    async def test_a_regular_file_named_rotating_is_a_named_contract_violation(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """``.rotating`` must be a directory or absent -- never a plain file.
+
+        Before the fix, a foreign file at this name made
+        ``_rotate_stale_metrics`` raise a bare ``FileExistsError`` out of
+        ``staging_dir.mkdir(...)``, naming nothing about what the caller
+        should do about it. It must instead raise
+        :class:`ContractViolationError` naming the offending path.
+        """
+        from turing.research.loop.runner import _STAGING_DIR_NAME, _rotate_stale_metrics
+
+        problem = make_problem("s1")
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        config = make_config()
+        await runner.run_attempt(problem, config, output_dir=store.round_dir(0))
+
+        metrics_dir = store.round_dir(0) / "attempts" / "s1"
+        staging_dir = metrics_dir / _STAGING_DIR_NAME
+        staging_dir.write_text("not a directory")
+
+        with pytest.raises(ContractViolationError, match=r"\.rotating"):
+            _rotate_stale_metrics(metrics_dir)
+
+
+# --------------------------------------------------------------------------- #
+# RES-18 — the verdict the desktop's badge reads
+# --------------------------------------------------------------------------- #
+
+
+class TestTheLoopStampsItsOwnVerdict:
+    """``metrics.verdict.json``, driven against the real emitter.
+
+    The desktop's metrics pane reads files; it cannot run ``verify``. So the
+    loop runs it at the end of every attempt and leaves the answer beside the
+    summary. These tests pin the three things the pane's badge depends on: the
+    file lands, its ``lines_checked`` is the count the pane will compare
+    against its own parse, and the file is invisible to every check it reports
+    on.
+    """
+
+    async def test_a_real_attempt_leaves_an_ok_verdict_matching_its_log(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        await runner.run_attempt(
+            make_problem("s1", scores=(1.0, 5.0)),
+            make_config(pass_criteria={"s1": PassCriterion(min_score=2.0)}),
+            output_dir=store.round_dir(0),
+        )
+
+        metrics_dir = store.round_dir(0) / "attempts" / "s1"
+        payload = json.loads((metrics_dir / METRICS_VERDICT_FILENAME).read_text())
+        assert payload["state"] == "ok"
+        log_lines = (metrics_dir / "metrics.jsonl").read_text().rstrip("\n").split("\n")
+        assert payload["lines_checked"] == len(log_lines)
+        assert payload["checked_by"] == "loop"
+
+        # And it changed nothing about what verify itself sees.
+        assert verify_cli.find_runs(metrics_dir) == [metrics_dir]
+        assert (await verify_cli.verify_run(metrics_dir)).state is verify_cli.RunState.OK
+
+    async def test_a_redrive_rotates_the_verdict_aside_with_its_trio(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """A verdict left behind would describe the superseded generation's log.
+
+        Rotation is what keeps a superseded attempt's evidence together and
+        out of the live directory; a verdict file exempted from it would sit
+        beside the *new* chain claiming a line count from the old one — which
+        the pane would read as ``stale`` forever, on data nobody touched.
+        Driven through the public re-drive path only.
+        """
+        config = make_config(pass_criteria={"s1": PassCriterion(min_score=2.0)})
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        metrics_dir = store.round_dir(0) / "attempts" / "s1"
+
+        await runner.run_attempt(
+            make_problem("s1", scores=(1.0, 5.0)), config, output_dir=store.round_dir(0)
+        )
+        first_verdict = (metrics_dir / METRICS_VERDICT_FILENAME).read_bytes()
+
+        await runner.run_attempt(
+            make_problem("s1", scores=(1.0, 5.0)), config, output_dir=store.round_dir(0)
+        )
+
+        prior = metrics_dir / "prior-1"
+        assert (prior / METRICS_VERDICT_FILENAME).read_bytes() == first_verdict
+        # The live directory has its own, freshly written, not the old one.
+        assert (metrics_dir / METRICS_VERDICT_FILENAME).is_file()
+        assert json.loads((prior / METRICS_VERDICT_FILENAME).read_text())["state"] == "ok"
+        assert json.loads((metrics_dir / METRICS_VERDICT_FILENAME).read_text())["state"] == "ok"
+        # The rotated generation is still exactly one independently checkable
+        # run — the verdict file joining it is not a second one.
+        assert sorted(p.name for p in verify_cli.find_runs(metrics_dir)) == ["prior-1", "s1"]
 
 
 # --------------------------------------------------------------------------- #
@@ -931,6 +1201,85 @@ class TestNonFiniteTargetAttempts:
 
 
 # --------------------------------------------------------------------------- #
+# RES-16 sibling — a colliding score_scale can no longer cost an attempt
+# --------------------------------------------------------------------------- #
+
+
+class TestACollidingScoreScaleNeverReachesARound:
+    """The failure moved from the attempt's first verification to the corpus.
+
+    The runner names the metrics key holding the raw score after
+    ``problem.verifier.score_scale``, so a scale of ``progress`` (or ``step``,
+    or ``tokens_used``) used to raise from ``MetricsLine.to_json`` mid-attempt
+    -- after the workspace was materialised and the solver had already run --
+    and lose that problem for the round, every round, forever. These drive
+    the same corpus a round would have been given and assert the refusal now
+    lands before any of that.
+    """
+
+    def test_the_corpus_cannot_even_be_built(self) -> None:
+        """``make_problem`` is the loop's own corpus builder for these tests;
+        the refusal fires inside it, at the verifier, with no runner, no
+        results tree and no workspace in existence yet.
+        """
+        with pytest.raises(ContractViolationError, match="progress"):
+            dataclasses.replace(
+                make_problem("bad").verifier,
+                score_scale="progress",
+            )
+
+    async def test_a_round_that_would_have_lost_an_attempt_now_never_starts(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """The full before/after, driven end to end.
+
+        Building the eleventh problem raises, so ``run_round`` is never
+        called: no round directory, no attempt directory, no ``.viewer.json``,
+        and -- the point -- none of the machine time the ten good problems
+        ahead of it would have spent before the bad one's name killed the
+        round.
+        """
+        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        corpus = [make_problem("good-1", scores=(2.0,)), make_problem("good-2", scores=(3.0,))]
+
+        with pytest.raises(ContractViolationError, match="score_scale"):
+            corpus.append(
+                dataclasses.replace(
+                    make_problem("bad"),
+                    verifier=dataclasses.replace(
+                        make_problem("bad").verifier, score_scale="tokens_used"
+                    ),
+                )
+            )
+
+        assert not store.round_dir(0).exists()
+        assert not (store.loop_dir.parent / ".viewer.json").exists()
+
+        # And the corpus that *is* buildable runs clean: the refusal costs
+        # nothing to a corpus that does not carry a colliding scale.
+        outcome = await runner.run_round(corpus, make_config())
+        assert outcome.failures == ()
+        assert outcome.record.gates["all_attempts_completed"] is True
+
+    async def test_the_metrics_line_still_refuses_the_key_on_its_own(
+        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    ) -> None:
+        """Defence in depth, deliberately kept.
+
+        ``results._validate_scored_metric`` is now unreachable *from the
+        runner's score series* -- the only ``metrics`` payload the runner
+        builds is ``{score_scale: score}`` -- but it is the definition of what
+        a metrics key may be, and it must keep refusing a caller that
+        assembles ``metrics`` from anywhere else. If this ever stops raising,
+        the scale check in ``contracts`` is guarding nothing.
+        """
+        with pytest.raises(ContractViolationError, match="collides with a core field"):
+            results_validate("progress", 1.0)
+        with pytest.raises(ContractViolationError, match="reserved by the desktop"):
+            results_validate("step", 1.0)
+
+
+# --------------------------------------------------------------------------- #
 # Round-6 regression — one bad attempt must not abort the whole round
 # --------------------------------------------------------------------------- #
 
@@ -941,26 +1290,30 @@ class TestOneBadAttemptDoesNotAbortTheRound:
     Before the fix, ``run_attempts`` called ``run_attempt`` with no per-attempt
     guard, so the first problem to raise discarded every attempt the round had
     already completed: no round record, no trajectory row, no cells, and the
-    machine time already spent on the earlier problems unrecoverable. The
-    reachable trigger needs no adversarial input — ``score_scale`` is free-form
-    by design, it becomes the metrics key naming the raw score, and
-    ``progress`` / ``step`` / ``ts`` / ``tokens_used`` / ``consumed_steps`` /
-    ``wall_clock_s`` (and ~10 more) are all rejected by
-    ``results._validate_scored_metric`` at that problem's *first* verification.
+    machine time already spent on the earlier problems unrecoverable.
 
-    The validation is right and stays strict: a scale that silently clobbered
-    a core field would corrupt every chart drawn off the file. What changed is
-    the blast radius. These tests drive a real, unmocked ``RoundRunner``
-    against a real colliding scale.
+    The trigger these tests were written around — a ``score_scale`` colliding
+    with a reserved metrics key — is gone: ``contracts`` now refuses such a
+    scale where the verifier declares it, so it cannot reach a round at all
+    (see ``test_contracts.py``'s score-scale cases). Containment still has
+    plenty to contain, and it is deliberately *not* specific to any one
+    trigger: what ``run_attempts`` guards is "``run_attempt`` raised", whatever
+    raised it. The two shapes driven here are the two that are still reachable
+    with no adversarial input at all — a workspace template that cannot be
+    read (pruned, evicted, full disk) and a backend reporting a non-finite
+    token count — and they land on opposite sides of the attempt's first
+    metrics append, which is the distinction the close-out contract below
+    turns on.
     """
 
-    async def test_a_colliding_score_scale_fails_only_its_own_problem(
-        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+    async def test_a_lost_workspace_fails_only_its_own_problem(
+        self, store: TrajectoryStore, tmp_path: Path, clock: FakeClock
     ) -> None:
+        workspaces = WorkspacesRefusingOneProblem(tmp_path / "workspaces", problem_ids=["bad"])
         runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
         corpus = [
             make_problem("good-1", scores=(2.0,)),
-            _problem_with_scale("bad", "progress"),
+            make_problem("bad"),
             make_problem("good-2", scores=(3.0,)),
         ]
         with structlog.testing.capture_logs() as cap:
@@ -977,7 +1330,7 @@ class TestOneBadAttemptDoesNotAbortTheRound:
 
         assert [o.problem.id for o in outcome.attempts] == ["good-1", "good-2"]
         assert [f.problem_id for f in outcome.failures] == ["bad"]
-        assert "ContractViolationError" in outcome.failures[0].error
+        assert "OSError" in outcome.failures[0].error
 
         crashed = [e for e in cap if e.get("event") == "research.attempt.crashed"]
         assert len(crashed) == 1
@@ -989,7 +1342,7 @@ class TestOneBadAttemptDoesNotAbortTheRound:
         assert lost[0]["lost"] == ["bad"]
 
     async def test_the_lost_problem_is_absent_from_the_cells_never_floored_into_them(
-        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+        self, store: TrajectoryStore, tmp_path: Path, clock: FakeClock
     ) -> None:
         """The containment must not buy round completion with a fake datum.
 
@@ -1001,10 +1354,11 @@ class TestOneBadAttemptDoesNotAbortTheRound:
         must therefore read as a two-problem cell with the two real scores,
         identical to what the same corpus minus the bad problem would produce.
         """
+        workspaces = WorkspacesRefusingOneProblem(tmp_path / "workspaces", problem_ids=["bad"])
         runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
         corpus = [
             make_problem("good-1", scores=(2.0,)),
-            _problem_with_scale("bad", "tokens_used"),
+            make_problem("bad"),
             make_problem("good-2", scores=(3.0,)),
         ]
         outcome = await runner.run_round(corpus, make_config())
@@ -1023,7 +1377,7 @@ class TestOneBadAttemptDoesNotAbortTheRound:
         assert outcome.record.cost.attempts == 2
 
     async def test_the_round_record_and_trajectory_row_both_say_an_attempt_was_lost(
-        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+        self, store: TrajectoryStore, tmp_path: Path, clock: FakeClock
     ) -> None:
         """Absent must not mean silent.
 
@@ -1034,8 +1388,9 @@ class TestOneBadAttemptDoesNotAbortTheRound:
         per-round ``constraints``; the verdict carries it into the one line an
         operator actually reads off a trajectory row.
         """
+        workspaces = WorkspacesRefusingOneProblem(tmp_path / "workspaces", problem_ids=["bad"])
         runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
-        corpus = [make_problem("good-1", scores=(2.0,)), _problem_with_scale("bad", "step")]
+        corpus = [make_problem("good-1", scores=(2.0,)), make_problem("bad")]
         outcome = await runner.run_round(corpus, make_config())
 
         assert outcome.record.gates["all_attempts_completed"] is False
@@ -1062,7 +1417,7 @@ class TestOneBadAttemptDoesNotAbortTheRound:
         assert outcome.record.cost.attempts == 2
 
     async def test_a_round_whose_every_attempt_fails_is_refused_not_recorded(
-        self, store: TrajectoryStore, workspaces: TempWorkspaceProvider, clock: FakeClock
+        self, store: TrajectoryStore, tmp_path: Path, clock: FakeClock
     ) -> None:
         """Containment is not "record whatever survived, even if that is nothing".
 
@@ -1071,8 +1426,11 @@ class TestOneBadAttemptDoesNotAbortTheRound:
         is the honest outcome, and the losses are still readable off the runner
         afterwards.
         """
+        workspaces = WorkspacesRefusingOneProblem(
+            tmp_path / "workspaces", problem_ids=["bad-1", "bad-2"]
+        )
         runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
-        corpus = [_problem_with_scale("bad-1", "progress"), _problem_with_scale("bad-2", "ts")]
+        corpus = [make_problem("bad-1"), make_problem("bad-2")]
         with pytest.raises(ContractViolationError, match="every one of the 2 attempt"):
             await runner.run_round(corpus, make_config())
 
@@ -1602,7 +1960,7 @@ class TestAParentSideLossManufacturesNoGainEither:
 
 
 class TestNestedProblemIdsStayInTheViewerList:
-    """``problem.id`` is an unvalidated path component (RES-16).
+    """``problem.id`` is a path component, and a nested one is legal.
 
     An operator namespacing a corpus -- ``"cuda/matmul-speedup"`` -- gets an
     attempt directory two segments below ``attempts/``, and the single-segment
@@ -1611,6 +1969,12 @@ class TestNestedProblemIdsStayInTheViewerList:
     stopped being listed, with no log line and no warning. ``verify``'s walk
     has always been recursive, so the two tools disagreed about which runs
     existed on disk -- and the silent one was the one the desktop reads.
+
+    RES-16's id validation (``contracts._reject_unsafe_problem_id``) must not
+    have closed this off while closing off the unsafe shapes: nesting is a
+    supported layout, not a tolerated accident, so the whole path from a
+    nested id to its files on disk to its entry in the viewer list is driven
+    here through a real ``RoundRunner``.
     """
 
     async def test_a_namespaced_id_is_listed_and_matches_what_verify_finds(
@@ -1626,6 +1990,17 @@ class TestNestedProblemIdsStayInTheViewerList:
         )
         results_root = store.loop_dir.parent
         viewer = json.loads((results_root / ".viewer.json").read_text())
+
+        # The files really are two segments below ``attempts/``, and the whole
+        # per-attempt contract landed there -- not just the JSONL.
+        nested = store.round_dir(0) / "attempts" / "cuda" / "matmul-speedup"
+        assert (nested / "metrics.jsonl").is_file()
+        assert (nested / "metrics.chain.json").is_file()
+        assert (nested / "metrics.json").is_file()
+        assert (await verify_metrics_chain(nested)).ok is True
+        assert (await reconcile_summary(nested)).state is ReconcileState.OK
+        # The attempt log is a *file* named after the same id, one directory up.
+        assert (store.round_dir(0) / "attempts" / "cuda" / "matmul-speedup.json").is_file()
 
         assert "loop-test-loop/round-00/attempts/cuda/matmul-speedup" in viewer["runs"]
         assert "loop-test-loop/round-00/attempts/flat" in viewer["runs"]
@@ -1687,16 +2062,15 @@ class TestNestedProblemIdsStayInTheViewerList:
 # --------------------------------------------------------------------------- #
 
 
-#: Three steps, escalating on the second. With ``verify_every_step=False`` the
-#: first two steps append plain metrics lines (no raw-score key, so a
-#: colliding ``score_scale`` cannot bite yet) and the third trips the cap,
-#: which forces the one verification -- and *that* append carries the score
-#: and raises. The attempt therefore dies with lines already on disk, having
-#: interrupted its operator once on the way.
-_ESCALATING_SCRIPT = (
+#: ``bad``'s script: one honest step, an escalation, then a step whose
+#: self-reported token count is not finite. The first two steps append plain
+#: metrics lines and interrupt the operator once on the way; the third is
+#: refused by the attempt checkpoint's ``allow_nan=False`` writer, so the
+#: attempt dies with lines already on disk and an escalation already written.
+_ESCALATING_THEN_UNACCOUNTABLE = (
     SolverStep(tokens=10, note="work"),
     SolverStep(tokens=10, note="stuck", escalate=EscalationReason.HARNESS_FAILURE),
-    SolverStep(tokens=10, note="work"),
+    UNACCOUNTABLE_STEP,
 )
 
 
@@ -1711,20 +2085,20 @@ class TestAFinishedRoundThatLostAnAttemptExitsZero:
     would read ``2`` where nothing would ever finish. That is a new
     cry-wolf, which is the failure class this contract exists to remove.
 
-    A contained crash *before* the first append -- the ``score_scale``
-    collision the containment fix was built around -- left no ``metrics.jsonl``
-    at all, so the directory was not a run and the root exited ``0``. Same
-    event class, two different codes, decided by which line of ``run_attempt``
+    A contained crash *before* the first append left no ``metrics.jsonl`` at
+    all, so the directory was not a run and the root exited ``0``. Same event
+    class, two different codes, decided by which line of ``run_attempt``
     raised. The exit-code contract is unchanged; what changed is that a
     finished round now finishes its own records.
-    """
 
-    @staticmethod
-    def _colliding(problem_id: str, scale: str) -> Problem:
-        problem = make_problem(problem_id)
-        return dataclasses.replace(
-            problem, verifier=dataclasses.replace(problem.verifier, score_scale=scale)
-        )
+    Both halves used to be driven by a colliding ``score_scale`` -- per-step
+    verification put the raw-score key on the *first* append, deferred
+    verification put it on a later one. That scale is now refused where the
+    verifier declares it and cannot reach a round, so the two halves are
+    driven by :data:`UNACCOUNTABLE_STEP` at the corresponding position in the
+    solver's script instead. The distinction under test was never the
+    trigger; it was which side of the first append the raise lands on.
+    """
 
     async def _round_losing_one_attempt_after_its_first_line(
         self,
@@ -1732,22 +2106,17 @@ class TestAFinishedRoundThatLostAnAttemptExitsZero:
         workspaces: TempWorkspaceProvider,
         clock: FakeClock,
         *,
-        solver: object | None = None,
-        bad_first: bool = False,
+        script: tuple[SolverStep, ...] = (SolverStep(tokens=10, note="work"), UNACCOUNTABLE_STEP),
     ) -> Path:
         runner = make_runner(
-            solver=solver or FakeSolver(),
+            solver=PerProblemSolver("bad", script),
             store=store,
             workspaces=workspaces,
             clock=clock,
             escalations=ScriptedEscalationChannel([EscalationVerdict.CONTINUE]),
         )
-        # ``FakeSolver`` walks one script across the whole round, so a test
-        # that needs the *lost* problem to escalate has to run it first.
-        good = make_problem("good", scores=(2.0,))
-        bad = self._colliding("bad", "tokens_used")
         await runner.run_round(
-            [bad, good] if bad_first else [good, bad],
+            [make_problem("good", scores=(2.0,)), make_problem("bad")],
             make_config(
                 verify_every_step=False,
                 cap=Cap(max_steps=3, max_tokens=10_000, max_wall_clock_seconds=600.0),
@@ -1769,7 +2138,7 @@ class TestAFinishedRoundThatLostAnAttemptExitsZero:
         assert summary["best_score"] is None
         assert summary["best_passed_correctness"] is None
         assert summary["final_state"].startswith("crashed_in_harness:")
-        assert "ContractViolationError" in summary["final_state"]
+        assert "ValueError" in summary["final_state"]
         # Not an AttemptState value: a harness crash is not an outcome the
         # experiment measured, and must not be readable as one.
         assert summary["final_state"] not in {s.value for s in AttemptState}
@@ -1814,7 +2183,7 @@ class TestAFinishedRoundThatLostAnAttemptExitsZero:
         suspended on each one, so the real count is recoverable.
         """
         metrics_dir = await self._round_losing_one_attempt_after_its_first_line(
-            store, workspaces, clock, solver=FakeSolver(_ESCALATING_SCRIPT), bad_first=True
+            store, workspaces, clock, script=_ESCALATING_THEN_UNACCOUNTABLE
         )
         escalations = sorted((store.round_dir(0) / "escalations").glob("*.json"))
         raised_by_bad = [
@@ -1831,14 +2200,19 @@ class TestAFinishedRoundThatLostAnAttemptExitsZero:
     ) -> None:
         """The other half of the same event class, and it must agree.
 
-        With per-step verification the colliding scale raises at the *first*
-        append, so nothing is written and the directory is not a run at all.
-        Nothing is fabricated to make it one -- writing a summary for a run
-        that does not exist would create a finding rather than clear one.
+        Here the raise lands on the attempt's *first* append, so nothing is
+        written and the directory is not a run at all. Nothing is fabricated
+        to make it one -- writing a summary for a run that does not exist
+        would create a finding rather than clear one.
         """
-        runner = make_runner(solver=FakeSolver(), store=store, workspaces=workspaces, clock=clock)
+        runner = make_runner(
+            solver=PerProblemSolver("bad", (UNACCOUNTABLE_STEP,)),
+            store=store,
+            workspaces=workspaces,
+            clock=clock,
+        )
         await runner.run_round(
-            [make_problem("good", scores=(2.0,)), self._colliding("bad", "progress")],
+            [make_problem("good", scores=(2.0,)), make_problem("bad")],
             make_config(),
         )
         assert not (store.round_dir(0) / "attempts" / "bad" / "metrics.jsonl").exists()
@@ -2021,10 +2395,9 @@ class TestACloseOutNeverWritesOverAnotherGenerationsChain:
         """The guard has to be precise, not merely safe.
 
         Here the re-drive gets far enough to rotate the previous generation
-        aside and start its own chain, and *then* dies (a colliding
-        ``score_scale`` on the first append that carries a score). The header
-        in the directory is now this attempt's, so the close-out writes the
-        terminal summary it exists to write -- and generation 1's complete
+        aside, start its own chain and append to it, and *then* dies. The
+        header in the directory is now this attempt's, so the close-out writes
+        the terminal summary it exists to write -- and generation 1's complete
         pair sits untouched in ``prior-1/``. A guard that refused here would
         have re-introduced the permanent exit ``2`` the close-out removed.
         """
@@ -2042,10 +2415,20 @@ class TestACloseOutNeverWritesOverAnotherGenerationsChain:
         metrics_dir = output_dir / "attempts" / "bad"
         first_generation = (metrics_dir / "metrics.json").read_bytes()
 
-        await runner.run_attempts(
+        # Generation 2 crashes only after ``bad``'s first line is on disk, so
+        # the chain in the directory is unambiguously this attempt's.
+        gen2 = make_runner(
+            solver=PerProblemSolver(
+                "bad", (SolverStep(tokens=10, note="work"), UNACCOUNTABLE_STEP)
+            ),
+            store=store,
+            workspaces=workspaces,
+            clock=clock,
+        )
+        await gen2.run_attempts(
             # A surviving sibling, because a round that loses *every* attempt
             # is refused outright one level up and never reaches a close-out.
-            [_problem_with_scale("bad", "tokens_used"), make_problem("good", scores=(1.0,))],
+            [make_problem("bad"), make_problem("good", scores=(1.0,))],
             dataclasses.replace(config, run_id="gen2", seed=99),
             output_dir=output_dir,
         )

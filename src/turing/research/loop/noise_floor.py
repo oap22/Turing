@@ -45,7 +45,11 @@ from turing.research.loop.metrics import (
     measure_noise_floor,
 )
 from turing.research.loop.runner import RoundConfig
-from turing.research.loop.trajectory import cell_key, encode_noise_floor, encode_type_score
+from turing.research.loop.trajectory import (
+    cell_key,
+    encode_noise_floor,
+    encode_type_score,
+)
 from turing.research.problems.adapter import bind_eval_set_hash
 
 if TYPE_CHECKING:
@@ -54,7 +58,7 @@ if TYPE_CHECKING:
     from turing.research.contracts import Cap, EngineIdentity, Problem, TypeScore
     from turing.research.loop.metrics import Cell, NoiseFloor
     from turing.research.loop.runner import AttemptFailure, PassCriterion, RoundRunner
-    from turing.research.loop.trajectory import TrajectoryStore
+    from turing.research.loop.trajectory import RunIdentity, TrajectoryStore
 
 logger = structlog.get_logger(__name__)
 
@@ -110,6 +114,9 @@ class NoiseFloorConfig:
     score_floors: Mapping[str, float] = field(default_factory=lambda: DEFAULT_SCORE_FLOORS)
     escalate_on_cap_exhaustion: bool = False
     max_escalations_per_attempt: int = 3
+    #: Forwarded to every seed's :class:`RoundConfig`; see the fields there.
+    eval_set_material: tuple[str, ...] = ()
+    harness_identity: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if len(self.seeds) < MIN_NOISE_FLOOR_SEEDS:
@@ -122,6 +129,8 @@ class NoiseFloorConfig:
                 "seeds must be distinct; re-running one seed measures determinism, not noise"
             )
         object.__setattr__(self, "seeds", tuple(self.seeds))
+        object.__setattr__(self, "eval_set_material", tuple(self.eval_set_material))
+        object.__setattr__(self, "harness_identity", tuple(self.harness_identity))
 
     def round_config_for(self, seed: int) -> RoundConfig:
         """The per-seed execution config.
@@ -142,6 +151,8 @@ class NoiseFloorConfig:
             max_escalations_per_attempt=self.max_escalations_per_attempt,
             pass_criteria=self.pass_criteria,
             score_floors=self.score_floors,
+            eval_set_material=self.eval_set_material,
+            harness_identity=self.harness_identity,
         )
 
 
@@ -188,8 +199,74 @@ class NoiseFloorRunner:
     """Drives >=3 identical seed runs and reduces them to per-cell floors."""
 
     def __init__(self, runner: RoundRunner, trajectory: TrajectoryStore) -> None:
+        # The driver lock is re-entrant per *store object*: ``run`` takes it
+        # through ``trajectory`` and ``runner.run_attempts`` takes it again
+        # through the runner's own store. Hand this class a second store
+        # object over the same tree and the inner take reads the outer's
+        # lock as another driver's — its own pid — and refuses itself with a
+        # message blaming a driver that does not exist. Refuse the
+        # construction instead, naming the actual mistake.
+        if trajectory is not runner.trajectory:
+            raise ContractViolationError(
+                "NoiseFloorRunner must be built over the same TrajectoryStore object its "
+                "RoundRunner drives: the driver lock is re-entrant per store object, so a "
+                "second store over the same tree would refuse the runner's own hold as "
+                "another driver's (pid <own>). Pass runner.trajectory"
+            )
         self._runner = runner
         self._trajectory = trajectory
+        self._skipped_seeds: tuple[int, ...] = ()
+
+    @property
+    def skipped_seeds(self) -> tuple[int, ...]:
+        """Seeds the last :meth:`run` reused whole instead of re-driving.
+
+        Reset at the head of every call. A seed is only listed here when
+        *every* problem in the corpus had a complete attempt under its
+        directory — see
+        :meth:`~turing.research.loop.trajectory.TrajectoryStore.list_completed_seeds`
+        for why a seed is all-or-nothing.
+        """
+        return self._skipped_seeds
+
+    async def _reduce_completed_seed(
+        self,
+        seed: int,
+        corpus: Sequence[Problem],
+        identity: RunIdentity,
+        config: NoiseFloorConfig,
+    ) -> tuple[tuple[TypeScore, ...], int]:
+        """Re-derive one already-measured seed's cells from its own artifacts.
+
+        No compute: each problem's score is read out of the checkpoint the
+        earlier process wrote, scored through the same
+        :meth:`ScoredProblem.from_result` the live path uses, and reduced by
+        the same :func:`build_type_scores`. A seed reconstructed here is
+        therefore byte-identical in the report to one driven now, which is the
+        property that lets the floor be reduced from a mix of the two at all.
+        """
+        output_dir = self._trajectory.noise_floor_seed_dir(seed)
+        scored: list[ScoredProblem] = []
+        escalations = 0
+        for problem in corpus:
+            stored = await self._trajectory.load_stored_attempt(
+                problem.id,
+                output_dir=output_dir,
+                identity=identity,
+                cap=problem.default_cap or config.default_cap,
+            )
+            if not stored.is_complete:  # pragma: no cover — list_completed_seeds checked
+                raise ContractViolationError(
+                    f"noise-floor seed {seed} was listed complete but {problem.id!r} is not: "
+                    f"{stored.reason}"
+                )
+            scored.append(
+                ScoredProblem.from_result(
+                    problem, stored.best_result, score_floors=config.score_floors
+                )
+            )
+            escalations += len(stored.escalation_ids)
+        return build_type_scores(scored), escalations
 
     def _refuse_seed(
         self,
@@ -236,8 +313,29 @@ class NoiseFloorRunner:
         self,
         corpus: Sequence[Problem],
         config: NoiseFloorConfig,
+        *,
+        resume: bool = True,
     ) -> NoiseFloorReport:
         """Measure every seed on the whole corpus, or refuse to report a floor.
+
+        **Resume, and what it does not soften.** With ``resume=True`` (the
+        default) a seed whose every problem already has a complete attempt
+        under :meth:`noise_floor_seed_dir` is not driven again: its cells are
+        re-derived from those attempts' own checkpoints, which costs nothing
+        and produces exactly the numbers a re-drive would have produced. A
+        seed that is *partly* done is driven, and ``run_attempts`` skips the
+        finished problems inside it. The floor is measured before round 0 and
+        has first claim on the subscription; paying twice for a seed a closed
+        window interrupted is the failure this exists to remove.
+
+        The refusal below is untouched by any of that. A seed is skipped only
+        when it is *complete* — every problem, terminally, with a finished
+        record on disk — so an incomplete seed still reaches the same guard,
+        still refuses, and still leaves ``noise-floor.json`` absent. What
+        counts as complete is
+        :meth:`~turing.research.loop.trajectory.TrajectoryStore.load_stored_attempt`'s
+        table, and it agrees with ``verify``: a terminal attempt whose summary
+        never landed is not complete here either.
 
         **Why a seed that lost an attempt is fatal here but not in a round.**
         :meth:`RoundRunner.run_attempts` contains a raising attempt: the round
@@ -260,7 +358,7 @@ class NoiseFloorRunner:
 
         **Deterministic vs transient failures do not get different
         treatment**, and the distinction is worth stating because it is the
-        obvious place to soften this. A colliding ``score_scale`` is a
+        obvious place to soften this. An unreadable workspace template is a
         property of the *problem* and so is lost by every seed identically:
         the resulting floor is at least internally consistent, just measured
         over a narrower corpus than advertised. A transient loss (I/O, a
@@ -288,28 +386,116 @@ class NoiseFloorRunner:
         ``noise_floor_available``) are already built to handle. A partial
         artifact would be read as a measurement.
 
+        **A different seed set after round 0 is refused.** Round 0's row
+        embeds the floor it was judged against, and a floor is a yardstick
+        for the rounds that follow it, not a thing to be re-chosen once they
+        have run. So once ``trajectory.json`` has a round and
+        ``noise-floor.json`` names a seed set, a ``config.seeds`` that
+        differs from it is refused before any seed is driven — *round 0
+        already measured floors for seeds […]; a different seed set is a
+        different measurement — new slug*. Before any round has run the floor
+        is still being chosen and a changed seed set simply rotates the old
+        report to ``noise-floor/prior-N.json`` and writes the new one (see
+        :meth:`~turing.research.loop.trajectory.TrajectoryStore.write_noise_floor`).
+
         Raises:
             ContractViolationError: a seed lost one or more attempts, or —
                 from ``measure_noise_floor`` and :class:`NoiseFloorConfig` —
-                too few seeds or a cell missing from some seed.
+                too few seeds or a cell missing from some seed; or another
+                driver holds this results tree (one driver per tree — the
+                whole measurement runs under
+                :meth:`~turing.research.loop.trajectory.TrajectoryStore.driver_lock`);
+                or a round has run and ``config.seeds`` is not the seed set
+                the floor on disk was measured with.
         """
+        async with self._trajectory.driver_lock():
+            return await self._run_locked(corpus, config, resume=resume)
+
+    async def _run_locked(
+        self,
+        corpus: Sequence[Problem],
+        config: NoiseFloorConfig,
+        *,
+        resume: bool,
+    ) -> NoiseFloorReport:
         await self._trajectory.ensure_layout()
         existing = await self._trajectory.load_trajectory()
-        if existing.get("rounds"):
+        rounds_already_logged = len(existing.get("rounds") or ())
+        if rounds_already_logged:
+            floor_on_disk = await self._trajectory.load_noise_floor()
+            measured_seeds = (
+                tuple(int(seed) for seed in floor_on_disk.get("seeds", ()))
+                if floor_on_disk is not None
+                else None
+            )
+            if measured_seeds is not None and measured_seeds != tuple(config.seeds):
+                raise ContractViolationError(
+                    f"round 0 already measured floors for seeds {list(measured_seeds)} "
+                    f"({self._trajectory.noise_floor_path}); this run asks for seeds "
+                    f"{list(config.seeds)}. A different seed set is a different "
+                    "measurement, and the rounds already logged were judged against the "
+                    "floor on disk — use a new loop slug"
+                )
+        per_seed: dict[int, tuple[TypeScore, ...]] = {}
+        escalations = 0
+        eval_set_hash = bind_eval_set_hash(
+            corpus, config.eval_set_hash, extra=config.eval_set_material
+        )
+        self._skipped_seeds = ()
+        # The per-seed identity is the *bound* seed config's — the same object
+        # ``run_attempts`` stamps onto every checkpoint — so it carries the
+        # ``config_digest`` and, through it, the engine. A floor measured
+        # under scaffold A is not re-derived and stamped with scaffold B: the
+        # seed's checkpoints name A's digest, this run's identity names B's,
+        # and the seed is driven again. Without this the report below would
+        # claim ``config.engine`` for numbers no process measured under it,
+        # and ``run_round``'s "a floor measured on a different scaffold is
+        # not a floor" guard would pass on exactly such a floor.
+        seed_configs = {
+            seed: replace(config.round_config_for(seed), eval_set_hash=eval_set_hash)
+            for seed in config.seeds
+        }
+        identities = {seed: seed_config.identity() for seed, seed_config in seed_configs.items()}
+        already_measured: tuple[int, ...] = ()
+        if resume:
+            already_measured = await self._trajectory.list_completed_seeds(
+                identities,
+                [problem.id for problem in corpus],
+                caps={problem.id: problem.default_cap or config.default_cap for problem in corpus},
+            )
+        # Warned only when a floor is actually about to be *measured* — some
+        # seed will be driven. The identical no-op re-run of a finished slug
+        # re-derives every seed from disk and measures nothing late.
+        if rounds_already_logged and set(config.seeds) - set(already_measured):
             logger.warning(
                 "research.noise_floor.measured_late",
-                rounds_already_logged=len(existing["rounds"]),
+                rounds_already_logged=rounds_already_logged,
+                seeds_to_drive=sorted(set(config.seeds) - set(already_measured)),
                 detail=(
                     "the noise floor is supposed to precede round 0; measuring it after "
                     "rounds have run makes those rounds interpretable only in hindsight"
                 ),
             )
-        per_seed: dict[int, tuple[TypeScore, ...]] = {}
-        escalations = 0
-        eval_set_hash = bind_eval_set_hash(corpus, config.eval_set_hash)
         for seed in config.seeds:
-            seed_config = replace(config.round_config_for(seed), eval_set_hash=eval_set_hash)
+            seed_config = seed_configs[seed]
             output_dir = self._trajectory.noise_floor_seed_dir(seed)
+            if seed in already_measured:
+                logger.info(
+                    "research.noise_floor.seed_reused",
+                    seed=seed,
+                    run_id=seed_config.run_id,
+                    problems=len(corpus),
+                    detail=(
+                        "every problem in this seed already has a complete attempt on "
+                        "disk; its cells are re-derived from them and no compute is spent"
+                    ),
+                )
+                cells, seed_escalations = await self._reduce_completed_seed(
+                    seed, corpus, identities[seed], config
+                )
+                per_seed[seed] = cells
+                escalations += seed_escalations
+                continue
             logger.info(
                 "research.noise_floor.seed_started",
                 seed=seed,
@@ -318,7 +504,7 @@ class NoiseFloorRunner:
             )
             try:
                 outcomes = await self._runner.run_attempts(
-                    corpus, seed_config, output_dir=output_dir
+                    corpus, seed_config, output_dir=output_dir, resume=resume
                 )
             except ContractViolationError as exc:
                 # ``run_attempts`` refuses outright when *every* attempt was
@@ -350,6 +536,7 @@ class NoiseFloorRunner:
             ]
             per_seed[seed] = build_type_scores(scored)
 
+        self._skipped_seeds = already_measured
         floors = measure_noise_floor(per_seed, statistic=config.statistic)
         report = NoiseFloorReport(
             run_id=config.run_id,
