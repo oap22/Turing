@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shutil
 import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -439,6 +438,19 @@ class SpeedupAdapter:
             *(spec.fingerprint_material() for spec in self.specs),
         )
 
+    def harness_identity(self) -> tuple[str, ...]:
+        """Canonical strings naming the instrument, for ``RoundConfig.harness_identity``.
+
+        ``python_executable`` is the interpreter every timing command and
+        gate runs under. It is not part of the corpus — the same specs, the
+        same baselines and the same tolerances hold whichever interpreter
+        times them — so it does not belong in :meth:`eval_set_material`; but
+        it *is* part of how the measurement was taken, so it belongs in the
+        round's ``config_digest``, where a swapped interpreter re-drives a
+        stored attempt instead of reusing it.
+        """
+        return (f"python_executable={self.python_executable}",)
+
     def missing_harness_scripts(self) -> tuple[Path, ...]:
         """Declared ``{harness}`` paths that do not exist yet.
 
@@ -471,6 +483,8 @@ class SpeedupAdapter:
         and the tests that restate the floors — those are how the eval set
         would otherwise leak into the write surface.
         """
+        import shutil
+
         spec = self.spec_for(problem.id)
         source = spec.source_root
         if not source.is_dir():

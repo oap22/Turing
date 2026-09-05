@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -204,6 +203,8 @@ def _has_contents(path: Path) -> bool:
 
 
 def _copy_template(template: Path, target: Path, excludes: tuple[str, ...] = ()) -> None:
+    import shutil
+
     target.parent.mkdir(parents=True, exist_ok=True)
     # ``symlinks=True`` keeps a link as a link rather than copying whatever it
     # points at into the workspace. Combined with ``Workspace.resolve``, a

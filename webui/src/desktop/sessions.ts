@@ -257,6 +257,24 @@ function findRsiParams(root: Node | null): { slug: string; problem: string } | n
   return null;
 }
 
+// Same recovery, but over every workspace in the layout rather than just one.
+// The loop terminal can live on any workspace — the send-to-workspace chord
+// (⌘⇧1..5) moves panes freely — so a search that only looked at workspace 0
+// would return null for an rsi workstation whose terminal had been moved,
+// and the reseed would silently rebuild it as `defaultLayout()`, losing the
+// slug/problem for good (the reseed only ever runs once). Workspaces are
+// searched in order and the first match wins; two loop terminals with rsi
+// params in the same workstation would be unusual (nothing creates more than
+// one), but if it ever happened, keeping the lowest-indexed workspace's
+// params is at least deterministic.
+function findRsiParamsInLayout(layout: LayoutState): { slug: string; problem: string } | null {
+  for (const ws of layout.workspaces) {
+    const found = findRsiParams(ws.root ?? null);
+    if (found) return found;
+  }
+  return null;
+}
+
 // Replace every stored layout with the current preset, keeping the workstation
 // itself — id, name, kind, createdAt — intact.
 //
@@ -275,7 +293,7 @@ function findRsiParams(root: Node | null): { slug: string; problem: string } | n
 export function reseedLayouts(store: SessionStore, now: number = Date.now()): SessionStore {
   const sessions: Record<string, Session> = {};
   for (const [id, session] of Object.entries(store.sessions)) {
-    const rsi = session.kind === "rsi" ? findRsiParams(session.layout.workspaces[0]?.root ?? null) : null;
+    const rsi = session.kind === "rsi" ? findRsiParamsInLayout(session.layout) : null;
     sessions[id] = {
       ...session,
       layout: rsi ? rsiLayout(rsi.slug, rsi.problem) : defaultLayout(),
@@ -304,23 +322,59 @@ export function loadSessions(storage: SessionStorage, now: number = Date.now()):
     return emptyStore();
   }
 
-  // The reseed is checked before anything is returned, and the marker is
-  // written whether or not there was a store to reseed — a profile that
+  // The reseed is checked before anything is returned, and the marker write
+  // is attempted whether or not there was a store to reseed — a profile that
   // reaches this line has, by definition, now been through it, and skipping
   // the write on an empty store would leave the reseed armed to fire later
   // against workstations the user creates *after* the change.
-  let reseeded = true;
+  //
+  // This is a destructive one-time migration, so it may run only when there
+  // is a durable record that it did. A `setItem` call that doesn't throw is
+  // NOT proof the write landed: on a near-full origin, writing an *existing*
+  // key can succeed while allocating a brand-new key throws
+  // `QuotaExceededError`, and Safari private mode is documented to accept
+  // some writes while silently dropping others. So the marker is read back
+  // rather than trusted, and `shouldReseed` only goes true when that
+  // readback confirms the write actually stuck. Any failure to durably
+  // record the marker — a throw from either call, or a write that silently
+  // didn't persist — leaves `shouldReseed` false, which skips the reseed for
+  // this launch. A skipped migration is recoverable (it's retried on the
+  // next launch, once/if storage frees up); a reseed that ran without a
+  // durable marker would run again on *every* launch, since the absent
+  // marker gives it nothing to remember it by — destroying whatever the user
+  // rearranges in between, forever, not just once.
+  let shouldReseed = false;
   try {
-    reseeded = storage.getItem(RESEED_KEY) !== null;
-    if (!reseeded) storage.setItem(RESEED_KEY, String(now));
+    const alreadyMarked = storage.getItem(RESEED_KEY) !== null;
+    if (!alreadyMarked) {
+      storage.setItem(RESEED_KEY, String(now));
+      shouldReseed = storage.getItem(RESEED_KEY) !== null;
+    }
   } catch {
-    // Unreadable storage is handled below by the same paths that already
-    // treat it as "no saved state"; never let it throw out of here.
+    // Unreadable/unwritable storage is handled below by the same paths that
+    // already treat it as "no saved state"; never let it throw out of here.
+    // `shouldReseed` stays false, which is the safe direction to fail in.
+    shouldReseed = false;
+  }
+
+  // Committing the reseed writes it straight back to storage rather than
+  // waiting for the shell's autosave. Autosave is gated on `!home`, and the
+  // app boots on Home: a user who launches, reads the workstation list and
+  // quits without opening one would otherwise burn the marker while the store
+  // on disk stayed on the old preset — the migration recorded as done, having
+  // changed nothing, with no second chance because the marker is checked
+  // before anything else. Writing here closes that window; the marker and the
+  // layouts it describes land in the same call. A failed write is swallowed
+  // by `saveSessions` as everywhere else, which leaves the old layouts on
+  // disk under a set marker — the reseed is simply skipped, never repeated.
+  function commit(store: SessionStore): SessionStore {
+    saveSessions(storage, store);
+    return store;
   }
 
   if (raw) {
     const parsed = deserializeSessions(raw);
-    if (parsed) return reseeded ? parsed : reseedLayouts(parsed, now);
+    if (parsed) return shouldReseed ? commit(reseedLayouts(parsed, now)) : parsed;
   }
 
   let legacyRaw: string | null = null;
@@ -338,7 +392,7 @@ export function loadSessions(storage: SessionStorage, now: number = Date.now()):
       // old is guaranteed to predate the three-workspace preset, so adopting
       // it verbatim would reintroduce exactly what the reseed exists to clear.
       const adopted = createSession(emptyStore(), DEFAULT_SESSION_NAME, legacy, now);
-      return reseeded ? adopted : reseedLayouts(adopted, now);
+      return shouldReseed ? commit(reseedLayouts(adopted, now)) : adopted;
     }
   }
 

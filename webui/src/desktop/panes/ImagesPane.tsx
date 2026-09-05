@@ -13,10 +13,10 @@ import {
   type ImageEntry,
   IMAGE_EXTS,
   ageLabel,
+  describeImage,
   mimeFor,
   newerCount,
   nextSelection,
-  relTail,
   sameEntry,
   stepSelection,
 } from "./images";
@@ -24,6 +24,23 @@ import {
 const ROOTS = ["vault", "results"] as const;
 const MAX_ENTRIES = 200;
 const LIST_DEBOUNCE_MS = 1000;
+
+// matplotlib renders its SVGs opaque white, which is correct in isolation
+// but reads as a stray hole in the dark shell (#50-images.png). There is no
+// CSS-only way to change what an *image* element's own bytes paint — a
+// `filter: invert()` would flip the plot's own colours along with the
+// background, and an SVG loaded via `<img src="data:...">` cannot be reached
+// by a stylesheet the way inline SVG can. So instead of fighting the white,
+// this frames it: padding and a light card behind the image turn the white
+// into a deliberate-looking mat around the chart rather than a raw edge
+// butting against the terminal background. Photographic formats (png/jpg/
+// gif/webp) are left alone — they are not guaranteed to have a white
+// background, and a card around a full-bleed image would be the wrong look.
+function svgCardClass(relPath: string): string {
+  return mimeFor(relPath) === "image/svg+xml"
+    ? "rounded-md bg-white p-3 shadow-md shadow-black/40"
+    : "";
+}
 
 export default function ImagesPane() {
   const [files, setFiles] = useState<ImageEntry[]>([]);
@@ -253,24 +270,37 @@ export default function ImagesPane() {
           {files.length === 0 && (
             <li className="p-2 text-[11px] text-term-dim">no images found</li>
           )}
-          {files.map((f) => (
-            <li key={`${f.root}/${f.rel_path}`}>
-              <button
-                type="button"
-                onClick={() => selectByUser(f)}
-                className={`flex w-full items-center gap-2 truncate px-2 py-1 text-left text-[11px] ${
-                  sameEntry(selected, f)
-                    ? "bg-term-raised text-term-accent"
-                    : "text-term-dim hover:text-term-fg"
-                }`}
-              >
-                <span className="truncate">{relTail(f.rel_path)}</span>
-                <span className="ml-auto shrink-0 text-term-dim">
-                  {ageLabel(f.mtime_ms, now)}
-                </span>
-              </button>
-            </li>
-          ))}
+          {files.map((f) => {
+            const { label, title, superseded } = describeImage(f);
+            return (
+              <li key={`${f.root}/${f.rel_path}`}>
+                <button
+                  type="button"
+                  onClick={() => selectByUser(f)}
+                  title={title}
+                  className={`flex w-full items-center gap-2 truncate px-2 py-1 text-left text-[11px] ${
+                    sameEntry(selected, f)
+                      ? "bg-term-raised text-term-accent"
+                      : "text-term-dim hover:text-term-fg"
+                  } ${
+                    // Marked, not hidden: `_rotate_stale_metrics` keeps a
+                    // superseded attempt's plots on disk deliberately (see
+                    // its docstring in runner.py), so the evidence stays
+                    // reachable here too — it just must never read like the
+                    // live chart it sits beside. Italic + dimmed opacity
+                    // does that without a second color to keep in sync with
+                    // the theme tokens.
+                    superseded ? "italic opacity-60" : ""
+                  }`}
+                >
+                  <span className="truncate">{label}</span>
+                  <span className="ml-auto shrink-0 text-term-dim">
+                    {ageLabel(f.mtime_ms, now)}
+                  </span>
+                </button>
+              </li>
+            );
+          })}
         </ul>
       </div>
       {/* `relative` scopes the lightbox to the pane's own rect, so it cannot
@@ -279,9 +309,10 @@ export default function ImagesPane() {
         {shown ? (
           <img
             src={shown.uri}
-            alt={shown.entry.rel_path}
+            alt={describeImage(shown.entry).label}
+            title={describeImage(shown.entry).title}
             onClick={() => setEnlarged(true)}
-            className="cursor-zoom-in"
+            className={`cursor-zoom-in ${svgCardClass(shown.entry.rel_path)}`}
             style={{
               objectFit: "contain",
               maxWidth: "100%",
@@ -304,14 +335,14 @@ export default function ImagesPane() {
           >
             <img
               src={shown.uri}
-              alt={shown.entry.rel_path}
+              alt={describeImage(shown.entry).label}
               onClick={(e) => {
                 // Clicking the image itself dismisses too, but stop the event
                 // so it isn't also counted as a backdrop click.
                 e.stopPropagation();
                 setEnlarged(false);
               }}
-              className="cursor-zoom-out"
+              className={`cursor-zoom-out ${svgCardClass(shown.entry.rel_path)}`}
               style={{
                 objectFit: "contain",
                 maxWidth: "100%",
@@ -319,7 +350,7 @@ export default function ImagesPane() {
               }}
             />
             <div className="pointer-events-none mt-1 shrink-0 truncate text-[11px] text-term-dim">
-              {relTail(shown.entry.rel_path)} · ←/→ step · esc close
+              {describeImage(shown.entry).label} · ←/→ step · esc close
             </div>
           </div>
         )}

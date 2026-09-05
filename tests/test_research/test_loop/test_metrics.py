@@ -7,6 +7,8 @@ number trustworthy: **no noise floor means no saturation verdict**, and
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from turing.research.contracts import (
@@ -140,6 +142,20 @@ class TestPerTypeScoring:
         with pytest.raises(ContractViolationError, match="scored twice"):
             build_type_scores([scored("s1", 1.0), scored("s1", 9.0)])
 
+    def test_a_cell_never_pools_two_score_scales(self) -> None:
+        """RES-15 widens which scales exist; it must not make two of them
+        poolable. A floored ``val_loss`` problem landing in a ``speedup`` cell
+        is refused rather than averaged.
+        """
+        loss = dataclasses.replace(scored("l1", 0.0, correct=False), score_scale="val_loss")
+        with pytest.raises(ContractViolationError, match="mixes score scales"):
+            build_type_scores([scored("s1", 1.0), loss])
+        # Same scale in two different cells is fine — cells never pool.
+        cells = build_type_scores(
+            [scored("s1", 1.0), dataclasses.replace(loss, split=Split.HELD_OUT)]
+        )
+        assert len(cells) == 2
+
     def test_correctness_is_tracked_separately_from_score(self) -> None:
         cells = build_type_scores(
             [scored("s1", 9.0, correct=False), scored("s2", 1.0, correct=True)]
@@ -217,6 +233,74 @@ class TestUnscoredProblems:
         problem = make_problem("speed-1")
         with pytest.raises(ContractViolationError, match="no declared floor"):
             ScoredProblem.from_result(problem, None, score_floors={})
+
+    def test_an_unrecognised_scale_still_raises_when_the_problem_declares_nothing(
+        self,
+    ) -> None:
+        """A scale outside DEFAULT_SCORE_FLOORS with no verifier-declared floor
+        either must still raise the pre-existing message — declaring a floor
+        is additive, it does not relax the refusal.
+        """
+        problem = make_problem("loss-1", score_scale="val_loss")
+        with pytest.raises(ContractViolationError, match="no declared floor"):
+            ScoredProblem.from_result(problem, None)
+
+    def test_a_problem_declared_floor_is_used_on_harness_failure(self) -> None:
+        """A loss-scale problem can be scored end to end, including when its
+        verification fails, once it declares its own floor.
+        """
+        problem = make_problem("loss-1", score_scale="val_loss", score_floor=1e9)
+        result = VerificationResult(
+            problem_id="loss-1",
+            verifier_id="v-loss-1",
+            score=0.0,
+            passed_correctness=False,
+            score_scale="val_loss",
+            raw_measurements={HARNESS_FAILURE_KEY: 1.0},
+        )
+        item = ScoredProblem.from_result(problem, result)
+        assert item.scored is False
+        assert item.passed_correctness is False
+        assert item.score == pytest.approx(1e9)
+
+    def test_a_problem_declared_floor_is_used_when_the_verifier_never_ran(self) -> None:
+        problem = make_problem("loss-1", score_scale="val_loss", score_floor=1e9)
+        item = ScoredProblem.from_result(problem, None)
+        assert item.scored is False
+        assert item.score == pytest.approx(1e9)
+
+    def test_a_problem_declared_floor_of_zero_is_used_not_treated_as_absent(self) -> None:
+        """``0.0`` is a legitimate worst grade (it is the floor for both
+        built-in scales); a truthiness check here would drop it and raise.
+        """
+        problem = make_problem("loss-1", score_scale="val_loss", score_floor=0.0)
+        item = ScoredProblem.from_result(problem, None)
+        assert item.scored is False
+        assert item.score == pytest.approx(0.0)
+
+    def test_round_level_override_wins_over_the_problems_declared_floor(self) -> None:
+        """RoundConfig.score_floors is an operator-level override and takes
+        precedence over whatever the problem itself declared.
+        """
+        problem = make_problem("loss-1", score_scale="val_loss", score_floor=1e9)
+        item = ScoredProblem.from_result(problem, None, score_floors={"val_loss": 42.0})
+        assert item.score == pytest.approx(42.0)
+
+    def test_the_happy_path_ignores_the_declared_floor_entirely(self) -> None:
+        """A real, non-harness-failed verification is scored at face value —
+        the declared floor never enters the picture.
+        """
+        problem = make_problem("loss-1", score_scale="val_loss", score_floor=1e9)
+        result = VerificationResult(
+            problem_id="loss-1",
+            verifier_id="v-loss-1",
+            score=0.37,
+            passed_correctness=True,
+            score_scale="val_loss",
+        )
+        item = ScoredProblem.from_result(problem, result)
+        assert item.scored is True
+        assert item.score == pytest.approx(0.37)
 
 
 # --------------------------------------------------------------------------- #

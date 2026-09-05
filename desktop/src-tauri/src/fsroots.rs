@@ -218,25 +218,74 @@ pub fn fs_read_binary(
     Ok(base64::engine::general_purpose::STANDARD.encode(data))
 }
 
+/// One `fs_tail` read. Every byte offset the frontend needs is computed here,
+/// on the bytes, so the webview never does byte arithmetic on a `String`
+/// (`from_utf8_lossy` can change the length, and JS string length is UTF-16
+/// code units either way).
+///
+/// The contract a line-oriented consumer (the metrics pane) relies on:
+///
+/// * `data` is the bytes `[start, offset)` of the file — **whole lines only**.
+///   A trailing partial line is not consumed: `data` is cut at the last `\n`
+///   and `offset` stops right after it, so the fragment is re-read, complete,
+///   by the next call. A non-empty read with no `\n` at all returns empty
+///   `data` and `offset == start`.
+/// * `start` is where the read actually began: the caller's offset, or `0`
+///   when the file is shorter than that offset (`restarted`). A caller that
+///   holds an offset applies a chunk only if `start` equals it — any other
+///   `start` is a duplicate or stale response and is not this file's next
+///   bytes.
+/// * `dev`/`ino` identify the file the bytes came from (unix; `None`
+///   elsewhere). A run file rotated away and re-created at the same path is a
+///   different inode even when the new bytes are at least as long as the old
+///   ones, which no offset check can see.
 #[derive(Serialize)]
 pub struct TailChunk {
     pub data: String,
     pub offset: u64,
+    pub start: u64,
+    pub dev: Option<u64>,
+    pub ino: Option<u64>,
+    pub restarted: bool,
+}
+
+#[cfg(unix)]
+fn file_identity(meta: &fs::Metadata) -> (Option<u64>, Option<u64>) {
+    use std::os::unix::fs::MetadataExt;
+    (Some(meta.dev()), Some(meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_meta: &fs::Metadata) -> (Option<u64>, Option<u64>) {
+    (None, None)
 }
 
 fn tail_impl(path: &Path, offset: u64) -> Result<TailChunk, String> {
-    let meta = fs::metadata(path).map_err(|e| e.to_string())?;
-    let len = meta.len();
-    let start = if offset > len { 0 } else { offset };
+    // Open first, then fstat the open handle: `len`, `dev`, `ino` and the
+    // bytes all come from the same file, so a rotation between a stat and an
+    // open cannot label a new file's bytes with the old file's identity.
     let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    let len = meta.len();
+    let restarted = offset > len;
+    let start = if restarted { 0 } else { offset };
+    let (dev, ino) = file_identity(&meta);
     file.seek(SeekFrom::Start(start))
         .map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-    let new_offset = start + buf.len() as u64;
+    // Hold back a trailing partial line: keep bytes up to and including the
+    // last `\n`; with no `\n` at all, keep nothing.
+    let keep = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    buf.truncate(keep);
+    let new_offset = start + keep as u64;
     Ok(TailChunk {
         data: String::from_utf8_lossy(&buf).into_owned(),
         offset: new_offset,
+        start,
+        dev,
+        ino,
+        restarted,
     })
 }
 
@@ -388,44 +437,118 @@ mod tests {
         assert!(roots.resolve("nope", "").is_err());
     }
 
+    fn append(path: &Path, text: &str) {
+        let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
+        write!(f, "{text}").unwrap();
+    }
+
     #[test]
     fn tail_offsets_advance_on_append() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log.txt");
-        {
-            let mut f = fs::File::create(&path).unwrap();
-            write!(f, "hello ").unwrap();
-        }
+        fs::write(&path, "hello\n").unwrap();
         let chunk1 = tail_impl(&path, 0).unwrap();
-        assert_eq!(chunk1.data, "hello ");
+        assert_eq!(chunk1.data, "hello\n");
+        assert_eq!(chunk1.start, 0);
         assert_eq!(chunk1.offset, 6);
-        {
-            let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
-            write!(f, "world").unwrap();
-        }
+        assert!(!chunk1.restarted);
+        append(&path, "world\n");
         let chunk2 = tail_impl(&path, chunk1.offset).unwrap();
-        assert_eq!(chunk2.data, "world");
-        assert_eq!(chunk2.offset, 11);
+        assert_eq!(chunk2.data, "world\n");
+        assert_eq!(chunk2.start, 6);
+        assert_eq!(chunk2.offset, 12);
+        assert!(!chunk2.restarted);
+        assert_eq!(chunk2.ino, chunk1.ino);
+        assert_eq!(chunk2.dev, chunk1.dev);
+        #[cfg(unix)]
+        assert!(chunk1.ino.is_some() && chunk1.dev.is_some());
+        // Nothing new: an empty chunk starting and ending where the caller is.
+        let chunk3 = tail_impl(&path, chunk2.offset).unwrap();
+        assert_eq!(chunk3.data, "");
+        assert_eq!(chunk3.start, 12);
+        assert_eq!(chunk3.offset, 12);
+        assert!(!chunk3.restarted);
     }
 
     #[test]
     fn tail_restarts_on_truncate() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log2.txt");
-        {
-            let mut f = fs::File::create(&path).unwrap();
-            write!(f, "0123456789").unwrap();
-        }
-        let len = fs::metadata(&path).unwrap().len();
-        let offset = len + 100;
-        // truncate to a shorter file — a stale offset must restart from 0.
-        fs::File::create(&path).unwrap();
-        {
-            let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
-            write!(f, "new").unwrap();
-        }
+        fs::write(&path, "0123456789\n").unwrap();
+        let first = tail_impl(&path, 0).unwrap();
+        let offset = first.offset + 100;
+        // Truncate in place to a shorter file — same inode, stale offset — and
+        // the read must restart from 0 and say so.
+        fs::write(&path, "new\n").unwrap();
         let chunk = tail_impl(&path, offset).unwrap();
-        assert_eq!(chunk.data, "new");
-        assert_eq!(chunk.offset, 3);
+        assert_eq!(chunk.data, "new\n");
+        assert_eq!(chunk.start, 0);
+        assert_eq!(chunk.offset, 4);
+        assert!(chunk.restarted);
+        assert_eq!(chunk.ino, first.ino);
+    }
+
+    #[test]
+    fn tail_restarted_boundary_is_strictly_past_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log2b.txt");
+        fs::write(&path, "abc\n").unwrap();
+        // offset == len: caught up, not restarted; nothing to read.
+        let at_end = tail_impl(&path, 4).unwrap();
+        assert!(!at_end.restarted);
+        assert_eq!((at_end.start, at_end.offset, at_end.data.as_str()), (4, 4, ""));
+        // offset == len + 1: one past the end is a shorter file — restart.
+        let past = tail_impl(&path, 5).unwrap();
+        assert!(past.restarted);
+        assert_eq!((past.start, past.offset, past.data.as_str()), (0, 4, "abc\n"));
+    }
+
+    #[test]
+    fn tail_reports_a_new_inode_when_the_file_is_replaced_by_a_longer_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log3.txt");
+        fs::write(&path, "one\n").unwrap();
+        let first = tail_impl(&path, 0).unwrap();
+        assert_eq!(first.offset, 4);
+        // Rotate the file away and create a fresh one at the same path whose
+        // bytes are at least as long as the caller's offset: no restart is
+        // visible from lengths alone, so identity is what tells the caller.
+        fs::rename(&path, dir.path().join("prior-log3.txt")).unwrap();
+        fs::write(&path, "alpha\nbeta\n").unwrap();
+        let chunk = tail_impl(&path, first.offset).unwrap();
+        assert!(!chunk.restarted);
+        assert_eq!(chunk.start, 4);
+        // Bytes 4.. of the new file, cut at whole lines: "a\nbeta\n".
+        assert_eq!(chunk.data, "a\nbeta\n");
+        assert_eq!(chunk.offset, 11);
+        #[cfg(unix)]
+        {
+            assert!(chunk.ino.is_some());
+            assert_ne!(chunk.ino, first.ino);
+        }
+    }
+
+    #[test]
+    fn tail_holds_back_a_trailing_partial_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log4.txt");
+        fs::write(&path, "{\"step\":1}\n{\"step\":2").unwrap();
+        let chunk1 = tail_impl(&path, 0).unwrap();
+        assert_eq!(chunk1.data, "{\"step\":1}\n");
+        assert_eq!(chunk1.start, 0);
+        // Stops right after the last `\n`, before the fragment.
+        assert_eq!(chunk1.offset, 11);
+        // The fragment alone, still incomplete: nothing is consumed.
+        let chunk2 = tail_impl(&path, chunk1.offset).unwrap();
+        assert_eq!(chunk2.data, "");
+        assert_eq!(chunk2.start, 11);
+        assert_eq!(chunk2.offset, 11);
+        assert!(!chunk2.restarted);
+        // The writer finishes the line: the next read returns it whole.
+        append(&path, "}\n");
+        let chunk3 = tail_impl(&path, chunk2.offset).unwrap();
+        assert_eq!(chunk3.data, "{\"step\":2}\n");
+        assert_eq!(chunk3.start, 11);
+        assert_eq!(chunk3.offset, 22);
     }
 }

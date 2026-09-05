@@ -82,14 +82,33 @@ MIN_NOISE_FLOOR_SEEDS = 3
 #: What an *unscored* problem contributes to its cell. Dropping unscored
 #: problems instead would bias every cell upward by exactly the problems that
 #: went worst (survivorship), so a floor is required; there is no universal
-#: one, so it is per score scale and the caller must extend this map for any
-#: scale it introduces.
+#: one, so it is per score scale.
 #:
 #: The floor is the **worst grade the scale actually emits**, not a "did
 #: nothing" midpoint. Speedup ``1.0`` means unchanged — a successful
 #: measurement — and a failed correctness gate scores ``0.0``. Flooring an
 #: abandon at ``1.0`` would let the operator raise the primary score by
 #: refusing to finish hopeless problems.
+#:
+#: This map covers the two scales the loop ships with; it is deliberately
+#: **not** the only place a floor can come from. A problem scored on a scale
+#: this map does not know (loss, throughput, anything else an operator's
+#: verifier invents) declares its own floor on
+#: :attr:`~turing.research.contracts.Verifier.score_floor` instead of forcing
+#: every corpus author to extend a shared module-level table for a scale only
+#: their problem uses. :meth:`ScoredProblem.from_result` resolves the two in a
+#: fixed order — **the round's ``score_floors`` table wins, then the
+#: problem's own declared floor, then refuse**:
+#:
+#: 1. ``score_floors`` (this map, or :class:`~turing.research.loop.runner.RoundConfig`'s
+#:    override of it) is checked first, because it is the operator's own
+#:    table for *this round* and an explicit round-level choice should not be
+#:    silently shadowed by whatever a verifier happened to declare.
+#: 2. :attr:`~turing.research.contracts.Verifier.score_floor` is checked
+#:    second — the problem's own declaration, used only when the round did
+#:    not already have an answer for that scale.
+#: 3. Neither: :class:`~turing.research.contracts.ContractViolationError`,
+#:    exactly as when no floor existed at all.
 DEFAULT_SCORE_FLOORS: Mapping[str, float] = MappingProxyType(
     {
         SCORE_SCALE_SPEEDUP: 0.0,  # failed gate; worse than an unchanged baseline
@@ -157,7 +176,19 @@ class ScoredProblem:
         *,
         score_floors: Mapping[str, float] | None = None,
     ) -> ScoredProblem:
-        """Build a cell contribution, flooring an unscored problem."""
+        """Build a cell contribution, flooring an unscored problem.
+
+        The floor for a scale with no usable verification is resolved in a
+        fixed order — see :data:`DEFAULT_SCORE_FLOORS` for the reasoning:
+
+        1. ``score_floors`` (the round's table; :data:`DEFAULT_SCORE_FLOORS`
+           when the caller passes none) — an operator-level override, checked
+           first so it can shadow a problem's own declaration.
+        2. ``problem.verifier.score_floor`` — the problem's own declared
+           floor, used only when the round's table has no entry for this
+           scale.
+        3. Neither: :class:`~turing.research.contracts.ContractViolationError`.
+        """
         scale = problem.verifier.score_scale
         if result is not None and not result.harness_failed:
             return cls(
@@ -170,7 +201,11 @@ class ScoredProblem:
                 scored=True,
             )
         floors = DEFAULT_SCORE_FLOORS if score_floors is None else score_floors
-        if scale not in floors:
+        if scale in floors:
+            floor_value = floors[scale]
+        elif problem.verifier.score_floor is not None:
+            floor_value = problem.verifier.score_floor
+        else:
             raise ContractViolationError(
                 f"problem {problem.id!r} produced no verification and score scale "
                 f"{scale!r} has no declared floor; dropping it would bias the "
@@ -181,7 +216,7 @@ class ScoredProblem:
             problem_id=problem.id,
             problem_type=problem.problem_type,
             split=problem.split,
-            score=floors[scale],
+            score=floor_value,
             passed_correctness=False,
             score_scale=scale,
             scored=False,
@@ -194,9 +229,16 @@ def build_type_scores(scored: Sequence[ScoredProblem]) -> tuple[TypeScore, ...]:
     Returns one :class:`TypeScore` per cell, ordered by type then split so the
     trajectory is byte-stable across runs. **There is no corpus-wide return
     value and there must never be one.**
+
+    A cell's mean is only a number if every score in it is on the same scale,
+    so a cell that mixes ``score_scale`` values is refused outright. Widening
+    which scales exist (declared floors, RES-15) must never make two of them
+    poolable — flooring a ``val_loss`` problem beside a ``speedup`` problem
+    would average seconds with losses and call it a score.
     """
     buckets: dict[Cell, dict[str, float]] = {}
     passes: dict[Cell, int] = {}
+    scales: dict[Cell, tuple[str, str]] = {}
     for item in scored:
         cell = (item.problem_type, item.split)
         bucket = buckets.setdefault(cell, {})
@@ -204,6 +246,13 @@ def build_type_scores(scored: Sequence[ScoredProblem]) -> tuple[TypeScore, ...]:
             raise ContractViolationError(
                 f"problem {item.problem_id!r} scored twice in one round; each problem "
                 "contributes to its cell exactly once"
+            )
+        first = scales.setdefault(cell, (item.problem_id, item.score_scale))
+        if first[1] != item.score_scale:
+            raise ContractViolationError(
+                f"cell {cell[0].value}/{cell[1].value} mixes score scales: problem "
+                f"{first[0]!r} scores on {first[1]!r} but {item.problem_id!r} scores on "
+                f"{item.score_scale!r}; scores on different scales are never averaged"
             )
         bucket[item.problem_id] = item.score
         passes[cell] = passes.get(cell, 0) + (1 if item.passed_correctness else 0)
@@ -368,6 +417,8 @@ def compute_deltas(
     cost: RoundCost,
     basis: CostBasis = CostBasis.WALL_CLOCK,
     comparable: bool = True,
+    all_attempts_completed: bool = True,
+    parent_attempts_completed: bool | None = True,
 ) -> tuple[RoundDelta, ...]:
     """Per-cell marginal gain, paired with the floor it is read against.
 
@@ -384,8 +435,71 @@ def compute_deltas(
 
     ``comparable=False`` (rounds measured on different eval sets) suppresses
     every delta: a curve drawn across an eval-set change is fiction.
+
+    ``all_attempts_completed=False`` suppresses every delta for the same
+    reason one step down. The eval set is the corpus a round *intended* to
+    measure; this flag is whether it actually measured all of it. A round that
+    lost an attempt has cells reduced over a strict subset of the problems the
+    parent's cells were reduced over, so the difference of the two means is
+    partly the agent and partly which problems dropped out — and, exactly as
+    with an eval-set change, nothing downstream can separate the two again.
+    The failure mode is not theoretical or symmetric: it is *biased*, because
+    a mean rises when its weakest member goes missing, so a contained harness
+    crash manufactures a marginal gain out of a bug in the runner. This is the
+    argument ``noise_floor.py`` already makes for refusing a seed that lost an
+    attempt rather than reducing a floor from it; a round-over-round delta is
+    the number that floor exists to be read against, and it gets the same
+    answer.
+
+    Suppressing the delta rather than flagging it is deliberate, and matches
+    the no-floor case above. A number that exists will be read; a caveat
+    beside it will not. The absence is machine-readable — the ``deltas`` tuple
+    is empty, :func:`assess_saturation` returns
+    :attr:`SaturationVerdict.REFUSED_ATTEMPT_LOST` naming the cause, and the
+    round record's ``all_attempts_completed`` gate is ``False``.
+
+    Refusal is round-wide, not per cell, even though a cell that lost nothing
+    still has a comparable mean. Two reasons, both structural rather than
+    conservative: ``cost_per_unit_gain`` divides *round* cost — one wall clock
+    over the whole round, and a token total the lost attempt's spend is
+    missing from — so every cell's driving-function-#3 number is contaminated
+    by the loss regardless of which cell it fell in; and ``noise_floor.py``
+    refuses the whole seed rather than the affected cell for the same shape of
+    fault, so per-cell salvage here would leave two neighbouring modules
+    disagreeing about what a lost attempt costs a measurement.
+
+    ``parent_attempts_completed`` is the **same refusal read off the other
+    side of the subtraction, and without it the fix above is one-sided.**
+    "Cells reduced over a strict subset of the problems the parent's cells
+    were reduced over" is a statement about a *pair* of rounds: it is equally
+    true when the child measured everything and the parent — the round whose
+    means are the ``before`` in every subtraction here — is the one missing a
+    problem. Driven for real, a round 0 that lost its *strongest* problem
+    recorded a cell mean of 0.5 over ``n=1`` and correctly refused its own
+    deltas; round 1 then measured the identical corpus with the identical
+    agent, reduced 1.75 over ``n=2``, and emitted ``marginal_gain=+1.25``
+    with every gate green. Nothing about that number is the agent: it is
+    "which problems ran in the parent". Losing the *weak* problem in the
+    parent manufactures the mirror-image phantom regression, so the bias
+    argument above applies with its sign flipped, not weakened.
+
+    **``None`` — the parent record carries no ``all_attempts_completed``
+    gate — is refused, not trusted.** Records written before that gate
+    existed are silent about the very fact this argument turns on, and the
+    two readings of that silence are not symmetric: trusting it re-opens
+    exactly the manufactured gain above (emitted with every gate green, which
+    is the property that makes it dangerous), while refusing it costs a delta
+    that can be recovered the moment the parent is re-driven under a runner
+    that writes the gate. Every other unresolved basis in this module — no
+    floor, a degenerate floor, a changed eval set — already resolves the same
+    way: refuse, and say which measurement was missing.
     """
-    if parent is None or not comparable:
+    if (
+        parent is None
+        or not comparable
+        or not all_attempts_completed
+        or parent_attempts_completed is not True
+    ):
         return ()
     previous = scores_by_cell(parent)
     deltas: list[RoundDelta] = []
@@ -416,10 +530,20 @@ def compute_deltas(
 class SaturationVerdict(str, Enum):  # noqa: UP042
     """Whether a cell is still improving — or why that cannot be said.
 
-    The four ``REFUSED_*`` members are not error codes. They are the honest
+    The six ``REFUSED_*`` members are not error codes. They are the honest
     answer when the measurement required to make the call was not made, and
     they are written into ``trajectory.json`` verbatim so a reader cannot
     mistake a missing verdict for a flat one.
+
+    ``REFUSED_ATTEMPT_LOST`` and ``REFUSED_PARENT_ATTEMPT_LOST`` are the same
+    fault on the two sides of one subtraction, and they are separate members
+    rather than one because the operator action differs: the first says *this*
+    round is short a problem, which a re-drive of that problem fixes; the
+    second says the *baseline* is short one, which no amount of re-driving
+    this round will repair — the parent has to be re-measured (or a later,
+    complete round adopted as the baseline) before any delta from it means
+    anything. One member for both would leave an operator re-running the wrong
+    round and watching the same refusal come back.
     """
 
     IMPROVING = "improving"
@@ -428,6 +552,8 @@ class SaturationVerdict(str, Enum):  # noqa: UP042
     REFUSED_NO_NOISE_FLOOR = "refused_no_noise_floor"
     REFUSED_DEGENERATE_NOISE_FLOOR = "refused_degenerate_noise_floor"
     REFUSED_EVAL_SET_CHANGED = "refused_eval_set_changed"
+    REFUSED_ATTEMPT_LOST = "refused_attempt_lost"
+    REFUSED_PARENT_ATTEMPT_LOST = "refused_parent_attempt_lost"
 
 
 @dataclass(frozen=True, slots=True)
@@ -457,17 +583,48 @@ def assess_saturation(
     floors: Mapping[Cell, NoiseFloor],
     *,
     comparable: bool = True,
+    all_attempts_completed: bool = True,
+    parent_attempts_completed: bool | None = True,
 ) -> tuple[SaturationAssessment, ...]:
     """Per-cell saturation verdicts, refusing wherever the basis is missing.
 
-    Saturation is "marginal gain below the seed-noise floor". Each of the four
+    Saturation is "marginal gain below the seed-noise floor". Each of the six
     ways that sentence can fail to apply gets its own refusal rather than a
     fabricated number:
 
     * round 0 has no parent to be a delta *from*;
     * the eval set changed, so the two rounds are not on the same axes;
+    * an attempt was lost, so the round measured a strict subset of the
+      problems the parent measured and the difference of the two means is
+      partly the agent and partly the missing problem — see
+      :func:`compute_deltas` for why that is refused rather than flagged, and
+      why the refusal is round-wide;
+    * the *parent* lost an attempt (or is silent about whether it did), so the
+      subtraction's ``before`` is the reduced mean and the same contamination
+      arrives from the other side — see :func:`compute_deltas` for the driven
+      example and for why an absent gate refuses rather than trusts;
     * no floor was measured for the cell;
     * the measured floor is zero, so "beats the noise" resolves nothing.
+
+    The gain is deliberately **not** carried on the attempt-lost refusal, and
+    that is the difference between this refusal and the two floor ones below
+    it. ``REFUSED_NO_NOISE_FLOOR`` reports ``marginal_gain`` because the gain
+    is a real difference between two comparable means that simply has no floor
+    to be judged against — it is a measurement missing its yardstick. A gain
+    computed across a shifting problem set is not a measurement at all, so
+    there is nothing honest to report; reporting it anyway is precisely how
+    ``"a marginal gain of +1.25"`` reached a verdict line for a round whose
+    only change was that its weakest problem crashed. The parent-side refusal
+    carries no gain for the identical reason — it is the same shifting problem
+    set, whichever of the two rounds it moved in.
+
+    **When both rounds are lossy the round's own loss is the verdict**, with
+    the parent's named in the same reason string rather than dropped. Naming
+    only the parent would contradict this record's own
+    ``all_attempts_completed`` gate and its verdict prefix, both of which
+    already say this round is short a problem; naming only this round's loss
+    would send an operator to re-drive a round whose delta is refused again
+    the moment it completes.
     """
     assessments: list[SaturationAssessment] = []
     previous = scores_by_cell(parent) if parent is not None else {}
@@ -493,6 +650,48 @@ def assess_saturation(
                     reason=(
                         f"{label}: eval set changed since the parent round; the "
                         "trajectory restarts and no delta is defined across the change"
+                    ),
+                )
+            )
+            continue
+        if not all_attempts_completed:
+            reason = (
+                f"{label}: at least one attempt was lost, so this round measured "
+                "fewer problems than its parent; a difference of means over a "
+                "shifting problem set measures the set as much as the agent and "
+                "no delta is reported"
+            )
+            if parent_attempts_completed is not True:
+                reason += (
+                    " (the parent round is also not a full-corpus measurement, so "
+                    "re-driving this round alone will not restore the delta)"
+                )
+            assessments.append(
+                SaturationAssessment(
+                    problem_type=cell[0],
+                    split=cell[1],
+                    verdict=SaturationVerdict.REFUSED_ATTEMPT_LOST,
+                    reason=reason,
+                )
+            )
+            continue
+        if parent_attempts_completed is not True:
+            assessments.append(
+                SaturationAssessment(
+                    problem_type=cell[0],
+                    split=cell[1],
+                    verdict=SaturationVerdict.REFUSED_PARENT_ATTEMPT_LOST,
+                    reason=(
+                        f"{label}: the parent round "
+                        + (
+                            "lost at least one attempt"
+                            if parent_attempts_completed is False
+                            else "records no all_attempts_completed gate, so whether it "
+                            "measured the full corpus is unknown"
+                        )
+                        + ", so this round's cells cover problems the parent's cells did "
+                        "not; a difference of means over a shifting problem set measures "
+                        "the set as much as the agent and no delta is reported"
                     ),
                 )
             )

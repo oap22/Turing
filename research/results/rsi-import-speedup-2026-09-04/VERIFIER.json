@@ -1,0 +1,8 @@
+{
+  "command": "./verify.sh",
+  "command_sha256": "f0d07ab3d72145f163ca08bf2dd202abfeb40582e4ab6d7db2f799b1dfc32de4",
+  "created_at_ms": 1788541682155,
+  "file_sha256s": {
+    "verify.sh": "a1068defdbb63dbcb4920f26c2678bfdad098bf908d92169a2b83b8cbcd8c4dd"
+  }
+}

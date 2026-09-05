@@ -18,7 +18,6 @@ directory is fresh.
 from __future__ import annotations
 
 import asyncio
-import shutil
 from typing import TYPE_CHECKING
 
 import structlog
@@ -63,6 +62,8 @@ class CopyTreeWorkspaceProvider:
         return target
 
     def _copy(self, template: Path, target: Path, excludes: tuple[str, ...] = ()) -> None:
+        import shutil
+
         if target.exists():
             if not self._clean_existing:
                 raise ContractViolationError(

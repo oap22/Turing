@@ -24,7 +24,11 @@ imported directly so that importing a contract never drags in a backend.
 from __future__ import annotations
 
 from turing.research.contracts import (
+    CORE_METRICS_FIELDS,
+    DIAGNOSTIC_KEY_PREFIX,
     HARNESS_FAILURE_KEY,
+    RESERVED_METRICS_FIELDS,
+    RESERVED_METRICS_KEYS,
     SCORE_SCALE_LEADERBOARD_PERCENTILE,
     SCORE_SCALE_SPEEDUP,
     TERMINAL_ATTEMPT_STATES,
@@ -57,7 +61,11 @@ from turing.research.contracts import (
 )
 
 __all__ = [
+    "CORE_METRICS_FIELDS",
+    "DIAGNOSTIC_KEY_PREFIX",
     "HARNESS_FAILURE_KEY",
+    "RESERVED_METRICS_FIELDS",
+    "RESERVED_METRICS_KEYS",
     "SCORE_SCALE_LEADERBOARD_PERCENTILE",
     "SCORE_SCALE_SPEEDUP",
     "TERMINAL_ATTEMPT_STATES",

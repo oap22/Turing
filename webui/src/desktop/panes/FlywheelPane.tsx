@@ -6,19 +6,34 @@
 // stays the default because the pane's preset is a third of a workspace
 // column; the `wheel`, which makes the loop metaphor real and reads
 // accumulating rounds as momentum; and `raw`. Clicking a round in either view
-// expands the full `round-NN/round.json` artifact underneath it.
+// expands the full `round-NN/round.json` artifact underneath it, and the
+// expanded detail carries a `[metrics]` link that points the metrics pane at
+// that round's runs (paneLink.ts — an in-app event, never `.viewer.json`,
+// which is the agent's channel and the app must not write).
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { inv, subscribe } from "../tauri";
 import { parseTrajectory, type Round } from "./flywheel";
 import Select from "../Select";
 import {
   parseRoundRecord,
+  parseRoundSummary,
   roundDirName,
   comparableToParent,
+  type Comparability,
+  type ProblemScore,
   type RoundRecord,
+  type RoundSummary,
 } from "./roundRecord";
 import { wheelGeometry } from "./wheel";
+import { publishMetricsTarget } from "./paneLink";
 
 interface Entry {
   rel_path: string;
@@ -95,17 +110,171 @@ function fmtCost(n: number | null): string {
   return n.toExponential(1);
 }
 
+/**
+ * The comparability label, worded for what the pane actually knows.
+ *
+ * The wording tracks the basis on purpose. "eval set changed" used to be the
+ * only refusal the pane could say, so it was hard-coded into the false branch
+ * — but the summary refuses for lost attempts too (this round's or its
+ * parent's), and naming the wrong cause sends the operator to re-cut an eval
+ * set when what they need is to re-drive one problem.
+ */
+function comparabilityLabel(c: Comparability): { text: string; title: string } {
+  if (c.comparable === true) {
+    return {
+      text: "comparable to parent",
+      title: "the round summary records comparable_to_parent: true",
+    };
+  }
+  if (c.basis === "eval-set-changed") {
+    return {
+      text: "NOT comparable — eval set changed",
+      title: "this round and its parent measured different eval sets",
+    };
+  }
+  if (c.comparable === false) {
+    return {
+      text: "NOT comparable to parent",
+      title:
+        "the round summary records comparable_to_parent: false — the gates " +
+        "and saturation verdicts below say which measurement is missing",
+    };
+  }
+  return {
+    text: "comparable: unknown",
+    title:
+      c.basis === "no-parent"
+        ? "a baseline round has no parent to be compared with"
+        : // Deliberately not recomputed from the eval-set hashes: matching
+          // hashes are necessary for comparability, not sufficient, and
+          // claiming "comparable" from them alone is the defect this label
+          // replaced.
+          "no round summary on disk records whether these numbers may be " +
+          "compared with the parent's",
+  };
+}
+
+/**
+ * The problems reduced into each cell, keyed by cell.
+ *
+ * Grouped rather than listed flat so a problem sits under the mean it moved —
+ * the two numbers only mean anything together.
+ */
+function problemsByCell(problems: ProblemScore[]): Map<string, ProblemScore[]> {
+  const byCell = new Map<string, ProblemScore[]>();
+  for (const p of problems) {
+    const existing = byCell.get(p.cell);
+    if (existing) existing.push(p);
+    else byCell.set(p.cell, [p]);
+  }
+  return byCell;
+}
+
+/** One problem's own row, indented under the cell it is reduced into. */
+function ProblemRow({
+  problem,
+  label,
+}: {
+  problem: ProblemScore;
+  label: string;
+}) {
+  const scale = problem.scoreScale ? `${problem.scoreScale}` : "score";
+  return (
+    <tr className="text-term-dim">
+      <td className="break-all pr-2 pl-2" title={problem.problemId}>
+        ↳ {label}
+      </td>
+      <td className="pr-2" />
+      <td className="pr-2" title={scale}>
+        {/* An unscored problem ran without producing a number; "—" says that,
+            where a 0 would read as a measured zero. */}
+        {problem.scored === false ? "unscored" : fmtNum(problem.score)}
+      </td>
+      <td
+        className={`pr-2 ${problem.passedCorrectness === false ? "text-rose-400" : ""}`}
+        title={
+          problem.passedCorrectness === null
+            ? "correctness not recorded"
+            : problem.passedCorrectness
+              ? "passed correctness"
+              : "failed correctness"
+        }
+      >
+        {problem.passedCorrectness === null
+          ? "—"
+          : problem.passedCorrectness
+            ? "✓"
+            : "✗"}
+      </td>
+      {/* Δ, floor, σ and cost/pt are per-cell quantities; a problem has no
+          noise floor of its own, and repeating the cell's would assert a
+          measurement that was never made per problem. */}
+      <td colSpan={4} />
+    </tr>
+  );
+}
+
+/** What the last `[metrics]` click came to: it reached a mounted metrics
+ * pane, or there was none anywhere to hear it. Rendered transiently beside
+ * the link — the two outcomes were otherwise identical pixels, and "nothing
+ * happened" must be readable as such rather than mistaken for success. */
+interface MetricsHint {
+  delivered: boolean;
+}
+
+/** The `[metrics]` cross-pane link: point the metrics pane at this round's
+ * runs (see paneLink.ts for the mapping and the last-action-wins rule). An
+ * explicit affordance rather than the row click doing double duty — the row
+ * click's job is expand-in-place, and silently re-aiming another pane on
+ * every expansion would make *reading* a round rearrange the workspace. */
+function MetricsLink({
+  onShowMetrics,
+  hint,
+}: {
+  onShowMetrics: () => void;
+  hint: MetricsHint | null;
+}) {
+  return (
+    <>
+      <button
+        type="button"
+        onClick={onShowMetrics}
+        title="show this round's runs in the metrics pane"
+        className="text-term-dim underline-offset-2 hover:text-term-fg hover:underline"
+      >
+        [metrics]
+      </button>
+      {hint && (
+        <span
+          data-testid="metrics-link-hint"
+          // Amber for "landed nowhere", same as the metrics pane's own
+          // attention states — not an accusation, just "look again".
+          className={hint.delivered ? "text-term-dim" : "text-amber-400"}
+        >
+          {hint.delivered ? "→ metrics" : "no metrics pane"}
+        </span>
+      )}
+    </>
+  );
+}
+
 /** The full round artifact, expanded under the round the user clicked. */
 function RoundDetail({
   record,
   parent,
+  summary,
   reason,
   onOpen,
+  onShowMetrics,
+  metricsHint,
 }: {
   record: RoundRecord | null;
   parent: RoundRecord | null;
+  summary: RoundSummary | null;
   reason: "loading" | "ok" | "missing" | "unparseable";
   onOpen: () => void;
+  onShowMetrics: () => void;
+  metricsHint: MetricsHint | null;
 }) {
   if (!record) {
     // "Not written yet" and "there but unreadable" are different situations
@@ -118,14 +287,25 @@ function RoundDetail({
           ? "round.json is present but could not be read"
           : "no round.json for this round yet";
     return (
-      <div className="border-l border-term-edge py-1 pl-3 text-[11px] text-term-dim">
-        {message}
+      <div className="flex flex-wrap gap-x-3 border-l border-term-edge py-1 pl-3 text-[11px] text-term-dim">
+        <span>{message}</span>
+        {/* The metrics link needs only the loop and index, and a round whose
+            round.json has not landed yet is exactly the one being watched
+            live — hiding the link here would hide it when it is most wanted. */}
+        <MetricsLink onShowMetrics={onShowMetrics} hint={metricsHint} />
       </div>
     );
   }
 
-  const comparable = comparableToParent(record, parent);
+  const comparable = comparableToParent(record, parent, summary);
+  const label = comparabilityLabel(comparable);
   const deltas = new Map(record.deltas.map((d) => [d.cell, d]));
+  const byCell = problemsByCell(record.problems);
+  // A problem whose cell never made it into `type_scores` would otherwise be
+  // dropped entirely — invisible is exactly the failure these rows fix, so the
+  // orphans are listed under their own cell name instead.
+  const scoredCells = new Set(record.scores.map((s) => s.cell));
+  const orphans = record.problems.filter((p) => !scoredCells.has(p.cell));
 
   return (
     <div className="space-y-1 border-l border-term-edge py-1 pl-3 text-[11px]">
@@ -140,23 +320,20 @@ function RoundDetail({
         <span>
           eval <span className="text-term-fg">{record.evalSetHash ?? "—"}</span>
         </span>
-        {/* Rounds measured on different eval sets may not be compared at all,
-            so this is stated rather than left to be inferred from a delta. */}
+        {/* Whether these numbers may be compared with the parent's at all —
+            stated rather than left to be inferred from a delta, and read from
+            the round summary rather than recomputed. */}
         <span
           className={
-            comparable === false
+            comparable.comparable === false
               ? "text-rose-400"
-              : comparable
+              : comparable.comparable
                 ? "text-emerald-400"
                 : ""
           }
-          title="whether this round may be compared to its parent"
+          title={label.title}
         >
-          {comparable === null
-            ? "comparable: unknown"
-            : comparable
-              ? "comparable to parent"
-              : "NOT comparable — eval set changed"}
+          {label.text}
         </span>
       </div>
 
@@ -171,7 +348,7 @@ function RoundDetail({
           : ""}
       </div>
 
-      {record.scores.length > 0 && (
+      {(record.scores.length > 0 || record.problems.length > 0) && (
         <table className="w-full text-left">
           <thead className="text-term-dim">
             <tr>
@@ -198,41 +375,61 @@ function RoundDetail({
             {record.scores.map((s) => {
               const d = deltas.get(s.cell);
               return (
-                <tr key={s.cell} className="text-term-fg">
-                  <td className="pr-2">{s.cell}</td>
-                  <td className="pr-2 text-term-dim">{s.n ?? "—"}</td>
-                  <td className="pr-2">{fmtNum(s.meanScore)}</td>
-                  <td className="pr-2 text-term-dim">
-                    {fmtNum(s.correctnessPassRate)}
-                  </td>
-                  <td className="pr-2">{fmtNum(d?.marginalGain ?? null)}</td>
-                  <td className="pr-2 text-term-dim">
-                    {fmtNum(d?.noiseFloor ?? null)}
-                  </td>
-                  <td
-                    className={`pr-2 ${
-                      d?.beatsNoiseFloor === true
-                        ? "text-emerald-400"
-                        : d?.beatsNoiseFloor === false
-                          ? "text-term-dim"
-                          : ""
-                    }`}
-                    title={
-                      d?.beatsNoiseFloor === true
-                        ? "beats the noise floor"
-                        : d?.beatsNoiseFloor === false
-                          ? "inside the noise floor"
-                          : "no noise floor measured"
-                    }
-                  >
-                    {fmtNum(d?.gainInNoiseUnits ?? null, 1)}
-                  </td>
-                  <td className="text-term-dim">
-                    {fmtCost(d?.costPerUnitGain ?? null)}
-                  </td>
-                </tr>
+                <Fragment key={s.cell}>
+                  <tr className="text-term-fg">
+                    <td className="pr-2">{s.cell}</td>
+                    <td className="pr-2 text-term-dim">{s.n ?? "—"}</td>
+                    <td className="pr-2">{fmtNum(s.meanScore)}</td>
+                    <td className="pr-2 text-term-dim">
+                      {fmtNum(s.correctnessPassRate)}
+                    </td>
+                    <td className="pr-2">{fmtNum(d?.marginalGain ?? null)}</td>
+                    <td className="pr-2 text-term-dim">
+                      {fmtNum(d?.noiseFloor ?? null)}
+                    </td>
+                    <td
+                      className={`pr-2 ${
+                        d?.beatsNoiseFloor === true
+                          ? "text-emerald-400"
+                          : d?.beatsNoiseFloor === false
+                            ? "text-term-dim"
+                            : ""
+                      }`}
+                      title={
+                        d?.beatsNoiseFloor === true
+                          ? "beats the noise floor"
+                          : d?.beatsNoiseFloor === false
+                            ? "inside the noise floor"
+                            : "no noise floor measured"
+                      }
+                    >
+                      {fmtNum(d?.gainInNoiseUnits ?? null, 1)}
+                    </td>
+                    <td className="text-term-dim">
+                      {fmtCost(d?.costPerUnitGain ?? null)}
+                    </td>
+                  </tr>
+                  {/* The problems the cell above averages, so an operator can
+                      see which ran and what each scored — a cell mean alone
+                      cannot distinguish a corpus that changed composition
+                      from one that did not. */}
+                  {(byCell.get(s.cell) ?? []).map((p) => (
+                    <ProblemRow
+                      key={`${s.cell}:${p.problemId}`}
+                      problem={p}
+                      label={p.problemId}
+                    />
+                  ))}
+                </Fragment>
               );
             })}
+            {orphans.map((p) => (
+              <ProblemRow
+                key={`orphan:${p.cell}:${p.problemId}`}
+                problem={p}
+                label={`${p.cell} · ${p.problemId}`}
+              />
+            ))}
           </tbody>
         </table>
       )}
@@ -288,13 +485,16 @@ function RoundDetail({
 
       {record.verdict && <div className="text-term-dim">{record.verdict}</div>}
 
-      <button
-        type="button"
-        onClick={onOpen}
-        className="text-term-dim underline-offset-2 hover:text-term-fg hover:underline"
-      >
-        [open round dir]
-      </button>
+      <div className="flex flex-wrap gap-x-3">
+        <button
+          type="button"
+          onClick={onOpen}
+          className="text-term-dim underline-offset-2 hover:text-term-fg hover:underline"
+        >
+          [open round dir]
+        </button>
+        <MetricsLink onShowMetrics={onShowMetrics} hint={metricsHint} />
+      </div>
     </div>
   );
 }
@@ -317,6 +517,8 @@ export default function FlywheelPane() {
     /** Distinguishes "not written yet" from "there but unreadable". */
     reason: "ok" | "missing" | "unparseable";
     parent: RoundRecord | null;
+    /** `round-NN/metrics.json`, the only file carrying comparability. */
+    summary: RoundSummary | null;
   } | null>(null);
   const [box, setBox] = useState({ w: 0, h: 0 });
   const observerRef = useRef<ResizeObserver | null>(null);
@@ -434,12 +636,29 @@ export default function FlywheelPane() {
         : { record: null, reason: "unparseable" };
     }
 
+    // The summary is written by the reporting layer, separately from
+    // `round.json`; an unreadable or absent one is not an error to report,
+    // it just leaves comparability unknown (see `comparableToParent`).
+    async function readSummary(i: number): Promise<RoundSummary | null> {
+      try {
+        return parseRoundSummary(
+          await inv<string>("fs_read_text", {
+            root: RESULTS_ROOT,
+            rel: `${loop}/${roundDirName(i)}/metrics.json`,
+          }),
+        );
+      } catch {
+        return null;
+      }
+    }
+
     async function loadDetail() {
-      const [own, parent] = await Promise.all([
+      const [own, parent, summary] = await Promise.all([
         read(index),
         index > 0
           ? read(index - 1)
           : Promise.resolve({ record: null, reason: "ok" as const }),
+        readSummary(index),
       ]);
       if (cancelled) return;
       setDetail({
@@ -448,6 +667,7 @@ export default function FlywheelPane() {
         record: own.record,
         reason: own.reason,
         parent: parent.record,
+        summary,
       });
     }
 
@@ -456,9 +676,14 @@ export default function FlywheelPane() {
       "fs-change",
       (payload) => {
         if (cancelled || payload.root !== RESULTS_ROOT) return;
+        // Both artifacts, because they land independently: a round whose
+        // summary is written after its `round.json` would otherwise stay
+        // "comparable: unknown" until the operator collapsed and re-expanded
+        // it, which reads as the answer rather than as a stale view.
+        const dir = `${selected}/${roundDirName(openRound)}`;
         if (
-          payload.rel_path ===
-          `${selected}/${roundDirName(openRound)}/round.json`
+          payload.rel_path === `${dir}/round.json` ||
+          payload.rel_path === `${dir}/metrics.json`
         ) {
           void loadDetail();
         }
@@ -515,6 +740,54 @@ export default function FlywheelPane() {
     setOpenRound((prev) => (prev === index ? null : index));
   }
 
+  // The outcome of the last [metrics] click, shown transiently beside the
+  // link it answers (keyed by loop AND round: round index alone is shared
+  // across loops, and switching the dropdown inside the hint window would
+  // render one loop's acknowledgment beside another loop's link). Cleared on
+  // a timer: it is an acknowledgment, not a status.
+  const [metricsHint, setMetricsHint] = useState<
+    ({ loop: string; round: number } & MetricsHint) | null
+  >(null);
+  const metricsHintTimer = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (metricsHintTimer.current !== null) {
+        window.clearTimeout(metricsHintTimer.current);
+      }
+    },
+    [],
+  );
+
+  // The `[metrics]` link in the expanded detail: hand the round to whatever
+  // metrics pane is mounted (paneLink.ts). Fired from the affordance, never
+  // from the expand click itself — expanding a round to read it must not
+  // re-aim another pane as a side effect. The publish reports how many panes
+  // heard it; zero means the click landed nowhere, and saying so beside the
+  // link is what keeps a dead click from impersonating a delivered one.
+  function showMetrics(index: number) {
+    if (!selected) return;
+    const heard = publishMetricsTarget({ loop: selected, round: index });
+    setMetricsHint({ loop: selected, round: index, delivered: heard > 0 });
+    if (metricsHintTimer.current !== null) {
+      window.clearTimeout(metricsHintTimer.current);
+    }
+    metricsHintTimer.current = window.setTimeout(() => {
+      metricsHintTimer.current = null;
+      setMetricsHint(null);
+    }, 2500);
+  }
+
+  /** The hint for THIS round's link, or nothing — a hint must never render
+   * beside a link it does not answer, another loop's same-numbered round
+   * included. */
+  function metricsHintFor(index: number): MetricsHint | null {
+    return metricsHint &&
+      metricsHint.loop === selected &&
+      metricsHint.round === index
+      ? metricsHint
+      : null;
+  }
+
   // Only hand the detail view a record that is stamped with the loop and
   // round it is being rendered under. Anything else is a leftover from a
   // previous selection whose read has not landed yet, and showing it would
@@ -522,14 +795,16 @@ export default function FlywheelPane() {
   function detailFor(index: number): {
     record: RoundRecord | null;
     parent: RoundRecord | null;
+    summary: RoundSummary | null;
     reason: "loading" | "ok" | "missing" | "unparseable";
   } {
     if (!detail || detail.loop !== selected || detail.index !== index) {
-      return { record: null, parent: null, reason: "loading" };
+      return { record: null, parent: null, summary: null, reason: "loading" };
     }
     return {
       record: detail.record,
       parent: detail.parent,
+      summary: detail.summary,
       reason: detail.reason,
     };
   }
@@ -652,7 +927,12 @@ export default function FlywheelPane() {
             </div>
             {openRound !== null && (
               <div className="max-h-[50%] shrink-0 overflow-auto border-t border-term-edge pt-1">
-                <RoundDetail {...detailFor(openRound)} onOpen={openRoundDir} />
+                <RoundDetail
+                  {...detailFor(openRound)}
+                  onOpen={openRoundDir}
+                  onShowMetrics={() => showMetrics(openRound)}
+                  metricsHint={metricsHintFor(openRound)}
+                />
               </div>
             )}
           </div>
@@ -685,6 +965,8 @@ export default function FlywheelPane() {
                     <RoundDetail
                       {...detailFor(r.index)}
                       onOpen={openRoundDir}
+                      onShowMetrics={() => showMetrics(r.index)}
+                      metricsHint={metricsHintFor(r.index)}
                     />
                   )}
                 </li>

@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -53,7 +54,11 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 __all__ = [
+    "CORE_METRICS_FIELDS",
+    "DIAGNOSTIC_KEY_PREFIX",
     "HARNESS_FAILURE_KEY",
+    "RESERVED_METRICS_FIELDS",
+    "RESERVED_METRICS_KEYS",
     "SCORE_SCALE_LEADERBOARD_PERCENTILE",
     "SCORE_SCALE_SPEEDUP",
     "TERMINAL_ATTEMPT_STATES",
@@ -160,11 +165,135 @@ class Split(str, Enum):  # noqa: UP042
     HELD_OUT = "held_out"
 
 
+# --------------------------------------------------------------------------- #
+# The reserved metrics namespace
+# --------------------------------------------------------------------------- #
+
+# These sets are the *definition*; every reader imports them from here rather
+# than keeping a copy. There are three readers: ``turing.research.loop.results``
+# emits the keys, ``turing.research.loop.integrity`` has to tell a core field
+# from a caller's score series when it reconciles a summary against a log, and
+# :func:`_reject_unusable_score_scale` below has to refuse a scale that would
+# collide with either. They live in *this* module because it is the only one
+# all three can import: ``results`` imports ``integrity`` (to seed its hash
+# chain) and both import ``contracts``, so any other home would be a cycle or a
+# hand-copy. ``integrity`` used to carry the hand-copy, with a drift test in
+# ``test_integrity.py`` as the only thing keeping the two in sync; that copy is
+# gone, and the test that guarded it now drives ``MetricsLine.to_json`` and
+# checks the keys it really emits against :data:`RESERVED_METRICS_KEYS`.
+
+#: Keys the desktop's chart series builder treats as axis/meta rather than a
+#: plottable series (``webui/src/desktop/panes/metrics.ts``,
+#: ``EXCLUDED_SERIES_KEYS``): the x-axis, its length, and the wall clock. A
+#: problem-supplied metric using one of these names would be silently
+#: swallowed by the pane, drawing a chart with a hole in it that only an
+#: operator staring at the pane would ever notice.
+RESERVED_METRICS_FIELDS: frozenset[str] = frozenset({"step", "total_steps", "ts"})
+
+#: The per-step fields
+#: :meth:`turing.research.loop.results.MetricsLine.to_json` writes itself,
+#: beyond :data:`RESERVED_METRICS_FIELDS`. A caller-supplied metric sharing one
+#: of these names would silently overwrite a core field — or, read the other
+#: way, a core field would silently clobber the caller's score.
+CORE_METRICS_FIELDS: frozenset[str] = frozenset(
+    {
+        "outcome_code",
+        "correctness_pass",
+        "tokens_used",
+        "tokens_cap",
+        "steps_cap",
+        "consumed_steps",
+        "wall_clock_s",
+        "wall_clock_cap_s",
+        "cap_extensions",
+        "step_wall_clock_s",
+        "verify_wall_clock_s",
+        "step_tokens",
+        "made_progress",
+        "progress",
+    }
+)
+
+#: Every key a metrics line already carries, and therefore every name a
+#: caller-supplied series may not use.
+RESERVED_METRICS_KEYS: frozenset[str] = RESERVED_METRICS_FIELDS | CORE_METRICS_FIELDS
+
+#: The namespace agent-authored diagnostics are written under. A scored metric
+#: must not be able to enter it: the two are validated with deliberately
+#: different strictness (``results.py``'s "the agent invents; the operator
+#: holds the ruler"), and a scored series wearing the agent's prefix would be
+#: read as the agent's own notebook.
+DIAGNOSTIC_KEY_PREFIX = "diag_"
+
+
 #: Conventional values for :attr:`VerificationResult.score_scale`. Free-form by
 #: design — each problem scores on its own scale and the scales are never
-#: pooled — but a shared spelling keeps the trajectory readable.
+#: pooled — but a shared spelling keeps the trajectory readable. "Free-form"
+#: stops at :func:`_reject_unusable_score_scale`: the scale names an emitted
+#: metrics key, so it may not collide with :data:`RESERVED_METRICS_KEYS`, be
+#: empty, or wear :data:`DIAGNOSTIC_KEY_PREFIX`.
 SCORE_SCALE_SPEEDUP = "speedup_ratio"
 SCORE_SCALE_LEADERBOARD_PERCENTILE = "leaderboard_percentile"
+
+
+def _reject_unusable_score_scale(scale: object, *, declared_by: str) -> None:
+    """Refuse a score scale that cannot be used as a metrics key.
+
+    ``score_scale`` is free-form by design — each problem scores on its own
+    scale — but it is not *unconstrained*, because the runner names the
+    emitted metrics key after it
+    (``runner.py``: ``metrics={score_series: result.score}``). A scale that
+    collides with a key the line already carries, or that is empty, or that
+    wears the agent's diagnostics prefix, is one
+    ``results._validate_scored_metric`` refuses — and without this check that
+    refusal landed at the attempt's **first verification**, after the
+    workspace was materialised and the solver had already run. The whole
+    attempt was lost, and with it (before round 6's containment fix) the
+    entire round. It happened once per round, forever, because the scale is a
+    property of the problem and every re-drive reproduces it.
+
+    Several of the colliding names are names an operator would plausibly
+    choose: ``progress`` for a problem scored on fraction-of-target,
+    ``step`` for one scored on step count, ``tokens_used`` for one scored on
+    token efficiency. Nothing about them looks wrong at the point they are
+    written down. So the refusal belongs here, where the scale is *declared*
+    — a corpus with a bad scale then fails before the round starts, at zero
+    compute, instead of losing an attempt mid-round.
+
+    The three checks mirror ``results._validate_scored_metric``'s key checks
+    exactly, and must keep mirroring them: any key shape that function
+    refuses is a scale that would be fatal mid-round, so leaving one out here
+    would leave the mid-round path reachable.
+    """
+    if type(scale) is not str:
+        raise ContractViolationError(
+            f"{declared_by} declares score_scale {scale!r}, which is not a plain str; "
+            "the score scale names an emitted metrics key and must be a string"
+        )
+    if not scale:
+        raise ContractViolationError(
+            f"{declared_by} declares an empty score_scale; the scale names the metrics "
+            "key holding the raw score, and an empty key is refused by the metrics "
+            "line, losing the attempt at its first verification"
+        )
+    if scale in RESERVED_METRICS_KEYS:
+        role = "an axis/meta field the desktop's chart pane excludes from its series"
+        if scale in CORE_METRICS_FIELDS:
+            role = "a core field every metrics line already emits"
+        raise ContractViolationError(
+            f"{declared_by} declares score_scale {scale!r}, which is {role}. The runner "
+            f"names the emitted metrics key after the score scale, so {scale!r} would "
+            "collide on the attempt's first verification and lose the attempt. Choose a "
+            "scale name outside "
+            f"{sorted(RESERVED_METRICS_KEYS)}"
+        )
+    if scale.startswith(DIAGNOSTIC_KEY_PREFIX):
+        raise ContractViolationError(
+            f"{declared_by} declares score_scale {scale!r}, which uses the "
+            f"{DIAGNOSTIC_KEY_PREFIX!r} prefix reserved for agent-authored diagnostics; "
+            "a scored series must not be able to enter the agent's own namespace, so "
+            "the metrics line would refuse it at the first verification"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -212,6 +341,9 @@ class VerificationResult:
     def __post_init__(self) -> None:
         if not math.isfinite(self.score):
             raise ContractViolationError(f"score must be finite, got {self.score!r}")
+        _reject_unusable_score_scale(
+            self.score_scale, declared_by=f"verification result for {self.problem_id!r}"
+        )
         # Provenance must survive the trip: a caller holding this result should
         # not be able to rewrite the measurements it was derived from.
         object.__setattr__(self, "raw_measurements", MappingProxyType(dict(self.raw_measurements)))
@@ -263,6 +395,46 @@ class Verifier(ABC):
     problem_id: str
     description: str
     score_scale: str
+    #: The worst grade :attr:`score_scale` actually emits, for a problem that
+    #: introduces a scale :data:`~turing.research.loop.metrics.DEFAULT_SCORE_FLOORS`
+    #: does not know about. ``None`` (the default) means "not declared": the
+    #: scale must then already be a key in the floors table
+    #: (:data:`~turing.research.loop.metrics.DEFAULT_SCORE_FLOORS`, or a
+    #: round's overridden ``score_floors``) or
+    #: :meth:`~turing.research.loop.metrics.ScoredProblem.from_result` raises.
+    #: Declared here rather than passed alongside the problem because the
+    #: scale itself lives here — the two travel together so a corpus author
+    #: cannot introduce one without the other. Like :attr:`score_scale`, this
+    #: must be the **worst** grade the scale emits, not a neutral midpoint:
+    #: see :data:`~turing.research.loop.metrics.DEFAULT_SCORE_FLOORS` for why.
+    #: ``kw_only`` so a defaulted field on this base class does not force
+    #: every subclass field declared after it to also carry a default.
+    score_floor: float | None = field(default=None, kw_only=True)
+
+    def __post_init__(self) -> None:
+        """Refuse a declared scale that could not survive as a metrics key.
+
+        This is the earliest point at which the scale exists, and the runner
+        names the raw-score metrics key after *this* attribute
+        (``problem.verifier.score_scale``), not after the one on the result it
+        returns. Refusing here is therefore what moves a colliding scale from
+        "loses one attempt at its first verification, mid-round, after the
+        solver has already run" to "the corpus will not build". A subclass
+        that overrides ``__post_init__`` must call ``super().__post_init__()``.
+        """
+        _reject_unusable_score_scale(self.score_scale, declared_by=f"verifier {self.verifier_id!r}")
+        if self.score_floor is not None:
+            if isinstance(self.score_floor, bool) or not isinstance(self.score_floor, (int, float)):
+                raise ContractViolationError(
+                    f"verifier {self.verifier_id!r} declares score_floor "
+                    f"{self.score_floor!r}, which is not a plain number"
+                )
+            if not math.isfinite(float(self.score_floor)):
+                raise ContractViolationError(
+                    f"verifier {self.verifier_id!r} declares score_floor "
+                    f"{self.score_floor!r}, which is not finite; a floor a real score can "
+                    "never beat or lose to is not a floor"
+                )
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -320,6 +492,188 @@ def _reject_if_mutable(verifier: Verifier) -> None:
 # --------------------------------------------------------------------------- #
 
 
+#: Longest ``Problem.id`` accepted, in characters.
+#:
+#: The id is a *path component*, not just a label: it appears as
+#: ``attempts/<id>/`` (the metrics trio and plots) and as
+#: ``attempts/<id>.json`` / ``checkpoints/<id>.json`` under a results root the
+#: operator chooses. The binding limits are ``NAME_MAX`` (255 bytes per
+#: component on APFS, ext4 and every filesystem this runs on) and ``PATH_MAX``
+#: (1024 on macOS, where this runs today). 128 keeps *any* single segment well
+#: inside ``NAME_MAX`` even for multi-byte characters, and leaves ~800
+#: characters of the path budget for the root, ``loop-<slug>/round-NN/
+#: attempts/`` and the longest filename underneath
+#: (``metrics.chain.json``) — enough that a deep default root cannot push a
+#: legal id over the limit. It is also far more than a human-chosen problem
+#: name needs: the shipped corpus's longest id is 29 characters.
+_MAX_PROBLEM_ID_LENGTH = 128
+
+#: Most ``/``-separated segments accepted in a ``Problem.id``.
+#:
+#: Nested ids are legitimate — ``cuda/matmul-speedup`` is a reasonable
+#: namespacing choice and resolves correctly through the desktop's filesystem
+#: walk — but the walk is not unbounded. ``desktop/src-tauri/src/fsroots.rs``
+#: stops at ``MAX_DEPTH = 8`` levels below the configured root, and the
+#: deepest place an attempt directory lands is a noise-floor seed run:
+#: ``loop-<slug>/noise-floor/seed-N/attempts/`` is already four levels down,
+#: so an id of *k* segments puts its ``metrics.jsonl`` at depth ``4 + k``. At
+#: five segments the desktop's metrics pane simply never lists the file — the
+#: same invisible-to-the-operator failure the dot-prefix rule below exists to
+#: prevent, arrived by depth instead of by name. (``verify``'s own walk is
+#: ``Path.rglob`` and has no depth limit, so such a run would still be
+#: checked — it would only be unwatchable, which is worse, not better: it
+#: fails silently.) If ``MAX_DEPTH`` changes, this changes with it.
+_MAX_PROBLEM_ID_SEGMENTS = 4
+
+#: The rotation namespace. :func:`turing.research.loop.runner._rotate_stale_metrics`
+#: moves a superseded generation of an attempt's chained trio into
+#: ``attempts/<id>/prior-<n>/``, and ``RoundRunner._viewer_runs`` excludes a
+#: chain whose *directory name* matches this from ``.viewer.json`` — that is
+#: how a rotated generation is told from a live one now that the walk is
+#: depth-independent. An id whose final segment is ``prior-<digits>`` would be
+#: excluded from the viewer list by that filter, and would collide on disk
+#: with the rotated generation of the id one segment above it.
+_PRIOR_GENERATION_SEGMENT = re.compile(r"prior-\d+\Z")
+
+#: Characters refused anywhere in a ``Problem.id``, with the reason each is
+#: refused. Deliberately short: this runs on macOS, where the filesystem
+#: itself forbids only ``/`` and NUL, so a maximalist Windows-flavoured
+#: denylist would reject ids that work perfectly. These two earn their place
+#: because each one *changes the path* rather than merely looking unusual.
+_FORBIDDEN_ID_CHARACTERS: tuple[tuple[str, str], ...] = (
+    (
+        "\\",
+        "a backslash is a path separator on Windows, and the desktop's directory walk "
+        "normalises it to '/' when it reports an entry "
+        "(desktop/src-tauri/src/fsroots.rs), so the path the viewer hands back would "
+        "not be the path the runner wrote",
+    ),
+    (
+        ":",
+        "a colon introduces a drive or UNC prefix on Windows and is still swapped with "
+        "'/' by macOS's Finder and Carbon path layers, so the id would display as a "
+        "different path than it is",
+    ),
+)
+
+
+def _reject_unsafe_problem_id(problem_id: object) -> None:
+    """Refuse a problem id that cannot be used as a path component.
+
+    ``problem.id`` is not only an identifier: the loop writes
+    ``attempts/<id>/`` (metrics trio, chain sidecar, plots),
+    ``attempts/<id>.json`` and ``checkpoints/<id>.json`` beneath the results
+    root, and the desktop reads them back from there. An id that escapes that
+    root, collides with a directory the runner mints itself, or lands
+    somewhere the desktop's walk will not look, does its damage far from
+    where it was written — after a workspace was materialised and a solver
+    ran, or worse, silently, as a run nobody can see. So it is refused here,
+    at problem-definition time, before any compute is spent.
+
+    **Nested ids stay legal.** ``cuda/matmul-speedup`` is a supported,
+    plausible operator choice: it resolves through the Rust filesystem walk,
+    ``RoundRunner._viewer_runs`` globs ``attempts/**/metrics.jsonl`` for
+    exactly this reason, and ``verify`` has always recursed. Banning
+    separators outright would break a documented, working layout. What is
+    refused is the narrower set of shapes that escape or collide:
+
+    * ``..`` as any segment, and an absolute or drive/UNC-prefixed path —
+      these leave the results root entirely.
+    * an empty segment (a leading, trailing or doubled ``/``) or a
+      whitespace-only one — ``Path`` silently discards or normalises these,
+      so two different ids would name one directory.
+    * NUL and other control characters — they cannot survive the JSON chain
+      header, the structlog fields or a terminal, and are illegal in a
+      filename on every non-POSIX filesystem.
+    * a ``.``-prefixed segment — ``fsroots.rs``'s ``should_skip`` skips every
+      dot-prefixed name, so the attempt would write files the desktop's
+      metrics and images panes can never list. The run would be invisible
+      rather than wrong, which is the harder failure to notice.
+    * a final segment matching ``prior-<digits>`` — that is the rotation
+      namespace (:data:`_PRIOR_GENERATION_SEGMENT`); such an id is filtered
+      out of ``.viewer.json`` by ``_viewer_runs`` and can collide on disk
+      with a rotated generation of a shorter id.
+
+    Every rule above exists because of a specific downstream consumer, and
+    each message names it: an operator who trips one should learn *why* their
+    id was refused, not merely that it was.
+    """
+    if type(problem_id) is not str:
+        raise ContractViolationError(
+            f"problem id {problem_id!r} is not a plain str; the id is used directly as "
+            "a filesystem path component and must be a string"
+        )
+    if not problem_id:
+        raise ContractViolationError("problem id must be non-empty")
+    if len(problem_id) > _MAX_PROBLEM_ID_LENGTH:
+        raise ContractViolationError(
+            f"problem id {problem_id!r} is {len(problem_id)} characters; the id is a "
+            f"path component under the results root and is capped at "
+            f"{_MAX_PROBLEM_ID_LENGTH} to stay inside NAME_MAX and PATH_MAX"
+        )
+    for char in problem_id:
+        if char == "\x00" or ord(char) < 0x20 or ord(char) == 0x7F:
+            raise ContractViolationError(
+                f"problem id {problem_id!r} contains the control character "
+                f"{char!r} (U+{ord(char):04X}); the id is a path component and is also "
+                "written verbatim into the metrics chain header and every log line, "
+                "none of which survive a control character"
+            )
+    for char, reason in _FORBIDDEN_ID_CHARACTERS:
+        if char in problem_id:
+            raise ContractViolationError(f"problem id {problem_id!r} contains {char!r}: {reason}")
+    if problem_id.startswith("/"):
+        raise ContractViolationError(
+            f"problem id {problem_id!r} is an absolute path; the id is joined onto the "
+            "round's attempts directory, and an absolute component would discard that "
+            "directory and write outside the results root"
+        )
+    segments = problem_id.split("/")
+    if len(segments) > _MAX_PROBLEM_ID_SEGMENTS:
+        raise ContractViolationError(
+            f"problem id {problem_id!r} has {len(segments)} path segments; at most "
+            f"{_MAX_PROBLEM_ID_SEGMENTS} are allowed, because the desktop's directory "
+            "walk (desktop/src-tauri/src/fsroots.rs, MAX_DEPTH=8) stops before a "
+            "deeper attempt directory and the run would never appear in the metrics "
+            "pane"
+        )
+    for segment in segments:
+        if segment == "..":
+            raise ContractViolationError(
+                f"problem id {problem_id!r} contains a '..' segment; the id is a path "
+                "component under the round's attempts directory and traversal would "
+                "write outside the results root"
+            )
+        if not segment:
+            raise ContractViolationError(
+                f"problem id {problem_id!r} has an empty path segment (a leading, "
+                "trailing or doubled '/'); the path layer discards it, so two "
+                "different ids would name one attempt directory"
+            )
+        if not segment.strip():
+            raise ContractViolationError(
+                f"problem id {problem_id!r} has a whitespace-only path segment "
+                f"{segment!r}; it is indistinguishable from an empty one to a reader "
+                "and to every shell an operator will use on the results tree"
+            )
+        if segment.startswith("."):
+            raise ContractViolationError(
+                f"problem id {problem_id!r} has a '.'-prefixed segment {segment!r}; "
+                "the desktop's directory walk skips every dot-prefixed name "
+                "(desktop/src-tauri/src/fsroots.rs), so this attempt would write "
+                "metrics and plots the metrics and images panes can never show"
+            )
+    if _PRIOR_GENERATION_SEGMENT.fullmatch(segments[-1]):
+        raise ContractViolationError(
+            f"problem id {problem_id!r} ends in the rotation namespace "
+            f"{segments[-1]!r}; runner._rotate_stale_metrics moves a superseded "
+            "attempt's chain into 'prior-<n>/', so RoundRunner._viewer_runs excludes "
+            "directories with that name from .viewer.json and this run would never be "
+            "listed — and a shorter id one segment above would rotate its own "
+            "generation straight on top of it"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class Problem:
     """One unit of work: a ``(goal, verifier)`` pair.
@@ -335,6 +689,14 @@ class Problem:
     :func:`shutil.ignore_patterns` applied at that copy. They have to live on
     the problem, not only on the family spec: the loop and the solver copy
     from this object, and they never call the adapter's materialise method.
+
+    ``id`` is a **path component**, not a free label — every attempt writes
+    ``attempts/<id>/`` and ``checkpoints/<id>.json`` under the results root —
+    and is validated as one by :func:`_reject_unsafe_problem_id`. Nested ids
+    such as ``cuda/matmul-speedup`` are supported; ids that escape the root,
+    collide with a directory the runner mints itself, or land where the
+    desktop's walk will not look are refused here rather than surfacing as a
+    lost attempt or an invisible run.
     """
 
     id: str
@@ -348,8 +710,7 @@ class Problem:
     workspace_excludes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not self.id:
-            raise ContractViolationError("problem id must be non-empty")
+        _reject_unsafe_problem_id(self.id)
         _reject_if_mutable(self.verifier)
         if self.verifier.problem_id != self.id:
             raise ContractViolationError(

@@ -45,8 +45,12 @@ round's results into a future self-edit summary is
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
+import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -55,6 +59,7 @@ import structlog
 from turing.research.contracts import (
     Attempt,
     AttemptState,
+    Cap,
     CapConsumption,
     ContractViolationError,
     EscalationProtocolError,
@@ -64,6 +69,7 @@ from turing.research.contracts import (
     RoundCost,
     RoundRecord,
 )
+from turing.research.loop import integrity
 from turing.research.loop.metrics import (
     DEFAULT_SCORE_FLOORS,
     CostBasis,
@@ -74,8 +80,32 @@ from turing.research.loop.metrics import (
     floors_by_cell,
     round_verdict,
 )
+from turing.research.loop.plots import PLOT_FILENAMES, render_attempt_plots, render_round_plot
 from turing.research.loop.protocols import SolverTask, SystemClock
-from turing.research.loop.trajectory import AttemptLog, StepLog
+from turing.research.loop.results import (
+    METRICS_VERDICT_FILENAME,
+    MetricsLine,
+    MetricsWriter,
+    Outcome,
+    ProgressTracker,
+    read_agent_diagnostics,
+    read_metrics_points,
+    usable_target,
+    write_attempt_summary,
+    write_round_summary,
+    write_viewer_config,
+)
+from turing.research.loop.trajectory import (
+    AttemptLog,
+    RunIdentity,
+    StepLog,
+    StoredAttempt,
+    cell_key,
+    decode_assessments,
+    decode_escalation_request,
+    decode_round_record,
+    decode_scored_problems,
+)
 from turing.research.problems.adapter import bind_eval_set_hash
 
 if TYPE_CHECKING:
@@ -83,7 +113,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from turing.research.contracts import (
-        Cap,
         EngineIdentity,
         EscalationDecision,
         Problem,
@@ -103,11 +132,14 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 __all__ = [
+    "AttemptFailure",
     "AttemptOutcome",
     "PassCriterion",
     "RoundConfig",
     "RoundOutcome",
     "RoundRunner",
+    "WorkspaceMissingError",
+    "find_finished_round",
 ]
 
 
@@ -167,11 +199,42 @@ class RoundConfig:
     #: mislabel the stop as ``FAILED_WITHIN_CAP`` with the cap untouched.
     max_escalations_per_attempt: int = 3
     pass_criteria: Mapping[str, PassCriterion] = field(default_factory=dict)
+    #: What an unscored problem's cell entry is floored to, by score scale.
+    #: Defaults to :data:`~turing.research.loop.metrics.DEFAULT_SCORE_FLOORS`
+    #: (``speedup_ratio`` and ``leaderboard_percentile`` only); an override
+    #: here *replaces* that table rather than extending it, unchanged from
+    #: before a problem could declare its own floor.
+    #:
+    #: A scale absent from this table is not automatically refused: a problem
+    #: whose verifier declares
+    #: :attr:`~turing.research.contracts.Verifier.score_floor` still scores,
+    #: because ``ScoredProblem.from_result`` falls back to that declaration
+    #: when this table has no entry for the scale. This table's entries take
+    #: precedence when both exist — an override here is an explicit operator
+    #: choice for *this round* and must be able to shadow whatever a verifier
+    #: declared. See
+    #: :data:`~turing.research.loop.metrics.DEFAULT_SCORE_FLOORS` for the full
+    #: precedence order.
     score_floors: Mapping[str, float] = field(default_factory=lambda: DEFAULT_SCORE_FLOORS)
     #: When False, skip per-step verification and run the frozen verifier once
     #: when the cap trips. Never verifying floors every cell and fabricates a
     #: parent-round delta.
     verify_every_step: bool = True
+    #: The family-specific strings ``eval_set_hash`` was fingerprinted with
+    #: (the speedup adapter's significance multiplier and per-spec material —
+    #: :meth:`~turing.research.problems.speedup.SpeedupAdapter.eval_set_material`).
+    #: :meth:`RoundRunner.run_round` re-derives the hash from the corpus with
+    #: exactly these, so a promised hash and its verification share one
+    #: definition (:func:`~turing.research.problems.adapter.fingerprint_corpus`).
+    #: Not part of :meth:`config_digest`: it is already inside ``eval_set_hash``.
+    eval_set_material: tuple[str, ...] = ()
+    #: Canonical strings naming the measurement instrument that the corpus
+    #: fingerprint does not cover — for the speedup family, the interpreter
+    #: the timing harness runs under
+    #: (:meth:`~turing.research.problems.speedup.SpeedupAdapter.harness_identity`).
+    #: Part of :meth:`config_digest`: two runs timing the same corpus under
+    #: different interpreters took different measurements.
+    harness_identity: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.round_index < 0:
@@ -187,9 +250,95 @@ class RoundConfig:
             raise ContractViolationError("an attempt must be allowed at least one escalation")
         object.__setattr__(self, "pass_criteria", MappingProxyType(dict(self.pass_criteria)))
         object.__setattr__(self, "score_floors", MappingProxyType(dict(self.score_floors)))
+        object.__setattr__(self, "eval_set_material", tuple(self.eval_set_material))
+        object.__setattr__(self, "harness_identity", tuple(self.harness_identity))
 
     def criterion_for(self, problem_id: str) -> PassCriterion | None:
         return self.pass_criteria.get(problem_id)
+
+    def config_digest(self) -> str:
+        """SHA-256 over the canonical JSON of every measurement-affecting field.
+
+        The fourth coordinate of :class:`~turing.research.loop.trajectory.RunIdentity`.
+        ``run_id``, ``seed`` and ``eval_set_hash`` say *which* measurement a
+        checkpoint belongs to; this says *how it was taken*, and a stored
+        attempt whose digest differs is a previous generation, re-driven
+        rather than reused. The fields, and why each is here:
+
+        * ``engine`` — a floor or a half-finished round measured under one
+          scaffold sha must not be re-derived and stamped with another;
+          ``run_round``'s engine guard on the noise floor is only as good as
+          the identity the floor's checkpoints were reused under.
+        * ``default_cap`` — a round killed at cap 2 and restarted at cap 6
+          would otherwise be one record half-measured each way.
+        * ``pass_criteria`` — the bar decides ``PASSED`` vs ``FAILED_WITHIN_CAP``
+          and when an attempt stops spending.
+        * ``verify_every_step`` — decides whether the reported score is the
+          latest verify or the single cap-trip verify.
+        * ``escalate_on_cap_exhaustion`` and ``max_escalations_per_attempt``
+          — decide whether a tripped cap ends the attempt or asks the
+          operator, and how many times.
+        * ``score_floors`` — the value an unscored problem enters its cell at.
+        * ``harness_identity`` — the instrument the corpus fingerprint does
+          not name (the timing harness's interpreter, for speedup problems);
+          the same corpus timed under two interpreters is two measurements.
+
+        Not included: ``round_index`` / ``run_id`` / ``parent_round_id`` /
+        ``seed`` / ``eval_set_hash`` (already identity coordinates, or
+        lineage rather than measurement), ``eval_set_material`` (already
+        inside ``eval_set_hash``) and ``cost_basis`` (a reduction over
+        finished attempts, not a property of any attempt). A **per-problem**
+        cap (``Problem.default_cap``) is not here either — it is a property of
+        one problem, not of the round — and is compared per attempt instead:
+        the checkpoint records the cap the attempt was measured under and
+        ``TrajectoryStore.load_stored_attempt`` refuses one that differs from
+        the cap this run would apply.
+
+        Byte-stable: keys sorted, mappings sorted by key, no whitespace
+        variance, so two processes with equal configs produce equal digests
+        on any platform. A non-finite ``min_score`` (tolerated elsewhere;
+        ``results.usable_target`` normalises it) is encoded as Python's own
+        ``NaN`` / ``Infinity`` token — this text is hashed, never written for
+        another reader, so the JSON-validity concern behind
+        ``trajectory._write_json``'s ``allow_nan=False`` does not apply, and
+        the token is deterministic.
+        """
+        canonical = {
+            "engine": {
+                "backend": self.engine.backend,
+                "orchestrator_model": self.engine.orchestrator_model,
+                "substep_model": self.engine.substep_model,
+                "scaffold_git_sha": self.engine.scaffold_git_sha,
+            },
+            "default_cap": {
+                "max_steps": self.default_cap.max_steps,
+                "max_tokens": self.default_cap.max_tokens,
+                "max_wall_clock_seconds": self.default_cap.max_wall_clock_seconds,
+            },
+            "pass_criteria": {
+                problem_id: {
+                    "min_score": criterion.min_score,
+                    "require_correctness": criterion.require_correctness,
+                }
+                for problem_id, criterion in sorted(self.pass_criteria.items())
+            },
+            "verify_every_step": self.verify_every_step,
+            "escalate_on_cap_exhaustion": self.escalate_on_cap_exhaustion,
+            "max_escalations_per_attempt": self.max_escalations_per_attempt,
+            "score_floors": dict(sorted(self.score_floors.items())),
+            "harness_identity": list(self.harness_identity),
+        }
+        encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def identity(self) -> RunIdentity:
+        """The :class:`RunIdentity` a stored attempt must carry to be this run's."""
+        return RunIdentity(
+            round_id=self.run_id,
+            seed=self.seed,
+            eval_set_hash=self.eval_set_hash,
+            config_digest=self.config_digest(),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,14 +359,55 @@ class AttemptOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class AttemptFailure:
+    """One problem whose attempt raised instead of returning an outcome.
+
+    Deliberately **not** an :class:`AttemptOutcome`, and deliberately carrying
+    neither an :class:`~turing.research.contracts.Attempt` nor a score. An
+    attempt that raised out of :meth:`RoundRunner.run_attempt` has no
+    trustworthy terminal state and no result — the exception can come from
+    anywhere between the first metrics line and ``write_attempt_log`` — so
+    there is no honest value to put in either field. Anything with a score
+    slot on it will eventually be read as a score; the type that cannot hold
+    one cannot be misread. See :meth:`RoundRunner.run_attempts` for why these
+    are kept out of the scored set entirely rather than floored into it.
+    """
+
+    problem_id: str
+    #: ``"<ExcType>: <message>"``. A string, not the exception: a
+    #: :class:`RoundOutcome` is a value the caller may hold, serialise or log
+    #: long after the round, and keeping a live exception here would keep its
+    #: whole traceback — and every frame's locals, including workspace paths
+    #: and solver state — alive with it. The traceback that matters is already
+    #: in the ``research.attempt.crashed`` log entry.
+    error: str
+
+
+@dataclass(frozen=True, slots=True)
 class RoundOutcome:
-    """The round record plus everything that produced it."""
+    """The round record plus everything that produced it.
+
+    ``attempts`` holds only the attempts that produced an outcome. Problems
+    lost to a raising attempt are in ``failures`` and are absent from
+    ``scored``, from ``record.type_scores`` and from ``record.cost`` — see
+    :meth:`RoundRunner.run_attempts`.
+    """
 
     record: RoundRecord
     attempts: tuple[AttemptOutcome, ...]
     scored: tuple[ScoredProblem, ...]
     assessments: tuple[SaturationAssessment, ...]
     trajectory_row: Mapping[str, Any] | None = None
+    failures: tuple[AttemptFailure, ...] = ()
+    #: True when :meth:`RoundRunner.run_round` found this round already in
+    #: ``trajectory.json`` under this ``run_id`` **and measured this way**
+    #: (same ``eval_set_hash``, ``engine``, ``config_digest`` and ``seed``;
+    #: see :func:`find_finished_round`) and returned what the first process
+    #: wrote — decoded from ``round.json`` — without driving, measuring, or
+    #: writing anything. ``attempts`` is empty on that path: no
+    #: attempt ran in this process, and the per-problem outcomes are in the
+    #: round directory for anyone who wants them.
+    already_finished: bool = False
 
 
 def _is_better(new: VerificationResult, old: VerificationResult | None) -> bool:
@@ -257,6 +447,799 @@ def _spend_carried_on_error(exc: BaseException) -> CapConsumption:
     return CapConsumption()
 
 
+#: The hash-chained trio :class:`~turing.research.loop.results.MetricsWriter`
+#: refuses to splice onto. Chained, so a re-drive cannot overwrite it in place
+#: and has to move it aside instead.
+_METRICS_TRIO = ("metrics.jsonl", "metrics.chain.json", "metrics.json")
+
+#: Rotated aside with the trio, for a different reason. Checkpoints and the
+#: attempt log really are wholesale overwrites that self-heal on a re-drive.
+#: **The plots are not**, and the docstring here used to claim they were.
+#: :func:`~turing.research.loop.plots.render_attempt_plots` *skips* — writes
+#: nothing at all — when the series a plot needs is absent from every point,
+#: so an attempt that dies before its first verification rewrites ``cap.svg``
+#: (``tokens_used`` is on every line, including the terminal one) and leaves
+#: the *previous* attempt's ``progress.svg`` sitting untouched beside it. The
+#: attempt directory then holds two charts drawn from two different attempts,
+#: and the desktop's images pane draws them side by side with nothing marking
+#: one as stale — the exact failure rotation exists to prevent, displaced from
+#: the JSONL to the SVG. Skipping rather than blanking is the right behaviour
+#: for the renderer (an empty chart reads as "the run produced nothing"), so
+#: the staleness has to be resolved here, at the one point that already knows
+#: a new generation is starting.
+#:
+#: Named files rather than a glob over ``*.svg``: rotation must never sweep
+#: aside a file the runner did not write.
+#: ``metrics.verdict.json`` joins them for the same displaced-staleness reason:
+#: it reports a line count for the chain it was written beside, so left in
+#: place it would describe the superseded generation's log while sitting next
+#: to the new one, and the desktop's badge would read ``stale`` forever.
+_ROTATED_NAMES: tuple[str, ...] = (*_METRICS_TRIO, METRICS_VERDICT_FILENAME, *PLOT_FILENAMES)
+
+#: Matches the subdirectory names :func:`_rotate_stale_metrics` creates. Used
+#: by :meth:`RoundRunner._viewer_runs` to tell a superseded chain from a live
+#: one now that its walk is depth-independent; kept next to the function that
+#: mints the names so the two cannot drift.
+#:
+#: Deliberately does **not** match :data:`_STAGING_DIR_NAME` (a leading dot,
+#: no digits) — a leftover staging directory is a rotation-in-progress, not a
+#: rotated generation, and must stay invisible to this filter until
+#: :func:`_rotate_stale_metrics` has finished committing it.
+_PRIOR_DIR_PATTERN = re.compile(r"prior-\d+")
+
+#: The subdirectory :func:`_rotate_stale_metrics` stages the trio and plots
+#: into before committing them, in one rename, to a numbered ``prior-N/``.
+#: One fixed name rather than one per rotation: the call site is fully
+#: synchronous (no ``await`` between staging and commit), so at most one
+#: rotation is ever in flight for a given ``metrics_dir``, and a leftover
+#: from an earlier crash is drained and committed — see
+#: :func:`_commit_staged_rotation` — before a new one is ever staged, so the
+#: name is always free by the time it would be reused. Leading dot so it
+#: sorts away from ordinary metrics files and never collides with a
+#: problem-id path segment (``contracts._reject_unsafe_problem_id`` already
+#: refuses ids that could shadow ``prior-<digits>``; a dot-prefixed name
+#: needs no matching refusal because no problem id may contain one).
+_STAGING_DIR_NAME = integrity.STAGING_DIR_NAME
+
+
+def _next_free_prior_suffix(metrics_dir: Path) -> int:
+    """The smallest ``N >= 1`` for which ``metrics_dir / f"prior-{N}"`` is free."""
+    suffix = 1
+    while (metrics_dir / f"prior-{suffix}").exists():
+        suffix += 1
+    return suffix
+
+
+def _commit_staged_rotation(metrics_dir: Path, staging_dir: Path) -> Path:
+    """Finish moving the trio/plots into ``staging_dir``, then commit it as ``prior-N/``.
+
+    Called from two shapes of caller, and cannot (needs not) tell them apart:
+
+    1. :func:`_rotate_stale_metrics`, right after creating ``staging_dir``
+       empty — the ordinary rotation, nothing moved yet.
+    2. :func:`_rotate_stale_metrics`'s self-heal, on a ``staging_dir`` a
+       previous, crashed call already left behind holding *some* subset of
+       :data:`_ROTATED_NAMES` — whatever it managed to move before it died.
+
+    Either way the move loop below is the same: a name still sitting in
+    ``metrics_dir`` gets moved in; a name already staged (case 2, partially)
+    is simply absent from ``metrics_dir`` and skipped — ``Path.exists()`` on
+    the source is enough to tell the two apart, no bookkeeping required. So a
+    crash between individual file moves is always recoverable by calling this
+    again with the same ``staging_dir``.
+
+    **The final step is what makes the whole set atomic.** One
+    ``Path.rename`` moves ``staging_dir`` onto a freshly chosen, currently
+    non-existent ``prior-N/`` — the same directory-entry-swap primitive that
+    already made each individual file move atomic, just applied one level up.
+    An observer walking ``metrics_dir`` therefore never finds a ``prior-N/``
+    holding some but not all of the files this rotation moved: either the
+    entry does not exist yet (rotation still staging, or not yet started), or
+    it exists complete (rotation committed). There is no third, half-written
+    state to observe — which is the property three sequential per-file
+    renames into a pre-existing ``prior-N/`` never had.
+
+    **The merge above has no generation-identity check and no cross-process
+    lock.** A name already staged is trusted to belong to the same rotation
+    as whatever this call is about to move in — nothing here reads either
+    side's chain header to confirm that. That is safe only because this
+    function has exactly one call site, :func:`_rotate_stale_metrics`, which
+    itself has exactly one call site, :meth:`RoundRunner.run_attempt`, and
+    the whole sequence — self-heal, staging, commit — runs synchronously
+    with no ``await`` between the moment it decides a rotation is needed and
+    the moment it constructs the new attempt's :class:`~turing.research.loop.results.MetricsWriter`.
+    At most one rotation is ever in flight per ``metrics_dir`` *within this
+    process*; a second process racing the same ``metrics_dir`` — two
+    ``turing`` instances pointed at one results tree — is out of scope here
+    and not defended against. In that shape the final ``staging_dir.rename``
+    can land on a ``prior-N/`` a concurrent commit picked at the same
+    moment: on POSIX that rename fails with ``OSError`` (renaming onto an
+    existing non-empty directory is refused) rather than silently merging or
+    clobbering the other process's files, so the failure is loud and costs
+    exactly the one attempt whose rotation lost the race — it does not
+    corrupt the winner's ``prior-N/``. Adding a real lock is filed
+    separately; nothing here should be read as one.
+    """
+    for name in _ROTATED_NAMES:
+        src = metrics_dir / name
+        if not src.exists():
+            continue
+        src.rename(staging_dir / name)
+    suffix = _next_free_prior_suffix(metrics_dir)
+    prior_dir = metrics_dir / f"prior-{suffix}"
+    staging_dir.rename(prior_dir)
+    logger.info(
+        "research.results.metrics_rotated", staging_dir=str(staging_dir), dest=str(prior_dir)
+    )
+    return prior_dir
+
+
+def _rotate_stale_metrics(metrics_dir: Path) -> Path | None:
+    """Move a prior attempt's chained trio — and its plots — aside, as one atomic set.
+
+    Returns the ``prior-N/`` directory it rotated into, or ``None`` when
+    there was no chain to rotate. The return value is the only thing RES-17
+    added here: :func:`_rotate_prior_generation` moves the checkpoint and the
+    attempt log into the *same* directory, and it has to know which one.
+    Nothing about the trigger, the set of names, or the atomicity changed.
+
+    A re-run of an attempt into an already-used ``output_dir`` is legitimate
+    and reachable — a closed subscription window, a killed process, a
+    re-driven round — and nothing in :meth:`RoundRunner.run_attempt` (or
+    :meth:`RoundRunner.run_round`, or ``NoiseFloorRunner.run``) has skip-if-
+    already-done logic to prevent it. ``results.MetricsWriter.__init__``
+    refuses outright rather than splice a second attempt's lines onto an
+    existing chain (see its docstring), so without this, a legitimate
+    re-drive would crash instead of re-reporting.
+
+    The trigger mirrors the writer's own refusal condition exactly — a
+    missing or zero-byte ``metrics.jsonl`` is not a chain and is left alone.
+    That one file is also the right trigger for the plots, because a plot can
+    only exist where a non-empty ``metrics.jsonl`` already did: the renderer
+    is fed points read back out of it.
+
+    **Staged, then committed in one rename — not three-plus sequential
+    per-file renames into a pre-existing ``prior-N/``.** Each individual
+    ``Path.rename`` is atomic; the *set* of them is not, and a process killed
+    between two of them used to leave ``prior-N/`` holding, say, a log with
+    no chain sidecar (fails verification on its own) while ``metrics_dir``
+    kept a stale sidecar with no log — which ``MetricsWriter``'s refusal used
+    to miss (see its docstring), so the next drive wrote a fresh chain beside
+    that orphaned sidecar and **both** generations then failed verification
+    on completely honest data. The fix: build the destination in a hidden
+    staging directory (:data:`_STAGING_DIR_NAME`, inside ``metrics_dir`` —
+    same filesystem, so every move below is a cheap directory-entry swap, not
+    a copy) and only rename the *directory* onto its numbered ``prior-N/``
+    name once every file that exists has landed inside it. See
+    :func:`_commit_staged_rotation` for why that last rename is what makes
+    the whole set observable as only ever "before" or "after", never
+    in-between.
+
+    **Self-heals a leftover staging directory on entry, before deciding
+    whether this call needs to start a new rotation.** A crash between two
+    of the moves above — or between the last move and the final commit —
+    leaves ``metrics_dir / _STAGING_DIR_NAME`` behind, holding whatever
+    subset of the trio/plots it had gotten to. Every call to this function
+    (which is to say, the start of every attempt — see the call site in
+    :meth:`RoundRunner.run_attempt`) checks for that directory first and, if
+    present, finishes committing it via :func:`_commit_staged_rotation`
+    before touching ``metrics_dir``'s own ``metrics.jsonl``. This closes the
+    residual window the staging approach still has: the interval between
+    "some files moved" and "directory committed" is no longer *file-level*
+    torn (a rename either lands or it does not), but it is still a window a
+    kill can land in, and self-heal is what keeps that window from becoming
+    permanent the way the old three-rename version's was.
+
+    When a (possibly self-healed) rotation is needed, every name in
+    :data:`_ROTATED_NAMES` ends up, un-renamed, in a numbered ``prior-N/``
+    subdirectory: not deleted (the earlier attempt's evidence survives, chart
+    included), not resumed (the new writer starts a fresh chain from its own
+    header), and — because the filenames inside that subdirectory are still
+    the canonical ``metrics.jsonl`` / ``metrics.chain.json`` / ``metrics.json``
+    — still independently checkable by
+    :func:`~turing.research.loop.integrity.verify_metrics_chain` and
+    :func:`~turing.research.loop.integrity.reconcile_summary`, and still found
+    by ``python -m turing.research.loop.verify``'s directory walk, which
+    matches ``metrics.jsonl`` at every depth under a root. Adding SVGs to that
+    directory does not disturb the walk: it keys on ``metrics.jsonl`` alone,
+    and ``prior-N/`` already contained one before the plots joined it.
+
+    Preserving beats deleting for the plots specifically. A stale chart is
+    only misleading while it sits where the *current* attempt's chart belongs;
+    under ``prior-N/``, beside the exact metrics it was drawn from, it is the
+    superseded generation's evidence and is labelled as such by its path.
+
+    **A non-directory at** :data:`_STAGING_DIR_NAME` **is a loud, named
+    error, not a silent no-op.** Nothing else in this module ever creates a
+    plain file there — the only writer of that path is ``staging_dir.mkdir``,
+    a few lines below, and its target is always a directory. So a file
+    sitting at that name is foreign: manual interference, a different tool,
+    a corrupted checkout. Checking only ``staging_dir.is_dir()`` before
+    self-healing would treat that shape exactly like "no rotation in
+    progress" and fall straight through into ``staging_dir.mkdir(...)``,
+    which raises a bare ``FileExistsError`` naming nothing about what is
+    actually wrong or what the operator should do about it. Refusing here,
+    by name, keeps that failure legible instead of trading one confusing
+    exception for another.
+    """
+    staging_dir = metrics_dir / _STAGING_DIR_NAME
+    if staging_dir.exists() and not staging_dir.is_dir():
+        raise ContractViolationError(
+            f"{staging_dir} exists and is not a directory; {_STAGING_DIR_NAME!r} is "
+            "reserved for the hidden staging directory a rotation-in-progress builds "
+            "its destination in, and must be either a directory or absent — remove or "
+            "rename this file before retrying"
+        )
+    if staging_dir.is_dir():
+        _commit_staged_rotation(metrics_dir, staging_dir)
+
+    jsonl_path = metrics_dir / "metrics.jsonl"
+    if not (jsonl_path.exists() and jsonl_path.stat().st_size > 0):
+        return None
+    staging_dir.mkdir(parents=True)
+    return _commit_staged_rotation(metrics_dir, staging_dir)
+
+
+#: Names the checkpoint and the attempt log take inside ``prior-N/``. Fixed
+#: names rather than the originals' basenames: ``checkpoints/<problem-id>.json``
+#: and ``attempts/<problem-id>.json`` share a basename, and a nested problem
+#: id (``cuda/matmul``) would put ``matmul.json`` beside ``matmul.json``.
+_PRIOR_CHECKPOINT_NAME = "checkpoint.json"
+_PRIOR_ATTEMPT_LOG_NAME = "attempt-log.json"
+
+
+def _rotate_prior_generation(
+    metrics_dir: Path, *, checkpoint_path: Path, log_path: Path
+) -> Path | None:
+    """Move everything a previous generation of this attempt left aside, together.
+
+    A *fresh* drive into an already-used attempt slot — ``--no-resume``, or a
+    stored attempt the resume probe called a previous generation — must land
+    in a new generation beside the old one, never over it. :func:`_rotate_stale_metrics`
+    already does that for the chained trio and the plots; before RES-17 the
+    checkpoint (``checkpoints/<problem-id>.json``) and the attempt log
+    (``attempts/<problem-id>.json``) were rewritten in place, so a
+    ``--no-resume`` re-run of the noise floor destroyed every seed's prior
+    checkpoint — the record that carries the score and the identity the
+    earlier measurement was taken under — while carefully preserving the
+    metrics chain that no longer had a checkpoint to reconcile with.
+
+    So the set that rotates together is extended *here*, around the RES-19
+    function rather than inside it: the trio and plots go where they always
+    went, and the checkpoint and log follow them into the same ``prior-N/``
+    under fixed names. When there is no chain to rotate but a checkpoint or
+    log is present (an attempt killed after its first checkpoint and before
+    its first metrics line, or a hand-placed file), the ``prior-N/`` directory
+    is created for them alone: a checkpoint can carry a score, and a fresh
+    drive must not overwrite it either.
+
+    Only called on the fresh-drive path. A *resumed* attempt keeps its
+    checkpoint and log in place — they are what it resumes from — and only
+    the chain restarts.
+    """
+    prior_dir = _rotate_stale_metrics(metrics_dir)
+    moves = (
+        (checkpoint_path, _PRIOR_CHECKPOINT_NAME),
+        (log_path, _PRIOR_ATTEMPT_LOG_NAME),
+    )
+    # ``is_file`` rather than ``exists``: rotation moves what the runner
+    # wrote, and the runner writes files. A directory squatting on the
+    # checkpoint path is a corrupted tree — left where it is, so the first
+    # checkpoint write raises and the problem is reported lost, rather than
+    # swept aside as if it were a previous generation's evidence.
+    if not any(src.is_file() for src, _ in moves):
+        return prior_dir
+    if prior_dir is None:
+        prior_dir = metrics_dir / f"prior-{_next_free_prior_suffix(metrics_dir)}"
+        prior_dir.mkdir(parents=True, exist_ok=True)
+    for src, name in moves:
+        if not src.is_file():
+            continue
+        dest = prior_dir / name
+        src.rename(dest)
+        logger.info("research.results.attempt_state_rotated", src=str(src), dest=str(dest))
+    return prior_dir
+
+
+#: Written into a contained attempt's ``metrics.json`` as ``final_state``,
+#: with the exception's type appended. Deliberately **not** a member of
+#: :class:`~turing.research.contracts.AttemptState`: the attempt reached no
+#: lifecycle state — it stopped existing — and a reader (or a future ``if
+#: final_state == "failed_within_cap"``) must not be able to mistake a
+#: harness crash for an outcome the experiment measured. It is prefixed
+#: rather than free prose so the whole class is greppable in one pass over a
+#: results tree.
+_CRASHED_FINAL_STATE_PREFIX = "crashed_in_harness"
+
+
+def _resolved_cap(problem: Problem, config: RoundConfig) -> Cap:
+    """The cap one attempt at ``problem`` starts under: the problem's own, else the round's.
+
+    One definition, used both to build the :class:`Attempt` and to stamp
+    ``configured_cap`` on its checkpoints, so the two cannot disagree.
+    """
+    return problem.default_cap or config.default_cap
+
+
+def _mint_attempt_id(config: RoundConfig, problem: Problem) -> str:
+    """The identity one attempt is known by, minted once per attempt.
+
+    Lifted out of :meth:`RoundRunner.run_attempt` so the *caller* can mint it
+    and keep it. That is the whole fix for the round-4 defect: the id is the
+    only field in the chain header that distinguishes two generations of the
+    same attempt, and it used to be created inside ``run_attempt`` — where it
+    died with any exception, leaving :meth:`RoundRunner._close_out_crashed_attempt`
+    nothing to compare a found chain against. Minted here and passed down, it
+    survives the exception in the caller's frame, so the close-out can always
+    answer "is this directory's chain the one *this* attempt wrote?" exactly.
+
+    The ``uuid4`` suffix is what makes it a generation discriminator rather
+    than a restatement of ``run_id``/``problem_id``: a re-drive under a
+    byte-identical ``RoundConfig`` — the built-in shape of the noise floor's
+    "fix the cause and re-run from seed 1" workflow, whose per-seed ``run_id``
+    is derived deterministically as ``<run_id>-seed-<n>`` — still gets a fresh
+    id here, where every other identity field repeats.
+    """
+    return f"{config.run_id}-{problem.id}-{uuid.uuid4().hex[:8]}"
+
+
+class WorkspaceMissingError(ContractViolationError):
+    """A resumable checkpoint's workspace is not there; the attempt was refused, not crashed.
+
+    A :class:`ContractViolationError` still — every caller that catches the
+    base class keeps catching this — but its own class so
+    :meth:`RoundRunner.run_attempts` can tell it from a crash and *skip*
+    :meth:`RoundRunner._close_out_crashed_attempt`. The
+    refusal is raised before anything is written, and the attempt on disk is
+    intact and still resumable once the workspace is restored — a close-out
+    would write ``attempts/<problem-id>/metrics.json`` with
+    ``final_state=crashed_in_harness:…`` beside a ``PAUSED`` checkpoint,
+    contradicting both the message ("nothing was written") and the state.
+    """
+
+
+class _ForeignChainError(Exception):
+    """The chain in an attempt directory is not the chain of the attempt that crashed.
+
+    Raised by :func:`_read_crashed_attempt_record` and caught separately from
+    every other failure by :meth:`RoundRunner._close_out_crashed_attempt`,
+    because the two mean opposite things: an ordinary failure there is
+    "reporting broke, the loss is still disclosed elsewhere", while this one
+    is "reporting worked and correctly declined to speak for someone else's
+    log". Collapsing them into one ``except`` would log a deliberate,
+    correct refusal under an event name an operator greps for when the
+    reporting layer is broken.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class _CrashedAttemptRecord:
+    """The terminal summary fields for a crashed attempt, read off its own log.
+
+    Every value here is re-derived from ``metrics.jsonl`` and the chain
+    sidecar rather than carried out of :meth:`RoundRunner.run_attempt` —
+    which is not merely convenient but necessary. The exception can come from
+    anywhere in that method, so its local ``attempt`` is gone and no in-memory
+    value is trustworthy at the point this is built. Deriving from the log
+    also makes the resulting ``metrics.json`` reconcile with that log by
+    construction: :func:`~turing.research.loop.integrity.reconcile_summary`
+    checks the summary against exactly these fields, so a summary built from
+    anything else would trade an ``INCOMPLETE`` verdict for a ``FAILED`` one —
+    strictly worse, because ``FAILED`` is that tool's word for dishonesty.
+    """
+
+    attempt_id: str
+    outcome: Outcome
+    steps_recorded: int
+    consumed_steps: int
+    consumed_tokens: int
+    consumed_wall_clock_seconds: float
+    cap_extensions: int
+    final_progress: float | None
+    baseline_score: float | None
+    escalation_count: int
+
+
+def _as_number(value: object) -> float | None:
+    """``value`` as a float when it is a real JSON number, else ``None``.
+
+    ``bool`` is excluded explicitly: it is an ``int`` subclass in Python, and
+    silently writing ``True`` into a numeric summary field as ``1`` would put
+    a value in ``metrics.json`` that the log does not contain.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _read_crashed_attempt_record(
+    metrics_dir: Path,
+    escalations_dir: Path,
+    *,
+    expected_attempt_id: str,
+    expected_problem_id: str,
+    expected_round_id: str,
+    expected_seed: int,
+) -> _CrashedAttemptRecord:
+    """Re-derive one crashed attempt's terminal summary from its own files.
+
+    Raises rather than returning a partial record: every caller is already
+    inside a guard that logs and moves on, and a half-derived summary written
+    over an honest log is the one outcome worse than no summary at all.
+
+    **The header must name this attempt, or nothing is derived.** The chain
+    header is the only place an attempt's identity survives on disk, and it is
+    checked field by field — ``attempt_id``, ``problem_id``, ``round_id``,
+    ``seed`` — against the attempt that actually crashed, raising
+    :class:`_ForeignChainError` when any of them disagrees or is missing. This
+    is not defensive programming; the directory genuinely can hold a *previous
+    generation's* chain at this moment. ``run_attempt`` materialises the
+    workspace (I/O against a template that can be pruned, evicted or fill a
+    disk) **before** it calls ``_rotate_stale_metrics``, so an exception in
+    that window leaves the earlier generation's trio untouched and un-rotated:
+    an intact chain with no summary — the honest "killed before its summary
+    write" shape that ``verify`` reports ``INCOMPLETE`` and that rotation
+    exists to preserve. Without this check the close-out adopted that chain,
+    wrote a summary asserting the *current* round's ``round_id`` and ``seed``
+    and an exception type that never touched it, and ``verify`` blessed the
+    result ``OK``, because every field it reconciles was re-derived from the
+    very log the summary had just been misattributed to. Two harms, either
+    sufficient: a fabricated claim about a run that did not make it, and the
+    destruction of the one honest state — ``INCOMPLETE`` — that said the
+    earlier generation was killed unfinished.
+
+    **``attempt_id`` is the field that actually decides it, and the other
+    three are kept for the message.** Round 3 left ``attempt_id`` out on the
+    grounds that it was minted inside ``run_attempt`` and died with the
+    exception; that made ``problem_id``/``round_id``/``seed`` the whole guard,
+    and those three are *equal across generations by construction* in the only
+    re-run workflow this package ships. ``NoiseFloorConfig.round_config_for``
+    derives each seed's ``run_id`` deterministically as
+    ``<run_id>-seed-<n>``, and the refusal an incomplete seed raises tells the
+    operator to "fix the cause and re-run the noise floor from seed 1" — so
+    the sanctioned recovery reuses the identical ``run_id`` *and* seed, into
+    the identical ``noise_floor_seed_dir``. A gen-2 attempt crashing in
+    ``materialise`` therefore matched all three, adopted gen 1's chain, and
+    overwrote a killed attempt's honest ``INCOMPLETE`` with
+    ``crashed_in_harness:OSError`` — flipping the directory to ``OK`` under
+    ``verify``, the pre-writeup gate. :func:`_mint_attempt_id` is now called by
+    ``run_attempts`` *before* ``run_attempt``, so the crashed attempt's own id
+    survives in the caller's frame and reaches here; its ``uuid4`` suffix
+    differs between generations even when every other field repeats. The other
+    three stay in the comparison because they cost nothing and they are what
+    makes the refusal *readable* — "round_id='gen1' (expected 'gen2')" tells
+    an operator which generation is sitting in the directory, where a bare
+    id mismatch would not.
+
+    This is a different comparison from
+    :data:`~turing.research.loop.integrity._IDENTITY_FIELDS`, which
+    ``reconcile_summary`` uses, and the two must not be conflated.
+    That one compares a ``metrics.json`` against the header *beside it* and
+    excludes ``started_at_ms`` because that field never reaches a summary —
+    a statement about which fields the two **documents** have in common. This
+    one compares the header against the **live attempt** that just crashed,
+    where the available evidence is whatever survived the exception in the
+    caller's frame. Different sides, different evidence, so neither list is
+    the other's.
+
+    ``started_at_ms`` cannot serve here, which is why the id is minted
+    upstream instead. ``run_attempt`` awaits ``materialise`` *before* it reads
+    the clock and builds the :class:`~turing.research.contracts.Attempt`, so
+    at the canonical crash point no start time has been taken at all; the
+    nearest substitute — a watermark stamped by the caller before the call and
+    compared with ``>=`` — would rest on wall-clock monotonicity *across
+    processes*, which ``SystemClock.now_ms`` (``time.time()``) does not
+    provide. An NTP step, a container clock reset, or simply a re-run inside
+    the same millisecond would make a previous generation's header look
+    current, and the guard would adopt exactly the chain it exists to refuse.
+    A ``uuid4`` needs no clock and no ordering assumption.
+
+    ``escalation_count`` is counted from the round's ``escalations/``
+    directory rather than defaulted to ``0``. The in-memory request list died
+    with the attempt, but the requests themselves were written to disk before
+    the loop suspended on each one, so the real number is recoverable — and
+    writing ``0`` for an attempt that interrupted its operator three times
+    would be a fabricated number in a file whose entire purpose is to be
+    citable. Files that do not parse, or that name a different attempt, are
+    skipped: this is a count of evidence found, not an assertion about
+    evidence missing.
+    """
+    tail = integrity.read_log_tail(metrics_dir)
+    last = tail.last_line
+    if last is None:
+        raise ContractViolationError(f"{metrics_dir} has no parseable metrics lines")
+    header = tail.header
+    if header is None:
+        raise ContractViolationError(f"{metrics_dir} has no readable chain header")
+    attempt_id = header.get("attempt_id")
+    if not isinstance(attempt_id, str) or not attempt_id:
+        raise ContractViolationError(f"{metrics_dir}'s chain header carries no attempt_id")
+
+    foreign = [
+        f"{field}={header.get(field)!r} (expected {expected!r})"
+        for field, expected in (
+            ("attempt_id", expected_attempt_id),
+            ("problem_id", expected_problem_id),
+            ("round_id", expected_round_id),
+            ("seed", expected_seed),
+        )
+        if header.get(field) != expected
+    ]
+    if foreign:
+        raise _ForeignChainError(
+            f"{metrics_dir}'s chain header names a different attempt ({attempt_id}): "
+            + "; ".join(foreign)
+        )
+
+    numbers = {
+        name: _as_number(last.get(key))
+        for name, key in (
+            ("outcome", "outcome_code"),
+            ("consumed_steps", "consumed_steps"),
+            ("consumed_tokens", "tokens_used"),
+            ("consumed_wall_clock_seconds", "wall_clock_s"),
+            ("cap_extensions", "cap_extensions"),
+        )
+    }
+    missing = sorted(name for name, value in numbers.items() if value is None)
+    if missing:
+        raise ContractViolationError(
+            f"{metrics_dir}'s last metrics line is missing or non-numeric in {missing}"
+        )
+
+    escalation_count = 0
+    for path in sorted(escalations_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        request = payload.get("request") if isinstance(payload, dict) else None
+        if isinstance(request, dict) and request.get("attempt_id") == attempt_id:
+            escalation_count += 1
+
+    return _CrashedAttemptRecord(
+        attempt_id=attempt_id,
+        # ``Outcome(...)`` rather than a cast: an outcome code the enum does
+        # not define is a corrupt log, and inventing a code for it here would
+        # put a number in metrics.json that no state maps to.
+        outcome=Outcome(int(numbers["outcome"] or 0)),
+        steps_recorded=tail.line_count,
+        consumed_steps=int(numbers["consumed_steps"] or 0),
+        consumed_tokens=int(numbers["consumed_tokens"] or 0),
+        consumed_wall_clock_seconds=numbers["consumed_wall_clock_seconds"] or 0.0,
+        cap_extensions=int(numbers["cap_extensions"] or 0),
+        final_progress=_as_number(tail.final_progress),
+        baseline_score=_as_number(tail.baseline_score),
+        escalation_count=escalation_count,
+    )
+
+
+def _read_prior_escalations(
+    escalations_dir: Path, attempt_id: str
+) -> tuple[EscalationRequest, ...]:
+    """Rebuild one attempt's already-raised requests from ``escalations/``.
+
+    The blocking half of :meth:`RoundRunner._prior_escalations`; see that
+    docstring for why ``best_result`` is dropped and why unreadable files are
+    skipped rather than reported. Ordered by ``created_at_ms`` so the
+    reconstructed list is in the order the operator saw them.
+
+    The per-file decode is
+    :func:`~turing.research.loop.trajectory.decode_escalation_request` — the
+    same one the store's resume probe applies to an ``ESCALATED``
+    checkpoint's request file — so "the store says awaiting decision" and
+    "the runner can rebuild the request" are one predicate, not two that
+    can disagree.
+    """
+    found: list[EscalationRequest] = []
+    for path in sorted(escalations_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        request = payload.get("request") if isinstance(payload, dict) else None
+        if not isinstance(request, dict) or request.get("attempt_id") != attempt_id:
+            continue
+        decoded = decode_escalation_request(payload, attempt_id=attempt_id)
+        if decoded is None:
+            logger.warning(
+                "research.attempt.escalation_unreadable",
+                path=str(path),
+                attempt_id=attempt_id,
+                detail="skipped when rebuilding a resumed attempt's escalation list",
+            )
+            continue
+        found.append(decoded)
+    return tuple(sorted(found, key=lambda r: r.created_at_ms))
+
+
+def _parent_attempts_completed(parent: RoundRecord | None) -> bool | None:
+    """Whether the parent round measured its whole corpus, as *it* recorded it.
+
+    Read off the parent's persisted ``all_attempts_completed`` gate rather
+    than recomputed, because it cannot be recomputed: the parent's losses
+    lived in a previous ``run_round`` call's ``attempt_failures``, and the
+    only surviving statement about them is the gate that call wrote. A round
+    that lost an attempt has cells reduced over a strict subset of the corpus,
+    and that is exactly as fatal to a delta when it happens on the parent side
+    of the subtraction as on this one — see :func:`compute_deltas`, which had
+    the argument in its docstring while the parent's gate was never read.
+
+    Three answers, not two. ``None`` means the record carries no such gate at
+    all — a record written before the gate existed, or one reconstructed by a
+    caller that dropped it. That is *unknown*, not *fine*, and
+    :func:`compute_deltas` refuses it: the failure this guards is a phantom
+    gain emitted with every gate green, so "silent" is the exact state it
+    cannot be allowed to resolve to. A non-``bool`` value is folded into
+    ``None`` for the same reason — a truthy string in a gate map is not a
+    measurement of anything.
+
+    ``parent is None`` answers ``True`` rather than ``None``: there is no
+    parent to be short a problem, and every consumer already refuses a
+    parentless round through ``REFUSED_NO_PARENT``. Answering ``None`` there
+    would relabel round 0's honest "no baseline yet" as a suspect baseline.
+    """
+    if parent is None:
+        return True
+    value = parent.gates.get("all_attempts_completed")
+    return value if isinstance(value, bool) else None
+
+
+async def find_finished_round(
+    trajectory: TrajectoryStore, config: RoundConfig, *, resume: bool
+) -> RoundOutcome | None:
+    """The outcome the first process wrote, if this round already finished *this way*.
+
+    Module-level rather than a method so the driver can run the same
+    check in its preflight — a dry run must refuse everything the real
+    run would refuse before its first write, and a real run must refuse
+    a finished-differently round *before* it re-drives the noise floor
+    under the new configuration, not after.
+
+    ``config`` must be the **bound** config (``eval_set_hash`` derived
+    from the corpus in hand, never empty), because the comparison below
+    is against it. ``None`` means "not in ``trajectory.json``; run it".
+    Otherwise the round is in the append-only file, and the rule is:
+
+    * The row's ``run_id`` is not this run's → refuse. The index is
+      taken by a different round; a re-measurement gets a new index.
+    * The row names this ``run_id`` but ``round-NN/round.json`` is
+      missing → refuse, as *finished but record lost*: a kill between
+      ``append_round`` and ``write_round_record`` leaves exactly this.
+      The row cannot rebuild the record — it carries the cell means,
+      deltas, cost, gates and verdict, but not the per-problem scores
+      (``round.json``'s ``problems`` list) nor ``created_at_ms`` — so the
+      message says what is missing and where it can be restored from.
+      The remedy is *not* a new round index: this round did finish.
+    * ``round.json`` names a different ``run_id`` than the row → refuse;
+      a directory that disagrees with the file it mirrors needs an
+      operator, not a rewrite.
+    * Same ``run_id`` in both, but the record's ``eval_set_hash``,
+      ``engine`` or ``config_digest`` — or the row's ``seed`` — differs
+      from this config's → refuse, naming every coordinate that differs. A finished round is
+      returned as this run's success **only for the identical
+      measurement**; a different corpus, scaffold, cap or criterion under
+      the same name is a different measurement and wants a new loop slug
+      or round index.
+    * All three equal, but ``resume`` is off → refuse. ``--no-resume``
+      means "re-measure", and a finished index cannot be re-measured
+      into: the trajectory is append-only.
+    * All three equal and ``resume`` on → the same measurement, finished;
+      decode the record and return it without writing anything. Logged
+      as ``research.round.already_finished`` so a restart log says why no
+      attempt ran.
+
+    Every refusal happens before any write.
+    """
+    document = await trajectory.load_trajectory()
+    row = next(
+        (r for r in document.get("rounds", []) if r.get("round") == config.round_index),
+        None,
+    )
+    if row is None:
+        return None
+    raw = await trajectory.load_round_record(config.round_index)
+    record_path = trajectory.round_dir(config.round_index) / "round.json"
+    row_run_id = row.get("run_id")
+    record_run_id = None if raw is None else raw.get("run_id")
+    if row_run_id != config.run_id:
+        raise ContractViolationError(
+            f"round {config.round_index} is already in {trajectory.trajectory_path} "
+            f"under run_id {row_run_id!r}; this run is {config.run_id!r}. The trajectory "
+            "is append-only — a re-measurement gets a new round index — and nothing was "
+            "written"
+        )
+    if raw is None:
+        raise ContractViolationError(
+            f"round {config.round_index} finished under this run_id ({config.run_id!r}) "
+            f"— its row is in {trajectory.trajectory_path} — but {record_path} is "
+            "missing: the process was killed between appending the row and writing "
+            "the record. The row cannot rebuild it (it carries cell means, deltas, cost "
+            "and verdict, not the per-problem scores or created_at_ms), so this run "
+            "refuses rather than re-measure a finished round or fabricate its record. "
+            f"Restore {record_path} from a backup, or rebuild it from the per-attempt "
+            f"checkpoints and summaries under {trajectory.round_dir(config.round_index)}; "
+            "a new round index is not the remedy — this round did finish. Nothing was "
+            "written"
+        )
+    if record_run_id != config.run_id:
+        raise ContractViolationError(
+            f"round {config.round_index} is in {trajectory.trajectory_path} under "
+            f"this run_id ({config.run_id!r}) but {record_path} names {record_run_id!r}; "
+            "the round directory disagrees with the trajectory it is supposed to mirror "
+            "and needs an operator, not a rewrite. Nothing was written"
+        )
+    ours: dict[str, object] = {
+        "eval_set_hash": config.eval_set_hash,
+        "engine": {
+            "backend": config.engine.backend,
+            "orchestrator_model": config.engine.orchestrator_model,
+            "substep_model": config.engine.substep_model,
+            "scaffold_git_sha": config.engine.scaffold_git_sha,
+        },
+        "config_digest": config.config_digest(),
+        # The record does not carry the seed (it is not a RoundRecord field);
+        # the row does. A round measured under another seed is another
+        # measurement, whatever the digest says.
+        "seed": config.seed,
+    }
+    theirs: dict[str, object] = {
+        "eval_set_hash": raw.get("eval_set_hash"),
+        "engine": raw.get("engine"),
+        "config_digest": raw.get("config_digest", ""),
+        "seed": row.get("seed"),
+    }
+    differing = [name for name in ours if ours[name] != theirs[name]]
+    if differing:
+        listed = "; ".join(
+            f"{name}: recorded {theirs[name]!r}, this run {ours[name]!r}" for name in differing
+        )
+        raise ContractViolationError(
+            f"round {config.round_index} finished under run_id {config.run_id!r} but was "
+            f"measured differently — {listed}. A finished round is returned as this "
+            "run's result only for the identical measurement; this is a different "
+            "measurement — use a new loop slug/round index. Nothing was written"
+        )
+    if not resume:
+        raise ContractViolationError(
+            f"round {config.round_index} finished under run_id {config.run_id!r} and "
+            "resume is off: the round is finished; --no-resume cannot re-measure into a "
+            "finished index (the trajectory is append-only). Re-run with resume on to "
+            "return the finished record, or use a new loop slug/round index to "
+            "re-measure. Nothing was written"
+        )
+    try:
+        record = decode_round_record(raw)
+        scored = decode_scored_problems(raw)
+        assessments = decode_assessments(raw)
+    except (KeyError, TypeError, ValueError, ContractViolationError) as exc:
+        raise ContractViolationError(
+            f"round {config.round_index} is already in {trajectory.trajectory_path} "
+            f"under this run_id but {record_path} does not decode "
+            f"({type(exc).__name__}: {exc}); nothing was written"
+        ) from exc
+    logger.info(
+        "research.round.already_finished",
+        round_index=config.round_index,
+        run_id=config.run_id,
+        verdict=record.verdict,
+        detail=(
+            "this round is already in trajectory.json under this run_id, measured under "
+            "this eval_set_hash, engine and config_digest; its record is returned as "
+            "the first process wrote it and no attempt is probed, driven or written"
+        ),
+    )
+    return RoundOutcome(
+        record=record,
+        attempts=(),
+        scored=scored,
+        assessments=assessments,
+        trajectory_row=row,
+        failures=(),
+        already_finished=True,
+    )
+
+
 class RoundRunner:
     """Runs one round of the corpus. Unattended except for escalations."""
 
@@ -275,11 +1258,59 @@ class RoundRunner:
         self._escalations = escalations
         self._clock = clock or SystemClock()
         self._operator_wait_seconds = 0.0
+        self._attempt_failures: tuple[AttemptFailure, ...] = ()
+        self._skipped_problems: tuple[str, ...] = ()
+        self._resumed_problems: tuple[str, ...] = ()
 
     @property
     def clock(self) -> Clock:
         """The injected clock, so callers timestamp against the same one."""
         return self._clock
+
+    @property
+    def trajectory(self) -> TrajectoryStore:
+        """The store this runner writes through — and holds the driver lock through.
+
+        Exposed so ``NoiseFloorRunner`` can refuse a *second* store object
+        over the same tree: the lock is re-entrant per store object, and a
+        second one reads the first's hold as another driver's.
+        """
+        return self._trajectory
+
+    @property
+    def skipped_problems(self) -> tuple[str, ...]:
+        """Problems the last :meth:`run_attempts` reused instead of re-driving.
+
+        Reset at the head of every call, the same per-invocation lifetime
+        :attr:`attempt_failures` has. These problems cost this process no
+        compute at all: their outcome came off disk. See
+        :meth:`~turing.research.loop.trajectory.TrajectoryStore.load_stored_attempt`
+        for what "complete" means.
+        """
+        return self._skipped_problems
+
+    @property
+    def resumed_problems(self) -> tuple[str, ...]:
+        """Problems the last :meth:`run_attempts` continued from a checkpoint.
+
+        A resumed attempt still spends compute — it just spends the
+        *remainder* of the attempt rather than the whole of it, which is the
+        guarantee ``Attempt``'s checkpoint model exists to provide.
+        """
+        return self._resumed_problems
+
+    @property
+    def attempt_failures(self) -> tuple[AttemptFailure, ...]:
+        """Problems lost to a raising attempt during the last :meth:`run_attempts`.
+
+        Reset at the head of every :meth:`run_attempts` call, the same
+        per-invocation lifetime ``_operator_wait_seconds`` already has, so a
+        noise-floor runner's seed-by-seed calls each report their own losses
+        instead of accumulating them. Returned rather than raised because the
+        round that lost an attempt still has real results to record for the
+        rest of the corpus — see :meth:`run_attempts`.
+        """
+        return self._attempt_failures
 
     # -- one attempt -------------------------------------------------------- #
 
@@ -289,31 +1320,189 @@ class RoundRunner:
         config: RoundConfig,
         *,
         output_dir: Path,
+        attempt_id: str | None = None,
+        resume: Attempt | None = None,
+        prior_steps: Sequence[StepLog] = (),
     ) -> AttemptOutcome:
-        """Work one problem until it passes, the cap trips, or it is abandoned."""
-        attempt_id = f"{config.run_id}-{problem.id}-{uuid.uuid4().hex[:8]}"
-        workspace = await self._workspaces.materialise(problem, attempt_id=attempt_id)
-        now = self._clock.now_ms()
-        attempt = Attempt(
-            attempt_id=attempt_id,
-            problem_id=problem.id,
-            round_id=config.run_id,
-            seed=config.seed,
-            workspace_path=workspace,
-            cap=problem.default_cap or config.default_cap,
-            state=AttemptState.PENDING,
-            started_at_ms=now,
-            updated_at_ms=now,
-        )
-        attempt = attempt.resume(now_ms=now)
+        """Work one problem until it passes, the cap trips, or it is abandoned.
 
-        steps: list[StepLog] = []
+        ``attempt_id`` is minted here when the caller does not supply one, so a
+        direct call still works. :meth:`run_attempts` *does* supply one, and
+        must: the id is the only evidence that distinguishes two generations of
+        the same attempt, and minting it inside this method meant it died with
+        any exception raised out of it — see :func:`_mint_attempt_id` and
+        :meth:`_close_out_crashed_attempt`.
+
+        ``resume`` is a checkpoint loaded off disk
+        (:meth:`~turing.research.loop.trajectory.TrajectoryStore.load_stored_attempt`),
+        and it changes four things:
+
+        * **The workspace is not re-materialised.** The partly-solved
+          directory *is* the work; ``CopyTreeWorkspaceProvider`` would delete
+          and re-copy it, which would make "resume" cost exactly as much as a
+          restart while pretending otherwise. It therefore has to *be there*:
+          a checkpoint whose ``workspace_path`` no longer exists refuses with
+          a :class:`WorkspaceMissingError` before anything is written, rather
+          than driving a solver against — and running a verifier on — a
+          directory that is not there and entering that score in a cell. The
+          refusal names the path and the two remedies (restore the workspace,
+          or delete the checkpoint to drive the attempt fresh, which resets
+          its consumption). Inside :meth:`run_attempts` it is contained like
+          any other raise — the problem is reported lost, not scored — except
+          that no crashed summary is written for it: the attempt on disk is
+          intact and resumable, and "nothing was written" has to stay true.
+        * **Identity, consumption and best result carry over**, so the cap
+          keeps counting from where the interruption found it and a resumed
+          attempt cannot buy itself a fresh budget.
+        * **The step rows carry over.** ``prior_steps`` are the rows the
+          previous process wrote to ``attempts/<problem-id>.json`` — that log
+          is rewritten after every step precisely so it survives a kill —
+          and this process appends to them, so the finished log's rows equal
+          ``consumed.steps`` rather than only this generation's share.
+        * **An ``ESCALATED`` checkpoint re-enters the wait** on its own open
+          request instead of re-driving. ``ESCALATED`` is neither terminal nor
+          resumable and only an operator moves it; raising a second request
+          for one event would inflate driving function #4.
+
+        Two known costs of resuming, stated rather than hidden. The metrics
+        chain restarts: ``_rotate_stale_metrics`` moves the pre-interruption
+        trio and plots into ``prior-N/`` (they stay independently verifiable
+        there) and this generation opens a fresh chain, so no single
+        ``metrics.jsonl`` spans the interruption — the attempt log is the one
+        artifact that does span it, and it is the one loop 2 samples (with
+        one caveat: the per-step order is checkpoint, log, metrics line, so
+        a kill between the checkpoint write and the log write leaves the log
+        one row behind the checkpoint, and the finished log stays one row
+        short of ``consumed.steps`` for that step). And ``baseline_score`` in
+        the resumed summary is the first score *this* process observed, not
+        the attempt's original baseline — the earlier one is in the rotated
+        directory.
+
+        A *fresh* drive into a used slot (``resume is None`` with a previous
+        generation on disk) is different: :func:`_rotate_prior_generation`
+        moves the checkpoint and log into ``prior-N/`` along with the chain,
+        so the earlier measurement is preserved rather than overwritten.
+
+        :meth:`run_attempts`, not this method, consults the store. A direct
+        call re-drives, which is what every caller that passes an explicit
+        ``output_dir`` twice already relies on.
+        """
+        criterion = config.criterion_for(problem.id)
+        steps: list[StepLog] = list(prior_steps) if resume is not None else []
         escalations: list[EscalationRequest] = []
         decisions: list[EscalationDecision] = []
-        best: VerificationResult | None = None
-        criterion = config.criterion_for(problem.id)
 
-        while True:
+        if resume is None:
+            attempt_id = attempt_id or _mint_attempt_id(config, problem)
+            workspace = await self._workspaces.materialise(problem, attempt_id=attempt_id)
+            now = self._clock.now_ms()
+            attempt = Attempt(
+                attempt_id=attempt_id,
+                problem_id=problem.id,
+                round_id=config.run_id,
+                seed=config.seed,
+                workspace_path=workspace,
+                cap=_resolved_cap(problem, config),
+                state=AttemptState.PENDING,
+                started_at_ms=now,
+                updated_at_ms=now,
+            )
+            attempt = attempt.resume(now_ms=now)
+            best: VerificationResult | None = None
+        else:
+            if not await asyncio.to_thread(resume.workspace_path.is_dir):
+                raise WorkspaceMissingError(
+                    f"attempt {resume.attempt_id!r} for {problem.id!r} resumes from a "
+                    f"checkpoint whose workspace {resume.workspace_path} no longer exists; "
+                    "driving on would run the solver and the verifier against a directory "
+                    "that is not there and score the result. Either restore the workspace "
+                    "at that path, or delete the checkpoint "
+                    f"{self._trajectory.attempt_checkpoint_path(problem.id, output_dir=output_dir)}"
+                    " so the attempt is driven fresh (which resets its consumption). "
+                    "Nothing was written: the checkpoint, log and chain are as the "
+                    "interrupted process left them"
+                )
+            attempt_id = resume.attempt_id
+            attempt = resume
+            best = resume.result
+            escalations.extend(
+                await self._prior_escalations(output_dir, attempt_id=resume.attempt_id)
+            )
+
+        # -- reporting: the seam that makes this attempt visible while it
+        # runs, not only after trajectory.json is appended to at round end.
+        # See turing.research.loop.results for the file contract.
+        metrics_dir = output_dir / "attempts" / problem.id
+        if resume is None:
+            # A fresh generation: whatever a previous one left — chain, plots,
+            # checkpoint, log — moves aside together, and this one starts
+            # beside it rather than over it.
+            _rotate_prior_generation(
+                metrics_dir,
+                checkpoint_path=self._trajectory.attempt_checkpoint_path(
+                    problem.id, output_dir=output_dir
+                ),
+                log_path=output_dir / "attempts" / f"{problem.id}.json",
+            )
+        else:
+            # A resumed one keeps its checkpoint and log — they are what it
+            # resumes from — and only the chain restarts.
+            _rotate_stale_metrics(metrics_dir)
+        metrics_writer = MetricsWriter(
+            metrics_dir / "metrics.jsonl",
+            header={
+                "attempt_id": attempt.attempt_id,
+                "problem_id": problem.id,
+                "round_id": attempt.round_id,
+                "seed": attempt.seed,
+                "score_scale": problem.verifier.score_scale,
+                "started_at_ms": attempt.started_at_ms,
+            },
+            clock=self._clock,
+        )
+        progress_tracker = ProgressTracker(
+            target=None if criterion is None else criterion.min_score
+        )
+        score_series = problem.verifier.score_scale
+        baseline_score: float | None = None
+        final_progress: float | None = None
+
+        # Two things a resumed attempt does before the loop, in this order.
+        # An ESCALATED checkpoint has to clear its open request *first* — the
+        # operator's verdict is what decides whether there is a loop to enter
+        # at all, and ABANDON means there is not. Everything else takes the
+        # ordinary resume transition back to RUNNING.
+        finished_on_resume = False
+        if resume is not None:
+            if resume.state is AttemptState.ESCALATED:
+                attempt, _ = await self._reopen_escalation(
+                    problem=problem,
+                    attempt=attempt,
+                    best=best,
+                    config=config,
+                    output_dir=output_dir,
+                    escalations=escalations,
+                    decisions=decisions,
+                )
+                finished_on_resume = attempt.is_terminal
+            else:
+                attempt = attempt.resume(now_ms=self._clock.now_ms())
+            logger.info(
+                "research.attempt.resumed_from_checkpoint",
+                problem_id=problem.id,
+                attempt_id=attempt.attempt_id,
+                from_state=resume.state.value,
+                state=attempt.state.value,
+                step_index=attempt.step_index,
+                consumed_steps=attempt.consumed.steps,
+            )
+
+        # ``while not finished_on_resume`` rather than ``while True``: the flag
+        # never changes inside the body, so this is "``while True`` unless the
+        # operator already abandoned the attempt on the reopened escalation".
+        # Guarding with a nested ``if`` instead would re-indent the whole loop
+        # for no gain.
+        while not finished_on_resume:
             attempt, cap_action = await self._enforce_cap(
                 problem=problem,
                 attempt=attempt,
@@ -430,7 +1619,50 @@ class RoundRunner:
                     verifier_error=verifier_error,
                 )
             )
-            await self._trajectory.write_attempt_checkpoint(attempt, output_dir=output_dir)
+            await self._checkpoint(attempt, config, output_dir, problem=problem)
+            # The log is rewritten after every step, not only at the end, so
+            # a kill between here and the terminal write leaves the rows this
+            # process took on disk for the next process to carry forward
+            # (``prior_steps``). Whole-file rewrite rather than append: the
+            # log is one JSON document, and its size is bounded by the step
+            # cap.
+            await self._write_attempt_log(
+                problem,
+                attempt,
+                best=best,
+                steps=steps,
+                escalations=escalations,
+                output_dir=output_dir,
+            )
+
+            observed = None if result is None else progress_tracker.observe(result.score)
+            if observed is not None:
+                final_progress = observed
+            if baseline_score is None:
+                baseline_score = progress_tracker.baseline
+            await metrics_writer.append(
+                MetricsLine(
+                    step=attempt.step_index,
+                    total_steps=attempt.cap.max_steps,
+                    ts=now / 1000.0,
+                    outcome=Outcome.from_attempt_state(attempt.state),
+                    correctness_pass=None if result is None else result.passed_correctness,
+                    tokens_used=attempt.consumed.tokens,
+                    tokens_cap=attempt.cap.max_tokens,
+                    steps_cap=attempt.cap.max_steps,
+                    consumed_steps=attempt.consumed.steps,
+                    wall_clock_s=attempt.consumed.wall_clock_seconds,
+                    wall_clock_cap_s=attempt.cap.max_wall_clock_seconds,
+                    cap_extensions=attempt.cap.extension_count,
+                    step_wall_clock_s=step_elapsed,
+                    verify_wall_clock_s=verify_elapsed,
+                    step_tokens=step.tokens,
+                    made_progress=step.made_progress,
+                    progress=observed,
+                    metrics={} if result is None else {score_series: result.score},
+                    diagnostics=await read_agent_diagnostics(attempt.workspace_path),
+                )
+            )
 
             if verifier_error is not None:
                 attempt, _ = await self._escalate_or_fail(
@@ -510,7 +1742,185 @@ class RoundRunner:
                 if attempt.is_terminal:
                     break
 
-        await self._trajectory.write_attempt_checkpoint(attempt, output_dir=output_dir)
+        await self._checkpoint(attempt, config, output_dir, problem=problem)
+
+        # Edit D, terminal line (spec's "Terminal-line rule", added
+        # 2026-08-14). Every line appended above was written from *inside*
+        # the loop, so each one necessarily carries the attempt's
+        # pre-termination state — nothing recorded the state the attempt
+        # actually ended in. metrics.json's outcome is the terminal Outcome,
+        # so without this the log's last line and the summary disagree on
+        # every honest run and reconcile_summary reports a false mismatch
+        # (this is the bug the gate caught). Resource fields are read from
+        # ``attempt``/``best`` directly rather than copied from the last
+        # in-loop line, so this still reconciles even on the
+        # solver-exception termination path, where no metrics line is
+        # written for the charge that ended the attempt. Deliberately *not*
+        # wrapped in the try/except below: it is a chain-extending write
+        # with the same integrity contract as the per-step appends above
+        # (also unwrapped) — a swallowed failure here would silently break
+        # the hash chain on the file's own last line.
+        #
+        # What that costs, stated exactly (the earlier claim here — "raising
+        # here cannot turn a solved attempt into a lost one" — was too
+        # strong): the workspace and the checkpoint written just above are
+        # durable, so the *work* survives a raise. But this append precedes
+        # the terminal write_attempt_log and the AttemptOutcome return below,
+        # so a raise does cost this attempt its *finished* log (the per-step
+        # log on disk still carries a non-terminal final_state, which is what
+        # keeps the resume probe from calling it complete) and its place in
+        # the round's cells. What it can no longer do is take the
+        # rest of the round with it: run_attempts contains a raising attempt
+        # to that attempt and reports the loss through the round's
+        # all_attempts_completed gate. See its docstring.
+        await metrics_writer.append(
+            MetricsLine(
+                step=attempt.step_index,
+                total_steps=attempt.cap.max_steps,
+                ts=self._clock.now_ms() / 1000.0,
+                outcome=Outcome.from_attempt_state(attempt.state),
+                correctness_pass=None if best is None else best.passed_correctness,
+                tokens_used=attempt.consumed.tokens,
+                tokens_cap=attempt.cap.max_tokens,
+                steps_cap=attempt.cap.max_steps,
+                consumed_steps=attempt.consumed.steps,
+                wall_clock_s=attempt.consumed.wall_clock_seconds,
+                wall_clock_cap_s=attempt.cap.max_wall_clock_seconds,
+                cap_extensions=attempt.cap.extension_count,
+                step_wall_clock_s=0.0,
+                verify_wall_clock_s=0.0,
+                step_tokens=0,
+                made_progress=None,
+                progress=final_progress,
+                metrics={},
+                diagnostics={},
+            )
+        )
+
+        path = await self._write_attempt_log(
+            problem,
+            attempt,
+            best=best,
+            steps=steps,
+            escalations=escalations,
+            output_dir=output_dir,
+        )
+
+        # Reporting failures must not fail an attempt that otherwise solved
+        # its problem — this is the one sanctioned swallowed error in this
+        # module. The metrics.jsonl append above is *not* inside this guard:
+        # a chain-breaking write failure there is a contract bug that must
+        # surface immediately, not an observability hiccup.
+        try:
+            await write_attempt_summary(
+                metrics_dir,
+                problem_id=problem.id,
+                attempt_id=attempt.attempt_id,
+                round_id=attempt.round_id,
+                seed=attempt.seed,
+                problem_type=problem.problem_type.value,
+                split=problem.split.value,
+                score_scale=problem.verifier.score_scale,
+                outcome=Outcome.from_attempt_state(attempt.state),
+                final_state=attempt.state.value,
+                best_score=None if best is None else best.score,
+                best_passed_correctness=None if best is None else best.passed_correctness,
+                baseline_score=baseline_score,
+                target_score=None if criterion is None else criterion.min_score,
+                final_progress=final_progress,
+                consumed_steps=attempt.consumed.steps,
+                consumed_tokens=attempt.consumed.tokens,
+                consumed_wall_clock_seconds=attempt.consumed.wall_clock_seconds,
+                cap_extensions=attempt.cap.extension_count,
+                escalation_count=len(escalations),
+                # Lines, not steps: the terminal line above makes the two
+                # legitimately differ by one (spec's terminal-line rule).
+                steps_recorded=metrics_writer.line_count,
+            )
+            points = await read_metrics_points(metrics_writer.path)
+            await render_attempt_plots(
+                metrics_dir,
+                points,
+                # Corrected 2026-08-14: was the literal "score", which the
+                # emitter never writes (the raw series is named after
+                # score_series, bound above from problem.verifier.score_scale).
+                # That mismatch skipped progress.svg on every attempt. See
+                # AC23 and the spec's per-file note on this call site.
+                forcing_series=score_series,
+                # ``usable_target`` rather than the raw ``min_score``: with a
+                # non-finite target matplotlib draws no reference line but
+                # still adds "target" to the legend, so the plot would claim a
+                # bar it never drew while metrics.json (which normalises the
+                # same value) says ``target_score: null``. One predicate, so
+                # the tracker, the summary and the plot cannot disagree.
+                target=usable_target(None if criterion is None else criterion.min_score),
+            )
+        except Exception:
+            logger.exception(
+                "research.results.emit_failed",
+                problem_id=problem.id,
+                attempt_id=attempt.attempt_id,
+                # The directory whose files did not land. ``verify`` reports a
+                # missing summary by path, and without this the ERROR that
+                # explains why cannot be matched to it in an overnight log.
+                directory=str(metrics_dir),
+            )
+
+        return AttemptOutcome(
+            problem=problem,
+            attempt=attempt,
+            best_result=best,
+            steps=tuple(steps),
+            escalations=tuple(escalations),
+            decisions=tuple(decisions),
+            attempt_log_path=path,
+        )
+
+    def _finish(
+        self,
+        attempt: Attempt,
+        state: AttemptState,
+        best: VerificationResult | None,
+    ) -> Attempt:
+        return attempt.evolve(now_ms=self._clock.now_ms(), state=state, result=best)
+
+    async def _checkpoint(
+        self, attempt: Attempt, config: RoundConfig, output_dir: Path, *, problem: Problem
+    ) -> Path:
+        """Write the attempt's checkpoint stamped with this run's full identity.
+
+        One place, so every checkpoint carries the same ``eval_set_hash``,
+        ``config_digest`` and ``configured_cap`` the resume probe will compare
+        against; a call site that forgot one would write a checkpoint no
+        restart could reuse. ``configured_cap`` is the cap the attempt was
+        *started* under (:func:`_resolved_cap`), not ``attempt.cap``, which an
+        operator extension raises.
+        """
+        return await self._trajectory.write_attempt_checkpoint(
+            attempt,
+            output_dir=output_dir,
+            eval_set_hash=config.eval_set_hash,
+            config_digest=config.config_digest(),
+            configured_cap=_resolved_cap(problem, config),
+        )
+
+    async def _write_attempt_log(
+        self,
+        problem: Problem,
+        attempt: Attempt,
+        *,
+        best: VerificationResult | None,
+        steps: Sequence[StepLog],
+        escalations: Sequence[EscalationRequest],
+        output_dir: Path,
+    ) -> Path:
+        """Write ``attempts/<problem-id>.json`` as the attempt stands right now.
+
+        Called after every step and once more at the end, so the log on disk
+        is always the whole of what this attempt has done — the property a
+        resumed attempt's ``prior_steps`` relies on. ``final_state`` is the
+        attempt's *current* state, terminal only on the last write.
+        """
         log = AttemptLog(
             problem_id=problem.id,
             attempt_id=attempt.attempt_id,
@@ -530,24 +1940,7 @@ class RoundRunner:
             escalation_ids=tuple(e.request_id for e in escalations),
             workspace_path=str(attempt.workspace_path),
         )
-        path = await self._trajectory.write_attempt_log(log, output_dir=output_dir)
-        return AttemptOutcome(
-            problem=problem,
-            attempt=attempt,
-            best_result=best,
-            steps=tuple(steps),
-            escalations=tuple(escalations),
-            decisions=tuple(decisions),
-            attempt_log_path=path,
-        )
-
-    def _finish(
-        self,
-        attempt: Attempt,
-        state: AttemptState,
-        best: VerificationResult | None,
-    ) -> Attempt:
-        return attempt.evolve(now_ms=self._clock.now_ms(), state=state, result=best)
+        return await self._trajectory.write_attempt_log(log, output_dir=output_dir)
 
     async def _enforce_cap(
         self,
@@ -717,7 +2110,7 @@ class RoundRunner:
             escalation_id=request.request_id,
             result=best,
         )
-        await self._trajectory.write_attempt_checkpoint(attempt, output_dir=output_dir)
+        await self._checkpoint(attempt, config, output_dir, problem=problem)
         await self._trajectory.write_escalation(request, None, output_dir=output_dir)
         logger.warning(
             "research.attempt.escalated",
@@ -726,10 +2119,49 @@ class RoundRunner:
             request_id=request.request_id,
             reason=reason.value,
         )
+        return await self._resolve_escalation(
+            problem=problem,
+            attempt=attempt,
+            request=request,
+            best=best,
+            config=config,
+            output_dir=output_dir,
+            decisions=decisions,
+        )
 
+    async def _resolve_escalation(
+        self,
+        *,
+        problem: Problem,
+        attempt: Attempt,
+        request: EscalationRequest,
+        best: VerificationResult | None,
+        config: RoundConfig,
+        output_dir: Path,
+        decisions: list[EscalationDecision],
+        reopened: bool = False,
+    ) -> tuple[Attempt, EscalationDecision | None]:
+        """Block on the operator's answer to an already-published request.
+
+        Split out of :meth:`_escalate` so :meth:`_reopen_escalation` can reach
+        it. A restart that finds an ``ESCALATED`` checkpoint must do exactly
+        this half — wait, then apply the verdict — and must *not* do the other
+        half, which would mint a second ``request_id`` for one event and count
+        it twice against driving function #4.
+
+        ``reopened`` is forwarded to the channel so it knows the operator was
+        already paged for this request by the process that raised it: the
+        channel polls for the answer first and keeps its reminder cadence
+        rather than pushing again on every restart. Passed only when true, so
+        a channel written against the one-argument protocol still works on
+        the ordinary path.
+        """
         waited_from = self._clock.monotonic()
         try:
-            decision = await self._escalations.request_decision(request)
+            if reopened:
+                decision = await self._escalations.request_decision(request, reopened=True)
+            else:
+                decision = await self._escalations.request_decision(request)
         finally:
             self._operator_wait_seconds += max(0.0, self._clock.monotonic() - waited_from)
         if decision.request_id != request.request_id:
@@ -749,7 +2181,7 @@ class RoundRunner:
                 request_id=request.request_id,
             )
             attempt = attempt.evolve(now_ms=now, state=AttemptState.ABANDONED, result=best)
-            await self._trajectory.write_attempt_checkpoint(attempt, output_dir=output_dir)
+            await self._checkpoint(attempt, config, output_dir, problem=problem)
             return attempt, decision
 
         # CONTINUE leaves the cap alone; EXTEND_CAP grows it via the
@@ -761,7 +2193,7 @@ class RoundRunner:
             assert decision.cap_extension is not None  # guaranteed by EscalationDecision
             attempt = attempt.apply_cap_extension(decision.cap_extension, now_ms=now)
         attempt = attempt.evolve(now_ms=now, state=AttemptState.RUNNING, escalation_id=None)
-        await self._trajectory.write_attempt_checkpoint(attempt, output_dir=output_dir)
+        await self._checkpoint(attempt, config, output_dir, problem=problem)
         logger.info(
             "research.attempt.resumed",
             problem_id=problem.id,
@@ -772,6 +2204,145 @@ class RoundRunner:
         )
         return attempt, decision
 
+    # -- resume ------------------------------------------------------------- #
+
+    async def _reopen_escalation(
+        self,
+        *,
+        problem: Problem,
+        attempt: Attempt,
+        best: VerificationResult | None,
+        config: RoundConfig,
+        output_dir: Path,
+        escalations: list[EscalationRequest],
+        decisions: list[EscalationDecision],
+    ) -> tuple[Attempt, EscalationDecision | None]:
+        """Re-enter the wait on the request an ``ESCALATED`` checkpoint names.
+
+        The request was published and pushed by a previous process; only the
+        *waiting* died with it. Re-driving the attempt instead would throw
+        away the work **and** raise a second request for one event, which is
+        the worse half: escalations per round is driving function #4, the
+        number the self-improvement claim lives or dies on, and it must count
+        operator interruptions, not process restarts.
+
+        The reconstructed request takes its identity, ``cap``, ``consumed``
+        and ``best_result`` from the checkpoint rather than from the request
+        file — the checkpoint is the authority on all of those, and its
+        ``result`` round-trips in full — and its ``reason``, ``summary`` and
+        ``created_at_ms`` from the file, which is the only place they survive.
+        The ``request_id`` is unchanged, so the decision the operator drops
+        (or already dropped) answers it.
+        """
+        request_id = attempt.escalation_id
+        if not request_id:
+            raise ContractViolationError(
+                f"attempt {attempt.attempt_id!r} is ESCALATED with no escalation_id; there "
+                "is no open request to re-enter and no verdict that could move it"
+            )
+        stored = await self._prior_escalations(output_dir, attempt_id=attempt.attempt_id)
+        open_request = next((r for r in stored if r.request_id == request_id), None)
+        if open_request is None:
+            raise ContractViolationError(
+                f"attempt {attempt.attempt_id!r} is suspended on request {request_id!r} but "
+                f"no readable request file for it is in {output_dir / 'escalations'}; the "
+                "attempt cannot be resumed without the question it is waiting on"
+            )
+        # ``_prior_escalations`` already put every request for this attempt in
+        # the list, the open one included, so this rebinds cap/consumed/best
+        # from the checkpoint rather than adding a duplicate.
+        request = replace(
+            open_request,
+            cap=attempt.cap,
+            consumed=attempt.consumed,
+            best_result=best,
+        )
+        escalations[:] = [request if r.request_id == request_id else r for r in escalations]
+        logger.warning(
+            "research.attempt.escalation_reopened",
+            problem_id=problem.id,
+            attempt_id=attempt.attempt_id,
+            request_id=request_id,
+            reason=request.reason.value,
+            detail=(
+                "a previous process suspended here and died waiting; the same request is "
+                "re-entered rather than re-raised, so it counts once toward human-gate load"
+            ),
+        )
+        return await self._resolve_escalation(
+            problem=problem,
+            attempt=attempt,
+            request=request,
+            best=best,
+            config=config,
+            output_dir=output_dir,
+            decisions=decisions,
+            reopened=True,
+        )
+
+    async def _prior_escalations(
+        self, output_dir: Path, *, attempt_id: str
+    ) -> tuple[EscalationRequest, ...]:
+        """Every request this attempt already raised, read back off disk.
+
+        A resumed attempt's in-memory request list died with the process that
+        raised them, and ``AttemptOutcome.escalation_count`` is what
+        ``run_round`` sums into the round's human-gate load. Rebuilding the
+        list from ``escalations/`` restores that count instead of reporting a
+        resumed attempt as having interrupted nobody — the same
+        count-the-evidence reasoning
+        :func:`_read_crashed_attempt_record` applies to a crashed attempt.
+
+        ``best_result`` is dropped rather than decoded: the operator-facing
+        encoding keeps only four of a
+        :class:`~turing.research.contracts.VerificationResult`'s fields, and a
+        half-built result would be a fabricated measurement in a record whose
+        only remaining job is to be counted. Files that do not parse, or that
+        name a different attempt, are skipped for the same reason — this is a
+        count of evidence found, never an assertion about evidence missing.
+        """
+        return await asyncio.to_thread(
+            _read_prior_escalations, output_dir / "escalations", attempt_id
+        )
+
+    async def _reuse_stored_outcome(
+        self, problem: Problem, stored: StoredAttempt, *, output_dir: Path
+    ) -> AttemptOutcome:
+        """The :class:`AttemptOutcome` a finished, on-disk attempt already earned.
+
+        Every field is read back from the artifacts that attempt wrote;
+        nothing here is synthesised. ``best_result`` is the checkpoint's
+        ``result`` — the runner writes ``result=best`` onto every checkpoint,
+        so the terminal one carries exactly what :meth:`run_attempt` would
+        have returned — and a ``None`` there is the honest "this attempt
+        produced no usable verification" that ``ScoredProblem.from_result``
+        floors. The escalations come from the request files themselves rather
+        than from the ids in the attempt log, because a count is only worth
+        having if each entry is a record that exists.
+
+        ``decisions`` stays empty, deliberately. The verdicts are on disk
+        beside the requests, but nothing downstream reads this field — the
+        round's human-gate load is ``len(escalations)`` — and decoding them
+        only to fill a shape would put values in a returned object that no
+        caller checks.
+        """
+        if stored.attempt is None:  # pragma: no cover — COMPLETE always carries one
+            raise ContractViolationError(
+                f"a completed attempt for {problem.id!r} carries no checkpoint to reuse"
+            )
+        escalations = await self._prior_escalations(
+            output_dir, attempt_id=stored.attempt.attempt_id
+        )
+        return AttemptOutcome(
+            problem=problem,
+            attempt=stored.attempt,
+            best_result=stored.attempt.result,
+            steps=stored.steps,
+            escalations=escalations,
+            decisions=(),
+            attempt_log_path=stored.attempt_log_path,
+        )
+
     # -- a whole round ------------------------------------------------------ #
 
     async def run_attempts(
@@ -780,6 +2351,7 @@ class RoundRunner:
         config: RoundConfig,
         *,
         output_dir: Path,
+        resume: bool = True,
     ) -> tuple[AttemptOutcome, ...]:
         """Run every problem once, sequentially. No trajectory row is written.
 
@@ -789,13 +2361,488 @@ class RoundRunner:
 
         Used directly by the noise-floor runner, whose seed runs are *not*
         rounds and must not enter ``trajectory.json``.
+
+        **Resume is the default, and it is a per-problem decision.** Before
+        spending an attempt on a problem this asks the store what is already in
+        ``output_dir`` for *this* run
+        (:meth:`~turing.research.loop.trajectory.TrajectoryStore.load_stored_attempt`,
+        which owns the completeness table). A finished attempt is reused
+        outright and costs nothing; an interrupted one is continued from its
+        checkpoint; one suspended on an operator decision re-enters that wait.
+        The compute this saves is the whole point — the sweep runs on a
+        subscription that closes unpredictably, so a restart is the normal
+        case, and RES-12 only made re-driving *safe*, never cheap.
+
+        ``resume=False`` drives every problem from scratch. It is the honest
+        way to re-measure a round rather than continue one, and it is what a
+        caller wants when the *scaffold* changed under a repeated ``run_id``
+        — a case no artifact on disk can detect, since identity is what
+        resume keys on.
+
+        **One attempt's failure is contained to that attempt.** Everything
+        inside :meth:`run_attempt` that is *not* the sanctioned reporting
+        guard raises straight out of it, and that is correct: the per-step and
+        terminal ``metrics_writer.append`` calls are chain-extending writes,
+        and swallowing a failure there would silently break the hash chain
+        that ``verify`` exists to check. It is *this* loop that must not
+        propagate. Without the guard below, one problem discards every attempt
+        the round had already completed — no round record, no trajectory row,
+        no cells — and the reachable triggers are not exotic: a workspace
+        template that cannot be read (pruned, evicted, a full disk), a
+        rotation the results tree will not permit, a backend whose usage
+        accounting reports a non-finite token count. Ten completed attempts
+        must not be thrown away by the eleventh problem's I/O.
+
+        The trigger this guard was originally built around — a
+        ``problem.verifier.score_scale`` colliding with a reserved or core
+        metrics key, fatal at that problem's *first verification* — is gone:
+        ``contracts._reject_unusable_score_scale`` refuses such a scale where
+        the verifier declares it, so a corpus carrying one now fails before
+        the round starts, at zero compute, instead of losing an attempt
+        mid-round. The containment stays: it guards "``run_attempt`` raised",
+        not any particular cause, and the remaining causes are I/O against a
+        results tree and a workspace this process does not own.
+
+        **A lost attempt is dropped from the results, not floored into
+        them.** The alternative — synthesising an ``AttemptOutcome`` with
+        ``best_result=None`` — looks safer and is worse: that is exactly the
+        shape of an honest attempt that ran its cap and never scored, so
+        ``ScoredProblem.from_result`` would enter the problem into its cell at
+        the scale floor and ``build_type_scores`` would average an instrument
+        failure in as a capability reading. A crashed harness would then
+        register as the agent performing at its worst, manufacturing a
+        regression against the parent round out of a bug in this file. This
+        module is the experiment's instrument; a measurement it did not take
+        must be reported as absent, never as a bad one. For the colliding-
+        scale trigger specifically, the floored outcome is not even
+        constructible: ``ScoredProblem.from_result`` refuses a scale with no
+        declared floor, so a synthesised outcome would only move the same
+        abort from the metrics line to the scoring pass.
+
+        Absent is not silent. Each loss is logged with its traceback
+        (``research.attempt.crashed``), returned to :meth:`run_round` via
+        :attr:`attempt_failures`, and surfaced in the round record's
+        ``all_attempts_completed`` gate and verdict line, so no reader of the
+        round can mistake ``n=10`` for a ten-problem corpus. It also *refuses
+        the round's deltas outright* — see :meth:`run_round` — because a cell
+        mean over nine problems is not comparable with a parent's over ten,
+        and the bias is one-directional: a mean rises when its weakest member
+        drops out, so a contained crash left unrefused manufactures a
+        marginal gain out of a bug in this file.
+
+        **A lost attempt still gets a finished record on disk.**
+        :meth:`_close_out_crashed_attempt` writes the terminal
+        ``metrics.json`` :meth:`run_attempt` never reached, so a round that
+        is over stops reporting itself as unfinished to ``verify``. That is a
+        reporting completion, not a rehabilitation: the attempt is still
+        absent from every cell and still counted as a loss here.
+
+        If **every** attempt is lost the round is refused outright rather than
+        recorded with zero cells: an empty round record is a baseline that
+        measures nothing, and a later round comparing against it would compute
+        deltas from an absence.
+
+        **The noise-floor caller has a stricter bar than this, and it is not
+        enforced here.** ``measure_noise_floor`` guards that every *cell* is
+        present in every seed, which cannot see a seed that measured a cell
+        over one fewer *problem* — and a spread computed over a shifting
+        problem set measures the set, not the agent. An unreadable workspace
+        template is a property of the problem and so is lost by every seed
+        identically (consistent, just narrower); a transient failure hitting
+        one seed only is not. ``NoiseFloorRunner.run`` therefore wants
+        to refuse a seed with a non-empty :attr:`attempt_failures` rather than
+        report a floor from it. That check belongs at that call site — a round
+        legitimately continues where a floor must not — and the property
+        exists for it.
+
+        Not caught: :class:`asyncio.CancelledError`,
+        :class:`KeyboardInterrupt` and :class:`SystemExit` are
+        ``BaseException``\\ s and stay outside ``except Exception`` on
+        purpose. A cancelled round must stop, not quietly re-label the
+        cancellation as a per-problem harness failure and keep working
+        through the corpus.
+
+        **One driver per results tree.** The whole loop runs under the
+        store's driver lock (:meth:`TrajectoryStore.driver_lock`): this is
+        the seam every entry point passes through — ``run_round`` and
+        ``NoiseFloorRunner.run`` both come here — so it is where a second
+        process over the same tree is refused. Without it the second process
+        reads the first's ``RUNNING`` checkpoint as *resumable*, drives the
+        same ``attempt_id`` in the same workspace, and rotates the live chain
+        into ``prior-N/``. The lock is re-entrant for the store object the
+        outer seams already hold it through.
         """
         if not corpus:
             raise ContractViolationError("a round with no problems measures nothing")
+        async with self._trajectory.driver_lock():
+            return await self._run_attempts_locked(
+                corpus, config, output_dir=output_dir, resume=resume
+            )
+
+    async def _run_attempts_locked(
+        self,
+        corpus: Sequence[Problem],
+        config: RoundConfig,
+        *,
+        output_dir: Path,
+        resume: bool,
+    ) -> tuple[AttemptOutcome, ...]:
         outcomes: list[AttemptOutcome] = []
+        failures: list[AttemptFailure] = []
+        skipped: list[str] = []
+        resumed: list[str] = []
+        self._attempt_failures = ()
+        self._skipped_problems = ()
+        self._resumed_problems = ()
+        identity = config.identity()
         for problem in corpus:
-            outcomes.append(await self.run_attempt(problem, config, output_dir=output_dir))
+            # Minted here, not inside ``run_attempt``, so it outlives an
+            # exception raised out of it and the close-out below can tell this
+            # attempt's chain from a previous generation's — the one field
+            # that can, when a re-drive repeats run_id, problem_id and seed.
+            # A resumed attempt keeps its own id instead: it *is* the same
+            # generation, and its rotated-aside chain names it. Minted before
+            # the resume probe so that a probe that raises still leaves the
+            # close-out an id to write under.
+            attempt_id = _mint_attempt_id(config, problem)
+            try:
+                # The probe is inside the containment, deliberately: it reads
+                # files this process did not write, and a read that raises —
+                # every path the store knows about now returns ABSENT, but the
+                # containment guards "it raised", not any listed cause — must
+                # cost this problem, not the round.
+                stored: StoredAttempt | None = None
+                if resume:
+                    stored = await self._trajectory.load_stored_attempt(
+                        problem.id,
+                        output_dir=output_dir,
+                        identity=identity,
+                        cap=_resolved_cap(problem, config),
+                    )
+                    if stored.is_complete:
+                        logger.info(
+                            "research.attempt.reused",
+                            problem_id=problem.id,
+                            run_id=config.run_id,
+                            round_index=config.round_index,
+                            reason=stored.reason,
+                            detail=(
+                                "a finished attempt for this run is already on disk; its "
+                                "outcome is reused and no compute is spent re-measuring it"
+                            ),
+                        )
+                        skipped.append(problem.id)
+                        outcomes.append(
+                            await self._reuse_stored_outcome(problem, stored, output_dir=output_dir)
+                        )
+                        continue
+                    if not stored.is_resumable:
+                        logger.debug(
+                            "research.attempt.driving_fresh",
+                            problem_id=problem.id,
+                            run_id=config.run_id,
+                            reason=stored.reason,
+                        )
+                        stored = None
+                    else:
+                        resumed.append(problem.id)
+                resume_from = None if stored is None else stored.attempt
+                if resume_from is not None:
+                    attempt_id = resume_from.attempt_id
+                outcomes.append(
+                    await self.run_attempt(
+                        problem,
+                        config,
+                        output_dir=output_dir,
+                        attempt_id=attempt_id,
+                        resume=resume_from,
+                        prior_steps=() if stored is None else stored.steps,
+                    )
+                )
+            except Exception as exc:
+                logger.exception(
+                    "research.attempt.crashed",
+                    problem_id=problem.id,
+                    run_id=config.run_id,
+                    round_index=config.round_index,
+                    error=f"{type(exc).__name__}: {exc}",
+                    detail=(
+                        "the attempt raised out of run_attempt and produced no outcome; it "
+                        "is absent from this round's cells rather than scored at its floor, "
+                        "and the remaining problems still run"
+                    ),
+                )
+                failures.append(
+                    AttemptFailure(problem_id=problem.id, error=f"{type(exc).__name__}: {exc}")
+                )
+                if isinstance(exc, WorkspaceMissingError):
+                    # Refused before anything was written, and the attempt on
+                    # disk is intact and resumable once the workspace is back.
+                    # A close-out here would write a crashed summary beside a
+                    # PAUSED checkpoint — see the exception's docstring.
+                    continue
+                await self._close_out_crashed_attempt(
+                    problem=problem,
+                    config=config,
+                    output_dir=output_dir,
+                    exc_type=type(exc).__name__,
+                    attempt_id=attempt_id,
+                )
+        # Set before the refusal below so a caller inspecting the runner after
+        # a total-loss raise can still see which problems were lost.
+        self._attempt_failures = tuple(failures)
+        self._skipped_problems = tuple(skipped)
+        self._resumed_problems = tuple(resumed)
+        if not outcomes:
+            raise ContractViolationError(
+                f"every one of the {len(corpus)} attempt(s) failed; a round with no "
+                "measured attempt has no cells, and recording it would put a baseline "
+                "in the trajectory that a later round computes its deltas against"
+            )
         return tuple(outcomes)
+
+    async def _close_out_crashed_attempt(
+        self,
+        *,
+        problem: Problem,
+        config: RoundConfig,
+        output_dir: Path,
+        exc_type: str,
+        attempt_id: str,
+    ) -> None:
+        """Give a contained attempt a terminal ``metrics.json``, or leave it alone.
+
+        **What this fixes.** ``metrics.json`` is written once, at the end of
+        :meth:`run_attempt`, so an attempt whose exception was contained never
+        reaches it. ``verify`` reads an intact chain with no summary beside it
+        as :attr:`~turing.research.loop.integrity.ReconcileState.INCOMPLETE`
+        and exits ``2``, which is correct and load-bearing for a round that is
+        *still running* — and wrong here, because this round is finished and
+        that directory will never gain a summary. The whole results root then
+        reports ``2`` forever, a pre-writeup gate demanding ``0`` can never
+        pass on the tree, and an operator taught "``2`` means still running"
+        learns to ignore it: a fresh cry-wolf, which is the exact failure
+        class this contract exists to remove. Worse, the same event produced
+        two different codes depending on *where* the attempt died — a crash
+        before the first append leaves no ``metrics.jsonl``, so ``find_runs``
+        never sees the directory and the root exits ``0``. One event class,
+        one code, and the code is decided by whether the round finished, not
+        by which line of ``run_attempt`` raised.
+
+        **The record is honest, not a placeholder.** ``best_score`` is
+        ``null``: this attempt produced no grade, and a floor value here would
+        be the same fabricated-regression bug :meth:`run_attempts` refuses one
+        level up. Every resource number is re-derived from the attempt's own
+        log by :func:`_read_crashed_attempt_record`, so the summary reconciles
+        with the log rather than merely coexisting with it — a summary built
+        from anything else would turn an ``INCOMPLETE`` into a ``FAILED``, and
+        ``FAILED`` is ``verify``'s word for dishonesty. ``final_state`` names
+        the crash and is deliberately not an
+        :class:`~turing.research.contracts.AttemptState` value; see
+        :data:`_CRASHED_FINAL_STATE_PREFIX`. The loss stays disclosed exactly
+        where it was — the ``research.attempt.crashed`` log, the round's
+        ``all_attempts_completed`` gate, the verdict prefix, and the refused
+        deltas — and ``INCOMPLETE`` goes back to meaning what the docs say it
+        means: genuinely unfinished.
+
+        **It cannot break the hash chain.** ``metrics.json`` is not a chained
+        file: nothing here opens ``metrics.jsonl`` or the sidecar for writing,
+        and the chain's digests do not cover the summary. The two files it
+        does read, it reads.
+
+        **It cannot mask the exception it is reporting on.** The caller is
+        already inside ``except Exception``; every failure in here is caught
+        and logged rather than raised, so a reporting problem can neither
+        replace the original traceback (already logged, with the exception
+        chained through ``logger.exception`` before this runs) nor escalate a
+        contained per-attempt loss into a lost round. That is the same
+        sanctioned-swallowed-error rule :meth:`run_attempt`'s emission block
+        follows, applied on the error path where it matters more.
+
+        **Three cases are deliberately left alone**, each ending in a code
+        that is already right:
+
+        * no ``metrics.jsonl`` (the attempt died before its first append —
+          a workspace that could not be materialised, say). ``find_runs``
+          keys on that file, so the directory is not a run and never affected
+          the exit code. Writing a summary for a run that does not exist would
+          *create* a finding, not clear one.
+        * ``metrics.json`` already present. The crash happened after the
+          summary landed, so the honest terminal record is already there and
+          overwriting it with a cruder one would lose information.
+        * a chain header that names a different attempt — a different
+          ``attempt_id``, ``problem_id``, ``round_id`` or ``seed``, or one of
+          those missing. Then this directory's chain belongs to an earlier
+          generation and a summary written over it would be a claim about
+          someone else's log. (A header that cannot be read *at all* is left
+          alone too, by the generic guard below rather than by this check: with
+          no header there is nothing to attribute a summary to, and it takes
+          the same "write nothing" path.) This is reachable, not hypothetical:
+          ``run_attempt`` materialises the workspace before it rotates the
+          stale trio aside, so a crash in that window finds the previous
+          generation's chain still in place, intact and summary-less — the
+          honest ``INCOMPLETE`` shape a killed attempt leaves and rotation
+          promises to preserve. :func:`_read_crashed_attempt_record` enforces
+          the check (see its docstring for the full driven example, and for why
+          ``attempt_id`` is the field that decides it); the refusal is logged
+          under its own event name so it cannot be mistaken for reporting
+          failing.
+
+        ``attempt_id`` is a parameter rather than something read back off disk
+        precisely so it can be *compared* with what is on disk. The caller
+        mints it before calling :meth:`run_attempt` (:func:`_mint_attempt_id`)
+        so it outlives the exception; reading it out of the header instead
+        would make the guard compare the found chain against itself, which is
+        what round 3's version effectively did and why a re-drive repeating
+        ``run_id``, ``problem_id`` and ``seed`` — the noise floor's documented
+        "re-run from seed 1" recovery, by construction — walked straight
+        through it.
+
+        Because the header must match the current attempt before anything is
+        written, ``target_score`` — taken from *this* config's criterion — is
+        necessarily the criterion the log was produced under. It could not be
+        while an adopted foreign chain was reachable.
+        """
+        metrics_dir = output_dir / "attempts" / problem.id
+        try:
+            if (metrics_dir / "metrics.json").exists():
+                return
+            if not (metrics_dir / "metrics.jsonl").exists():
+                return
+            record = await asyncio.to_thread(
+                _read_crashed_attempt_record,
+                metrics_dir,
+                output_dir / "escalations",
+                expected_attempt_id=attempt_id,
+                expected_problem_id=problem.id,
+                expected_round_id=config.run_id,
+                expected_seed=config.seed,
+            )
+            criterion = config.criterion_for(problem.id)
+            await write_attempt_summary(
+                metrics_dir,
+                problem_id=problem.id,
+                attempt_id=record.attempt_id,
+                round_id=config.run_id,
+                seed=config.seed,
+                problem_type=problem.problem_type.value,
+                split=problem.split.value,
+                score_scale=problem.verifier.score_scale,
+                outcome=record.outcome,
+                final_state=f"{_CRASHED_FINAL_STATE_PREFIX}:{exc_type}",
+                # No score, and no floor standing in for one. This attempt
+                # was not graded; the cells above already exclude it.
+                best_score=None,
+                best_passed_correctness=None,
+                baseline_score=record.baseline_score,
+                target_score=None if criterion is None else criterion.min_score,
+                final_progress=record.final_progress,
+                consumed_steps=record.consumed_steps,
+                consumed_tokens=record.consumed_tokens,
+                consumed_wall_clock_seconds=record.consumed_wall_clock_seconds,
+                cap_extensions=record.cap_extensions,
+                escalation_count=record.escalation_count,
+                steps_recorded=record.steps_recorded,
+            )
+        except _ForeignChainError as exc:
+            # Not a failure: the guard fired and nothing was written. Logged
+            # at ERROR anyway, because the *reason* it fired — a previous
+            # generation's chain still sitting where this attempt's belongs —
+            # is a real finding about the results tree, and the directory will
+            # keep reporting INCOMPLETE until someone looks at it.
+            logger.error(
+                "research.results.crashed_attempt_summary_refused",
+                problem_id=problem.id,
+                run_id=config.run_id,
+                round_index=config.round_index,
+                directory=str(metrics_dir),
+                reason=str(exc),
+                detail=(
+                    "this directory holds a different attempt's chain (an earlier "
+                    "generation that was never rotated aside, because the crash "
+                    "happened before rotation); no summary is written over it — that "
+                    "would assert this round's identity and exception over a log they "
+                    "never touched, and would destroy the honest INCOMPLETE state that "
+                    "says the earlier attempt was killed unfinished"
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "research.results.crashed_attempt_summary_failed",
+                problem_id=problem.id,
+                run_id=config.run_id,
+                round_index=config.round_index,
+                directory=str(metrics_dir),
+                detail=(
+                    "the contained attempt keeps its intact chain with no summary, so "
+                    "verify reports it INCOMPLETE and the results root exits 2; the "
+                    "attempt loss itself is already reported by research.attempt.crashed"
+                ),
+            )
+        else:
+            logger.info(
+                "research.results.crashed_attempt_summary_written",
+                problem_id=problem.id,
+                run_id=config.run_id,
+                round_index=config.round_index,
+                directory=str(metrics_dir),
+                final_state=f"{_CRASHED_FINAL_STATE_PREFIX}:{exc_type}",
+            )
+
+    def _viewer_runs(self) -> list[str]:
+        """Every attempt directory with a metrics chain, across every round on disk.
+
+        Deriving this from the filesystem rather than the current round's
+        in-memory ``outcomes`` is the fix for the bug where ``.viewer.json``
+        showed only the latest round: ``outcomes`` only ever holds *this*
+        round's attempts, so building the list from it — even merged into
+        whatever the file already held — would still lose every earlier
+        round the moment the runner process restarts between rounds and that
+        in-memory state is gone. The directories are exactly as durable as
+        ``metrics.jsonl`` itself, so re-deriving them from disk on every round
+        costs nothing a restart doesn't already pay, and never depends on a
+        prior ``.viewer.json`` having been written honestly (or at all).
+
+        **The walk is depth-independent, and it has to be.** An attempt's
+        metrics directory is ``attempts/<problem.id>``, and ``problem.id`` is
+        a path component operators may plausibly namespace —
+        ``"cuda/matmul-speedup"`` is a reasonable id and produces
+        ``attempts/cuda/matmul-speedup/metrics.jsonl``. A single-segment glob
+        (``attempts/*/metrics.jsonl``) matched exactly one path segment, so
+        such a run vanished from ``.viewer.json`` with no log line and no
+        warning while ``verify`` — whose walk has always been recursive —
+        went on finding and checking it. Silently listing fewer runs than
+        exist is the same class of fault as listing only the latest round,
+        which this method was written to fix. Nesting stays supported; what
+        ``contracts._reject_unsafe_problem_id`` refuses (RES-16) is the
+        narrower set of ids that escape the results root or collide with a
+        directory this runner mints itself.
+
+        Rotated ``prior-N/`` chains (see :func:`_rotate_stale_metrics`) are
+        still excluded, now by directory *name* rather than by depth, since
+        depth no longer distinguishes them. That is exact for every
+        directory this runner creates: ``prior-N/`` is only ever the last
+        segment before a rotated ``metrics.jsonl``. The residual this filter
+        used to concede — a problem id whose final segment is literally
+        ``prior-<digits>``, which would be skipped — is closed at the other
+        end: ``contracts._reject_unsafe_problem_id`` refuses such an id at
+        problem-definition time, naming this filter as the reason.
+
+        An attempt whose ``MetricsWriter`` never took its first
+        :meth:`~turing.research.loop.results.MetricsWriter.append`
+        (``metrics.jsonl`` is created lazily, on that first write) is
+        correctly absent, the same as it would be from ``outcomes``.
+        """
+        loop_dir = self._trajectory.loop_dir
+        results_root = loop_dir.parent
+        return sorted(
+            {
+                match.parent.relative_to(results_root).as_posix()
+                for match in loop_dir.glob("round-*/attempts/**/metrics.jsonl")
+                if not _PRIOR_DIR_PATTERN.fullmatch(match.parent.name)
+                and match.parent.name != _STAGING_DIR_NAME
+            }
+        )
 
     @staticmethod
     def _floors_from_report(
@@ -834,6 +2881,10 @@ class RoundRunner:
             )
         return tuple(floors)
 
+    async def _already_finished(self, config: RoundConfig, *, resume: bool) -> RoundOutcome | None:
+        """:func:`find_finished_round` against this runner's store."""
+        return await find_finished_round(self._trajectory, config, resume=resume)
+
     async def run_round(
         self,
         corpus: Sequence[Problem],
@@ -841,6 +2892,7 @@ class RoundRunner:
         *,
         parent: RoundRecord | None = None,
         noise_floor: NoiseFloorReport | None = None,
+        resume: bool = True,
     ) -> RoundOutcome:
         """Run the round, reduce it to cells, and append the trajectory row.
 
@@ -852,13 +2904,88 @@ class RoundRunner:
         ``noise_floor`` must be a :class:`NoiseFloorReport` (eval set + engine
         bound). A bare sequence of floors has no provenance; a floor from
         anywhere would license every gain.
+
+        ``resume`` is forwarded to :meth:`run_attempts`, whose docstring owns
+        the per-problem decision. Two consequences belong here, though:
+
+        * ``cost.tokens`` is a sum over the whole round, reused attempts
+          included, because their checkpoints recorded what they spent. The
+          round's ``wall_clock_seconds`` is **not**: it is one clock over
+          *this* process, so a round finished across two processes reports the
+          machine time of the second one only. That is honest as far as it
+          goes and understates driving function #3's numerator; nothing on
+          disk records the wall clock of a process that was killed.
+        * The trajectory row is appended by whichever process finishes the
+          round, exactly once, and it is the *last* write of the round —
+          ``round.json`` lands after it, never before, so a refused append
+          cannot have already rewritten the record it refused to log.
+          ``append_round`` refuses a round index already in the file, so a
+          resumed round cannot double-log.
+
+        **A restart after the round finished is a no-op success — for the
+        identical measurement.** The operator procedure is "kill it and run
+        the identical command again", and a round that finished between the
+        two must not turn that procedure into a refusal — or, worse, into a
+        rewritten ``round.json`` followed by one. So before anything is
+        written this checks ``trajectory.json``: if the row for
+        ``config.round_index`` is already there, ``round-NN/round.json`` names
+        this ``run_id``, and the record's ``eval_set_hash``, ``engine`` and
+        ``config_digest`` all equal this config's, the record is decoded off
+        disk and returned with :attr:`RoundOutcome.already_finished` set — no
+        attempt is probed, no file touched. Anything else — the index taken
+        by another ``run_id``, the record missing, a coordinate that differs,
+        or ``resume=False`` on a finished round — is refused here, before any
+        write, with a message naming which; the full rule is
+        :meth:`_already_finished`.
+
+        **One driver per results tree.** Everything from ``ensure_layout`` to
+        the last write runs under :meth:`TrajectoryStore.driver_lock`; a
+        second driver over the same tree is refused with the holder's pid.
         """
+        if not corpus:
+            raise ContractViolationError("a round with no problems measures nothing")
+        # Bind first, then ask whether this measurement is already finished:
+        # the finished-round comparison is against the *bound* hash, and
+        # ``config.eval_set_hash`` may be empty ("derive it").
+        eval_set_hash = bind_eval_set_hash(
+            corpus, config.eval_set_hash, extra=config.eval_set_material
+        )
+        # The *bound* hash, not the promised one: it is written into every
+        # attempt checkpoint and is what stops a resumed round from adopting
+        # work measured over a different corpus. An empty string is not an
+        # identity.
+        bound_config = replace(config, eval_set_hash=eval_set_hash)
+        finished = await self._already_finished(bound_config, resume=resume)
+        if finished is not None:
+            # Nothing ran, so the per-invocation ledgers say so rather than
+            # carrying a previous call's values.
+            self._attempt_failures = ()
+            self._skipped_problems = ()
+            self._resumed_problems = ()
+            return finished
+        async with self._trajectory.driver_lock():
+            return await self._run_round_locked(
+                corpus,
+                bound_config,
+                parent=parent,
+                noise_floor=noise_floor,
+                resume=resume,
+            )
+
+    async def _run_round_locked(
+        self,
+        corpus: Sequence[Problem],
+        config: RoundConfig,
+        *,
+        parent: RoundRecord | None,
+        noise_floor: NoiseFloorReport | None,
+        resume: bool,
+    ) -> RoundOutcome:
+        """The body of :meth:`run_round`, under the driver lock, with ``config`` bound."""
+        eval_set_hash = config.eval_set_hash
         await self._trajectory.ensure_layout()
         output_dir = self._trajectory.round_dir(config.round_index)
         self._operator_wait_seconds = 0.0
-        if not corpus:
-            raise ContractViolationError("a round with no problems measures nothing")
-        eval_set_hash = bind_eval_set_hash(corpus, config.eval_set_hash)
         floors_seq = self._floors_from_report(eval_set_hash, config.engine, noise_floor)
         started = self._clock.monotonic()
         logger.info(
@@ -881,7 +3008,23 @@ class RoundRunner:
                 ),
             )
 
-        outcomes = await self.run_attempts(corpus, config, output_dir=output_dir)
+        outcomes = await self.run_attempts(corpus, config, output_dir=output_dir, resume=resume)
+        failures = self._attempt_failures
+        if failures:
+            logger.error(
+                "research.round.attempts_lost",
+                round_index=config.round_index,
+                run_id=config.run_id,
+                lost=[f.problem_id for f in failures],
+                errors=[f.error for f in failures],
+                measured=len(outcomes),
+                corpus=len(corpus),
+                detail=(
+                    "these problems are absent from this round's cells and cost; the "
+                    "round's n is smaller than the corpus and is not comparable "
+                    "problem-for-problem with a round that measured all of them"
+                ),
+            )
         elapsed = max(0.0, self._clock.monotonic() - started - self._operator_wait_seconds)
 
         scored = tuple(
@@ -892,12 +3035,29 @@ class RoundRunner:
         cost = RoundCost(
             wall_clock_seconds=elapsed,
             tokens=sum(o.attempt.consumed.tokens for o in outcomes),
+            # Measured attempts, not attempted ones. RoundCost is driving
+            # function #3's numerator and ``type_scores`` is its denominator's
+            # source; counting an attempt here whose score is missing from
+            # there would compute cost-per-unit-gain over two different sets
+            # of problems. ``wall_clock_seconds`` cannot be split that way (it
+            # is one clock over the whole round) and ``tokens`` undercounts by
+            # whatever a lost attempt spent before it raised, since its
+            # ``Attempt`` died with it — so a round with a non-empty
+            # ``failures`` list reads slightly cheap, and the
+            # ``all_attempts_completed`` gate below is what says so.
             attempts=len(outcomes),
         )
+        # Same undercount as cost.tokens, and it lands on driving function #4:
+        # escalations a lost attempt raised before it died went to a real
+        # operator but are not counted here, because the request list died with
+        # the attempt. Human-gate load therefore reads low on a round whose
+        # all_attempts_completed gate is False, which is the second reason that
+        # gate has to be written rather than inferred from these numbers.
         escalation_count = sum(o.escalation_count for o in outcomes)
 
         parent_scores: tuple[TypeScore, ...] | None = None
         comparable = True
+        parent_attempts_completed: bool | None = True
         if parent is not None:
             if config.parent_round_id != parent.run_id:
                 raise ContractViolationError(
@@ -915,8 +3075,46 @@ class RoundRunner:
                     eval_set_hash=eval_set_hash,
                     detail="rounds measured on different eval sets are not comparable",
                 )
+            parent_attempts_completed = _parent_attempts_completed(parent)
+            if parent_attempts_completed is not True:
+                logger.error(
+                    "research.round.parent_attempts_lost",
+                    round_index=config.round_index,
+                    run_id=config.run_id,
+                    parent_round_id=parent.run_id,
+                    parent_all_attempts_completed=parent_attempts_completed,
+                    detail=(
+                        "the parent round did not measure its full corpus (or does not "
+                        "record whether it did), so its cells are the reduced side of "
+                        "every subtraction this round would report; the deltas and the "
+                        "saturation verdicts are refused. Re-driving this round does not "
+                        "fix it — the baseline has to be re-measured"
+                    ),
+                )
 
         floors = floors_by_cell(floors_seq)
+        # Two separate facts, deliberately not folded into one flag.
+        # ``comparable`` is "the parent measured the same corpus"; it is the
+        # eval-set gate and nothing else, because ``trajectory.py`` derives
+        # ``trajectory_restart`` from exactly that question and a lost attempt
+        # is emphatically *not* a trajectory restart — the next round still
+        # descends from this one. ``all_attempts_completed`` is "this round
+        # measured all of that corpus". A delta needs both, and the two
+        # refusals read differently in the verdict on purpose, because the
+        # operator actions they call for are different (re-derive the corpus
+        # vs. re-drive the lost problem).
+        #
+        # ``parent_attempts_completed`` is the third fact, and it is *this*
+        # round's gate asked of the parent record rather than anything
+        # recomputed here: a delta is a subtraction, and it is contaminated
+        # by a missing problem on either side. It is deliberately not written
+        # into ``gates`` below — every entry there is a statement about this
+        # round, and a gate whose subject is a different round would be read
+        # (by the desktop's flywheel pane, among others) as this round having
+        # failed something. The refusal travels in the channel built for it
+        # instead: ``refused_parent_attempt_lost`` per cell, in the record,
+        # the trajectory row and the verdict line.
+        all_attempts_completed = not failures
         deltas = compute_deltas(
             type_scores,
             parent_scores,
@@ -924,13 +3122,44 @@ class RoundRunner:
             cost=cost,
             basis=config.cost_basis,
             comparable=comparable,
+            all_attempts_completed=all_attempts_completed,
+            parent_attempts_completed=parent_attempts_completed,
         )
-        assessments = assess_saturation(type_scores, parent_scores, floors, comparable=comparable)
+        assessments = assess_saturation(
+            type_scores,
+            parent_scores,
+            floors,
+            comparable=comparable,
+            all_attempts_completed=all_attempts_completed,
+            parent_attempts_completed=parent_attempts_completed,
+        )
         gates = {
             "eval_set_stable": comparable,
             "lineage_recorded": config.round_index == 0 or config.parent_round_id is not None,
             "noise_floor_available": bool(floors_seq),
+            # False means at least one problem is missing from the cells
+            # above. Every other number in this record is computed over the
+            # attempts that survived, so without this gate a round of ten
+            # measured problems and a round of eleven are indistinguishable
+            # on disk. ``gates`` is written into both the round record and
+            # trajectory.json's per-round ``constraints``, which is the
+            # narrowest honest channel available here — ``round_verdict``
+            # lives in metrics.py and takes only assessments, and
+            # ``write_round_summary``'s payload is fixed by results.py.
+            "all_attempts_completed": all_attempts_completed,
         }
+        # Refusals first, never summarised away — the same rule
+        # ``round_verdict`` applies to unscorable cells, applied to unmeasured
+        # problems. The verdict string is the one line an operator reads off
+        # a trajectory row, so a round missing a problem must say so there and
+        # not only in a gate flag two levels down.
+        verdict = round_verdict(assessments)
+        if failures:
+            lost = ", ".join(f.problem_id for f in failures)
+            verdict = (
+                f"{len(failures)} of {len(corpus)} attempt(s) failed and are absent from "
+                f"every cell ({lost}); {verdict}"
+            )
         record = RoundRecord(
             round_index=config.round_index,
             run_id=config.run_id,
@@ -943,11 +3172,17 @@ class RoundRunner:
             escalation_count=escalation_count,
             created_at_ms=self._clock.now_ms(),
             gates=gates,
-            verdict=round_verdict(assessments),
+            verdict=verdict,
         )
-        await self._trajectory.write_round_record(
-            record, scored=scored, assessments=assessments, noise_floors=floors_seq
-        )
+        # Append first, record second. ``append_round`` is the write that can
+        # refuse (a round index already logged), and a refusal must find
+        # ``round.json`` exactly as the first process left it — cost,
+        # ``created_at_ms`` and all — not rewritten by the process that was
+        # then told no. The window between the two writes is the same size it
+        # was; only the order changed, and with it which artifact a kill in
+        # that window leaves behind: a row without a matching record, which
+        # ``_already_finished`` refuses loudly, rather than a record with no
+        # row, which looked finished to a reader of the round directory.
         row = await self._trajectory.append_round(
             record,
             assessments=assessments,
@@ -957,6 +3192,14 @@ class RoundRunner:
             seed=config.seed,
             cap=config.default_cap,
             verify_every_step=config.verify_every_step,
+            config_digest=config.config_digest(),
+        )
+        await self._trajectory.write_round_record(
+            record,
+            scored=scored,
+            assessments=assessments,
+            noise_floors=floors_seq,
+            config_digest=config.config_digest(),
         )
         logger.info(
             "research.round.finished",
@@ -970,10 +3213,126 @@ class RoundRunner:
             operator_wait_seconds=self._operator_wait_seconds,
             verdict=record.verdict,
         )
+
+        # Reporting failures must not lose a round record that is otherwise
+        # valid — the same one-sanctioned-swallowed-error reasoning as
+        # run_attempt's summary/plot emission.
+        try:
+            deltas_by_cell = {(d.problem_type, d.split): d for d in record.deltas}
+            cells: list[dict[str, object]] = []
+            for ts in type_scores:
+                cell: dict[str, object] = {
+                    "cell": cell_key((ts.problem_type, ts.split)),
+                    "problem_type": ts.problem_type.value,
+                    "split": ts.split.value,
+                    "mean_score": ts.mean_score,
+                    "n": ts.n,
+                    "correctness_passes": ts.correctness_passes,
+                }
+                delta = deltas_by_cell.get((ts.problem_type, ts.split))
+                if delta is not None:
+                    cell["marginal_gain"] = delta.marginal_gain
+                    cell["noise_floor"] = delta.noise_floor
+                    cell["cost_per_unit_gain"] = delta.cost_per_unit_gain
+                cells.append(cell)
+
+            await write_round_summary(
+                output_dir,
+                round_index=config.round_index,
+                run_id=config.run_id,
+                parent_round_id=config.parent_round_id,
+                eval_set_hash=eval_set_hash,
+                seed=config.seed,
+                # Fix 4: match trajectory.json's append_round semantics.
+                # "Comparable to parent" is not a yes/no fact about a round
+                # with no parent -- it's not applicable, and trajectory.json
+                # already encodes exactly that (`comparable` stays None
+                # there when there is no previous row). `comparable` here
+                # defaults to True even when `parent is None`, which made
+                # the round summary claim comparability to a parent that
+                # does not exist while the trajectory row for the same
+                # round recorded null. trajectory.py owns that null and is
+                # do-not-touch, so the summary is what changes to match it.
+                #
+                # It is ``comparable and all_attempts_completed``, not
+                # ``comparable`` alone, and the asymmetry with the
+                # identically-named trajectory.json field is intentional
+                # rather than the drift it looks like. This field answers the
+                # question a reader of a round summary is actually asking --
+                # *may these numbers be compared with the parent's?* -- for
+                # which a matching eval-set hash is necessary and not
+                # sufficient: a round that lost an attempt reduced its cells
+                # over a strict subset of the problems the parent's cells were
+                # reduced over. trajectory.py's field is narrower by
+                # construction (it is computed from the previous *row*, which
+                # carries an eval_set_hash and knows nothing about lost
+                # attempts) and, more importantly, must stay narrow, because
+                # ``trajectory_restart`` is derived from it and a lost attempt
+                # does not restart the trajectory. The row carries this
+                # round's incomparability the other way instead: an empty
+                # ``delta`` map, ``saturation`` entries reading
+                # ``refused_attempt_lost``, and
+                # ``constraints.all_attempts_completed: false``.
+                #
+                # The parent's own completeness is in this conjunction for the
+                # same reason ``not failures`` is: the question is whether
+                # these numbers may be compared with the parent's, and a
+                # parent that measured a subset of the corpus (or is silent
+                # about whether it did) makes the answer no from the other
+                # side of the subtraction.
+                comparable_to_parent=(
+                    None
+                    if parent is None
+                    else (comparable and not failures and parent_attempts_completed is True)
+                ),
+                cells=cells,
+                wall_clock_seconds=elapsed,
+                tokens=cost.tokens,
+                attempts=cost.attempts,
+                escalations=escalation_count,
+                verdict=record.verdict,
+            )
+            # Viewer config ahead of the plot, deliberately — this used to be
+            # last. ``render_round_plot`` does ``float(cell["mean_score"])``
+            # with no guard, so a missing/non-numeric mean_score raises and
+            # everything after it in this block never runs; with the plot
+            # last, that took the viewer config down too, and an unrelated
+            # matplotlib problem left the desktop pane pointed at a stale (or
+            # in round 0's case, nonexistent) run list. Both writes here are
+            # cheap, structural JSON — nothing here should ever raise, so the
+            # plot (the one call in this block with a genuine, known failure
+            # mode) is what moves, not these.
+            await write_viewer_config(self._trajectory.loop_dir.parent, runs=self._viewer_runs())
+        except Exception:
+            logger.exception(
+                "research.results.round_emit_failed",
+                round_index=config.round_index,
+                run_id=config.run_id,
+            )
+        else:
+            # Isolated in its own try/except rather than folded into the one
+            # above: render_round_plot's known failure mode (unguarded
+            # float(cell["mean_score"])) is a different fault than a summary
+            # or viewer-config write failing outright, and collapsing both
+            # into "round_emit_failed" would read, on an overnight log, as
+            # "this round's results never landed" when the JSON in fact did.
+            # `else` rather than unconditional: cells is only guaranteed
+            # bound if the try above completed without raising.
+            try:
+                await render_round_plot(output_dir, cells)
+            except Exception:
+                logger.exception(
+                    "research.results.round_plot_failed",
+                    round_index=config.round_index,
+                    run_id=config.run_id,
+                    directory=str(output_dir),
+                )
+
         return RoundOutcome(
             record=record,
             attempts=outcomes,
             scored=scored,
             assessments=assessments,
             trajectory_row=row,
+            failures=failures,
         )
