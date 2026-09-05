@@ -1,0 +1,3 @@
+# Repository defaults; personal model/provider choices remain in user config.
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
