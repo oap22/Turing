@@ -117,13 +117,22 @@ class MemoryRetriever:
             return []
 
         matches = await self._vectors.search(query_vec, limit=limit)
+        if not matches:
+            return []
+
+        # One batched fetch rather than a lookup per hit. `matches` is already
+        # ordered nearest-first, so we re-apply that order to the mapping
+        # instead of taking whatever order the database returned rows in.
+        by_id = await self._store.get_messages_by_ids([mid for mid, _ in matches])
 
         memories: list[dict[str, Any]] = []
         for memory_id, distance in matches:
-            msg = await self._store.get_message_by_id(memory_id)
-            if msg is not None:
-                msg["distance"] = distance
-                memories.append(msg)
+            row = by_id.get(memory_id)
+            if row is not None:
+                # Copy per hit: the batch returns one dict per id, so two hits
+                # on the same id would otherwise share it and the second
+                # `distance` would overwrite the first.
+                memories.append({**row, "distance": distance})
         return memories
 
     async def _fetch_user_preferences(self, user_id: str) -> dict[str, str]:

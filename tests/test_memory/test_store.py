@@ -168,6 +168,31 @@ class TestMessages:
         assert results[0]["content"] == "The weather is sunny"
 
     @pytest.mark.asyncio
+    async def test_get_messages_by_ids_batches(self, store: MemoryStore) -> None:
+        conv_id = await store.create_conversation("ch")
+        ids = [await store.add_message(conv_id, "user", f"m{i}") for i in range(5)]
+
+        found = await store.get_messages_by_ids(ids)
+        assert set(found) == set(ids)
+        assert found[ids[2]]["content"] == "m2"
+
+    @pytest.mark.asyncio
+    async def test_get_messages_by_ids_edge_cases(self, store: MemoryStore) -> None:
+        conv_id = await store.create_conversation("ch")
+        real_id = await store.add_message(conv_id, "user", "only one")
+
+        # Empty input short-circuits without touching the database.
+        assert await store.get_messages_by_ids([]) == {}
+
+        # Missing ids are simply absent, mirroring get_message_by_id -> None.
+        found = await store.get_messages_by_ids([real_id, 9999])
+        assert set(found) == {real_id}
+
+        # Duplicate ids collapse to a single entry.
+        found = await store.get_messages_by_ids([real_id, real_id])
+        assert set(found) == {real_id}
+
+    @pytest.mark.asyncio
     async def test_add_message_updates_conversation_timestamp(self, store: MemoryStore) -> None:
         conv_id = await store.create_conversation("ch")
         conv_before = await store.get_conversation(conv_id)

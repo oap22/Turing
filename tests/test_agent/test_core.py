@@ -5,7 +5,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 from turing.agent.core import Agent
-from turing.llm.base import LLMResponse, ToolCall, ToolDefinition
+from turing.llm.base import LLMResponse, Role, ToolCall, ToolDefinition
 from turing.memory.retriever import RetrievalResult
 from turing.tools.base import ToolResult
 
@@ -151,6 +151,56 @@ async def test_tool_use_loop():
     tool_registry.execute.assert_awaited_once_with("shell", command="echo hi")
 
 
+async def test_parallel_tool_calls_append_one_assistant_turn():
+    """A multi-tool turn must be recorded once, not once per tool call.
+
+    The assistant message already carries every tool_call, so appending it
+    inside the per-call loop duplicated it N times — and because each copy
+    carries all N tool_use blocks, the history the LLM re-reads on the next
+    iteration grew with the square of the tool-call count.
+    """
+    calls = [
+        ToolCall(id=f"tc-{i}", name="shell", arguments={"command": f"echo {i}"}) for i in range(4)
+    ]
+    tool_registry = _make_mock_tool_registry()
+    tool_registry.get_definitions.return_value = [
+        ToolDefinition(
+            name="shell",
+            description="Run shell commands",
+            parameters={"type": "object", "properties": {}},
+        )
+    ]
+
+    llm_router = AsyncMock()
+    llm_router.route.side_effect = [
+        LLMResponse(content="", tool_calls=calls, model="test"),
+        LLMResponse(content="All four ran.", tool_calls=[], model="test"),
+    ]
+
+    agent = _make_agent(
+        llm_router=llm_router,
+        tool_registry=tool_registry,
+        safety_gate=_make_mock_safety_gate(),
+    )
+
+    await agent.handle_message(
+        message="Run all four",
+        channel_id="ch-1",
+        user_id="user-1",
+        user_name="TestUser",
+    )
+
+    # Inspect the history handed to the second LLM call.
+    second_call_messages = llm_router.route.await_args_list[1].kwargs["messages"]
+    assistant_turns = [m for m in second_call_messages if m.role == Role.ASSISTANT]
+    tool_turns = [m for m in second_call_messages if m.role == Role.TOOL]
+
+    assert len(assistant_turns) == 1, "the assistant turn must appear exactly once"
+    assert assistant_turns[0].tool_calls == calls
+    # One result per call, in call order, each tied to its own tool_call id.
+    assert [m.tool_call_id for m in tool_turns] == [c.id for c in calls]
+
+
 async def test_max_iterations_safety():
     """If LLM keeps returning tool calls, we stop at MAX_ITERATIONS."""
     tool_call = ToolCall(id="tc-loop", name="shell", arguments={"command": "echo loop"})
@@ -285,9 +335,10 @@ async def test_existing_conversation_reuse():
 
     # Should NOT create a new conversation
     memory_store.create_conversation.assert_not_awaited()
-    # Should touch the existing conversation
-    memory_store.touch_conversation.assert_awaited_once_with("existing-conv")
-    # Messages should use the existing conversation ID
+    # Messages should use the existing conversation ID. Storing the message is
+    # also what bumps last_message_at, so no separate touch_conversation call
+    # is made — add_message already stamps it.
+    memory_store.touch_conversation.assert_not_awaited()
     calls = memory_store.add_message.await_args_list
     assert calls[0].args[0] == "existing-conv"
 

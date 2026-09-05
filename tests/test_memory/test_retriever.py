@@ -35,12 +35,16 @@ def mock_store() -> AsyncMock:
             }
         ]
     )
-    store.get_message_by_id = AsyncMock(
+    # Semantic retrieval resolves all vector hits in one batched call, keyed
+    # by message id (see MemoryStore.get_messages_by_ids).
+    store.get_messages_by_ids = AsyncMock(
         return_value={
-            "id": 10,
-            "role": "user",
-            "content": "relevant message",
-            "timestamp": "2024-01-01T00:00:00Z",
+            10: {
+                "id": 10,
+                "role": "user",
+                "content": "relevant message",
+                "timestamp": "2024-01-01T00:00:00Z",
+            }
         }
     )
     return store
