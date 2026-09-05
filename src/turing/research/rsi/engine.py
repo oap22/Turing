@@ -23,6 +23,11 @@ What this module guarantees:
   survived the group kill) cannot stall the loop past that grace, the pipes
   are closed and whatever was captured is returned. The verifier runner
   shares this helper.
+* **Output is bounded.** :func:`run_capped` retains at most
+  :data:`DEFAULT_MAX_OUTPUT_BYTES` per stream by default. A first discarded
+  byte signals overflow and causes :data:`OUTPUT_LIMIT_EXIT`; callers must
+  treat :attr:`CappedOutput.output_limit_exceeded` as authoritative even if
+  the leader races to exit zero.
 * :class:`FakeEngine` replays a script in order and records every call. A
   script item may be a ready :class:`EngineResult` or a callable that
   receives ``(prompt, cwd)`` and may mutate the sandbox — which is how tests
@@ -63,7 +68,9 @@ from turing.research.rsi.contracts import EngineResult
 logger = structlog.get_logger(__name__)
 
 __all__ = [
+    "DEFAULT_MAX_OUTPUT_BYTES",
     "DRAIN_GRACE_SECONDS",
+    "OUTPUT_LIMIT_EXIT",
     "CappedOutput",
     "ClaudeCliEngine",
     "FakeCall",
@@ -85,6 +92,10 @@ ScriptItem = (
 _EXIT_NOT_FOUND = 127
 #: Exit code reported for a killed, timed-out CLI (``timeout(1)`` convention).
 _EXIT_TIMED_OUT = 124
+#: Exit code reported when either captured output stream exceeds its byte cap.
+OUTPUT_LIMIT_EXIT: int = 125
+#: Default retained output per stream. The cap is deliberately per stream.
+DEFAULT_MAX_OUTPUT_BYTES: int = 8 * 1024 * 1024
 #: How long the pipe drain (and the post-kill wait) may take once the process is done.
 DRAIN_GRACE_SECONDS: float = 2.0
 _PUMP_CHUNK = 1 << 16
@@ -94,7 +105,13 @@ _EXIT_POLL_SECONDS: float = 0.05
 
 @dataclass(frozen=True, slots=True)
 class CappedOutput:
-    """What :func:`run_capped` captured: the exit code and the pipe bytes, plus how it ended."""
+    """What :func:`run_capped` captured and how the process ended.
+
+    ``stdout`` and ``stderr`` contain at most the requested number of bytes
+    each. ``output_limit_exceeded`` is authoritative when deciding whether
+    the exit was successful: a process that writes byte ``limit + 1`` is an
+    overflow even if it races to return zero.
+    """
 
     exit_code: int
     stdout: bytes
@@ -102,6 +119,8 @@ class CappedOutput:
     timed_out: bool
     #: ``True`` when a pipe was still held open after the grace and had to be closed.
     pipe_abandoned: bool
+    #: ``True`` when stdout or stderr produced more than the configured cap.
+    output_limit_exceeded: bool = False
 
 
 def kill_process_group(proc: asyncio.subprocess.Process) -> None:
@@ -118,12 +137,35 @@ def kill_process_group(proc: asyncio.subprocess.Process) -> None:
                 proc.kill()
 
 
-async def _pump(stream: asyncio.StreamReader, into: bytearray) -> None:
+async def _pump(
+    stream: asyncio.StreamReader,
+    into: bytearray,
+    *,
+    max_output_bytes: int,
+    overflow: asyncio.Event,
+    overflow_at: list[float],
+) -> None:
+    """Copy a pipe into a bounded buffer and signal on the first discarded byte.
+
+    ``StreamReader.read`` may return a chunk much larger than the remaining
+    capacity. Slice before mutating ``into`` so the actual capture buffer's
+    high-water length never exceeds the cap; discarded bytes are never kept.
+    The pump returns as soon as overflow is observed so the supervisor can
+    kill a still-running producer promptly.
+    """
     while True:
         chunk = await stream.read(_PUMP_CHUNK)
         if not chunk:
             return
-        into += chunk
+        remaining = max_output_bytes - len(into)
+        if len(chunk) > remaining:
+            if remaining:
+                into.extend(chunk[:remaining])
+            if not overflow.is_set():
+                overflow_at.append(asyncio.get_running_loop().time())
+            overflow.set()
+            return
+        into.extend(chunk)
 
 
 async def _wait_exited(proc: asyncio.subprocess.Process, timeout_seconds: float) -> bool:
@@ -143,6 +185,23 @@ async def _wait_exited(proc: asyncio.subprocess.Process, timeout_seconds: float)
             return False
         await asyncio.sleep(min(_EXIT_POLL_SECONDS, remaining))
     return True
+
+
+async def _join_tasks(
+    tasks: Sequence[asyncio.Task[object]], *, cancel_pending: bool = False
+) -> list[object]:
+    """Join tasks and retrieve every exception, including pump failures."""
+    if cancel_pending:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+    if not tasks:
+        return []
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for task, result in zip(tasks, results, strict=True):
+        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+            logger.warning("rsi.process.reader_failed", task=repr(task), error=repr(result))
+    return results
 
 
 def _close_pipes(proc: asyncio.subprocess.Process) -> None:
@@ -165,67 +224,150 @@ async def run_capped(
     *,
     timeout_seconds: float,
     grace_seconds: float = DRAIN_GRACE_SECONDS,
+    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
 ) -> CappedOutput:
-    """Wait for ``proc`` (started with pipes and ``start_new_session=True``) under a hard cap.
+    """Wait for ``proc`` under hard time and per-stream output caps.
 
-    The cap applies to the process, not its pipes. Whatever happens the
-    group is SIGKILLed once the process is done, and reading the pipes to
-    EOF is given at most ``grace_seconds``; then the pipes are closed and
-    the bytes read so far are returned.
+    ``proc`` must have stdout and stderr pipes and should have been started
+    with ``start_new_session=True``. ``max_output_bytes`` is a positive int
+    (``bool`` is rejected) and applies independently to each stream. The
+    default retains at most 8 MiB per stream. The helper owns the process
+    group and its pipes: invalid arguments still kill that group and close
+    its pipes before raising ``ContractViolationError``.
+
+    Whatever happens, the group is SIGKILLed once the process exits, the
+    wall deadline expires, or either pump detects overflow. Pipe cleanup is
+    bounded by ``grace_seconds``; then the pipes are closed and bytes read so
+    far are returned. Overflow has result-code precedence over timeout.
     """
+    if not isinstance(max_output_bytes, int) or isinstance(max_output_bytes, bool):
+        await _cleanup_invalid_process(proc, grace_seconds)
+        raise ContractViolationError(
+            "max_output_bytes must be a positive integer (bool is invalid)"
+        )
+    if max_output_bytes <= 0:
+        await _cleanup_invalid_process(proc, grace_seconds)
+        raise ContractViolationError("max_output_bytes must be a positive integer")
     if proc.stdout is None or proc.stderr is None:
+        await _cleanup_invalid_process(proc, grace_seconds)
         raise ContractViolationError("run_capped needs a process started with stdout/stderr pipes")
+
     out, err = bytearray(), bytearray()
-    readers = [
-        asyncio.ensure_future(_pump(proc.stdout, out)),
-        asyncio.ensure_future(_pump(proc.stderr, err)),
+    overflow = asyncio.Event()
+    overflow_at: list[float] = []
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    readers: list[asyncio.Task[object]] = [
+        asyncio.ensure_future(
+            _pump(
+                proc.stdout,
+                out,
+                max_output_bytes=max_output_bytes,
+                overflow=overflow,
+                overflow_at=overflow_at,
+            )
+        ),
+        asyncio.ensure_future(
+            _pump(
+                proc.stderr,
+                err,
+                max_output_bytes=max_output_bytes,
+                overflow=overflow,
+                overflow_at=overflow_at,
+            )
+        ),
     ]
+    exit_wait = asyncio.ensure_future(_wait_exited(proc, timeout_seconds))
+    overflow_wait = asyncio.ensure_future(overflow.wait())
+    waiters: list[asyncio.Task[object]] = [exit_wait, overflow_wait]
     try:
-        timed_out = not await _wait_exited(proc, timeout_seconds)
-    except asyncio.CancelledError:
-        # Ctrl-C / task cancellation: never leave the detached group running.
+        done, _pending = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        if exit_wait in done:
+            timed_out = not bool(exit_wait.result())
+            output_limit_exceeded = overflow.is_set()
+        else:
+            # Overflow was detected before the process deadline. If the
+            # deadline task happened to complete in the same loop turn, use
+            # its actual result to preserve deterministic timeout semantics.
+            output_limit_exceeded = overflow.is_set()
+            timed_out = bool(exit_wait.done() and not exit_wait.result())
+        # The process wait and overflow reader can complete in the same event
+        # loop turn. If the pump crossed the cap before the deadline, that
+        # overflow is the independent terminating condition; if it crossed
+        # during post-deadline cleanup, retain the timeout flag as well.
+        if timed_out and overflow_at and overflow_at[0] < deadline:
+            timed_out = False
+        await _join_tasks(waiters, cancel_pending=True)
         kill_process_group(proc)
-        for task in readers:
-            task.cancel()
+        if proc.returncode is None:
+            await _wait_exited(proc, grace_seconds)
+
+        _done, pending = await asyncio.wait(readers, timeout=grace_seconds)
+        abandoned = bool(pending)
+        if abandoned:
+            for task in pending:
+                task.cancel()
+            _close_pipes(proc)
+            await _join_tasks(list(pending), cancel_pending=False)
+            logger.warning(
+                "rsi.process.pipe_abandoned",
+                pid=proc.pid,
+                grace_seconds=grace_seconds,
+                hint="a descendant outside the process group still held stdout/stderr",
+            )
+        await _join_tasks(readers, cancel_pending=False)
+        # A short-lived process can exit before the pump consumes its final
+        # bytes. Detect overflow during this bounded drain as well.
+        output_limit_exceeded = output_limit_exceeded or overflow.is_set()
         _close_pipes(proc)
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await asyncio.gather(*readers, return_exceptions=True)
+
+        if proc.returncode is None:
+            # Unreapable within the grace (should not happen after SIGKILL); do not block on it.
+            with contextlib.suppress(Exception):
+                transport = getattr(proc, "_transport", None)
+                if transport is not None:
+                    transport.close()
+            exit_code = -1
+        else:
+            exit_code = proc.returncode
+        if output_limit_exceeded:
+            exit_code = OUTPUT_LIMIT_EXIT
+        return CappedOutput(
+            exit_code=exit_code,
+            stdout=bytes(out),
+            stderr=bytes(err),
+            timed_out=timed_out,
+            pipe_abandoned=abandoned,
+            output_limit_exceeded=output_limit_exceeded,
+        )
+    except asyncio.CancelledError:
+        # Cancellation can arrive while waiting for exit, during the kill
+        # grace, or while draining an escaped descendant's pipe. Every path
+        # owns the group and reader tasks, so clean all of them before the
+        # caller observes the original CancelledError.
+        kill_process_group(proc)
+        _close_pipes(proc)
+        await _join_tasks(waiters + readers, cancel_pending=True)
+        with contextlib.suppress(Exception):
+            await _wait_exited(proc, max(0.0, grace_seconds))
+        _close_pipes(proc)
         logger.warning("rsi.process.cancelled", pid=proc.pid)
         raise
+
+
+async def _cleanup_invalid_process(proc: asyncio.subprocess.Process, grace_seconds: float) -> None:
+    """Issue ownership cleanup and reap before an invalid-limit raise.
+
+    Argument validation runs before any capture allocation. The process has
+    already been spawned, however, so still kill its group and close the
+    parent-side pipe transports. Waiting for the leader is bounded by the
+    existing grace; this prevents an invalid call from stranding a child while
+    preserving the validation-before-buffer-allocation guarantee.
+    """
     kill_process_group(proc)
-    if proc.returncode is None:
-        await _wait_exited(proc, grace_seconds)
-    _done, pending = await asyncio.wait(readers, timeout=grace_seconds)
-    abandoned = bool(pending)
-    if abandoned:
-        for task in pending:
-            task.cancel()
-        _close_pipes(proc)
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await asyncio.gather(*pending, return_exceptions=True)
-        logger.warning(
-            "rsi.process.pipe_abandoned",
-            pid=proc.pid,
-            grace_seconds=grace_seconds,
-            hint="a descendant outside the process group still held stdout/stderr",
-        )
-    if proc.returncode is None:
-        # Unreapable within the grace (should not happen after SIGKILL); do not block on it.
-        _close_pipes(proc)
-        with contextlib.suppress(Exception):
-            transport = getattr(proc, "_transport", None)
-            if transport is not None:
-                transport.close()
-        exit_code = -1
-    else:
-        exit_code = proc.returncode
-    return CappedOutput(
-        exit_code=exit_code,
-        stdout=bytes(out),
-        stderr=bytes(err),
-        timed_out=timed_out,
-        pipe_abandoned=abandoned,
-    )
+    _close_pipes(proc)
+    with contextlib.suppress(Exception):
+        await _wait_exited(proc, max(0.0, grace_seconds))
+    _close_pipes(proc)
 
 
 class ClaudeCliEngine:
@@ -271,6 +413,25 @@ class ClaudeCliEngine:
             )
         capped = await run_capped(proc, timeout_seconds=timeout_seconds)
         wall = time.monotonic() - started
+        if capped.output_limit_exceeded:
+            diagnostic = (
+                "[rsi output limit exceeded; stdout/stderr capture was capped at "
+                f"{DEFAULT_MAX_OUTPUT_BYTES} bytes per stream]"
+            )
+            stderr = capped.stderr.decode("utf-8", "replace")
+            stderr = f"{stderr}\n{diagnostic}" if stderr else diagnostic
+            logger.warning(
+                "rsi.engine.output_limit_exceeded",
+                wall_seconds=wall,
+                max_output_bytes=DEFAULT_MAX_OUTPUT_BYTES,
+            )
+            return EngineResult(
+                exit_code=OUTPUT_LIMIT_EXIT,
+                stdout=capped.stdout.decode("utf-8", "replace"),
+                stderr=stderr,
+                wall_seconds=wall,
+                timed_out=False,
+            )
         if capped.timed_out:
             logger.warning("rsi.engine.timed_out", wall_seconds=wall, timeout=timeout_seconds)
             return EngineResult(

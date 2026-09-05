@@ -22,12 +22,14 @@ What this module guarantees:
   refuses a first run whose lock would pin nothing while the command names
   a sandbox file; a lock that legitimately pins nothing freezes only the
   command string. See :func:`~turing.research.rsi.contracts.compute_verifier_lock`.
-* :func:`run_verifier` runs the command in its own process group with a
-  hard wall-clock cap (:func:`~turing.research.rsi.engine.run_capped`): the
-  group is always killed when the command is done, a timed-out verifier is
-  a failure (``exit_code=124``), never a pass, and a stray holder of the
-  output pipe cannot stall the loop past the drain grace. Output is captured
-  in full for score parsing and truncated only in ``stdout_tail``.
+* :func:`run_verifier` runs the command in its own process group with hard
+  wall-clock and per-stream output caps
+  (:func:`~turing.research.rsi.engine.run_capped`): the group is always killed
+  when the command is done, a timed-out verifier is a failure
+  (``exit_code=124``), and a verifier that exceeds the output cap is a failure
+  (``exit_code=125``) before any score parsing. A stray holder of the output
+  pipe cannot stall the loop past the drain grace. Output below the cap is
+  captured for score parsing and truncated only in ``stdout_tail``.
 * :func:`load_verifier_lock` never constructs a lock it did not read: a
   malformed file — unreadable, not an object, inconsistent, or refused by
   the lock's own validation — is a :class:`FrozenVerifierError`, never a
@@ -62,7 +64,7 @@ from turing.research.rsi.contracts import (
     compute_verifier_lock,
     parse_score,
 )
-from turing.research.rsi.engine import run_capped
+from turing.research.rsi.engine import OUTPUT_LIMIT_EXIT, run_capped
 
 logger = structlog.get_logger(__name__)
 
@@ -248,12 +250,21 @@ async def run_verifier(
     wall = time.monotonic() - started
     stdout = capped.stdout.decode("utf-8", "replace")
     stderr = capped.stderr.decode("utf-8", "replace")
-    exit_code = VERIFIER_TIMEOUT_EXIT if capped.timed_out else capped.exit_code
-    passed = exit_code == 0
-    score = parse_score(stdout) if passed else None
+    if capped.output_limit_exceeded:
+        # Overflow is checked before parsing: retained bytes can contain a
+        # perfectly valid score, but they are an incomplete verifier result.
+        exit_code = OUTPUT_LIMIT_EXIT
+        passed = False
+        score = None
+    else:
+        exit_code = VERIFIER_TIMEOUT_EXIT if capped.timed_out else capped.exit_code
+        passed = exit_code == 0
+        score = parse_score(stdout) if passed else None
     tail = stdout[-STDOUT_TAIL_CHARS:]
     if not passed and stderr:
         tail = (tail + "\n[stderr] " + stderr)[-STDOUT_TAIL_CHARS:]
+    if capped.output_limit_exceeded:
+        tail = (tail + "\n[verifier output limit exceeded]")[-STDOUT_TAIL_CHARS:]
     logger.info(
         "rsi.verifier.finished",
         exit_code=exit_code,
