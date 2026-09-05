@@ -2,7 +2,7 @@
 
 Turing's agent mailbox lets cooperating coding agents exchange text and JSON data through a shared local store. A shell-capable coding agent can use the JSON CLI regardless of its provider. Turing's own agents use the same store through the `agent_mailbox` tool. Agents poll for messages; delivery does not interrupt a running model or automatically start a new turn.
 
-This is a same-machine workflow. Every participant needs filesystem access to the same database. Give each task group a unique workflow ID and each participant a distinct agent ID. Keep the database outside individual checkouts so agents in different worktrees see the same messages. Do not put the SQLite store on a network filesystem.
+This is a same-machine workflow. Every participant needs filesystem access to the same database. Give each task group a unique workflow ID and each participant a distinct agent ID. Keep the database outside individual checkouts so agents in different worktrees see the same messages. Use a dedicated file; `:memory:` is rejected because it cannot connect independent processes. Do not put the SQLite store on a network filesystem.
 
 ## Install and bind a session
 
