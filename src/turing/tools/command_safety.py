@@ -25,6 +25,14 @@ import shlex
 # is the union of the former ``shell.py`` and ``safety.py`` lists; a match is
 # a denial, not a confirmation prompt. It is a pre-filter, not a boundary —
 # the parse-based classifier below is what actually gates approvals.
+
+# A bare drive-root token at a token boundary: ``C:\``, ``C:/``, or ``C:``,
+# optionally with a trailing ``*`` / ``*.*`` wildcard after the slash
+# (``del /s /q C:\*`` wipes the drive just as surely as ``C:\``). A
+# subdirectory path (``C:\temp\*``) never matches — the token must end at
+# the root.
+_DRIVE_ROOT = r"[A-Za-z]:(?:[\\/]\*(?:\.\*)?|[\\/]?)(?=\s|$)"
+
 DENY_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"rm\s+-rf\s+/(?!\w)", re.IGNORECASE),  # rm -rf /
     re.compile(r"mkfs", re.IGNORECASE),  # format a filesystem
@@ -36,6 +44,42 @@ DENY_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"wget.*\|\s*(?:bash|sh)\b", re.IGNORECASE),  # wget … | sh
     re.compile(r"\b(?:shutdown|reboot|halt|poweroff)\b", re.IGNORECASE),  # power
     re.compile(r"\b(?:userdel|useradd|passwd)\b", re.IGNORECASE),  # user mgmt
+    # ── Windows / PowerShell spellings (issue #399) ──────────────────────
+    # The deny check runs before the platform branch in the shell tool, so
+    # these apply on every platform — intended: a PowerShell-native
+    # catastrophe pasted into a POSIX shell is still nothing we should run.
+    # PowerShell is case-insensitive, so IGNORECASE is load-bearing here.
+    re.compile(r"\b(?:Stop|Restart)-Computer\b", re.IGNORECASE),  # power
+    # Remove-Item (or any of its built-in PowerShell aliases: rm, ri, rd,
+    # rmdir, del, erase) -Recurse -Force <drive root>, flags/path in any
+    # order. The -Recurse/-Force lookaheads keep POSIX `rm` out of this
+    # pattern: `rm -rf /` is caught by the first pattern above, and
+    # `rm -rf ./build` matches neither.
+    re.compile(
+        r"\b(?:Remove-Item|rm|ri|rd|rmdir|del|erase)\b"
+        r"(?=.*\s-Recurse\b)(?=.*\s-Force\b)(?=.*\s" + _DRIVE_ROOT + r")",
+        re.IGNORECASE,
+    ),
+    # cmd.exe drive-root wipes, flags before or after the path:
+    # rd|rmdir /s /q C:\  and  del with two of /f /s /q plus C:\ (or C:\*).
+    re.compile(
+        r"\b(?:rd|rmdir)\b(?=.*\s/s\b)(?=.*\s/q\b)(?=.*\s" + _DRIVE_ROOT + r")",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bdel\b(?=(?:.*\s/[fsq]\b){2})(?=.*\s" + _DRIVE_ROOT + r")",
+        re.IGNORECASE,
+    ),
+    # disk/volume destruction (mkfs analogues)
+    re.compile(r"\b(?:Format-Volume|Clear-Disk|Initialize-Disk)\b", re.IGNORECASE),
+    # download-pipe-execute: iwr/irm … | iex (curl | sh analogue). Requires
+    # the download cmdlet *and* the pipe, so `Get-Command iex` or a file
+    # literally named `iex` never matches — same tradeoff as curl|sh above.
+    re.compile(
+        r"\b(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b"
+        r".*\|\s*(?:iex|Invoke-Expression)\b",
+        re.IGNORECASE,
+    ),
 ]
 
 

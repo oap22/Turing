@@ -50,7 +50,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import signal
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +57,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+from turing import oscompat
 from turing.config import TuringConfig
 from turing.coordinator.episode_rewards import EpisodeRewardsStore
 from turing.gateway.app import create_app
@@ -235,9 +235,10 @@ async def _run(config: TuringConfig) -> None:
         logger.info("gateway_standalone_shutdown_requested")
         shutdown_event.set()
 
+    # add_signal_handler raises NotImplementedError on Windows (Proactor
+    # loop); oscompat falls back to signal.signal so startup survives.
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _signal_handler)
+    oscompat.install_signal_handlers(loop, _signal_handler)
 
     try:
         await shutdown_event.wait()

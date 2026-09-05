@@ -10,6 +10,7 @@ from typing import Any
 
 import structlog
 
+from turing import oscompat
 from turing.tools.base import RiskLevel, Tool, ToolResult
 from turing.tools.command_safety import check_denylist, classify_command_risk
 
@@ -39,6 +40,9 @@ class ShellTool(Tool):
 
     @property
     def description(self) -> str:
+        # Name the shell so the LLM writes syntax that will actually run.
+        if oscompat.is_windows():
+            return "Execute a shell command on the system (runs under PowerShell)"
         return "Execute a shell command on the system"
 
     @property
@@ -105,11 +109,22 @@ class ShellTool(Tool):
 
         # --- Execute ---
         try:
-            process = await asyncio.create_subprocess_shell(
-                final_command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            if oscompat.is_windows():
+                # Run under PowerShell explicitly (create_subprocess_shell
+                # would use cmd.exe via %COMSPEC%) and suppress the console
+                # window a GUI-launched process would otherwise flash.
+                process = await asyncio.create_subprocess_exec(
+                    *oscompat.windows_shell_argv(final_command),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    creationflags=oscompat.subprocess_creation_flags(),
+                )
+            else:
+                process = await asyncio.create_subprocess_shell(
+                    final_command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
             try:
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
                     process.communicate(),
@@ -165,6 +180,16 @@ class ShellTool(Tool):
         """
         if not self._sandbox_enabled:
             return command
+
+        if oscompat.is_windows():
+            # bubblewrap is Linux-only; there is no equivalent sandbox here.
+            # Same fail-closed posture, but an honest message instead of
+            # "install bwrap" (which is impossible on Windows).
+            raise RuntimeError(
+                "sandbox_enabled is set but bubblewrap sandboxing is not "
+                "available on Windows; set TURING_SANDBOX_ENABLED=false to "
+                "run shell commands unsandboxed"
+            )
 
         bwrap_path = shutil.which("bwrap")
         if bwrap_path is None:

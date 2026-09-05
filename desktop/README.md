@@ -99,8 +99,32 @@ and the launcher offer two identical `turing` apps. The marker itself can't
 be committed (`target/` is gitignored), which is why the script recreates
 it on every build.
 
-Bundling is on for macOS only in practice; the config carries no
-Windows/Linux-specific bundle settings.
+`bundle.targets` names only the macOS bundles (`app`, `dmg`), so local
+`tauri build` on a Mac is unaffected by other platforms' settings. The
+Windows bundle is selected **per-invocation** instead of via `targets` —
+`tauri build --bundles nsis` — which is what CI's `desktop-windows` job
+runs; the config carries no Linux-specific bundle settings.
+
+### Windows (NSIS)
+
+Built by CI only (the `desktop-windows` job on `windows-latest`, issue
+#399) — there is no cross-compile path from macOS. `bundle.windows` in
+`tauri.conf.json` configures:
+
+- **NSIS, per-user** (`installMode: "currentUser"`): no admin prompt,
+  installs under `%LOCALAPPDATA%\turing` (Tauri's NSIS template uses
+  `$LOCALAPPDATA\<productName>`), per-user uninstaller. An MSI
+  is available on demand via `--bundles msi` (WiX); nothing else changes.
+- **WebView2** via the Evergreen `downloadBootstrapper` (silent), for
+  images that don't ship it.
+- **Code-signing placeholders**: `certificateThumbprint: null`,
+  `timestampUrl: null`, `digestAlgorithm: "sha256"`. The installer is
+  unsigned until a certificate exists, so SmartScreen warns on first run
+  ("More info → Run anyway"). Fill in a real thumbprint + RFC-3161
+  timestamp URL to sign; never commit fake values.
+
+Install/run/Defender details for operators live in
+`docs/operator/windows.md`.
 
 ### Icon
 
@@ -130,10 +154,11 @@ macOS' `qlmanage` bakes a drop shadow into its output.
 
 ## Config
 
-Optional overlay at `~/.config/turing-desktop/config.json` — any key may be
-omitted to keep the default; a missing file or parse error silently falls
-back to defaults (nothing is ever written by the app). `roots`, when
-present, replaces the default root list wholesale.
+Optional overlay at `~/.config/turing-desktop/config.json` (on Windows:
+`%APPDATA%\turing-desktop\config.json`) — any key may be omitted to keep
+the default; a missing file or parse error silently falls back to defaults
+(nothing is ever written by the app). `roots`, when present, replaces the
+default root list wholesale.
 
 ```json
 {

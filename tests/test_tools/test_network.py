@@ -9,6 +9,7 @@ patched; ``http_request`` uses ``httpx.AsyncClient``; ``dns_lookup`` uses
 from __future__ import annotations
 
 import socket
+import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -155,6 +156,29 @@ class TestPing:
             with _patch_ping_subprocess(0, stdout=b"ok"):
                 result = await network_tool.execute(action="ping", host=host)
             assert result.success is True
+
+    async def test_windows_argv_and_no_window_flag(
+        self, network_tool: NetworkTool, monkeypatch: pytest.MonkeyPatch
+    ):
+        """On Windows ping counts with -n and takes -w in milliseconds, and
+        the spawn carries CREATE_NO_WINDOW (issue #399)."""
+        monkeypatch.setattr(sys, "platform", "win32")
+        with _patch_ping_subprocess(0, stdout=b"ok") as p:
+            result = await network_tool.execute(action="ping", host="1.1.1.1", count=3)
+        assert result.success is True
+        argv = p.await_args.args
+        assert argv[0] == "ping"
+        assert argv[1:3] == ("-n", "3")
+        assert argv[3:5] == ("-w", "10000")
+        assert argv[-1] == "1.1.1.1"
+        assert p.await_args.kwargs["creationflags"] == 0x08000000
+
+    async def test_posix_spawn_has_noop_creationflags(self, network_tool: NetworkTool):
+        """POSIX argv is unchanged and creationflags is the no-op 0."""
+        with _patch_ping_subprocess(0, stdout=b"ok") as p:
+            await network_tool.execute(action="ping", host="1.1.1.1")
+        assert p.await_args.args[1:3] == ("-c", "4")
+        assert p.await_args.kwargs["creationflags"] == 0
 
 
 # ---------------------------------------------------------------------------
