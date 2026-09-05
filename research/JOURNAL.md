@@ -21,6 +21,14 @@ first run is how real priors start accumulating.
 
 ---
 
+## 2026-09-05 — Desktop latency engineering verification
+
+Three paired clean-source runs reduce live graph series/rendering work, and native
+watcher checks preserve final samples previously lost. Evidence, raw-run paths,
+commands, falsifiers, mutation-test correction, and native UI verification are in
+[the latency brief](briefs/2026-09-05-desktop-latency.md). This is engineering
+verification, not an RSI trajectory or corpus result.
+
 ## 2026-09-04 — First live RSI workstation run: import-speedup, 4 rounds, one self-edit, 4.77× measured
 
 **This is the first entry in this program that carries measured numbers.** It

@@ -365,6 +365,10 @@ mod tests {
             blocked_writer.try_lock().is_err(),
             "large paste must actually block"
         );
+        assert!(
+            ptys.entries.try_lock().is_ok(),
+            "blocked writer holds the shared registry"
+        );
         let start = Instant::now();
         tauri::async_runtime::block_on(write_input(&ptys, 2, "ok".to_string())).unwrap();
         let elapsed = start.elapsed();
