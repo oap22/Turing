@@ -11,6 +11,7 @@ Install this Turing checkout into a Python 3.11+ environment using the project's
 For example, in every participant's terminal:
 
 ```sh
+mkdir -p "$HOME/.local/share/turing/mailboxes"
 export TURING_AGENT_MAILBOX_DB="$HOME/.local/share/turing/mailboxes/demo.sqlite3"
 export TURING_AGENT_MAILBOX_WORKFLOW="feature-demo"
 ```
@@ -78,6 +79,7 @@ A harness without shell access needs an adapter to the Python API or the native 
 Set all three mailbox configuration values on the Turing process:
 
 ```sh
+mkdir -p "$HOME/.local/share/turing/mailboxes"
 export TURING_AGENT_MAILBOX_DB="$HOME/.local/share/turing/mailboxes/demo.sqlite3"
 export TURING_AGENT_MAILBOX_WORKFLOW="feature-demo"
 export TURING_AGENT_MAILBOX_AGENT="local-reviewer"
@@ -94,7 +96,7 @@ export TURING_OLLAMA_TOOLS_ENABLED=true
 python -m turing
 ```
 
-This preserves tool definitions on the local route and uses Turing's existing executor and safety gate. It does not make a text-only model capable of tool use. Default local behavior remains unchanged unless enabled. Model quality and compliance require testing with the actual installed model; adapter tests alone cannot establish them. Give the native agent a task that tells it when to poll and whom to contact. The in-tree node service is part of the dormant fleet stack: starting it registers the tool but does not create an interactive coding session or wake an agent. An embedding caller must submit a turn through the existing `Agent.process_message` API. For current desktop coding sessions, use the CLI from the coding harness.
+This preserves tool definitions on the local route and uses Turing's existing executor and safety gate. It does not make a text-only model capable of tool use. Default local behavior remains unchanged unless enabled. Model quality and compliance require testing with the actual installed model; adapter tests alone cannot establish them. Give the native agent a task that tells it when to poll and whom to contact. The in-tree node service is part of the dormant fleet stack: starting it registers the tool but does not create an interactive coding session or wake an agent. An embedding caller must submit a turn through the existing `Agent.handle_message` API. For current desktop coding sessions, use the CLI from the coding harness.
 
 ## Persistence, capacity, and trust
 

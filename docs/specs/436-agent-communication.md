@@ -2,7 +2,7 @@
 
 Tracking: https://github.com/oap22/Turing/issues/436
 Status: implementation specification
-Review tier: human review (new persisted mailbox schema and protocol).
+Review tier: human review (new persisted mailbox schema and protocol; explicit classification in the CODEOWNERS-protected safety gate).
 
 ## Problem and feasibility
 
