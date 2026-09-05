@@ -4,7 +4,7 @@
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
@@ -196,7 +196,7 @@ pub fn pty_spawn(
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
 
-    let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
+    let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
     let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
 
     let id = ptys.next_id.fetch_add(1, Ordering::SeqCst) + 1;
@@ -210,24 +210,16 @@ pub fn pty_spawn(
 
     let app_for_reader = app.clone();
     std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        // Trailing bytes of a multi-byte sequence that straddled the previous
-        // read boundary; prepended to the next chunk. See `split_utf8`.
+        // Decode across batch boundaries exactly as across read boundaries.
         let mut carry: Vec<u8> = Vec::new();
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    carry.extend_from_slice(&buf[..n]);
-                    let (data, rest) = split_utf8(&carry);
-                    carry = rest;
-                    if !data.is_empty() {
-                        let _ = app_for_reader.emit("pty-output", PtyOutput { id, data });
-                    }
-                }
-                Err(_) => break,
+        crate::pty_output::stream(reader, |bytes| {
+            carry.extend_from_slice(bytes);
+            let (data, rest) = split_utf8(&carry);
+            carry = rest;
+            if !data.is_empty() {
+                let _ = app_for_reader.emit("pty-output", PtyOutput { id, data });
             }
-        }
+        });
         // The stream ended mid-sequence (truncated output). Nothing more is
         // coming, so flush the stub lossily rather than dropping it silently.
         if !carry.is_empty() {
@@ -321,6 +313,7 @@ mod tests {
     use super::*;
 
     use std::ffi::OsStr;
+    use std::io::Read;
 
     // Real PTY child deliberately does not drain a large paste. While its
     // write is blocked, another terminal must remain writable and the stalled
@@ -388,6 +381,71 @@ mod tests {
             elapsed < Duration::from_millis(500),
             "another pane waited for the blocked child"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "real PTY throughput benchmark"]
+    fn measure_output_batches() {
+        use std::time::Instant;
+        let bytes = "log λ 😀 ".repeat(400_000).into_bytes();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&bytes).unwrap();
+        for baseline in [true, false, true, false, true, false] {
+            let pair = native_pty_system()
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap();
+            let mut command = CommandBuilder::new("/bin/cat");
+            command.arg(file.path());
+            let start = Instant::now();
+            let mut child = pair.slave.spawn_command(command).unwrap();
+            drop(pair.slave);
+            let mut reader = pair.master.try_clone_reader().unwrap();
+            let mut received = Vec::new();
+            let mut carry = Vec::new();
+            let mut events = 0;
+            let mut first_ms = None;
+            let mut consume = |part: &[u8]| {
+                received.extend_from_slice(part);
+                carry.extend_from_slice(part);
+                let (data, rest) = split_utf8(&carry);
+                carry = rest;
+                if data.is_empty() {
+                    return;
+                }
+                first_ms.get_or_insert(start.elapsed().as_secs_f64() * 1000.0);
+                let json = serde_json::to_string(&PtyOutput { id: 1, data }).unwrap();
+                // Same payload a webview receives; parse and consume it so the
+                // measured work is not optimized away. No simulated IPC delay.
+                let decoded: serde_json::Value = serde_json::from_str(&json).unwrap();
+                assert_eq!(decoded["id"], 1);
+                events += 1;
+            };
+            if baseline {
+                let mut buf = [0; 4096];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => consume(&buf[..n]),
+                    }
+                }
+            } else {
+                crate::pty_output::stream(reader, &mut consume);
+            }
+            child.wait().unwrap();
+            assert_eq!(
+                received, bytes,
+                "no lost, duplicated, or reordered PTY bytes"
+            );
+            assert!(carry.is_empty());
+            eprintln!("pty_output baseline={baseline} bytes={} events={events} elapsed_ms={:.3} first_ms={:.3}",
+                bytes.len(), start.elapsed().as_secs_f64()*1000.0, first_ms.unwrap());
+        }
     }
 
     // The regression that actually made the pane unusable: with TERM unset,
