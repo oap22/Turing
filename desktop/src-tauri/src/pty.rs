@@ -326,6 +326,7 @@ mod tests {
     // write is blocked, another terminal must remain writable and the stalled
     // child must remain killable. A bounded timeout makes lock regressions fail.
     #[test]
+    #[cfg(unix)]
     fn blocked_paste_does_not_block_another_terminal_or_kill() {
         use std::time::{Duration, Instant};
         let ptys = Arc::new(Ptys::default());
