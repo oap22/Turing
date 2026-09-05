@@ -34,7 +34,9 @@ cleans up coordinator tasks; remote work follows existing deadlines.
 3. A worker returning NEEDS_SUBTASK remains incomplete and its in-flight entry
    is removed before rediscovery. The parent becomes eligible after its original dependencies and the
    designated rejoin_after nodes complete, even if other fragment nodes are
-   still running; synthesis waits for all nodes. Retry once per deferral. No busy loop or second concurrent parent attempt.
+   still running; synthesis waits for all nodes. Retry once per deferral. No busy loop or second concurrent parent attempt. A resumed parent may
+   request another valid fragment; do not introduce a one-deferral lifetime
+   limit or change the existing retry policy.
 4. Fragment insertion must be atomic: validate every new ID/output key against
    the live graph and the proposed fragment before mutation. A late collision
    must not leave earlier fragment nodes installed. Output URI collisions must
@@ -69,6 +71,8 @@ no sleep-based performance assertions, no private helper scheduler replicas.
   completion; multiple simultaneous completions handled without lost outputs.
 - Local deferral while an unrelated task is blocked: inserted child executes,
   parent resumes with child plus original inputs, and synthesis waits for all.
+- Parent defers twice sequentially with distinct valid fragments, then
+  succeeds: three parent calls total, never two in flight, correct inputs.
 - Collision in second fragment node leaves the graph unchanged; concurrent
   overlapping fragments abort with no stranded owned tasks. Include distinct
   IDs sharing an output URI and existing-graph output collisions.

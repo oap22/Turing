@@ -1,7 +1,7 @@
 # RSI for Turing orchestration
 
 Owner: oap22. Tracking: #419. Baseline: main `94f1e1f` (2026-09-05).
-Implementation model: GPT-5.6 Luna, xhigh reasoning. Status: S01/S02/S04 reviewed and dispatched; S03 follow-on design.
+Implementation model: GPT-5.6 Luna, xhigh reasoning. Status: S01/S02/S04 implemented and independently reviewed; S03 follow-on design.
 
 The goal is reliable completion per unit cost, not more agents, more rounds,
 or higher self-reported scores. Existing RSI can edit SCAFFOLD.md, but a best
@@ -10,6 +10,19 @@ randomness, and task difficulty. It is a regression heuristic, not evidence
 that self-improvement works. #413 is merged; its live speedup trace does not
 establish causality for scaffold edits. The research runner's self_edit_seam
 is explicitly unwired. Do not silently join these two systems.
+
+## Delivered implementation PRs
+
+| Spec | PR | Verified behavior |
+| --- | --- | --- |
+| S01 | [#425](https://github.com/oap22/Turing/pull/425) | Eligible dependents run without waiting for unrelated tasks; cleanup is joined |
+| S02 | [#426](https://github.com/oap22/Turing/pull/426) | Prior valid scoreless passes remain no_progress across restarts |
+| S04 | [#427](https://github.com/oap22/Turing/pull/427) | Output is capped per stream; overflow fails explicitly; cancelled readers are joined |
+
+All three were implemented by GPT-5.6 Luna with xhigh reasoning, then reviewed
+and verified independently. Read review-log.md for before/after evidence and
+review repairs. These changes are PRs, not deployed runtime changes. S03 remains
+a follow-on experiment design, not evidence that scaffold edits improve models.
 
 ## Ordered campaign
 
