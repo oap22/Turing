@@ -3,6 +3,7 @@ mod fs_dispatch;
 mod fsroots;
 mod gateway;
 mod pty;
+mod pty_output;
 mod window;
 
 use tauri::menu::{MenuBuilder, PredefinedMenuItem, SubmenuBuilder};
