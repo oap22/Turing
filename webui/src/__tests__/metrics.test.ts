@@ -5,6 +5,7 @@ import { createElement } from "react";
 import { render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  dedupeRunFiles,
   VERDICT_QUALIFIER,
   badgeLabelOf,
   badgeRunTailOf,
@@ -18,6 +19,7 @@ import {
   parseVerdictFile,
   parseViewerFile,
   pickSeries,
+  runLabelOf,
   runIdOf,
   seriesOf,
   verdictPathOf,
@@ -34,13 +36,22 @@ describe("parseMetricsText", () => {
       '{"step":2,"loss":0.3}',
     ].join("\n");
     const points = parseMetricsText(text);
-    expect(points).toEqual([{ step: 1, loss: 0.5 }, { step: 2, loss: 0.3 }]);
+    expect(points).toEqual([
+      { step: 1, loss: 0.5 },
+      { step: 2, loss: 0.3 },
+    ]);
   });
 
   it("accepts a whole-file JSON array", () => {
-    const text = JSON.stringify([{ step: 0, loss: 1.0 }, { step: 1, loss: 0.8 }]);
+    const text = JSON.stringify([
+      { step: 0, loss: 1.0 },
+      { step: 1, loss: 0.8 },
+    ]);
     const points = parseMetricsText(text);
-    expect(points).toEqual([{ step: 0, loss: 1.0 }, { step: 1, loss: 0.8 }]);
+    expect(points).toEqual([
+      { step: 0, loss: 1.0 },
+      { step: 1, loss: 0.8 },
+    ]);
   });
 
   it("keeps only finite-number values", () => {
@@ -58,6 +69,38 @@ describe("parseMetricsText", () => {
   });
 });
 
+describe("runLabelOf", () => {
+  it("uses the run directory, or the whole path when there isn't one", () => {
+    expect(runLabelOf("run-42/metrics.jsonl")).toBe("run-42");
+    expect(runLabelOf("run-42/ckpt/metrics.json")).toBe("run-42");
+    expect(runLabelOf("metrics.jsonl")).toBe("metrics.jsonl");
+  });
+});
+
+describe("dedupeRunFiles", () => {
+  it("keeps only the newest file per run so a run can't be plotted twice", () => {
+    const files = [
+      { rel_path: "run-a/metrics.jsonl", mtime_ms: 100 },
+      { rel_path: "run-a/ckpt/metrics.json", mtime_ms: 300 },
+      { rel_path: "run-b/metrics.jsonl", mtime_ms: 200 },
+      { rel_path: "run-a/metrics.json", mtime_ms: 50 },
+    ];
+    expect(dedupeRunFiles(files)).toEqual([
+      { rel_path: "run-a/ckpt/metrics.json", mtime_ms: 300 },
+      { rel_path: "run-b/metrics.jsonl", mtime_ms: 200 },
+    ]);
+  });
+
+  it("preserves input order and leaves already-unique lists alone", () => {
+    const files = [
+      { rel_path: "run-b/metrics.jsonl", mtime_ms: 2 },
+      { rel_path: "run-a/metrics.jsonl", mtime_ms: 1 },
+    ];
+    expect(dedupeRunFiles(files)).toEqual(files);
+    expect(dedupeRunFiles([])).toEqual([]);
+  });
+});
+
 describe("isChartRunFile", () => {
   // The regression this guards: `results.py` writes *summaries* named
   // `metrics.json` (`write_attempt_summary`, `write_round_summary`), the round
@@ -66,21 +109,34 @@ describe("isChartRunFile", () => {
   // pretty-printed JSON object and the operator saw "no metrics yet" the
   // moment a round completed.
   it("accepts the step log and rejects the summaries beside it", () => {
-    expect(isChartRunFile("loop/round-00/attempts/cuda/matmul-speedup/metrics.jsonl")).toBe(true);
+    expect(
+      isChartRunFile(
+        "loop/round-00/attempts/cuda/matmul-speedup/metrics.jsonl",
+      ),
+    ).toBe(true);
     expect(isChartRunFile("demo-run/metrics.jsonl")).toBe(true);
     expect(isChartRunFile("metrics.jsonl")).toBe(true);
 
     expect(isChartRunFile("loop/round-00/metrics.json")).toBe(false);
-    expect(isChartRunFile("loop/round-00/attempts/cuda/matmul-speedup/metrics.json")).toBe(false);
+    expect(
+      isChartRunFile("loop/round-00/attempts/cuda/matmul-speedup/metrics.json"),
+    ).toBe(false);
     expect(isChartRunFile("loop/round-00/round.json")).toBe(false);
-    expect(isChartRunFile("loop/round-00/attempts/x/metrics.chain.json")).toBe(false);
+    expect(isChartRunFile("loop/round-00/attempts/x/metrics.chain.json")).toBe(
+      false,
+    );
   });
 
   // A summary must not merely be un-followed — it must not present as a
   // chartable run at all, because `parseMetricsText` yields nothing for it.
   it("a summary object it would have listed carries no series (#401 behaviour, unchanged)", () => {
     const summary = JSON.stringify(
-      { schema_version: 1, problem_id: "flat-baseline", best_score: 2.05, consumed_steps: 3 },
+      {
+        schema_version: 1,
+        problem_id: "flat-baseline",
+        best_score: 2.05,
+        consumed_steps: 3,
+      },
       null,
       2,
     );
@@ -93,12 +149,12 @@ describe("runIdOf", () => {
   // The old label was the first path segment — the loop name — so the real
   // listbox showed 18 rows all reading `loop-probe`.
   it("names the run directory, keeping the round and a nested problem id legible", () => {
-    expect(runIdOf("loop-probe/round-00/attempts/cuda/matmul-speedup/metrics.jsonl")).toBe(
-      "loop-probe/round-00/attempts/cuda/matmul-speedup",
-    );
-    expect(runIdOf("loop-probe/round-01/attempts/flat-baseline/metrics.jsonl")).toBe(
-      "loop-probe/round-01/attempts/flat-baseline",
-    );
+    expect(
+      runIdOf("loop-probe/round-00/attempts/cuda/matmul-speedup/metrics.jsonl"),
+    ).toBe("loop-probe/round-00/attempts/cuda/matmul-speedup");
+    expect(
+      runIdOf("loop-probe/round-01/attempts/flat-baseline/metrics.jsonl"),
+    ).toBe("loop-probe/round-01/attempts/flat-baseline");
     expect(runIdOf("demo-run/metrics.jsonl")).toBe("demo-run");
   });
 
@@ -127,16 +183,39 @@ describe("matchesViewerRuns", () => {
   ];
 
   it("selects exactly the runs the loop emitted", () => {
-    expect(matchesViewerRuns("loop-probe/round-00/attempts/bad-instrument/metrics.jsonl", runs)).toBe(true);
     expect(
-      matchesViewerRuns("loop-probe/round-00/attempts/cuda/matmul-speedup/metrics.jsonl", runs),
+      matchesViewerRuns(
+        "loop-probe/round-00/attempts/bad-instrument/metrics.jsonl",
+        runs,
+      ),
     ).toBe(true);
-    expect(matchesViewerRuns("loop-probe/round-01/attempts/flat-baseline/metrics.jsonl", runs)).toBe(true);
+    expect(
+      matchesViewerRuns(
+        "loop-probe/round-00/attempts/cuda/matmul-speedup/metrics.jsonl",
+        runs,
+      ),
+    ).toBe(true);
+    expect(
+      matchesViewerRuns(
+        "loop-probe/round-01/attempts/flat-baseline/metrics.jsonl",
+        runs,
+      ),
+    ).toBe(true);
   });
 
   it("does not select an unnamed run", () => {
-    expect(matchesViewerRuns("loop-probe/round-01/attempts/kaggle/titanic/metrics.jsonl", runs)).toBe(false);
-    expect(matchesViewerRuns("loop-probe/round-00/attempts/flat-baseline/metrics.jsonl", runs)).toBe(false);
+    expect(
+      matchesViewerRuns(
+        "loop-probe/round-01/attempts/kaggle/titanic/metrics.jsonl",
+        runs,
+      ),
+    ).toBe(false);
+    expect(
+      matchesViewerRuns(
+        "loop-probe/round-00/attempts/flat-baseline/metrics.jsonl",
+        runs,
+      ),
+    ).toBe(false);
   });
 
   // The prefix trap, and the reason this is equality and not `startsWith`: the
@@ -145,31 +224,42 @@ describe("matchesViewerRuns", () => {
   // prefix rule would draw a superseded attempt as if the loop had asked for it.
   it("does not select a sibling directory sharing the whole prefix", () => {
     expect(
-      matchesViewerRuns("loop-probe/round-00/attempts/cuda/matmul-speedup/prior-1/metrics.jsonl", runs),
+      matchesViewerRuns(
+        "loop-probe/round-00/attempts/cuda/matmul-speedup/prior-1/metrics.jsonl",
+        runs,
+      ),
     ).toBe(false);
     expect(
-      matchesViewerRuns("loop-probe/round-00/attempts/bad-instrument-2/metrics.jsonl", runs),
+      matchesViewerRuns(
+        "loop-probe/round-00/attempts/bad-instrument-2/metrics.jsonl",
+        runs,
+      ),
     ).toBe(false);
   });
 
   // The old code compared against the first path segment, which no
   // multi-segment entry could ever equal — the field was wholly inert.
   it("is not satisfied by the loop name alone", () => {
-    expect(matchesViewerRuns("loop-probe/round-00/attempts/bad-instrument/metrics.jsonl", ["loop-probe"])).toBe(
-      false,
-    );
+    expect(
+      matchesViewerRuns(
+        "loop-probe/round-00/attempts/bad-instrument/metrics.jsonl",
+        ["loop-probe"],
+      ),
+    ).toBe(false);
   });
 
   it("accepts the run file spelled out, and tolerates a trailing slash", () => {
     expect(
-      matchesViewerRuns("loop-probe/round-00/attempts/bad-instrument/metrics.jsonl", [
+      matchesViewerRuns(
         "loop-probe/round-00/attempts/bad-instrument/metrics.jsonl",
-      ]),
+        ["loop-probe/round-00/attempts/bad-instrument/metrics.jsonl"],
+      ),
     ).toBe(true);
     expect(
-      matchesViewerRuns("loop-probe/round-00/attempts/bad-instrument/metrics.jsonl", [
-        "loop-probe/round-00/attempts/bad-instrument/",
-      ]),
+      matchesViewerRuns(
+        "loop-probe/round-00/attempts/bad-instrument/metrics.jsonl",
+        ["loop-probe/round-00/attempts/bad-instrument/"],
+      ),
     ).toBe(true);
   });
 });
@@ -182,14 +272,23 @@ describe("seriesOf", () => {
     ];
     const series = seriesOf(points);
     expect(Array.from(series.keys()).sort()).toEqual(["acc", "loss"]);
-    expect(series.get("loss")).toEqual([[0, 1.0], [1, 0.8]]);
-    expect(series.get("acc")).toEqual([[0, 0.1], [1, 0.2]]);
+    expect(series.get("loss")).toEqual([
+      [0, 1.0],
+      [1, 0.8],
+    ]);
+    expect(series.get("acc")).toEqual([
+      [0, 0.1],
+      [1, 0.2],
+    ]);
   });
 
   it("falls back to index for x when step is absent", () => {
     const points = [{ loss: 1.0 }, { loss: 0.5 }];
     const series = seriesOf(points);
-    expect(series.get("loss")).toEqual([[0, 1.0], [1, 0.5]]);
+    expect(series.get("loss")).toEqual([
+      [0, 1.0],
+      [1, 0.5],
+    ]);
   });
 });
 
@@ -220,7 +319,9 @@ describe("etaOf", () => {
 
 describe("pickSeries", () => {
   it("keeps the stored series when it's still available", () => {
-    expect(pickSeries(["acc", "loss", "grad_norm"], "grad_norm")).toBe("grad_norm");
+    expect(pickSeries(["acc", "loss", "grad_norm"], "grad_norm")).toBe(
+      "grad_norm",
+    );
   });
 
   it("falls back to loss when the stored series is missing", () => {
@@ -260,8 +361,21 @@ describe("Chart", () => {
 
   it("renders one polyline per series and a bordered (not white-filled) plot area", () => {
     const series = [
-      { label: "run1/loss", points: [[0, 1], [1, 0.5], [2, 0.25]] as Array<[number, number]> },
-      { label: "run2/loss", points: [[0, 1.2], [1, 0.6]] as Array<[number, number]> },
+      {
+        label: "run1/loss",
+        points: [
+          [0, 1],
+          [1, 0.5],
+          [2, 0.25],
+        ] as Array<[number, number]>,
+      },
+      {
+        label: "run2/loss",
+        points: [
+          [0, 1.2],
+          [1, 0.6],
+        ] as Array<[number, number]>,
+      },
     ];
     const { container } = render(createElement(Chart, { series }));
     const polylines = container.querySelectorAll("polyline");
@@ -278,6 +392,77 @@ describe("Chart", () => {
     expect(border?.getAttribute("stroke")).toBe("var(--t-edge)");
   });
 
+  it("gives every overlaid series its own theme-palette color", () => {
+    const series = Array.from({ length: 8 }, (_, i) => ({
+      label: `run${i}/loss`,
+      points: [
+        [0, i],
+        [1, i + 1],
+      ] as Array<[number, number]>,
+    }));
+    const { container } = render(createElement(Chart, { series }));
+    const strokes = Array.from(container.querySelectorAll("polyline")).map(
+      (p) => p.getAttribute("stroke"),
+    );
+    expect(strokes).toEqual([
+      "var(--t-series-1)",
+      "var(--t-series-2)",
+      "var(--t-series-3)",
+      "var(--t-series-4)",
+      "var(--t-series-5)",
+      "var(--t-series-6)",
+      "var(--t-series-7)",
+      "var(--t-series-8)",
+    ]);
+    // Past the palette length the colors cycle rather than going undefined.
+    const wrapped = render(
+      createElement(Chart, {
+        series: [
+          ...series,
+          { label: "run8/loss", points: [[0, 0]] as Array<[number, number]> },
+        ],
+      }),
+    );
+    const wrappedStrokes = Array.from(
+      wrapped.container.querySelectorAll("polyline"),
+    );
+    expect(wrappedStrokes[8].getAttribute("stroke")).toBe("var(--t-series-1)");
+  });
+
+  it("prefers an explicitly assigned color over the positional fallback", () => {
+    // MetricsPane assigns sticky per-run colors, so the run in slot 0 of the
+    // chart is not necessarily the run holding series-1.
+    const series = [
+      {
+        label: "run-b/loss",
+        points: [[0, 1]] as Array<[number, number]>,
+        color: "var(--t-series-4)",
+      },
+    ];
+    const { container } = render(createElement(Chart, { series }));
+    expect(container.querySelector("polyline")?.getAttribute("stroke")).toBe(
+      "var(--t-series-4)",
+    );
+  });
+
+  it("renders a legend remove button only for series that can be removed", () => {
+    const onRemove = vi.fn();
+    const series = [
+      {
+        label: "run-a/loss",
+        points: [[0, 1]] as Array<[number, number]>,
+        onRemove,
+      },
+      { label: "run-b/loss", points: [[0, 2]] as Array<[number, number]> },
+    ];
+    const { container } = render(createElement(Chart, { series }));
+    const buttons = container.querySelectorAll("button");
+    expect(buttons.length).toBe(1);
+    expect(buttons[0].getAttribute("aria-label")).toBe("remove run-a/loss");
+    (buttons[0] as HTMLButtonElement).click();
+    expect(onRemove).toHaveBeenCalledTimes(1);
+  });
+
   // The ghost-curve defect: the key used to be `s.label`, a display string
   // that two pinned runs charting the same series produce identically. React
   // logged "Encountered two children with the same key" and left the
@@ -290,20 +475,30 @@ describe("Chart", () => {
       {
         id: "runA/metrics.jsonl::progress",
         label: "loop-probe/progress",
-        points: [[0, 1], [1, 0.5]] as Array<[number, number]>,
+        points: [
+          [0, 1],
+          [1, 0.5],
+        ] as Array<[number, number]>,
       },
       {
         id: "runB/metrics.jsonl::progress",
         label: "loop-probe/progress",
-        points: [[0, 2], [1, 1.5]] as Array<[number, number]>,
+        points: [
+          [0, 2],
+          [1, 1.5],
+        ] as Array<[number, number]>,
       },
     ];
     const { container } = render(createElement(Chart, { series }));
     expect(container.querySelectorAll("polyline").length).toBe(2);
     // Duplicate testids are the same footgun as duplicate keys.
-    expect(new Set(
-      Array.from(container.querySelectorAll("polyline")).map((p) => p.getAttribute("data-testid")),
-    ).size).toBe(2);
+    expect(
+      new Set(
+        Array.from(container.querySelectorAll("polyline")).map((p) =>
+          p.getAttribute("data-testid"),
+        ),
+      ).size,
+    ).toBe(2);
   });
 
   it("does not accumulate stale polylines across series switches with colliding labels", () => {
@@ -317,7 +512,10 @@ describe("Chart", () => {
       return ["runA", "runB"].map((run, i) => ({
         id: `${run}/metrics.jsonl::${seriesName}`,
         label: `loop-probe/${seriesName}`,
-        points: [[0, i + 1], [1, i + 2]] as Array<[number, number]>,
+        points: [
+          [0, i + 1],
+          [1, i + 2],
+        ] as Array<[number, number]>,
       }));
     }
     const { container, rerender } = render(
@@ -333,9 +531,27 @@ describe("Chart", () => {
   // the chart cannot accumulate stale nodes however it is driven.
   it("stays one-polyline-per-series when labels collide and no id is supplied", () => {
     const dup = [
-      { label: "same", points: [[0, 1], [1, 2]] as Array<[number, number]> },
-      { label: "same", points: [[0, 3], [1, 4]] as Array<[number, number]> },
-      { label: "same", points: [[0, 5], [1, 6]] as Array<[number, number]> },
+      {
+        label: "same",
+        points: [
+          [0, 1],
+          [1, 2],
+        ] as Array<[number, number]>,
+      },
+      {
+        label: "same",
+        points: [
+          [0, 3],
+          [1, 4],
+        ] as Array<[number, number]>,
+      },
+      {
+        label: "same",
+        points: [
+          [0, 5],
+          [1, 6],
+        ] as Array<[number, number]>,
+      },
     ];
     const { container } = render(createElement(Chart, { series: dup }));
     expect(container.querySelectorAll("polyline").length).toBe(3);
@@ -351,7 +567,11 @@ describe("parseViewerFile", () => {
   });
 
   it("applies a titles map", () => {
-    expect(parseViewerFile('{"series":"loss","titles":{"loss":"DPO loss — run 42"}}')).toEqual({
+    expect(
+      parseViewerFile(
+        '{"series":"loss","titles":{"loss":"DPO loss — run 42"}}',
+      ),
+    ).toEqual({
       series: "loss",
       titles: { loss: "DPO loss — run 42" },
     });
@@ -377,11 +597,15 @@ describe("parseViewerFile", () => {
   });
 
   it("ignores unknown keys", () => {
-    expect(parseViewerFile('{"series":"loss","nope":123}')).toEqual({ series: "loss" });
+    expect(parseViewerFile('{"series":"loss","nope":123}')).toEqual({
+      series: "loss",
+    });
   });
 
   it("drops individually malformed keys but keeps the valid ones", () => {
-    expect(parseViewerFile('{"series":7,"runs":["a"],"titles":{"a":"A"}}')).toEqual({
+    expect(
+      parseViewerFile('{"series":7,"runs":["a"],"titles":{"a":"A"}}'),
+    ).toEqual({
       runs: ["a"],
       titles: { a: "A" },
     });
@@ -452,14 +676,20 @@ describe("parseVerdictFile", () => {
   });
 
   it("reads the two non-ok states", () => {
-    expect(parseVerdictFile(verdictJson({ state: "failed" }))?.state).toBe("failed");
-    expect(parseVerdictFile(verdictJson({ state: "incomplete" }))?.state).toBe("incomplete");
+    expect(parseVerdictFile(verdictJson({ state: "failed" }))?.state).toBe(
+      "failed",
+    );
+    expect(parseVerdictFile(verdictJson({ state: "incomplete" }))?.state).toBe(
+      "incomplete",
+    );
   });
 
   it("returns null rather than guessing when the state is unknown or absent", () => {
     // A file this reader cannot understand must read as "no verdict", never
     // as a passing one: the badge's whole job is to not overclaim.
-    expect(parseVerdictFile(verdictJson({ state: "probably-fine" }))).toBeNull();
+    expect(
+      parseVerdictFile(verdictJson({ state: "probably-fine" })),
+    ).toBeNull();
     expect(parseVerdictFile('{"lines_checked":4}')).toBeNull();
     expect(parseVerdictFile("not json")).toBeNull();
     expect(parseVerdictFile("null")).toBeNull();
@@ -488,11 +718,17 @@ describe("parseVerdictFile", () => {
 describe("chainDigestOfLastLine", () => {
   // `MetricsWriter._append_sync`: `payload["_chain"] = f"{seq}:{digest}"`.
   function line(seq: number, digest: string): string {
-    return JSON.stringify({ step: seq + 1, loss: 0.5, _chain: `${seq}:${digest}` });
+    return JSON.stringify({
+      step: seq + 1,
+      loss: 0.5,
+      _chain: `${seq}:${digest}`,
+    });
   }
 
   it("returns the digest half of the last line's `_chain`", () => {
-    expect(chainDigestOfLastLine([line(0, "aa"), line(1, HEAD)].join("\n"))).toBe(HEAD);
+    expect(
+      chainDigestOfLastLine([line(0, "aa"), line(1, HEAD)].join("\n")),
+    ).toBe(HEAD);
   });
 
   it("ignores the sequence number, which is not what `chain_head` records", () => {
@@ -508,7 +744,9 @@ describe("chainDigestOfLastLine", () => {
   });
 
   it("ignores trailing blank lines, which the writer's own `\\n` produces", () => {
-    expect(chainDigestOfLastLine(`${line(0, "aa")}\n${line(1, HEAD)}\n`)).toBe(HEAD);
+    expect(chainDigestOfLastLine(`${line(0, "aa")}\n${line(1, HEAD)}\n`)).toBe(
+      HEAD,
+    );
     expect(chainDigestOfLastLine(`${line(1, HEAD)}\n\n  \n`)).toBe(HEAD);
   });
 
@@ -518,9 +756,13 @@ describe("chainDigestOfLastLine", () => {
     // the verifier rejects. `fs_tail` holds a mid-write fragment back, so an
     // unparseable last line here is a real one, not a writer mid-append.
     expect(chainDigestOfLastLine(`${line(0, HEAD)}\ngarbage\n`)).toBeNull();
-    expect(chainDigestOfLastLine(`${line(0, HEAD)}\n{"step":2,"loss":1}\n`)).toBeNull();
+    expect(
+      chainDigestOfLastLine(`${line(0, HEAD)}\n{"step":2,"loss":1}\n`),
+    ).toBeNull();
     expect(chainDigestOfLastLine(`${line(0, HEAD)}\n[1,2]\n`)).toBeNull();
-    expect(chainDigestOfLastLine(`${line(0, HEAD)}\n{"step":2,"_ch`)).toBeNull();
+    expect(
+      chainDigestOfLastLine(`${line(0, HEAD)}\n{"step":2,"_ch`),
+    ).toBeNull();
   });
 });
 
@@ -542,9 +784,13 @@ describe("badgeStateOf", () => {
   it("is stale when the verdict recorded no chain head to bind to", () => {
     // No head means the sidecar could not be read; there is nothing to bind
     // the badge to, and a green chip would be asserting a match nobody made.
-    expect(badgeStateOf(parseVerdictFile(verdictJson({ chain_head: null })), 4, HEAD)).toBe(
-      "stale",
-    );
+    expect(
+      badgeStateOf(
+        parseVerdictFile(verdictJson({ chain_head: null })),
+        4,
+        HEAD,
+      ),
+    ).toBe("stale");
   });
 
   it("is stale when the log has grown or shrunk since the loop checked", () => {
@@ -558,12 +804,16 @@ describe("badgeStateOf", () => {
   });
 
   it("reports incomplete and failed verdicts as themselves", () => {
-    expect(badgeStateOf(parseVerdictFile(verdictJson({ state: "incomplete" })), 4, HEAD)).toBe(
-      "incomplete",
-    );
-    expect(badgeStateOf(parseVerdictFile(verdictJson({ state: "failed" })), 4, HEAD)).toBe(
-      "failed",
-    );
+    expect(
+      badgeStateOf(
+        parseVerdictFile(verdictJson({ state: "incomplete" })),
+        4,
+        HEAD,
+      ),
+    ).toBe("incomplete");
+    expect(
+      badgeStateOf(parseVerdictFile(verdictJson({ state: "failed" })), 4, HEAD),
+    ).toBe("failed");
   });
 
   it("never softens a failed verdict into stale, however the bytes moved", () => {
@@ -587,9 +837,9 @@ describe("badgeRunTailOf", () => {
     expect(badgeRunTailOf("loop-probe/round-00/attempts/bad-instrument")).toBe(
       "round-00/bad-instrument",
     );
-    expect(badgeRunTailOf("loop-probe/round-00/attempts/cuda/matmul-speedup")).toBe(
-      "cuda/matmul-speedup",
-    );
+    expect(
+      badgeRunTailOf("loop-probe/round-00/attempts/cuda/matmul-speedup"),
+    ).toBe("cuda/matmul-speedup");
   });
 
   it("degrades to whatever the run id has", () => {
@@ -608,9 +858,9 @@ describe("badgeLabelOf", () => {
   });
 
   it("gives every state its own glyph as well as its own words", () => {
-    const labels = (["verified", "stale", "incomplete", "failed", "unverified"] as const).map(
-      badgeLabelOf,
-    );
+    const labels = (
+      ["verified", "stale", "incomplete", "failed", "unverified"] as const
+    ).map(badgeLabelOf);
     expect(new Set(labels).size).toBe(labels.length);
     expect(new Set(labels.map((l) => l[0])).size).toBe(labels.length);
   });
@@ -620,8 +870,15 @@ describe("badgeTitleOf", () => {
   const dir = "loop/round-00/attempts/s1";
 
   it("carries the honesty qualifier, with the run's own directory in the command", () => {
-    const title = badgeTitleOf("verified", parseVerdictFile(verdictJson()), dir, "results");
-    expect(title).toContain(VERDICT_QUALIFIER.replace("<dir>", `results/${dir}`));
+    const title = badgeTitleOf(
+      "verified",
+      parseVerdictFile(verdictJson()),
+      dir,
+      "results",
+    );
+    expect(title).toContain(
+      VERDICT_QUALIFIER.replace("<dir>", `results/${dir}`),
+    );
     expect(title).toContain("python -m turing.research.loop.verify");
   });
 
@@ -637,9 +894,17 @@ describe("badgeTitleOf", () => {
   });
 
   it("offers the independent check from every state, including the failing ones", () => {
-    for (const state of ["verified", "stale", "incomplete", "failed", "unverified"] as const) {
+    for (const state of [
+      "verified",
+      "stale",
+      "incomplete",
+      "failed",
+      "unverified",
+    ] as const) {
       const title = badgeTitleOf(state, null, dir, "results");
-      expect(title, state).toContain(`python -m turing.research.loop.verify results/${dir}`);
+      expect(title, state).toContain(
+        `python -m turing.research.loop.verify results/${dir}`,
+      );
     }
   });
 
@@ -651,10 +916,12 @@ describe("badgeTitleOf", () => {
     const failed = parseVerdictFile(verdictJson({ state: "failed" }));
     const title = badgeTitleOf("failed", failed, dir, "results");
     expect(title).toContain("FAILED here");
-    expect(title).not.toContain("not proof the numbers are authentic or meaningful");
-    expect(badgeTitleOf("verified", parseVerdictFile(verdictJson()), dir, "results")).toContain(
+    expect(title).not.toContain(
       "not proof the numbers are authentic or meaningful",
     );
+    expect(
+      badgeTitleOf("verified", parseVerdictFile(verdictJson()), dir, "results"),
+    ).toContain("not proof the numbers are authentic or meaningful");
     for (const state of ["stale", "incomplete", "unverified"] as const) {
       expect(badgeTitleOf(state, null, dir, "results"), state).not.toContain(
         "not proof the numbers are authentic or meaningful",
@@ -663,7 +930,12 @@ describe("badgeTitleOf", () => {
   });
 
   it("says when the loop last looked, so 'as last checked' names a time", () => {
-    const title = badgeTitleOf("verified", parseVerdictFile(verdictJson()), dir, "results");
+    const title = badgeTitleOf(
+      "verified",
+      parseVerdictFile(verdictJson()),
+      dir,
+      "results",
+    );
     expect(title).toContain("as last checked by loop at");
     expect(title).toContain(new Date(CHECKED_AT_MS).toLocaleString());
   });
@@ -673,7 +945,12 @@ describe("badgeTitleOf", () => {
     // stale "the ordinary state of a run still being written" described a
     // state that cannot happen, and taught the operator to shrug at the one
     // badge that means the pane and the loop are looking at different bytes.
-    const title = badgeTitleOf("stale", parseVerdictFile(verdictJson()), dir, "results");
+    const title = badgeTitleOf(
+      "stale",
+      parseVerdictFile(verdictJson()),
+      dir,
+      "results",
+    );
     expect(title).toContain("4");
     expect(title).toContain("re-driven");
     expect(title).not.toContain("still being written");
@@ -697,7 +974,8 @@ describe("badgeTitleOf", () => {
     // The badge and the terminal must tell the same story, so the reason
     // travels verbatim from `verify`'s own formatter rather than being
     // re-worded here.
-    const detail = "/results/…/s1: FAIL chain: line 0 digest does not match the recomputed chain";
+    const detail =
+      "/results/…/s1: FAIL chain: line 0 digest does not match the recomputed chain";
     const title = badgeTitleOf(
       "failed",
       parseVerdictFile(verdictJson({ state: "failed", detail })),
