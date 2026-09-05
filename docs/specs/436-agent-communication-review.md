@@ -64,9 +64,10 @@ Non-author human/code-owner review remains required before merge.
 
 ## Validation evidence
 
-After hardening, the current-main feature branch passed the Python suite with
-slow and integration tests excluded: 3,647 passed, 5 skipped, 4 deselected.
-The command was `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null .venv/bin/pytest tests/ -m "not slow and not integration" -q`.
+After the final hardening fixes, the CI-equivalent Python suite passed:
+**3,651 passed, 6 skipped, 92.84% coverage** (required minimum: 75%).
+The command was `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null .venv/bin/pytest tests/ -q -m "not integration" --ignore=tests/integration --cov=turing --cov-report=term --cov-fail-under=75`.
+Docker integration tests were excluded from this local run.
 The initial sandbox-only run could not bind a loopback socket in one existing
 trainer test; allowing loopback access resolved that environment failure.
 Ruff and mypy over all source files passed (281 source files checked by mypy).
