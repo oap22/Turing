@@ -22,23 +22,28 @@ logger = structlog.get_logger(__name__)
 RoutingMode = Literal["cloud_only", "local_only", "auto"]
 
 
-def warn_if_local_only_disables_tools(routing_mode: str, tool_count: int) -> bool:
+def warn_if_local_only_disables_tools(
+    routing_mode: str,
+    tool_count: int,
+    local_tools_enabled: bool = False,
+) -> bool:
     """Emit a startup WARN when ``local_only`` routing makes tools unreachable.
 
-    Local Ollama models in this codebase don't surface ``tool_calls`` in their
-    responses, so when the router is forced to ``local_only`` every
-    tool-requiring request is silently answered as prose. The router enforces
-    "tools => cloud" only when ``routing_mode='auto'``; under ``local_only``
-    that escape hatch is disabled. See issue #158.
+    Local Ollama models have varying tool compliance. Unless explicitly opted
+    in, local routing strips the tool catalog and a tool-requiring request may
+    be answered as prose. See issue #158.
 
     Returns True when the warning was emitted, False otherwise — handy for
     tests and so callers can react if they want to.
     """
-    if routing_mode == "local_only" and tool_count > 0:
+    if routing_mode == "local_only" and tool_count > 0 and not local_tools_enabled:
         logger.warning(
             "llm.local_only_disables_tools",
             tool_count=tool_count,
-            hint="set TURING_LLM_ROUTING_MODE=auto (or cloud) for tool calls to fire",
+            hint=(
+                "set TURING_OLLAMA_TOOLS_ENABLED=true for a capable local model, "
+                "or use TURING_LLM_ROUTING_MODE=auto (or cloud)"
+            ),
         )
         return True
     return False
@@ -98,12 +103,14 @@ class LLMRouter:
         classifier: ComplexityClassifier | None = None,
         routing_mode: RoutingMode = "auto",
         prompt_sample_max_bytes: int = 2048,
+        local_tools_enabled: bool = False,
     ) -> None:
         self._cloud = cloud_provider
         self._local = local_provider
         self._classifier = classifier or ComplexityClassifier()
         self._routing_mode: RoutingMode = routing_mode
         self._sample_max_bytes = prompt_sample_max_bytes
+        self._local_tools_enabled = local_tools_enabled
 
     # ── public API ─────────────────────────────────────────────────────
 
@@ -118,10 +125,13 @@ class LLMRouter:
         """Route the request to the appropriate LLM provider and return the response."""
         provider, reason = self._select_provider(messages, tools)
         label = _provider_label(provider, self._cloud, self._local)
-        # Local Ollama models do not reliably emit tool calls, so when we
-        # route to local we drop the tool catalog rather than send a
-        # confusing prompt the model will ignore.
-        effective_tools = tools if provider is self._cloud else None
+        # Local Ollama tool use is opt-in.  The opt-in applies to local_only,
+        # classifier-selected local calls, and cloud->local auth fallbacks.
+        effective_tools = (
+            tools
+            if provider is self._cloud or self._local_tools_enabled
+            else None
+        )
         logger.info(
             "llm_route_decision",
             provider=label,
@@ -160,7 +170,13 @@ class LLMRouter:
                     exc_info=True,
                 )
                 local_fallback: LLMResponse = await self._invoke_provider(
-                    self._local, "local", messages, system, None, max_tokens, temperature
+                    self._local,
+                    "local",
+                    messages,
+                    system,
+                    tools if self._local_tools_enabled else None,
+                    max_tokens,
+                    temperature,
                 )
                 return local_fallback
             raise

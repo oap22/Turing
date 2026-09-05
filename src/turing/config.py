@@ -73,6 +73,30 @@ class TuringConfig(BaseSettings):
         description="Ollama server base URL",
     )
     ollama_model: str = Field(default="gemma3:1b", description="Default Ollama model")
+    ollama_tools_enabled: bool = Field(
+        default=False,
+        description=(
+            "Opt in to passing tool definitions to the local Ollama model; "
+            "disabled by default because model tool compliance varies"
+        ),
+    )
+
+    # ── Native agent mailbox (optional) ─────────────────────────────────
+    # The mailbox is a dedicated SQLite store shared by cooperating local
+    # processes.  All three settings are required together; leaving all unset
+    # keeps the native tool disabled.
+    agent_mailbox_db: Path | None = Field(
+        default=None,
+        description="Dedicated SQLite path for the native agent mailbox",
+    )
+    agent_mailbox_workflow: str | None = Field(
+        default=None,
+        description="Workflow namespace for the native agent mailbox",
+    )
+    agent_mailbox_agent: str | None = Field(
+        default=None,
+        description="Fixed agent identity used by the native mailbox tool",
+    )
 
     # ── LLM routing ─────────────────────────────────────────────────────
     llm_routing_mode: Literal["local", "cloud", "auto"] = Field(
@@ -229,6 +253,22 @@ class TuringConfig(BaseSettings):
             self.node_id = str(uuid.uuid4())
         return self
 
+    @model_validator(mode="after")
+    def _validate_agent_mailbox_binding(self) -> TuringConfig:
+        """Require the native mailbox database, workflow, and agent together."""
+        values = (self.agent_mailbox_db, self.agent_mailbox_workflow, self.agent_mailbox_agent)
+        if any(value not in (None, "") for value in values) and not all(
+            value not in (None, "") for value in values
+        ):
+            raise ValueError(
+                "TURING_AGENT_MAILBOX_DB, TURING_AGENT_MAILBOX_WORKFLOW, and "
+                "TURING_AGENT_MAILBOX_AGENT must be configured together"
+            )
+        if self.agent_mailbox_db is not None:
+            self.agent_mailbox_db = self.agent_mailbox_db.expanduser().resolve()
+            self.agent_mailbox_db.parent.mkdir(parents=True, exist_ok=True)
+        return self
+
     @field_validator("db_path", mode="after")
     @classmethod
     def _ensure_db_parent_dir(cls, v: Path) -> Path:
@@ -236,6 +276,12 @@ class TuringConfig(BaseSettings):
         resolved = v.resolve()
         resolved.parent.mkdir(parents=True, exist_ok=True)
         return resolved
+
+    @field_validator("agent_mailbox_db", mode="before")
+    @classmethod
+    def _empty_agent_mailbox_db_is_unset(cls, v: object) -> object:
+        """Treat an explicitly blank env value as an unset optional path."""
+        return None if v == "" else v
 
     @field_validator("embedding_model_path", mode="after")
     @classmethod

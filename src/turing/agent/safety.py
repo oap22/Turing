@@ -167,7 +167,7 @@ class SafetyGate:
     def _get_tool_risk(self, tool_name: str, arguments: dict[str, Any]) -> str:
         """Determine the effective risk level based on tool and action."""
         # Tools with action-dependent risk.
-        medium_risk_tools = {"filesystem", "network"}
+        medium_risk_tools = {"filesystem", "network", "agent_mailbox"}
         low_risk_tools = {"system_info"}
 
         if tool_name in low_risk_tools:

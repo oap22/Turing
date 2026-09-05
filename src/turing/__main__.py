@@ -60,9 +60,16 @@ async def _run(config: TuringConfig) -> None:
         "Literal['cloud_only', 'local_only', 'auto']",
         routing_mode_map.get(config.llm_routing_mode, "auto"),
     )
-    llm_router = LLMRouter(cloud_provider, local_provider, classifier, routing_mode)
+    llm_router = LLMRouter(
+        cloud_provider,
+        local_provider,
+        classifier,
+        routing_mode,
+        local_tools_enabled=config.ollama_tools_enabled,
+    )
 
     # 3. Initialize Tools
+    from turing.tools.agent_mailbox import register_agent_mailbox_tool
     from turing.tools.base import ToolRegistry
     from turing.tools.filesystem import FileSystemTool
     from turing.tools.network import NetworkTool
@@ -76,6 +83,7 @@ async def _run(config: TuringConfig) -> None:
     tool_registry.register(ProcessTool())
     tool_registry.register(NetworkTool())
     tool_registry.register(SystemInfoTool())
+    await register_agent_mailbox_tool(tool_registry, config)
 
     # 4. Load Plugins
     from turing.plugins.loader import PluginLoader
@@ -97,7 +105,11 @@ async def _run(config: TuringConfig) -> None:
                 logger.warning("plugin.load_failed", name=manifest.name, error=str(e))
 
     # Issue #158 — warn loudly when local_only is set with tools registered.
-    warn_if_local_only_disables_tools(routing_mode, len(tool_registry.get_all()))
+    warn_if_local_only_disables_tools(
+        routing_mode,
+        len(tool_registry.get_all()),
+        local_tools_enabled=config.ollama_tools_enabled,
+    )
 
     # 5. Safety Gate
     from turing.agent.safety import SafetyGate
