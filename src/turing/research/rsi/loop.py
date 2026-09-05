@@ -89,11 +89,10 @@ What it does not do:
   parse flags (``__main__`` does); it raises
   :class:`~turing.research.contracts.ContractViolationError` for usage
   errors and leaves exit-code mapping to the CLI.
-* On a pass/fail-only problem (the verifier never prints ``score=``) it
-  never carries a ``best_score``, so every later pass is recorded as an
-  improvement (empty category set), not ``no_progress``;
-  :func:`~turing.research.rsi.taxonomy.classify_round`'s "later pass is
-  no progress" rule only fires once a numeric score has been measured.
+* On a pass/fail-only problem (the verifier never prints ``score=``), the
+  first valid verifier pass is progress and every later valid pass is
+  ``no_progress``. This fact is reconstructed from ``passed`` and ``void``
+  on historical rows, independently of numeric ``best_score``.
 * It cannot see a scaffold rewrite that a crash left between the engine's
   exit and the post-engine reconcile of an *earlier* invocation, unless a
   ``scaffold_blob`` event exists (every loop-made scaffold change writes
@@ -254,6 +253,16 @@ class TrajectoryState:
             return None
         last = counted[-1]
         return last.score if last.passed else None
+
+    @property
+    def prior_pass(self) -> bool:
+        """Whether any historical row records a valid verifier pass.
+
+        A pass remains evidence even when its row also carries
+        ``engine_error`` or ``no_metrics``. Void rows are excluded because a
+        fired detector invalidates the verifier result.
+        """
+        return any(record.passed and not record.void for record in self.records)
 
 
 # --------------------------------------------------------------------------- #
@@ -500,6 +509,7 @@ class RsiLoop:
             results=str(self.results),
             next_round=state.next_round,
             best_score=state.best_score,
+            prior_pass=state.prior_pass,
             scaffold_sha=(self.scaffold_sha or "")[:12],
             pending_self_edit=None if self._pending is None else self._pending.sha[:12],
         )
@@ -687,6 +697,7 @@ class RsiLoop:
         records: list[RoundRecord] = list(state.records)
         best_score = state.best_score
         previous_score = state.previous_score
+        prior_pass = state.prior_pass
         start = state.next_round
         round_no = start
         rounds_run = 0
@@ -766,6 +777,7 @@ class RsiLoop:
                 best_score=best_score,
                 had_metrics_line=had_metrics,
                 cheat=verdict,
+                prior_pass=prior_pass,
             )
             measured_score = outcome.score if outcome is not None and outcome.passed else None
             record = RoundRecord(
@@ -808,6 +820,8 @@ class RsiLoop:
             previous_score = measured_score
             if measured_score is not None and (best_score is None or measured_score > best_score):
                 best_score = measured_score
+            if record.passed and not record.void:
+                prior_pass = True
             if pending is not None:
                 pending.rounds_after.append(record)
 

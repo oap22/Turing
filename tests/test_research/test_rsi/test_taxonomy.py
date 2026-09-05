@@ -114,6 +114,31 @@ class TestClassifyRound:
             FailureCategory.NO_PROGRESS
         }
 
+    def test_explicit_prior_pass_is_independent_of_best_score(self) -> None:
+        scoreless = _outcome(0, None)
+        assert _classify(verifier=scoreless, best_score=None, prior_pass=False) == frozenset()
+        assert _classify(verifier=scoreless, best_score=None, prior_pass=True) == {
+            FailureCategory.NO_PROGRESS
+        }
+        # An explicit signal is authoritative, including when it disagrees with
+        # the legacy best-score inference.
+        assert _classify(verifier=scoreless, best_score=1.0, prior_pass=False) == frozenset()
+
+    def test_omitted_prior_pass_keeps_legacy_best_score_inference(self) -> None:
+        scoreless = _outcome(0, None)
+        assert _classify(verifier=scoreless, best_score=0.0) == {FailureCategory.NO_PROGRESS}
+        assert _classify(verifier=scoreless, best_score=-1.0) == {FailureCategory.NO_PROGRESS}
+
+    def test_prior_pass_does_not_create_numeric_baseline(self) -> None:
+        # A prior scoreless pass makes a later scoreless pass stale, but it
+        # does not make a later numeric score compete with an invented score.
+        assert (
+            _classify(
+                verifier=_outcome(0, 1.0), best_score=None, previous_score=None, prior_pass=True
+            )
+            == frozenset()
+        )
+
     def test_no_metrics_rides_alongside(self) -> None:
         assert _classify(had_metrics_line=False) == {FailureCategory.NO_METRICS}
         assert _classify(had_metrics_line=False, verifier=_outcome(1, None)) == {

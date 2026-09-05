@@ -25,10 +25,8 @@ What it does not do:
   merges its categories in.
 * It does not decide whether the loop stops. That is the loop's job, driven
   by the categories this module returns.
-* It does not track ``best_score`` itself. The loop supplies it from numeric
-  scores only, so the "a later pass on a pass/fail-only problem is
-  ``NO_PROGRESS``" rule in :func:`classify_round` is unreachable in the
-  running loop unless a numeric score was measured earlier.
+* It does not track prior verifier passes itself. The loop supplies that
+  append-only fact explicitly, independently of numeric ``best_score``.
 """
 
 from __future__ import annotations
@@ -72,8 +70,10 @@ class FailureCategory(str, Enum):  # noqa: UP042
     same history.
 
     A round carries a *set* of categories (see :func:`classify_round`); a
-    round that passed the verifier and improved on the best score carries the
-    empty set, which is the success sentinel.
+    clean pass that makes progress carries the empty set, which is the
+    success sentinel. A first scoreless pass makes progress, while
+    independently applicable categories such as ``engine_error`` or
+    ``no_metrics`` still remain on its row.
     """
 
     #: ``claude`` exited non-zero or could not be started.
@@ -84,7 +84,8 @@ class FailureCategory(str, Enum):  # noqa: UP042
     VERIFIER_FAILED = "verifier_failed"
     #: The verifier lock did not match before or after the round.
     VERIFIER_TAMPERED = "verifier_tampered"
-    #: Verifier passed (or scored) but the score is not better than the best so far.
+    #: Verifier passed but is not progress: a score is not better than the best,
+    #: or a scoreless pass follows an earlier valid pass.
     NO_PROGRESS = "no_progress"
     #: Score is worse than the previous round's.
     REGRESSED = "regressed"
@@ -122,6 +123,7 @@ def classify_round(
     best_score: float | None,
     had_metrics_line: bool,
     cheat: CheatVerdict | None,
+    prior_pass: bool | None = None,
 ) -> frozenset[FailureCategory]:
     """Categorise one round from its measured facts. Pure and deterministic.
 
@@ -134,8 +136,9 @@ def classify_round(
     * ``verifier`` is ``None`` (never ran) → no verifier category.
       ``verifier.passed`` false → :attr:`FailureCategory.VERIFIER_FAILED`.
     * a passing verifier with ``score is None`` is progress only on the
-      first pass (``best_score is None``); later passes are
-      :attr:`FailureCategory.NO_PROGRESS`.
+      first valid pass; later passes are :attr:`FailureCategory.NO_PROGRESS`.
+      ``prior_pass`` is the explicit prior-valid-pass signal. When omitted,
+      it preserves the legacy inference from ``best_score is not None``.
     * a passing verifier with a score: not strictly greater than
       ``best_score`` → ``NO_PROGRESS``; strictly less than
       ``previous_score`` → :attr:`FailureCategory.REGRESSED` (both can hold).
@@ -146,8 +149,12 @@ def classify_round(
 
     ``best_score`` is the best *before* this round; the caller updates it
     afterwards. ``previous_score`` is the immediately preceding round's
-    measured score (``None`` if that round had none).
+    measured score (``None`` if that round had none). A valid prior pass is a
+    non-void record with ``passed=True``; the running loop supplies that fact
+    even when the pass carries ``engine_error`` or ``no_metrics``.
     """
+    if prior_pass is None:
+        prior_pass = best_score is not None
     categories: set[FailureCategory] = set()
     if timed_out:
         categories.add(FailureCategory.TIMEOUT)
@@ -158,7 +165,7 @@ def classify_round(
         if not verifier.passed:
             categories.add(FailureCategory.VERIFIER_FAILED)
         elif verifier.score is None:
-            if best_score is not None:
+            if prior_pass:
                 categories.add(FailureCategory.NO_PROGRESS)
         else:
             if best_score is not None and verifier.score <= best_score:
