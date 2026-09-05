@@ -110,3 +110,9 @@ guards that keep them from colliding are in the portable skill
 `skills/multi-agent-workflow/SKILL.md` — it applies to every agent, not just
 Claude Code, so it lives outside this file. (Decision record: issue #356.)
 
+Its companion `skills/adversarial-review/SKILL.md` covers how to run a review
+that finds defects rather than confirming a green suite: reproduce before
+reporting, drive real code instead of fixtures, watch for checks that cannot
+fail, and re-review the fixes. Load it when reviewing a PR or auditing a
+subsystem. (Derived from the RES-12 review, PRs #401–#404.)
+

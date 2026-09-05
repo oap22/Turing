@@ -1,5 +1,5 @@
-// Pure-SVG line chart — no library, no animation. Used by MetricsPane, one
-// instance per series name (union across the selected runs).
+// Pure-SVG line chart — no library, no animation. Used by MetricsPane: one
+// instance showing the active series, with one polyline per selected run.
 //
 // Responsive by measurement, not by `preserveAspectRatio="none"`: that
 // attribute stretches text glyphs along with the lines, which makes tick
@@ -16,6 +16,7 @@
 // outside the plot area, never over a curve) plus a subtle plot-area border.
 
 import { useEffect, useRef, useState } from "react";
+import { colorForSlot } from "./seriesColors";
 
 interface Series {
   /**
@@ -27,6 +28,13 @@ interface Series {
   label: string;
   points: Array<[number, number]>;
   color?: string;
+  /**
+   * Drops this line. Rendered as an `×` on the legend entry — the legend is
+   * already where the eye is when a curve turns out to be noise, so removing
+   * it shouldn't mean re-opening the run picker. Omit for a display-only
+   * legend.
+   */
+  onRemove?: () => void;
 }
 
 // A React key has to be unique and stable. `label` is neither by construction:
@@ -52,7 +60,6 @@ interface Props {
   height?: number;
 }
 
-const PALETTE = ["#7aa2f7", "#a7c080", "#ebbcba", "#fabd2f", "#88c0d0"];
 const TICK_COLOR = "var(--t-dim)";
 const PLOT_BORDER_COLOR = "var(--t-edge)";
 const LEFT_GUTTER = 48;
@@ -64,9 +71,11 @@ const BOTTOM_GUTTER = 18;
 // enough that the top tick's full glyph height fits inside the svg.
 const TOP_GUTTER = 16;
 
+// Callers that assign sticky per-run colors pass `color` explicitly; the
+// positional fallback is for charts that just want distinct lines and don't
+// care which run holds which color.
 function colorFor(index: number): string {
-  if (index === 0) return "var(--t-accent)";
-  return PALETTE[(index - 1) % PALETTE.length];
+  return colorForSlot(index);
 }
 
 // 4-significant-digit formatting for axis ticks and the latest-value label
@@ -77,10 +86,10 @@ function formatSig(n: number, sig = 4): string {
   return n.toPrecision(sig);
 }
 
-function useSize(fallback: { w: number; h: number }): [
-  React.RefObject<HTMLDivElement | null>,
-  { w: number; h: number },
-] {
+function useSize(fallback: {
+  w: number;
+  h: number;
+}): [React.RefObject<HTMLDivElement | null>, { w: number; h: number }] {
   const ref = useRef<HTMLDivElement | null>(null);
   const [size, setSize] = useState(fallback);
   useEffect(() => {
@@ -137,17 +146,43 @@ export default function Chart({ series, height = 120 }: Props) {
     <div className="flex h-full w-full flex-col">
       <div className="mb-1 flex flex-wrap gap-x-3 text-[12px] leading-none">
         {series.map((s, i) => {
-          const latest = s.points.length > 0 ? s.points[s.points.length - 1][1] : null;
+          const latest =
+            s.points.length > 0 ? s.points[s.points.length - 1][1] : null;
           return (
-            <span key={seriesKey(s, i)} style={{ color: s.color ?? colorFor(i) }}>
-              {s.label}
-              {latest !== null ? `: ${formatSig(latest)}` : ""}
+            <span
+              key={seriesKey(s, i)}
+              className="inline-flex items-center gap-1"
+              style={{ color: s.color ?? colorFor(i) }}
+            >
+              <span>
+                {s.label}
+                {latest !== null ? `: ${formatSig(latest)}` : ""}
+              </span>
+              {s.onRemove && (
+                <button
+                  type="button"
+                  onClick={s.onRemove}
+                  aria-label={`remove ${s.label}`}
+                  data-testid={`chart-remove-${s.label}`}
+                  // Inherits the series color so it reads as part of the entry
+                  // rather than as pane chrome that happens to sit nearby.
+                  className="px-0.5 leading-none opacity-60 hover:opacity-100"
+                >
+                  ×
+                </button>
+              )}
             </span>
           );
         })}
       </div>
       <div ref={containerRef} className="min-h-0 flex-1">
-        <svg width="100%" height="100%" viewBox={`0 0 ${W} ${H}`} className="block" role="img">
+        <svg
+          width="100%"
+          height="100%"
+          viewBox={`0 0 ${W} ${H}`}
+          className="block"
+          role="img"
+        >
           <rect
             data-testid="chart-plot-border"
             x={plotX0}
@@ -159,7 +194,13 @@ export default function Chart({ series, height = 120 }: Props) {
             strokeWidth={1}
           />
           {ticks.map((t, i) => (
-            <text key={i} x={4} y={toSvgY(t) + 4} fontSize={12} fill={TICK_COLOR}>
+            <text
+              key={i}
+              x={4}
+              y={toSvgY(t) + 4}
+              fontSize={12}
+              fill={TICK_COLOR}
+            >
               {formatSig(t)}
             </text>
           ))}
@@ -168,13 +209,20 @@ export default function Chart({ series, height = 120 }: Props) {
               <text x={plotX0} y={H - 4} fontSize={12} fill={TICK_COLOR}>
                 {minX}
               </text>
-              <text x={plotX0 + plotW - 28} y={H - 4} fontSize={12} fill={TICK_COLOR}>
+              <text
+                x={plotX0 + plotW - 28}
+                y={H - 4}
+                fontSize={12}
+                fill={TICK_COLOR}
+              >
                 {maxX}
               </text>
             </>
           )}
           {series.map((s, i) => {
-            const points = s.points.map(([x, y]) => `${toSvgX(x)},${toSvgY(y)}`).join(" ");
+            const points = s.points
+              .map(([x, y]) => `${toSvgX(x)},${toSvgY(y)}`)
+              .join(" ");
             return (
               <polyline
                 key={seriesKey(s, i)}

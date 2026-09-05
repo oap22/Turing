@@ -31,6 +31,9 @@ The rules below keep them from colliding. (Decision record: issue #356.)
 - Otherwise a **fresh agent session** reviews the PR (findings posted as PR
   comments) and the owning human reads the verdict before merging. (Claude Code
   sessions do this with `/code-review`; use the closest equivalent your agent has.)
+  How to run that review so it finds real defects — reproduce before reporting,
+  drive real code rather than fixtures, re-review the fixes — is
+  `skills/adversarial-review/SKILL.md`.
 - Every PR description must self-classify its review tier.
 
 ## Sequence rules (hazards git merges cleanly but breaks)

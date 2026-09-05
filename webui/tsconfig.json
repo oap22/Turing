@@ -3,6 +3,9 @@
     "target": "ES2022",
     "useDefineForClassFields": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    // Explicit because TS 6 no longer auto-includes every `@types/*` package;
+    // the theme test reads `src/index.css` off disk with `node:fs`.
+    "types": ["node"],
     "module": "ESNext",
     "skipLibCheck": true,
     "moduleResolution": "bundler",

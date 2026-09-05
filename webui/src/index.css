@@ -25,6 +25,12 @@
  * Omarchy-style color themes (desktop shell, issue #382). `:root` carries the
  * default "turing" palette; `[data-theme="<id>"]` overrides it app-wide,
  * including inside open xterm panes (`theme.ts` reads these back).
+ *
+ * `--t-series-1..8` is the categorical palette for plotted curves (Chart.tsx
+ * cycles through it). Every theme defines all eight so overlaid runs stay
+ * tellable apart without leaving that theme's palette; `--t-series-1` is
+ * always the theme accent, so a single-run chart looks exactly as it did
+ * before the palette existed.
  */
 :root {
   --t-bg: #060809;
@@ -34,6 +40,14 @@
   --t-fg: #c9d1d9;
   --t-dim: #6b7280;
   --t-accent: #22d3ee;
+  --t-series-1: #22d3ee;
+  --t-series-2: #fbbf24;
+  --t-series-3: #34d399;
+  --t-series-4: #fb7185;
+  --t-series-5: #a78bfa;
+  --t-series-6: #f97316;
+  --t-series-7: #60a5fa;
+  --t-series-8: #f472b6;
 }
 [data-theme="tokyo-night"] {
   --t-bg: #1a1b26;
@@ -43,6 +57,14 @@
   --t-fg: #c0caf5;
   --t-dim: #565f89;
   --t-accent: #7aa2f7;
+  --t-series-1: #7aa2f7;
+  --t-series-2: #e0af68;
+  --t-series-3: #9ece6a;
+  --t-series-4: #f7768e;
+  --t-series-5: #bb9af7;
+  --t-series-6: #ff9e64;
+  --t-series-7: #2ac3de;
+  --t-series-8: #c0caf5;
 }
 [data-theme="gruvbox"] {
   --t-bg: #282828;
@@ -52,6 +74,14 @@
   --t-fg: #ebdbb2;
   --t-dim: #928374;
   --t-accent: #fabd2f;
+  --t-series-1: #fabd2f;
+  --t-series-2: #83a598;
+  --t-series-3: #b8bb26;
+  --t-series-4: #fb4934;
+  --t-series-5: #d3869b;
+  --t-series-6: #8ec07c;
+  --t-series-7: #fe8019;
+  --t-series-8: #ebdbb2;
 }
 [data-theme="catppuccin"] {
   --t-bg: #1e1e2e;
@@ -61,6 +91,14 @@
   --t-fg: #cdd6f4;
   --t-dim: #6c7086;
   --t-accent: #89b4fa;
+  --t-series-1: #89b4fa;
+  --t-series-2: #f9e2af;
+  --t-series-3: #a6e3a1;
+  --t-series-4: #f38ba8;
+  --t-series-5: #cba6f7;
+  --t-series-6: #fab387;
+  --t-series-7: #94e2d5;
+  --t-series-8: #f5c2e7;
 }
 [data-theme="nord"] {
   --t-bg: #2e3440;
@@ -70,6 +108,14 @@
   --t-fg: #d8dee9;
   --t-dim: #616e88;
   --t-accent: #88c0d0;
+  --t-series-1: #88c0d0;
+  --t-series-2: #ebcb8b;
+  --t-series-3: #a3be8c;
+  --t-series-4: #bf616a;
+  --t-series-5: #b48ead;
+  --t-series-6: #d08770;
+  --t-series-7: #81a1c1;
+  --t-series-8: #d8dee9;
 }
 [data-theme="everforest"] {
   --t-bg: #2d353b;
@@ -79,6 +125,14 @@
   --t-fg: #d3c6aa;
   --t-dim: #859289;
   --t-accent: #a7c080;
+  --t-series-1: #a7c080;
+  --t-series-2: #dbbc7f;
+  --t-series-3: #7fbbb3;
+  --t-series-4: #e67e80;
+  --t-series-5: #d699b6;
+  --t-series-6: #e69875;
+  --t-series-7: #83c092;
+  --t-series-8: #d3c6aa;
 }
 [data-theme="kanagawa"] {
   --t-bg: #1f1f28;
@@ -88,6 +142,14 @@
   --t-fg: #dcd7ba;
   --t-dim: #727169;
   --t-accent: #7e9cd8;
+  --t-series-1: #7e9cd8;
+  --t-series-2: #e6c384;
+  --t-series-3: #98bb6c;
+  --t-series-4: #e46876;
+  --t-series-5: #957fb8;
+  --t-series-6: #ffa066;
+  --t-series-7: #7aa89f;
+  --t-series-8: #d27e99;
 }
 [data-theme="rose-pine"] {
   --t-bg: #191724;
@@ -97,6 +159,14 @@
   --t-fg: #e0def4;
   --t-dim: #6e6a86;
   --t-accent: #ebbcba;
+  --t-series-1: #ebbcba;
+  --t-series-2: #9ccfd8;
+  --t-series-3: #f6c177;
+  --t-series-4: #eb6f92;
+  --t-series-5: #c4a7e7;
+  --t-series-6: #56949f;
+  --t-series-7: #e0def4;
+  --t-series-8: #a3a0b8;
 }
 [data-theme="matte-black"] {
   --t-bg: #121212;
@@ -106,6 +176,16 @@
   --t-fg: #bebebe;
   --t-dim: #7a7a7a;
   --t-accent: #cacaca;
+  /* Deliberately near-monochrome to keep the theme's character: curves
+     separate on lightness first, with only a whisper of hue behind it. */
+  --t-series-1: #cacaca;
+  --t-series-2: #8f8f8f;
+  --t-series-3: #ede7db;
+  --t-series-4: #a89e8c;
+  --t-series-5: #6f6f6f;
+  --t-series-6: #b0b8b6;
+  --t-series-7: #b3a8b0;
+  --t-series-8: #9a9a9a;
 }
 
 html,
