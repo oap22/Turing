@@ -16,6 +16,7 @@
 // outside the plot area, never over a curve) plus a subtle plot-area border.
 
 import { useEffect, useRef, useState } from "react";
+import { boundsOf, pixelEnvelope } from "./chartGeometry";
 import { colorForSlot } from "./seriesColors";
 
 interface Series {
@@ -112,16 +113,11 @@ export default function Chart({ series, height = 120 }: Props) {
   const W = size.w;
   const H = size.h;
 
-  const allY = series.flatMap((s) => s.points.map(([, y]) => y));
-  const minY = allY.length > 0 ? Math.min(...allY) : 0;
-  const maxY = allY.length > 0 ? Math.max(...allY) : 1;
+  const { minX, maxX, minY, maxY } = boundsOf(series);
   const pad = (maxY - minY) * 0.05 || 1;
   const domainMin = minY - pad;
   const domainMax = maxY + pad;
 
-  const allX = series.flatMap((s) => s.points.map(([x]) => x));
-  const minX = allX.length > 0 ? Math.min(...allX) : 0;
-  const maxX = allX.length > 0 ? Math.max(...allX) : 1;
   const xRange = maxX - minX || 1;
   const yRange = domainMax - domainMin || 1;
 
@@ -220,7 +216,7 @@ export default function Chart({ series, height = 120 }: Props) {
             </>
           )}
           {series.map((s, i) => {
-            const points = s.points
+            const points = pixelEnvelope(s.points, minX, maxX, plotW)
               .map(([x, y]) => `${toSvgX(x)},${toSvgY(y)}`)
               .join(" ");
             return (

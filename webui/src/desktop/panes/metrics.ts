@@ -166,8 +166,18 @@ const EXCLUDED_SERIES_KEYS = new Set(["step", "total_steps", "ts"]);
 
 export function seriesOf(points: Point[]): Map<string, Array<[number, number]>> {
   const series = new Map<string, Array<[number, number]>>();
+  appendSeries(series, points, 0);
+  return series;
+}
+
+/** Index only newly arrived records; fallback x values remain global to the run. */
+export function appendSeries(
+  series: Map<string, Array<[number, number]>>,
+  points: Point[],
+  offset: number,
+): void {
   points.forEach((p, i) => {
-    const x = typeof p.step === "number" ? p.step : i;
+    const x = typeof p.step === "number" ? p.step : offset + i;
     for (const [k, v] of Object.entries(p)) {
       if (EXCLUDED_SERIES_KEYS.has(k)) continue;
       if (typeof v !== "number") continue;
@@ -176,7 +186,6 @@ export function seriesOf(points: Point[]): Map<string, Array<[number, number]>> 
       series.set(k, arr);
     }
   });
-  return series;
 }
 
 // Tab-selection fallback for the single active series MetricsPane shows:

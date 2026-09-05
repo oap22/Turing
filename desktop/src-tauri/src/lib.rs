@@ -1,4 +1,5 @@
 mod config;
+mod fs_dispatch;
 mod fsroots;
 mod gateway;
 mod pty;
