@@ -1,0 +1,63 @@
+[Unit]
+Description=Turing agent (per-user, for a Linux desktop running the Turing desktop app)
+Documentation=https://github.com/oap22/Turing
+# The per-user companion to the system units in this directory: runs the
+# Python agent (`turing` console script) as *you*, no root, no dedicated
+# `turing` account. Pairs with the desktop app installed by
+# scripts/install-desktop.sh (issue #400). Install (XDG-aware — systemd --user
+# reads units from $XDG_CONFIG_HOME/systemd/user when that is set, and %E
+# below resolves to the same base, so both paths must follow it):
+#
+#   cfg="${XDG_CONFIG_HOME:-$HOME/.config}"
+#   mkdir -p "$cfg/systemd/user"
+#   cp deploy/turing-agent-user.service "$cfg/systemd/user/"
+#   install -d -m 700 "$cfg/turing"
+#   install -m 600 .env.example "$cfg/turing/agent.env"   # then fill in TURING_* vars
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now turing-agent-user.service
+#   journalctl --user -u turing-agent-user -f    # logs
+#
+# The 700/600 modes matter: agent.env holds real secrets (Anthropic key,
+# Discord token, NATS seed), and a plain `cp` under the default umask 022
+# would leave it world-readable.
+#
+# To keep it running while logged out: `loginctl enable-linger $USER`.
+#
+# (No After=/Wants=network-online.target here: that target does not exist in
+# the per-user manager, so ordering against it would be a silent no-op. The
+# agent retries its own connections on startup instead.)
+
+[Service]
+Type=simple
+# %h = your home directory. The default ExecStart assumes a per-user install
+# (`pip install --user -e .` or `pipx install .` putting `turing` on
+# ~/.local/bin). Running from a repo venv instead? Override with:
+#   systemctl --user edit turing-agent-user.service
+# and set ExecStart=%h/Developer/active/Turing/.venv/bin/turing (or wherever).
+WorkingDirectory=%h
+# %E = $XDG_CONFIG_HOME, falling back to ~/.config. `-` makes it optional so
+# the unit still starts when all TURING_* config comes from elsewhere.
+EnvironmentFile=-%E/turing/agent.env
+ExecStart=%h/.local/bin/turing
+
+# Lighter hardening than the system units: this runs in your session and needs
+# your home (vault, sqlite DB, results roots), so ProtectHome is off by design.
+#
+# Note: in the per-user manager these sandboxing options are implemented via
+# unprivileged user namespaces. On kernels that restrict those (e.g. stock
+# Ubuntu 24.04's AppArmor default), PrivateTmp=/LockPersonality= can fail the
+# unit with `status=226/NAMESPACE`; if that hits you, comment out those two
+# lines below and keep the rest.
+NoNewPrivileges=true
+PrivateTmp=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+Restart=on-failure
+RestartSec=10s
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Install]
+WantedBy=default.target

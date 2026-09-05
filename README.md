@@ -46,7 +46,9 @@ npm --prefix desktop run install-app       # build + (re)install /Applications/t
   plots land in the images pane. Agents steer the view via
   `~/research-results/.viewer.json`. Remote (ssh) runs stream in through the
   `ssh-follow-metrics` / `ssh-pull-assets` runners.
-- Config (gateway URL/token, filesystem roots): `~/.config/turing-desktop/config.json`.
+- Config (gateway URL/token, filesystem roots): `~/.config/turing-desktop/config.json`
+  on macOS; `${XDG_CONFIG_HOME:-~/.config}/turing-desktop/config.json` on Linux
+  (see `desktop/README.md` §Config).
 - Updating the installed app: `npm --prefix desktop run install-app`
   (`scripts/install-desktop.sh` — build, quit, replace, re-sign, report version).
 - Full keymap, panes, runners, troubleshooting: `desktop/README.md`.

@@ -471,11 +471,17 @@ mod tests {
 
     #[test]
     fn locale_default_applies_only_when_environment_has_none() {
+        // CommandBuilder captures the test process's own environment, so a
+        // LANG inherited from the host (CI runners export one) would satisfy
+        // or break these assertions for the wrong reason — drop it first and
+        // assert only on what apply_terminal_env itself does.
         let mut cmd = CommandBuilder::new("/bin/zsh");
+        cmd.env_remove("LANG");
         apply_terminal_env(&mut cmd, false);
         assert_eq!(cmd.get_env("LANG"), Some(OsStr::new("en_US.UTF-8")));
 
         let mut cmd = CommandBuilder::new("/bin/zsh");
+        cmd.env_remove("LANG");
         apply_terminal_env(&mut cmd, true);
         assert_eq!(
             cmd.get_env("LANG"),

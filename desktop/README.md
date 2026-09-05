@@ -8,8 +8,9 @@ panes, and an authenticated Rust-side proxy to the `turing-gateway` so
 Queue/Chat/Observability stay live outside the browser. See issue #382 and
 `.plan-then-ship/SPEC.md` for the full design.
 
-It runs either from source (`npm run dev`) or as an installed
-`/Applications/turing.app` — see [Packaging](#packaging).
+It runs either from source (`npm run dev`) or installed — as
+`/Applications/turing.app` on macOS (see [Packaging](#packaging)) or as an
+AppImage under `~/.local/bin` on Linux (see [Linux](#linux)).
 
 ## Prereqs
 
@@ -100,10 +101,10 @@ be committed (`target/` is gitignored), which is why the script recreates
 it on every build.
 
 `bundle.targets` names only the macOS bundles (`app`, `dmg`), so local
-`tauri build` on a Mac is unaffected by other platforms' settings. The
-Windows bundle is selected **per-invocation** instead of via `targets` —
-`tauri build --bundles nsis` — which is what CI's `desktop-windows` job
-runs; the config carries no Linux-specific bundle settings.
+`tauri build` on a Mac is unaffected by other platforms' settings. Windows
+and Linux bundles are selected **per-invocation** instead: `tauri build
+--bundles nsis` and `tauri build --bundles appimage,deb,rpm`, respectively.
+Those are the commands CI's platform-specific jobs run.
 
 ### Windows (NSIS)
 
@@ -152,13 +153,100 @@ only the five files it actually uses. The script needs Pillow
 rasterizing the SVG, because no SVG rasterizer is assumed present and
 macOS' `qlmanage` bakes a drop shadow into its output.
 
+## Linux
+
+Native Linux packaging alongside — not replacing — the Docker Compose
+Pi-node sim (issue #400). Everything is per-user and sudo-free.
+
+> **Darwin-host caveat:** Linux bundles cannot be produced *or run* from a
+> Mac checkout — `tauri build` only bundles for the host OS, and an AppImage
+> is a Linux ELF. The `desktop-linux` CI job
+> (`.github/workflows/ci.yml`) is where AppImage/deb/rpm bundling is
+> actually exercised; it uploads all three as the
+> `turing-desktop-linux-bundles` artifact on any PR touching `desktop/`,
+> `webui/`, or the workflow.
+
+### Build prerequisites (Ubuntu/Debian)
+
+The Tauri v2 Linux stack, plus what the deb/rpm/AppImage bundlers need:
+
+```bash
+sudo apt-get install libwebkit2gtk-4.1-dev build-essential curl wget file \
+  libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
+  patchelf rpm
+```
+
+(Other distros: any WebKitGTK 4.1 dev package set equivalent to the above.)
+
+### Install
+
+```bash
+scripts/install-desktop.sh          # build the AppImage + install, no sudo
+scripts/install-desktop.sh --open   # ... and launch it
+```
+
+The script builds `--bundles appimage` only and installs per the XDG base
+directory spec:
+
+- `~/.local/bin/turing.AppImage` — the app itself (chmod +x, run directly)
+- `${XDG_DATA_HOME:-~/.local/share}/applications/turing.desktop` — launcher
+- `${XDG_DATA_HOME:-~/.local/share}/icons/hicolor/128x128/apps/turing.png`
+
+`--no-build`, `--open`, and `--in-place` behave as on macOS. deb/rpm
+bundles are for machines without the repo checkout:
+
+```bash
+cd desktop && npm run build -- --bundles deb,rpm
+sudo apt install ./src-tauri/target/release/bundle/deb/turing_*.deb   # or
+sudo dnf install ./src-tauri/target/release/bundle/rpm/turing-*.rpm
+```
+
+### Run & environment
+
+WebKitGTK quirks worth knowing when the window is blank, flickers, or
+crashes at startup:
+
+- `WEBKIT_DISABLE_COMPOSITING_MODE=1` — fixes blank/flickering windows on
+  some GPU/driver combos (notably NVIDIA proprietary drivers).
+- `WEBKIT_DISABLE_DMABUF_RENDERER=1` — the equivalent hammer for newer
+  WebKitGTK versions when rendering breaks under Wayland or in a VM.
+- `APPIMAGE_EXTRACT_AND_RUN=1` — runs the AppImage without FUSE (containers,
+  minimal installs without `libfuse2`).
+
+The window chrome stays on the shared contract (`tauri.conf.json` sets no
+`decorations`/CSD overrides), so the UI is pixel-identical to macOS inside
+the window; the title bar is whatever your WM draws.
+
+### Config path on Linux
+
+The config overlay honors `$XDG_CONFIG_HOME`:
+`${XDG_CONFIG_HOME:-~/.config}/turing-desktop/config.json`. An empty or
+relative `$XDG_CONFIG_HOME` is ignored per the XDG spec. (macOS stays
+literally `~/.config/turing-desktop/config.json` — see [Config](#config).)
+The default `roots` are Owen's macOS layout; on Linux you will almost
+certainly want to override `roots` in the overlay.
+
+### Running the Python agent under systemd
+
+`deploy/turing-agent-user.service` is a systemd `--user` unit for the
+Python agent (`turing` console script) on a desktop Linux box — no root, no
+dedicated service account, logs in `journalctl --user`. Install
+instructions are in the unit's comments; the system-level units for
+dedicated hardware stay in `deploy/` alongside it.
+
 ## Config
 
-Optional overlay at `~/.config/turing-desktop/config.json` (on Windows:
-`%APPDATA%\turing-desktop\config.json`) — any key may be omitted to keep
-the default; a missing file or parse error silently falls back to defaults
-(nothing is ever written by the app). `roots`, when present, replaces the
-default root list wholesale.
+Optional overlay at `<config dir>/turing-desktop/config.json` (per-platform
+base directory below) — any key may be omitted to keep the default; a
+missing file or parse error silently falls back to defaults (nothing is ever
+written by the app). `roots`, when present, replaces the default root list
+wholesale.
+
+On Windows, the path is `%APPDATA%\turing-desktop\config.json`. On macOS it
+is literally `~/.config/turing-desktop/config.json`
+(deliberately not `~/Library/Application Support` — it predates the Linux
+port and is scripted against). On Linux the base directory honors
+`$XDG_CONFIG_HOME` (see [Linux](#linux)).
 
 ```json
 {
@@ -686,7 +774,8 @@ terminal pane.
   backoff quietly, and HTTP calls surface a synthetic 599.
 - **Vault pane / `vault-vim` runner errors** — the vault path
   (`~/Owen's Awesome Vault`) is machine-specific; fix it in
-  `~/.config/turing-desktop/config.json`.
+  `${XDG_CONFIG_HOME:-~/.config}/turing-desktop/config.json` (on macOS the
+  path is literally `~/.config/...` — see [Config](#config)).
 - **A `results`/`claude-sessions`/`codex-sessions` root that doesn't exist
   on this machine** — the panes that watch it just error on use; it's not
   fatal to the rest of the shell.
