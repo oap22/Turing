@@ -133,6 +133,35 @@ function cleanPoint(value: unknown): Point | null {
   return out;
 }
 
+/** The subset of the `fs_list` entry shape the run-file helpers need. */
+export interface RunFile {
+  rel_path: string;
+  mtime_ms: number;
+}
+
+/** Run label = the directory the metrics file lives under, e.g. `run-42`. */
+export function runLabelOf(relPath: string): string {
+  const parts = relPath.split("/");
+  return parts.length > 1 ? parts[0] : relPath;
+}
+
+// One graph per run. A run directory can hold several metrics files at once —
+// `metrics.jsonl` alongside a whole-file `metrics.json`, or a nested copy under
+// a checkpoint dir — and every one of them used to become its own row in the
+// run picker, all sharing the same label. Pinning two of them plotted the same
+// run twice, in overlapping strokes, with no way to tell which row was which.
+// Keep the newest file per run label (input order otherwise preserved) so a run
+// can be plotted at most once.
+export function dedupeRunFiles<T extends RunFile>(files: T[]): T[] {
+  const newestByLabel = new Map<string, T>();
+  for (const file of files) {
+    const label = runLabelOf(file.rel_path);
+    const prev = newestByLabel.get(label);
+    if (!prev || file.mtime_ms > prev.mtime_ms) newestByLabel.set(label, file);
+  }
+  return files.filter((f) => newestByLabel.get(runLabelOf(f.rel_path)) === f);
+}
+
 const EXCLUDED_SERIES_KEYS = new Set(["step", "total_steps", "ts"]);
 
 export function seriesOf(points: Point[]): Map<string, Array<[number, number]>> {
