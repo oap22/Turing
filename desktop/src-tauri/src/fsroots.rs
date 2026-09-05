@@ -14,7 +14,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 use tauri::{AppHandle, Emitter};
 
 use crate::config::AppConfig;
@@ -24,7 +24,6 @@ const DEFAULT_MAX_ENTRIES: u32 = 5000;
 const DEFAULT_MAX_TEXT_BYTES: u64 = 2_000_000;
 const MAX_BINARY_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_DEPTH: u32 = 8;
-const DEBOUNCE_MS: u64 = 300;
 
 pub struct Roots(pub HashMap<String, PathBuf>);
 
@@ -339,7 +338,20 @@ pub fn fs_watch(
         // Snapshot roots for rel-path resolution inside the watcher thread —
         // the map is immutable after startup.
         let roots_snapshot: HashMap<String, PathBuf> = roots.0.clone();
-        let debounce = std::sync::Arc::new(Mutex::new(HashMap::<PathBuf, Instant>::new()));
+        let dispatch = crate::fs_dispatch::coalesce(move |path| {
+            for (root_id, root_path) in &roots_snapshot {
+                if let Ok(rel_path) = path.strip_prefix(root_path) {
+                    let _ = app_for_handler.emit(
+                        "fs-change",
+                        FsChangePayload {
+                            root: root_id.clone(),
+                            rel_path: rel_path.to_string_lossy().replace('\\', "/"),
+                        },
+                    );
+                    break;
+                }
+            }
+        });
         let handler = move |res: notify::Result<Event>| {
             let Ok(event) = res else { return };
             let is_relevant = matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
@@ -350,26 +362,7 @@ pub fn fs_watch(
                 if !path.is_file() {
                     continue;
                 }
-                {
-                    let mut db = debounce.lock().unwrap();
-                    let now = Instant::now();
-                    if let Some(last) = db.get(&path) {
-                        if now.duration_since(*last) < Duration::from_millis(DEBOUNCE_MS) {
-                            continue;
-                        }
-                    }
-                    db.insert(path.clone(), now);
-                }
-                for (root_id, root_path) in roots_snapshot.iter() {
-                    if let Ok(rel_path) = path.strip_prefix(root_path) {
-                        let payload = FsChangePayload {
-                            root: root_id.clone(),
-                            rel_path: rel_path.to_string_lossy().replace('\\', "/"),
-                        };
-                        let _ = app_for_handler.emit("fs-change", payload);
-                        break;
-                    }
-                }
+                dispatch(path);
             }
         };
         let watcher =
@@ -392,6 +385,104 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("r".to_string(), dir.canonicalize().unwrap());
         Roots(map)
+    }
+
+    /// Opt-in measurement: real macOS/Linux watcher and real append-only file.
+    /// Baseline is the exact 300 ms leading-edge filter replaced in #428;
+    /// the after path drives the production dispatcher. Excludes Tauri/paint.
+    #[test]
+    #[ignore = "native delivery benchmark; run with --ignored --nocapture"]
+    fn measure_native_file_delivery() {
+        use std::sync::{mpsc, Arc};
+        use std::time::{Duration, Instant};
+        for baseline in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("metrics.jsonl");
+            fs::write(&path, "").unwrap();
+            let (send, receive) = mpsc::channel();
+            let emit = move |p: PathBuf| {
+                let text = fs::read_to_string(p).unwrap_or_default();
+                let _ = send.send((Instant::now(), text));
+            };
+            let dispatch: Box<dyn Fn(PathBuf) + Send> = if baseline {
+                let last = Arc::new(Mutex::new(HashMap::<PathBuf, Instant>::new()));
+                Box::new(move |p| {
+                    let now = Instant::now();
+                    let mut db = last.lock().unwrap();
+                    if db
+                        .get(&p)
+                        .is_some_and(|t| now.duration_since(*t) < Duration::from_millis(300))
+                    {
+                        return;
+                    }
+                    db.insert(p.clone(), now);
+                    drop(db);
+                    emit(p);
+                })
+            } else {
+                Box::new(crate::fs_dispatch::coalesce(emit))
+            };
+            let mut watcher = RecommendedWatcher::new(
+                move |res: notify::Result<Event>| {
+                    if let Ok(event) = res {
+                        if matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
+                            for p in event.paths {
+                                if p.is_file() {
+                                    dispatch(p);
+                                }
+                            }
+                        }
+                    }
+                },
+                NotifyConfig::default(),
+            )
+            .unwrap();
+            watcher.watch(dir.path(), RecursiveMode::Recursive).unwrap();
+            // Establish readiness with a real write, not an assumed startup sleep.
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(file, "ready").unwrap();
+            drop(file);
+            receive.recv_timeout(Duration::from_secs(2)).unwrap();
+            std::thread::sleep(Duration::from_millis(320));
+            let mut written = Vec::new();
+            for step in 0..20 {
+                written.push(Instant::now());
+                let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+                writeln!(file, "{step}").unwrap();
+                drop(file);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let deadline = Instant::now() + Duration::from_millis(500);
+            let mut seen = HashSet::new();
+            let mut latencies = Vec::new();
+            while let Ok((observed, text)) =
+                receive.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                for step in text.lines().filter_map(|v| v.parse::<usize>().ok()) {
+                    if seen.insert(step) {
+                        latencies
+                            .push(observed.duration_since(written[step]).as_secs_f64() * 1000.0);
+                    }
+                }
+                if seen.len() == 20 {
+                    break;
+                }
+            }
+            assert!(
+                !latencies.is_empty(),
+                "native watcher delivered no measured writes"
+            );
+            latencies.sort_by(f64::total_cmp);
+            eprintln!("native_delivery baseline={baseline} visible={}/20 p50_ms={:.3} p95_ms={:.3} final_visible={}",
+                seen.len(), latencies[latencies.len()/2], latencies[(latencies.len()*95/100).min(latencies.len()-1)], seen.contains(&19));
+            if !baseline {
+                assert_eq!(
+                    seen.len(),
+                    20,
+                    "final samples must arrive without a later write"
+                );
+            }
+        }
     }
 
     #[test]
@@ -496,11 +587,17 @@ mod tests {
         // offset == len: caught up, not restarted; nothing to read.
         let at_end = tail_impl(&path, 4).unwrap();
         assert!(!at_end.restarted);
-        assert_eq!((at_end.start, at_end.offset, at_end.data.as_str()), (4, 4, ""));
+        assert_eq!(
+            (at_end.start, at_end.offset, at_end.data.as_str()),
+            (4, 4, "")
+        );
         // offset == len + 1: one past the end is a shorter file — restart.
         let past = tail_impl(&path, 5).unwrap();
         assert!(past.restarted);
-        assert_eq!((past.start, past.offset, past.data.as_str()), (0, 4, "abc\n"));
+        assert_eq!(
+            (past.start, past.offset, past.data.as_str()),
+            (0, 4, "abc\n")
+        );
     }
 
     #[test]

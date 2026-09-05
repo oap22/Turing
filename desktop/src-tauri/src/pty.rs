@@ -6,12 +6,12 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 
 pub struct PtyEntry {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn Child + Send + Sync>,
 }
 
@@ -203,7 +203,7 @@ pub fn pty_spawn(
 
     let entry = PtyEntry {
         master: pair.master,
-        writer,
+        writer: Arc::new(Mutex::new(writer)),
         child,
     };
     ptys.entries.lock().unwrap().insert(id, entry);
@@ -258,16 +258,33 @@ pub fn pty_spawn(
     Ok(id)
 }
 
+// Never hold the registry across a potentially blocking pipe write: a child
+// that stops reading must not stall input/resize/kill for all other panes.
+fn writer_for(ptys: &Ptys, id: u32) -> Result<Arc<Mutex<Box<dyn Write + Send>>>, String> {
+    ptys.entries
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|entry| Arc::clone(&entry.writer))
+        .ok_or_else(|| "no such pty".to_string())
+}
+
 #[tauri::command]
-pub fn pty_write(ptys: tauri::State<'_, Ptys>, id: u32, data: String) -> Result<(), String> {
-    let mut entries = ptys.entries.lock().unwrap();
-    let entry = entries
-        .get_mut(&id)
-        .ok_or_else(|| "no such pty".to_string())?;
-    entry
-        .writer
-        .write_all(data.as_bytes())
-        .map_err(|e| e.to_string())
+pub async fn pty_write(ptys: tauri::State<'_, Ptys>, id: u32, data: String) -> Result<(), String> {
+    write_input(&ptys, id, data).await
+}
+
+async fn write_input(ptys: &Ptys, id: u32, data: String) -> Result<(), String> {
+    let writer = writer_for(ptys, id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        writer
+            .lock()
+            .unwrap()
+            .write_all(data.as_bytes())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -304,6 +321,74 @@ mod tests {
     use super::*;
 
     use std::ffi::OsStr;
+
+    // Real PTY child deliberately does not drain a large paste. While its
+    // write is blocked, another terminal must remain writable and the stalled
+    // child must remain killable. A bounded timeout makes lock regressions fail.
+    #[test]
+    #[cfg(unix)]
+    fn blocked_paste_does_not_block_another_terminal_or_kill() {
+        use std::time::{Duration, Instant};
+        let ptys = Arc::new(Ptys::default());
+        for id in 1..=2 {
+            let pair = native_pty_system()
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap();
+            let mut cmd = CommandBuilder::new("/bin/sleep");
+            cmd.arg("2");
+            let child = pair.slave.spawn_command(cmd).unwrap();
+            drop(pair.slave);
+            let writer = pair.master.take_writer().unwrap();
+            ptys.entries.lock().unwrap().insert(
+                id,
+                PtyEntry {
+                    master: pair.master,
+                    writer: Arc::new(Mutex::new(writer)),
+                    child,
+                },
+            );
+        }
+        let blocked_writer = writer_for(&ptys, 1).unwrap();
+        let slow_ptys = Arc::clone(&ptys);
+        let slow = std::thread::spawn(move || {
+            tauri::async_runtime::block_on(write_input(&slow_ptys, 1, "x".repeat(4 * 1024 * 1024)))
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while blocked_writer.try_lock().is_ok() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            blocked_writer.try_lock().is_err(),
+            "large paste must actually block"
+        );
+        assert!(
+            ptys.entries.try_lock().is_ok(),
+            "blocked writer holds the shared registry"
+        );
+        let start = Instant::now();
+        tauri::async_runtime::block_on(write_input(&ptys, 2, "ok".to_string())).unwrap();
+        let elapsed = start.elapsed();
+        // Remove and kill exactly as pty_kill does; no writer lock required.
+        for id in 1..=2 {
+            let mut entry = ptys.entries.lock().unwrap().remove(&id).unwrap();
+            entry.child.kill().unwrap();
+            entry.child.wait().unwrap();
+        }
+        let _ = slow.join().unwrap();
+        eprintln!(
+            "other_terminal_write_ms={:.3}",
+            elapsed.as_secs_f64() * 1000.0
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "another pane waited for the blocked child"
+        );
+    }
 
     // The regression that actually made the pane unusable: with TERM unset,
     // zsh has no terminfo entry, ZLE cannot cursor-address, and the prompt
@@ -486,7 +571,7 @@ mod tests {
             id,
             PtyEntry {
                 master: pair.master,
-                writer,
+                writer: Arc::new(Mutex::new(writer)),
                 child,
             },
         );

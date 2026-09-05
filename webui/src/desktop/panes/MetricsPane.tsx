@@ -54,7 +54,7 @@ import {
   parseViewerFile,
   pickSeries,
   runIdOf,
-  seriesOf,
+  appendSeries,
   verdictPathOf,
   type BadgeState,
   type Point,
@@ -121,6 +121,7 @@ interface RunState {
    * first chunk lands, or where the platform reports no identity. */
   ident: string | null;
   points: Point[];
+  series: Map<string, Array<[number, number]>>;
   arrivals: number[];
   /** The `_chain` digest of the last non-blank line this run holds, or
    * `null` — including when that line does not parse. This is what binds the
@@ -165,6 +166,7 @@ function forgetRun(run: RunState) {
   run.offset = 0;
   run.ident = null;
   run.points = [];
+  run.series.clear();
   run.arrivals = [];
   run.lastDigest = null;
 }
@@ -407,6 +409,7 @@ export default function MetricsPane() {
         offset: 0,
         ident: null,
         points: [],
+        series: new Map(),
         arrivals: [],
         lastDigest: null,
         tailing: false,
@@ -528,11 +531,14 @@ export default function MetricsPane() {
     run.offset = chunk.offset;
     const newPoints = parseMetricsText(chunk.data);
     if (reset) {
+      run.series.clear();
+      appendSeries(run.series, newPoints, 0);
       run.points = newPoints;
       run.arrivals = newPoints.length > 0 ? [Date.now()] : [];
     } else if (newPoints.length > 0) {
-      run.points = [...run.points, ...newPoints];
-      run.arrivals = [...run.arrivals, Date.now()];
+      appendSeries(run.series, newPoints, run.points.length);
+      for (const point of newPoints) run.points.push(point);
+      run.arrivals.push(Date.now());
     }
     // The digest of the last non-blank line of the bytes that just arrived —
     // what the badge is bound to. `fs_tail` returns whole lines only, so if
@@ -609,7 +615,7 @@ export default function MetricsPane() {
     for (const path of activePaths) {
       const run = runsRef.current.get(path);
       if (!run) continue;
-      for (const name of seriesOf(run.points).keys()) names.add(name);
+      for (const name of run.series.keys()) names.add(name);
     }
     return Array.from(names).sort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -764,12 +770,8 @@ export default function MetricsPane() {
         //     the new `metrics.jsonl`. Re-reading the verdict on the run's own
         //     event is what stops the badge sitting green over a directory the
         //     verdict has left.
-        //   * A run append can be dropped: the watcher debounces repeat writes to
-        //     one path inside 300 ms, which a solver stepping faster than ~3 Hz
-        //     hits routinely. If the dropped write was the last one, the verdict
-        //     event that follows it is the pane's only remaining chance to catch
-        //     up — without the re-tail the badge stays amber forever on a run
-        //     that is perfectly clean.
+        //   * The verdict event can arrive before the final metrics read
+        //     resolves. Re-tail both to bind the badge to the latest bytes.
         if (runsRef.current.has(payload.rel_path)) {
           void tailRun(payload.rel_path);
           void loadVerdict(payload.rel_path);
@@ -847,7 +849,7 @@ export default function MetricsPane() {
       // no two entries can collide however the labels read. See Chart.tsx.
       id: `${run.path}::${activeSeries}`,
       label: `${run.label}/${titles[activeSeries] ?? activeSeries}`,
-      points: seriesOf(run.points).get(activeSeries) ?? [],
+      points: run.series.get(activeSeries) ?? [],
       color: colorForSlot(colors.get(run.path) ?? 0),
       // The legend `×` always means "this line goes away" — including for
       // auto's line, which it switches auto off to remove.

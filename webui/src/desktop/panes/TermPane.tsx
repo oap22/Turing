@@ -8,6 +8,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { actionFor, PANE_FOCUS_EVENT, type PaneFocusDetail } from "../keymap";
+import { createPtyInput } from "../ptyInput";
 import { createPtyStream } from "../ptyStream";
 import { readTermTokens } from "../theme";
 import { inv, subscribe } from "../tauri";
@@ -159,6 +160,13 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
     openedRef.current = false;
     disposedRef.current = false;
 
+    const input = createPtyInput(
+      (data) => inv("pty_write", { id: idRef.current, data }),
+      (error) => {
+        if (!disposedRef.current) term.write(`\r\n[input failed: ${String(error)}]`);
+      },
+    );
+
     term.attachCustomKeyEventHandler((e) => {
       // No pane-local ⌘ chord may shadow the keymap. DesktopShell listens on
       // `window` with capture:true and preventDefault/stopPropagation's every
@@ -187,7 +195,7 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
       }
       if (e.metaKey && !e.ctrlKey && !e.altKey && e.key === "v" && e.type === "keydown") {
         void navigator.clipboard.readText().then((text) => {
-          if (idRef.current !== null) void inv("pty_write", { id: idRef.current, data: text });
+          if (idRef.current !== null) input.push(text);
         });
         return false;
       }
@@ -258,13 +266,13 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
       void inv("pty_resize", { id, cols: term.cols, rows: term.rows });
 
       if (runner && !runner.autorun) {
-        await inv("pty_write", { id, data: runner.command });
+        input.push(runner.command);
       }
     }
     void boot();
 
     term.onData((data) => {
-      if (idRef.current !== null) void inv("pty_write", { id: idRef.current, data });
+      if (idRef.current !== null) input.push(data);
     });
 
     function onThemeChange() {
@@ -277,6 +285,7 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
       // every await and kills a pty that spawn returns too late, so teardown
       // is correct whether or not spawn ever resolved.
       cancelled = true;
+      input.close();
       // Flip before dispose: async output can still be in flight, and
       // term.write() on a disposed Terminal throws.
       disposedRef.current = true;
