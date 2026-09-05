@@ -78,12 +78,15 @@ own timeout (`--verifier-timeout-seconds`, default 600):
 - The **last line of its stdout** that matches exactly `score=<number>` is the
   score. `score=0.83`, `score=-2`, `score=1e-3` all match; `score = 1` and
   `Score: 1` do not. No such line means the problem is pass/fail only.
-  **[not enforced]** On a pass/fail-only problem the loop never has a best
-  score to compare against, so *every* pass is recorded as an improvement
-  (empty category set) — not only the first; the "later pass is
-  `no_progress`" rule exists in the classifier but is only reached once a
-  numeric score has been measured. Pass→fail after a self-edit is still
-  judged for rollback (below).
+  On a pass/fail-only problem the first valid verifier pass is recorded as
+  progress (it has no `no_progress` category), and every later valid pass is
+  recorded as `no_progress`, including after a restart. A clean first pass
+  therefore has an empty category set; independently applicable categories
+  such as `engine_error` or `no_metrics` still accompany it. The loop
+  reconstructs this state from historical `passed` and `void` facts,
+  independently of numeric scoring. A failed round does not clear a
+  previously established pass, while a void passing row never establishes
+  one. Pass→fail after a self-edit is still judged for rollback (below).
 
 The first run writes `<sandbox>/VERIFIER.json`: the command, its sha256, and
 the sha256 of every file it pins. **Pinning is narrow and literal:** a file is
@@ -136,9 +139,10 @@ by more than one part in a million, the cheat detector fires (below).
 
 ## The frozen error taxonomy
 
-Every round carries a **set** of categories from a closed list. A round that
-passed and improved on the best score so far carries the empty set. The list
-is `turing.research.rsi.taxonomy.FailureCategory`; its digest is written to
+Every round carries a **set** of categories from a closed list. A clean pass
+that makes progress carries the empty set; a first scoreless pass can still
+carry independently applicable categories such as `engine_error` or
+`no_metrics`. The list is `turing.research.rsi.taxonomy.FailureCategory`; its digest is written to
 `<results>/taxonomy.json` on the first run and checked on every later run — a
 mismatch **refuses to start**, because per-category counts are only comparable
 across rounds if every round was categorised the same way (this closes
@@ -150,11 +154,16 @@ across rounds if every round was categorised the same way (this closes
 | `timeout` | The round hit its wall-clock cap (`--round-timeout-seconds`, default 1800) and was killed. Recorded on its own, not together with `engine_error` |
 | `verifier_failed` | The verifier exited non-zero (or timed out) |
 | `verifier_tampered` | The verifier lock no longer matches the sandbox. The round is void and the loop stops |
-| `no_progress` | The verifier passed, but the score is not better than the best score so far. On a pass/fail-only problem this is never recorded by the running loop (see the frozen-verifier section) |
+| `no_progress` | The verifier passed, but the score is not better than the best score so far; on a pass/fail-only problem, every valid pass after the first |
 | `regressed` | The score is worse than the *previous* round's. Can hold together with `no_progress` |
 | `no_metrics` | The round wrote no `metrics.jsonl` line. Recorded *alongside* whatever the verifier said, never instead of it |
 | `cheat_detected` | The agent's self-reported score disagrees with the measured one. The round is void and the loop stops |
 | `sandbox_escape` | A symlink in the sandbox points outside it, or the round created a results file of a kind the panes do not read. The round is void and the loop stops |
+
+When resuming, historical rows are read as facts. New rows use the corrected
+classifier, while the loop never rewrites old category arrays or their
+historical counts. The taxonomy digest freezes category names; it does not
+retroactively reclassify earlier rows or version the classifier's behavior.
 
 `taxonomy.json` holds version `1` and the digest
 `2ee65add4eb8a03fe2466d53584904d12f7d78a374c45f74475ef646dc3dcd8d`. Changing

@@ -44,6 +44,17 @@ if TYPE_CHECKING:
 
 VERIFY_SH = "cat SCORE 2>/dev/null || exit 1\n"
 VERIFIER = VerifierSpec(command="sh verify.sh", files=("verify.sh",))
+PASS_FAIL_VERIFIER = VerifierSpec(command="test -f PASS")
+MIXED_VERIFY_SH = (
+    "if [ -f SCORE ]; then\n"
+    "    cat SCORE\n"
+    "elif [ -f PASS ]; then\n"
+    "    exit 0\n"
+    "else\n"
+    "    exit 1\n"
+    "fi\n"
+)
+MIXED_VERIFIER = VerifierSpec(command="sh verify.sh", files=("verify.sh",))
 _ROUND_RE = re.compile(r"You are round (\d+) of")
 
 
@@ -93,6 +104,39 @@ def score_step(
     return step
 
 
+def pass_fail_step(
+    *,
+    results: Path,
+    verifier_passes: bool = True,
+    metrics: bool = True,
+    engine_exit: int = 0,
+) -> Callable[[str, Path], EngineResult]:
+    """A real scoreless verifier round with optional engine/telemetry failures."""
+
+    def step(prompt: str, cwd: Path) -> EngineResult:
+        round_no = _round_of(prompt)
+        marker = cwd / "PASS"
+        (cwd / "SCORE").unlink(missing_ok=True)
+        if verifier_passes:
+            marker.write_text("valid\n")
+        else:
+            marker.unlink(missing_ok=True)
+        if metrics:
+            append_jsonl(
+                results / "metrics.jsonl",
+                json.dumps({"step": round_no, "ts": 1, "measurement": 1.0}),
+            )
+        return EngineResult(
+            exit_code=engine_exit,
+            stdout="",
+            stderr="",
+            wall_seconds=0.01,
+            timed_out=False,
+        )
+
+    return step
+
+
 def _config(dirs: RsiDirs, **overrides: Any) -> RsiConfig:
     return replace(dirs.config, **overrides)
 
@@ -105,8 +149,9 @@ def _loop(
     self_edit: Any = None,
     verifier: VerifierSpec | None = VERIFIER,
     problem: str | None = "Make the number bigger.",
+    verifier_script: str = VERIFY_SH,
 ) -> RsiLoop:
-    (dirs.sandbox / "verify.sh").write_text(VERIFY_SH)
+    (dirs.sandbox / "verify.sh").write_text(verifier_script)
     return RsiLoop(
         config or dirs.config,
         engine=engine,
@@ -250,6 +295,250 @@ class TestRounds:
         assert VERIFY_SH.strip() not in prompts[0]  # never the verifier's internals
         assert engine.calls[0].cwd == rsi_dirs.sandbox
         assert engine.calls[0].timeout_seconds == rsi_dirs.config.round_timeout_seconds
+
+    async def test_scoreless_passes_record_progress_then_no_progress(
+        self, rsi_dirs: RsiDirs
+    ) -> None:
+        results = rsi_dirs.results
+        engine = FakeEngine(
+            script=[
+                pass_fail_step(results=results),
+                pass_fail_step(results=results),
+                pass_fail_step(results=results),
+            ]
+        )
+        outcome = await _loop(
+            rsi_dirs,
+            engine,
+            config=_config(rsi_dirs, rounds=3),
+            verifier=PASS_FAIL_VERIFIER,
+        ).run()
+        assert outcome.best_score is None
+        records = _records(results)
+        assert [record["categories"] for record in records] == [
+            [],
+            ["no_progress"],
+            ["no_progress"],
+        ]
+        assert all(record["passed"] and not record["void"] for record in records)
+        # The verifier passes with a measured result, and every round has
+        # telemetry; no_metrics cannot explain the later categories.
+        assert all(record["score"] is None for record in records)
+        assert all(record["categories"] != ["no_metrics"] for record in records)
+
+    @pytest.mark.parametrize(
+        ("verifier_passes", "expected_categories"),
+        [
+            ([False, True, True], [["verifier_failed"], [], ["no_progress"]]),
+            ([True, False, True], [[], ["verifier_failed"], ["no_progress"]]),
+        ],
+    )
+    async def test_scoreless_failures_do_not_establish_or_clear_prior_pass(
+        self,
+        rsi_dirs: RsiDirs,
+        verifier_passes: list[bool],
+        expected_categories: list[list[str]],
+    ) -> None:
+        results = rsi_dirs.results
+        engine = FakeEngine(
+            script=[
+                pass_fail_step(results=results, verifier_passes=passes)
+                for passes in verifier_passes
+            ]
+        )
+        await _loop(
+            rsi_dirs,
+            engine,
+            config=_config(rsi_dirs, rounds=3),
+            verifier=PASS_FAIL_VERIFIER,
+        ).run()
+        categories = [record["categories"] for record in _records(results)]
+        assert categories == expected_categories
+
+    @pytest.mark.parametrize(
+        ("engine_exit", "metrics", "prior_category"),
+        [(1, True, "engine_error"), (0, False, "no_metrics"), (1, False, None)],
+    )
+    async def test_mixed_engine_and_metrics_flags_on_a_pass_still_establish_prior_pass(
+        self,
+        rsi_dirs: RsiDirs,
+        engine_exit: int,
+        metrics: bool,
+        prior_category: str | None,
+    ) -> None:
+        results = rsi_dirs.results
+        engine = FakeEngine(
+            script=[
+                pass_fail_step(results=results, engine_exit=engine_exit, metrics=metrics),
+                pass_fail_step(results=results),
+            ]
+        )
+        await _loop(
+            rsi_dirs,
+            engine,
+            config=_config(rsi_dirs, rounds=2),
+            verifier=PASS_FAIL_VERIFIER,
+        ).run()
+        records = _records(results)
+        assert records[0]["passed"] is True and records[0]["void"] is False
+        if prior_category is None:
+            assert set(records[0]["categories"]) == {"engine_error", "no_metrics"}
+        else:
+            assert records[0]["categories"] == [prior_category]
+        assert records[1]["categories"] == ["no_progress"]
+
+    @pytest.mark.parametrize("numeric_score", [0.0, -1.0])
+    async def test_live_numeric_zero_or_negative_then_scoreless_is_no_progress(
+        self, rsi_dirs: RsiDirs, numeric_score: float
+    ) -> None:
+        results = rsi_dirs.results
+        engine = FakeEngine(
+            script=[
+                score_step(numeric_score, results=results),
+                pass_fail_step(results=results),
+            ]
+        )
+        outcome = await _loop(
+            rsi_dirs,
+            engine,
+            config=_config(rsi_dirs, rounds=2),
+            verifier=MIXED_VERIFIER,
+            verifier_script=MIXED_VERIFY_SH,
+        ).run()
+        records = _records(results)
+        assert records[0]["score"] == numeric_score
+        assert records[1]["score"] is None
+        assert records[1]["categories"] == ["no_progress"]
+        assert outcome.best_score == numeric_score
+
+    async def test_live_scoreless_then_negative_numeric_has_no_progress_or_regressed(
+        self, rsi_dirs: RsiDirs
+    ) -> None:
+        results = rsi_dirs.results
+        engine = FakeEngine(
+            script=[
+                pass_fail_step(results=results),
+                score_step(-1.0, results=results),
+            ]
+        )
+        outcome = await _loop(
+            rsi_dirs,
+            engine,
+            config=_config(rsi_dirs, rounds=2),
+            verifier=MIXED_VERIFIER,
+            verifier_script=MIXED_VERIFY_SH,
+        ).run()
+        records = _records(results)
+        assert records[0]["score"] is None and records[0]["categories"] == []
+        assert records[1]["score"] == -1.0
+        assert records[1]["categories"] == []
+        assert outcome.best_score == -1.0
+
+    async def test_live_numeric_then_scoreless_then_lower_numeric_preserves_best_without_regression(
+        self, rsi_dirs: RsiDirs
+    ) -> None:
+        results = rsi_dirs.results
+        engine = FakeEngine(
+            script=[
+                score_step(5.0, results=results),
+                pass_fail_step(results=results),
+                score_step(4.0, results=results),
+            ]
+        )
+        outcome = await _loop(
+            rsi_dirs,
+            engine,
+            config=_config(rsi_dirs, rounds=3),
+            verifier=MIXED_VERIFIER,
+            verifier_script=MIXED_VERIFY_SH,
+        ).run()
+        records = _records(results)
+        assert [record["categories"] for record in records] == [
+            [],
+            ["no_progress"],
+            ["no_progress"],
+        ]
+        assert outcome.best_score == 5.0
+
+    @pytest.mark.parametrize("numeric_score", [0.0, -1.0])
+    async def test_fresh_loop_restart_numeric_then_scoreless_keeps_prior_pass(
+        self, rsi_dirs: RsiDirs, numeric_score: float
+    ) -> None:
+        results = rsi_dirs.results
+        first = await _loop(
+            rsi_dirs,
+            FakeEngine(script=[score_step(numeric_score, results=results)]),
+            config=_config(rsi_dirs, rounds=1),
+            verifier=MIXED_VERIFIER,
+            verifier_script=MIXED_VERIFY_SH,
+        ).run()
+        second = await _loop(
+            rsi_dirs,
+            FakeEngine(script=[pass_fail_step(results=results)]),
+            config=_config(rsi_dirs, rounds=1),
+            verifier=MIXED_VERIFIER,
+            verifier_script=MIXED_VERIFY_SH,
+        ).run()
+        assert first.best_score == numeric_score
+        assert second.best_score == numeric_score
+        assert _records(results)[1]["categories"] == ["no_progress"]
+
+    async def test_fresh_loop_restart_scoreless_then_negative_numeric_is_progress(
+        self, rsi_dirs: RsiDirs
+    ) -> None:
+        results = rsi_dirs.results
+        first = await _loop(
+            rsi_dirs,
+            FakeEngine(script=[pass_fail_step(results=results)]),
+            config=_config(rsi_dirs, rounds=1),
+            verifier=MIXED_VERIFIER,
+            verifier_script=MIXED_VERIFY_SH,
+        ).run()
+        second = await _loop(
+            rsi_dirs,
+            FakeEngine(script=[score_step(-1.0, results=results)]),
+            config=_config(rsi_dirs, rounds=1),
+            verifier=MIXED_VERIFIER,
+            verifier_script=MIXED_VERIFY_SH,
+        ).run()
+        assert first.best_score is None
+        assert second.best_score == -1.0
+        assert _records(results)[1]["categories"] == []
+
+    async def test_fresh_loop_restart_numeric_scoreless_lower_numeric_uses_numeric_best(
+        self, rsi_dirs: RsiDirs
+    ) -> None:
+        results = rsi_dirs.results
+        first = await _loop(
+            rsi_dirs,
+            FakeEngine(script=[score_step(5.0, results=results)]),
+            config=_config(rsi_dirs, rounds=1),
+            verifier=MIXED_VERIFIER,
+            verifier_script=MIXED_VERIFY_SH,
+        ).run()
+        second = await _loop(
+            rsi_dirs,
+            FakeEngine(script=[pass_fail_step(results=results)]),
+            config=_config(rsi_dirs, rounds=1),
+            verifier=MIXED_VERIFIER,
+            verifier_script=MIXED_VERIFY_SH,
+        ).run()
+        third = await _loop(
+            rsi_dirs,
+            FakeEngine(script=[score_step(4.0, results=results)]),
+            config=_config(rsi_dirs, rounds=1),
+            verifier=MIXED_VERIFIER,
+            verifier_script=MIXED_VERIFY_SH,
+        ).run()
+        assert first.best_score == 5.0
+        assert second.best_score == 5.0
+        assert third.best_score == 5.0
+        records = _records(results)
+        assert [record["categories"] for record in records] == [
+            [],
+            ["no_progress"],
+            ["no_progress"],
+        ]
 
     async def test_regression_and_no_progress_both_recorded(self, rsi_dirs: RsiDirs) -> None:
         results = rsi_dirs.results
@@ -413,6 +702,90 @@ class TestResume:
             "scaffold_seeded",
         ]
         assert len(lines) == 9
+
+    @pytest.mark.parametrize(
+        ("engine_exit", "metrics", "prior_categories"),
+        [
+            (0, True, []),
+            (1, True, ["engine_error"]),
+            (0, False, ["no_metrics"]),
+            (1, False, ["engine_error", "no_metrics"]),
+        ],
+    )
+    async def test_scoreless_restart_reconstructs_any_nonvoid_prior_pass(
+        self,
+        rsi_dirs: RsiDirs,
+        engine_exit: int,
+        metrics: bool,
+        prior_categories: list[str],
+    ) -> None:
+        results = rsi_dirs.results
+        first = await _loop(
+            rsi_dirs,
+            FakeEngine(
+                script=[pass_fail_step(results=results, engine_exit=engine_exit, metrics=metrics)]
+            ),
+            config=_config(rsi_dirs, rounds=1),
+            verifier=PASS_FAIL_VERIFIER,
+        ).run()
+        assert first.rounds_run == 1
+        first_records = _records(results)
+        assert first_records[0]["passed"] is True and first_records[0]["void"] is False
+        assert first_records[0]["categories"] == prior_categories
+        prefix = (results / "trajectory.json").read_bytes()
+
+        second = await _loop(
+            rsi_dirs,
+            FakeEngine(script=[pass_fail_step(results=results)]),
+            config=_config(rsi_dirs, rounds=1),
+            verifier=PASS_FAIL_VERIFIER,
+        ).run()
+        assert second.rounds_run == 1
+        assert (results / "trajectory.json").read_bytes().startswith(prefix)
+        assert _records(results)[1]["categories"] == ["no_progress"]
+
+    async def test_void_passing_replay_row_does_not_establish_prior_pass(
+        self, rsi_dirs: RsiDirs, write_trajectory: Callable[[Sequence[dict[str, Any]]], Path]
+    ) -> None:
+        write_trajectory(
+            [
+                RoundRecord(
+                    round=1,
+                    started=1,
+                    ended=2,
+                    exit=0,
+                    passed=True,
+                    void=True,
+                    categories=frozenset(
+                        {
+                            FailureCategory.CHEAT_DETECTED,
+                            FailureCategory.ENGINE_ERROR,
+                            FailureCategory.NO_METRICS,
+                        }
+                    ),
+                ).to_json()
+            ]
+        )
+        state = read_trajectory(rsi_dirs.results / "trajectory.json")
+        assert state.prior_pass is False
+
+    async def test_valid_scoreless_replay_row_establishes_prior_pass(
+        self, rsi_dirs: RsiDirs, write_trajectory: Callable[[Sequence[dict[str, Any]]], Path]
+    ) -> None:
+        write_trajectory(
+            [
+                RoundRecord(
+                    round=1,
+                    started=1,
+                    ended=2,
+                    exit=0,
+                    passed=True,
+                    categories=frozenset({FailureCategory.NO_METRICS}),
+                ).to_json()
+            ]
+        )
+        state = read_trajectory(rsi_dirs.results / "trajectory.json")
+        assert state.prior_pass is True
 
     async def test_first_run_without_problem_is_a_usage_error(self, rsi_dirs: RsiDirs) -> None:
         engine = FakeEngine(script=[])
