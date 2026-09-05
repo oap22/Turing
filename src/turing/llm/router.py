@@ -127,11 +127,7 @@ class LLMRouter:
         label = _provider_label(provider, self._cloud, self._local)
         # Local Ollama tool use is opt-in.  The opt-in applies to local_only,
         # classifier-selected local calls, and cloud->local auth fallbacks.
-        effective_tools = (
-            tools
-            if provider is self._cloud or self._local_tools_enabled
-            else None
-        )
+        effective_tools = tools if provider is self._cloud or self._local_tools_enabled else None
         logger.info(
             "llm_route_decision",
             provider=label,

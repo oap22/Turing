@@ -184,7 +184,6 @@ class OllamaProvider(LLMProvider):
 
         return api_msgs
 
-
     @staticmethod
     def _convert_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
         """Convert ToolDefinitions to Ollama's OpenAI-style tool format."""

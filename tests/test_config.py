@@ -136,11 +136,14 @@ class TestEnvOverrides:
         assert cfg.agent_mailbox_agent == "local-agent"
 
     def test_native_mailbox_partial_override_is_rejected(self, tmp_path: Path) -> None:
-        with patch.dict(
-            "os.environ",
-            {"TURING_AGENT_MAILBOX_DB": str(tmp_path / "mailbox.db")},
-            clear=True,
-        ), pytest.raises(ValueError, match="must be configured together"):
+        with (
+            patch.dict(
+                "os.environ",
+                {"TURING_AGENT_MAILBOX_DB": str(tmp_path / "mailbox.db")},
+                clear=True,
+            ),
+            pytest.raises(ValueError, match="must be configured together"),
+        ):
             TuringConfig(_env_file=None)  # type: ignore[call-arg]
 
     def test_routing_mode_override(self) -> None:

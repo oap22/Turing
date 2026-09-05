@@ -293,7 +293,9 @@ async def test_real_agent_loop_executes_native_tool_with_local_router(tmp_path: 
     assert local.complete.await_count == 2
     assert local.complete.call_args_list[0].kwargs["tools"] == registry.get_definitions()
     second_messages = local.complete.call_args_list[1].kwargs["messages"]
-    assistant_messages = [message for message in second_messages if message.role.value == "assistant"]
+    assistant_messages = [
+        message for message in second_messages if message.role.value == "assistant"
+    ]
     tool_messages = [message for message in second_messages if message.role.value == "tool"]
     assert len(assistant_messages) == 1
     assert len(assistant_messages[0].tool_calls or []) == 2

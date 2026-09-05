@@ -234,4 +234,5 @@ async def register_agent_mailbox_tool(
     tool_registry.register(tool)
     return tool
 
+
 __all__ = ["AgentMailboxTool", "register_agent_mailbox_tool"]
