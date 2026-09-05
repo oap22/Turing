@@ -133,6 +133,7 @@ interface RunState {
    * follow-up read when it lands — the same bytes are never in two responses
    * that both get applied. */
   tailing: boolean;
+  lastTailMs: number;
   pending: boolean;
 }
 
@@ -413,6 +414,7 @@ export default function MetricsPane() {
         arrivals: [],
         lastDigest: null,
         tailing: false,
+        lastTailMs: 0,
         pending: false,
       };
       runsRef.current.set(path, run);
@@ -429,6 +431,7 @@ export default function MetricsPane() {
       } while (run.pending);
     } finally {
       run.tailing = false;
+      run.lastTailMs = Date.now();
     }
   }
 
@@ -607,6 +610,21 @@ export default function MetricsPane() {
       void tailRun(path);
       void loadVerdict(path);
     }
+    // FSEvents can withhold updates for a long-lived open writer, and remote
+    // filesystems may miss notifications. Reconcile only selected runs after
+    // 50 ms without a completed tail (checked every 50 ms); fast event-driven streams add no polls.
+    // Reads remain serialized, and unchanged tails do not trigger a render.
+    if (activePaths.length === 0) return;
+    const timer = window.setInterval(() => {
+      for (const path of activePaths) {
+        const run = runsRef.current.get(path);
+        if (run && !run.tailing && Date.now() - run.lastTailMs >= 50) {
+          void tailRun(path);
+          void loadVerdict(path);
+        }
+      }
+    }, 50);
+    return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activePaths.join("|")]);
 

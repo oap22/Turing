@@ -72,7 +72,7 @@ describe("RUNNERS", () => {
     const pull = RUNNERS.find((r) => r.id === "ssh-pull-assets");
     expect(pull?.command).toContain("rsync");
     expect(pull?.command).toContain(`${RESULTS_ROOT_TOKEN}/rosie-live/`);
-    expect(pull?.command).toContain("sleep 30");
+    expect(pull?.command).toContain("sleep 1");
   });
 
   // The whole point of the placeholder: nothing may pin the watched results

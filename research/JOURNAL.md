@@ -21,6 +21,15 @@ first run is how real priors start accumulating.
 
 ---
 
+## 2026-09-05 — Selected graph freshness and rejected mirror prototype
+
+A selected-run watchdog recovers silent appends without duplicating healthy
+native-event reads. An alternative metrics mirror was slower than the actual
+existing tail stream and was rejected. Measurements, mutation-test evidence,
+estimate versus actual, and limitations are in the
+[graph freshness brief](briefs/2026-09-05-graph-freshness.md). This is engineering
+verification, not a result of the RSI program.
+
 ## 2026-09-05 — Desktop latency engineering verification
 
 Three paired clean-source runs reduce live graph series/rendering work, and native
