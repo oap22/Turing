@@ -98,13 +98,13 @@ export const RUNNERS: readonly Runner[] = [
     group: "remote",
     autorun: false,
   },
-  // Mirrors remote plots/metrics into the watched results dir every 30s, so
+  // Mirrors remote plots/metrics into the watched results dir every second, so
   // the images and metrics panes keep updating while a cluster job runs.
   {
     id: "ssh-pull-assets",
     label: "pull remote assets (ssh)",
     command:
-      "while true; do rsync -az --include='*/' --include='*.png' --include='*.svg' --include='*.json*' --include='*.log' --exclude='*' <SSH_HOST>:<REMOTE_RUN_DIR>/ <RESULTS_ROOT>/rosie-live/; sleep 30; done",
+      "while true; do rsync -az --include='*/' --include='*.png' --include='*.svg' --include='*.json*' --include='*.log' --exclude='*' <SSH_HOST>:<REMOTE_RUN_DIR>/ <RESULTS_ROOT>/rosie-live/; sleep 1; done",
     group: "remote",
     autorun: false,
   },

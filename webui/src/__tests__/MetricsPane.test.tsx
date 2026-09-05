@@ -1492,3 +1492,46 @@ describe("MetricsPane — a missed run event must not pin the badge amber", () =
     );
   });
 });
+
+
+describe("MetricsPane — missing native notifications", () => {
+  it("reconciles a silent final append and stops polling after unmount", async () => {
+    const path = `${R1}/cuda/matmul-speedup/metrics.jsonl`;
+    const view = render(createElement(MetricsPane));
+    await waitFor(() => expect(tailedPaths()).toContain(path));
+    const previous = contents.get(path)!;
+    const line = chainLine(20, 0.1, 3, "silent");
+    contents.set(path, previous + line + "\n");
+    // No fs-change event: held-open producers must still reach the consumer.
+    await waitFor(() => expect(screen.getByTestId("metrics-eta").textContent).toContain("last step: 21"));
+    view.unmount();
+    const calls = invMock.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(invMock.mock.calls.length).toBe(calls);
+  });
+});
+
+describe("MetricsPane — active notification streams", () => {
+  it("does not add watchdog reads while native updates arrive frequently", async () => {
+    const path = `${R1}/cuda/matmul-speedup/metrics.jsonl`;
+    vi.useFakeTimers();
+    try {
+      await act(async () => {
+        render(createElement(MetricsPane));
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(tailedPaths()).toContain(path);
+      invMock.mockClear();
+      for (let i = 0; i < 10; i++) {
+        await act(async () => {
+          for (const handler of fsChangeHandlers) handler({ root: "results", rel_path: path });
+          await vi.advanceTimersByTimeAsync(20);
+        });
+      }
+      expect(invMock.mock.calls.filter(([cmd]) => cmd === "fs_tail")).toHaveLength(10);
+    } finally {
+      cleanup();
+      vi.useRealTimers();
+    }
+  });
+});
