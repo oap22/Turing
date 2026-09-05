@@ -145,6 +145,50 @@ def test_rejects_incomplete_mailbox_marker_without_repairing_file(tmp_path: Path
         ).fetchall() == [("mailbox_schema",)]
 
 
+def test_rejects_extra_schema_constraint_without_mutating_file(tmp_path: Path) -> None:
+    path = tmp_path / "extra-constraint.db"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE mailbox_schema
+                (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL);
+            CREATE TABLE mailbox_workflows (
+                workflow TEXT PRIMARY KEY, created_at TEXT NOT NULL
+            );
+            CREATE TABLE mailbox_registrations (
+                workflow TEXT NOT NULL, agent TEXT NOT NULL, provider TEXT NOT NULL,
+                registered_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                PRIMARY KEY (workflow, agent),
+                FOREIGN KEY (workflow) REFERENCES mailbox_workflows(workflow)
+            );
+            CREATE TABLE mailbox_sequences (
+                workflow TEXT PRIMARY KEY,
+                next_sequence INTEGER NOT NULL CHECK (next_sequence >= 1)
+                    CHECK (next_sequence <> 2),
+                FOREIGN KEY (workflow) REFERENCES mailbox_workflows(workflow)
+            );
+            CREATE TABLE mailbox_messages (
+                message_id TEXT PRIMARY KEY, workflow TEXT NOT NULL, sequence INTEGER NOT NULL,
+                sender TEXT NOT NULL, recipient TEXT NOT NULL, created_at TEXT NOT NULL,
+                kind TEXT NOT NULL, text TEXT NOT NULL, data_json TEXT, reply_to TEXT,
+                idempotency_key TEXT, acknowledged_at TEXT,
+                UNIQUE (workflow, sequence), UNIQUE (workflow, sender, idempotency_key),
+                FOREIGN KEY (workflow, sender) REFERENCES mailbox_registrations(workflow, agent),
+                FOREIGN KEY (workflow, recipient) REFERENCES mailbox_registrations(workflow, agent)
+            );
+            CREATE INDEX mailbox_messages_inbox_idx
+              ON mailbox_messages(workflow, recipient, acknowledged_at, sequence);
+            INSERT INTO mailbox_schema VALUES (1, 1);
+            """
+        )
+    before = path.read_bytes()
+
+    with pytest.raises(MailboxError, match="unsupported schema"):
+        Mailbox(path, "workflow", "alice")
+
+    assert path.read_bytes() == before
+
+
 @pytest.mark.parametrize(
     "version", [pytest.param(1.9, id="fractional"), pytest.param(float("inf"), id="infinite")]
 )
