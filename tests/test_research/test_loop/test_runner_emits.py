@@ -578,10 +578,21 @@ class TestRoundEmission:
 # --------------------------------------------------------------------------- #
 
 
-def test_plots_module_selected_the_agg_backend() -> None:
-    """Cheap guard: importing turing.research.loop.runner must not have pulled
-    in a GUI backend via some other import path.
+async def test_plots_module_selected_the_agg_backend(tmp_path: Path) -> None:
+    """Cheap guard: the first real render must leave matplotlib on the Agg
+    backend, not a GUI one reached via some other import path.
+
+    ``plots`` no longer imports matplotlib at module scope — it defers the
+    import (and the ``matplotlib.use("Agg")`` call) to the first render — so
+    this test triggers a render itself rather than relying on an earlier test
+    in the session having done so. It must hold when run in isolation.
     """
+    points = (
+        {"step": 1, "progress": 0.0, "score": 1.0, "tokens_used": 10, "wall_clock_s": 1.0},
+        {"step": 2, "progress": 1.0, "score": 2.0, "tokens_used": 20, "wall_clock_s": 2.0},
+    )
+    await plots_module.render_attempt_plots(tmp_path, points, forcing_series="score", target=2.0)
+
     import matplotlib
 
     assert matplotlib.get_backend().lower() == "agg"

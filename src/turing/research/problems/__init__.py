@@ -36,64 +36,74 @@ undecided_loopholes` keeps the unanswered policy questions visible.
 
 from __future__ import annotations
 
-from turing.research.problems.adapter import (
-    AdapterRegistry,
-    ProblemAdapter,
-    WorkspaceMaterialisationError,
-    bind_eval_set_hash,
-    fingerprint_corpus,
-)
-from turing.research.problems.catalog import (
-    DEFAULT_MAESTRO_REPO,
-    DEFAULT_SPLITS,
-    DEFAULT_TURING_REPO,
-    MEASURED_AT,
-    MEASURED_ON,
-    speedup_specs,
-)
-from turing.research.problems.kaggle import (
-    KAGGLE_CORPUS_SIZE,
-    KAGGLE_SELECTION_CRITERION,
-    KaggleAdapter,
-)
-from turing.research.problems.process import (
-    CommandResult,
-    CommandRunner,
-    SubprocessCommandRunner,
-    count_passing_tests,
-    render_argv,
-    run_command,
-)
-from turing.research.problems.spec import (
-    ASSUMED_RELATIVE_SPREAD,
-    DEFAULT_WORKSPACE_EXCLUDES,
-    CorrectnessGate,
-    GateCommand,
-    Loophole,
-    LoopholeRuling,
-    OutputComparison,
-    SpeedupProblemSpec,
-    SpreadProvenance,
-    TimingSpec,
-)
-from turing.research.problems.speedup import (
-    HARNESS_FAILURE_KEY,
-    SpeedupAdapter,
-    SpeedupVerifier,
-)
-from turing.research.problems.timing import (
-    MINIMUM_NOISE_BAND,
-    SpeedupMeasurement,
-    TimingHarness,
-    TimingMeasurement,
-    relative_spread,
-)
-from turing.research.problems.tolerance import (
-    ComparisonOutcome,
-    Tolerance,
-    ToleranceMode,
-    compare,
-)
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    # See turing/research/loop/__init__.py for why this package resolves its
+    # public names lazily instead of importing every submodule up front:
+    # importing this package (a step Python always takes before importing any
+    # submodule of it, e.g. turing.research.problems.adapter) would otherwise
+    # force turing.research.problems.kaggle to load unconditionally even
+    # though nothing on the speedup path — the corpus this package's own
+    # __all__ is overwhelmingly about — touches it.
+    from turing.research.problems.adapter import (
+        AdapterRegistry,
+        ProblemAdapter,
+        WorkspaceMaterialisationError,
+        bind_eval_set_hash,
+        fingerprint_corpus,
+    )
+    from turing.research.problems.catalog import (
+        DEFAULT_MAESTRO_REPO,
+        DEFAULT_SPLITS,
+        DEFAULT_TURING_REPO,
+        MEASURED_AT,
+        MEASURED_ON,
+        speedup_specs,
+    )
+    from turing.research.problems.kaggle import (
+        KAGGLE_CORPUS_SIZE,
+        KAGGLE_SELECTION_CRITERION,
+        KaggleAdapter,
+    )
+    from turing.research.problems.process import (
+        CommandResult,
+        CommandRunner,
+        SubprocessCommandRunner,
+        count_passing_tests,
+        render_argv,
+        run_command,
+    )
+    from turing.research.problems.spec import (
+        ASSUMED_RELATIVE_SPREAD,
+        DEFAULT_WORKSPACE_EXCLUDES,
+        CorrectnessGate,
+        GateCommand,
+        Loophole,
+        LoopholeRuling,
+        OutputComparison,
+        SpeedupProblemSpec,
+        SpreadProvenance,
+        TimingSpec,
+    )
+    from turing.research.problems.speedup import (
+        HARNESS_FAILURE_KEY,
+        SpeedupAdapter,
+        SpeedupVerifier,
+    )
+    from turing.research.problems.timing import (
+        MINIMUM_NOISE_BAND,
+        SpeedupMeasurement,
+        TimingHarness,
+        TimingMeasurement,
+        relative_spread,
+    )
+    from turing.research.problems.tolerance import (
+        ComparisonOutcome,
+        Tolerance,
+        ToleranceMode,
+        compare,
+    )
 
 __all__ = [
     "ASSUMED_RELATIVE_SPREAD",
@@ -139,3 +149,71 @@ __all__ = [
     "run_command",
     "speedup_specs",
 ]
+
+_SUBMODULE_BY_NAME: dict[str, str] = {
+    "AdapterRegistry": "adapter",
+    "ProblemAdapter": "adapter",
+    "WorkspaceMaterialisationError": "adapter",
+    "bind_eval_set_hash": "adapter",
+    "fingerprint_corpus": "adapter",
+    "DEFAULT_MAESTRO_REPO": "catalog",
+    "DEFAULT_SPLITS": "catalog",
+    "DEFAULT_TURING_REPO": "catalog",
+    "MEASURED_AT": "catalog",
+    "MEASURED_ON": "catalog",
+    "speedup_specs": "catalog",
+    "KAGGLE_CORPUS_SIZE": "kaggle",
+    "KAGGLE_SELECTION_CRITERION": "kaggle",
+    "KaggleAdapter": "kaggle",
+    "CommandResult": "process",
+    "CommandRunner": "process",
+    "SubprocessCommandRunner": "process",
+    "count_passing_tests": "process",
+    "render_argv": "process",
+    "run_command": "process",
+    "ASSUMED_RELATIVE_SPREAD": "spec",
+    "DEFAULT_WORKSPACE_EXCLUDES": "spec",
+    "CorrectnessGate": "spec",
+    "GateCommand": "spec",
+    "Loophole": "spec",
+    "LoopholeRuling": "spec",
+    "OutputComparison": "spec",
+    "SpeedupProblemSpec": "spec",
+    "SpreadProvenance": "spec",
+    "TimingSpec": "spec",
+    "HARNESS_FAILURE_KEY": "speedup",
+    "SpeedupAdapter": "speedup",
+    "SpeedupVerifier": "speedup",
+    "MINIMUM_NOISE_BAND": "timing",
+    "SpeedupMeasurement": "timing",
+    "TimingHarness": "timing",
+    "TimingMeasurement": "timing",
+    "relative_spread": "timing",
+    "ComparisonOutcome": "tolerance",
+    "Tolerance": "tolerance",
+    "ToleranceMode": "tolerance",
+    "compare": "tolerance",
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve a public name by importing its defining submodule on first use.
+
+    Keeps every name in ``__all__`` importable from ``turing.research.problems``
+    without paying for all eight submodules — including ``kaggle``, which
+    nothing on the speedup path touches — just to import this package, which
+    Python always does before importing any submodule of it.
+    """
+    submodule_name = _SUBMODULE_BY_NAME.get(name)
+    if submodule_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+
+    submodule = importlib.import_module(f"{__name__}.{submodule_name}")
+    value = getattr(submodule, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))

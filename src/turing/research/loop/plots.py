@@ -42,28 +42,14 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
-import matplotlib
-
-matplotlib.use("Agg")
-# Text as SVG <text> elements, not vector paths — the round plot's cell labels
-# ("speedup/practice") must be greppable strings in the file, not shapes with
-# no string content. Matplotlib's default ("path") would make that
-# unverifiable and would make every SVG larger for no benefit here.
-matplotlib.rcParams["svg.fonttype"] = "none"
-# Without a fixed salt, matplotlib derives every clip-path/marker id in the
-# SVG from Python's ``id(obj)`` — a memory address that differs between
-# interpreter runs even for byte-identical input. That alone would break the
-# determinism this module is held to, independently of the ``Date`` metadata.
-# A fixed salt makes those ids a hash of content instead.
-matplotlib.rcParams["svg.hashsalt"] = "turing-research-loop-plots"
-
-import structlog  # noqa: E402
-from matplotlib.backends.backend_agg import FigureCanvasAgg  # noqa: E402
-from matplotlib.figure import Figure  # noqa: E402
+import structlog
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
     from pathlib import Path
+
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
 
 logger = structlog.get_logger(__name__)
 
@@ -73,6 +59,46 @@ PLOT_FILENAMES = ("progress.svg", "cap.svg")
 ROUND_PLOT_FILENAME = "scores.svg"
 
 _SAVEFIG_KWARGS: dict[str, Any] = {"format": "svg", "metadata": {"Date": None}}
+
+_matplotlib_objects_cache: tuple[type[Any], type[Any]] | None = None
+
+
+def _matplotlib_objects() -> tuple[type[Figure], type[FigureCanvasAgg]]:
+    """Import matplotlib on first actual plot render, not at module import time.
+
+    ``--dry-run``, ``--list`` and preflight never call a render function, so
+    the ~0.3s matplotlib import (and its C-extension backend init) should
+    never happen on those paths. The three ordering rules from the module
+    docstring still hold here: the backend is selected, and the SVG rcParams
+    set, before the first import of ``matplotlib.figure`` or
+    ``matplotlib.backends.backend_agg`` — same order as before, just deferred
+    to the first call instead of pinned to import time.
+    """
+    global _matplotlib_objects_cache
+    if _matplotlib_objects_cache is None:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        # Text as SVG <text> elements, not vector paths — the round plot's
+        # cell labels ("speedup/practice") must be greppable strings in the
+        # file, not shapes with no string content. Matplotlib's default
+        # ("path") would make that unverifiable and would make every SVG
+        # larger for no benefit here.
+        matplotlib.rcParams["svg.fonttype"] = "none"
+        # Without a fixed salt, matplotlib derives every clip-path/marker id
+        # in the SVG from Python's ``id(obj)`` — a memory address that
+        # differs between interpreter runs even for byte-identical input.
+        # That alone would break the determinism this module is held to,
+        # independently of the ``Date`` metadata. A fixed salt makes those
+        # ids a hash of content instead.
+        matplotlib.rcParams["svg.hashsalt"] = "turing-research-loop-plots"
+
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+
+        _matplotlib_objects_cache = (Figure, FigureCanvasAgg)
+
+    return _matplotlib_objects_cache
 
 
 def _numeric_series(
@@ -109,8 +135,9 @@ def _render_progress_plot(
         )
         return None
 
-    fig = Figure()
-    canvas = FigureCanvasAgg(fig)
+    figure_cls, canvas_cls = _matplotlib_objects()
+    fig = figure_cls()
+    canvas = canvas_cls(fig)
     ax = fig.add_subplot(111)
     ax.set_title(f"{directory.name} — progress")
     ax.set_xlabel("step")
@@ -149,8 +176,9 @@ def _render_cap_plot(directory: Path, points: Sequence[Mapping[str, float]]) -> 
         )
         return None
 
-    fig = Figure()
-    canvas = FigureCanvasAgg(fig)
+    figure_cls, canvas_cls = _matplotlib_objects()
+    fig = figure_cls()
+    canvas = canvas_cls(fig)
     ax = fig.add_subplot(111)
     ax.set_title(f"{directory.name} — cap consumption")
     ax.set_xlabel("step")
@@ -261,8 +289,9 @@ def _render_round_plot_sync(directory: Path, cells: Sequence[Mapping[str, object
     # not a runtime guarantee.
     means = [float(cell["mean_score"]) for cell in cells]  # type: ignore[arg-type]
 
-    fig = Figure()
-    canvas = FigureCanvasAgg(fig)
+    figure_cls, canvas_cls = _matplotlib_objects()
+    fig = figure_cls()
+    canvas = canvas_cls(fig)
     ax = fig.add_subplot(111)
     ax.set_title(f"{directory.name} — scores")
     ax.set_xlabel("cell")
