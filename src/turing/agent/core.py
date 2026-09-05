@@ -182,13 +182,11 @@ class Agent:
 
         # 2. Get or create conversation
         conv = await self.memory_store.get_active_conversation(channel_id)
-        if not conv:
-            conv_id = await self.memory_store.create_conversation(channel_id)
-        else:
-            conv_id = conv["id"]
-            await self.memory_store.touch_conversation(conv_id)
+        conv_id = conv["id"] if conv else await self.memory_store.create_conversation(channel_id)
 
-        # 3. Store user message
+        # 3. Store user message. No touch_conversation() first — add_message
+        # already stamps last_message_at, so touching was a second UPDATE plus
+        # a second commit whose result the very next statement overwrote.
         await self.memory_store.add_message(conv_id, "user", message, user_id, user_name)
 
         # 4. Build system prompt and messages
@@ -218,20 +216,23 @@ class Agent:
                 # Text response — we are done
                 break
 
+            # The assistant turn already carries every tool_call, so it belongs
+            # in the history once — not once per call. Appending it inside the
+            # loop duplicated it N times for N tool calls, and since each copy
+            # carries all N tool_use blocks the history grew as N², all of it
+            # re-sent on every following iteration.
+            messages.append(
+                Message(
+                    role=Role.ASSISTANT,
+                    content=response.content,
+                    tool_calls=response.tool_calls,
+                )
+            )
+
             # Execute each tool call and feed results back
             for tool_call in response.tool_calls:
                 result = await self.executor.execute_tool_call(tool_call, user_id, channel_id)
 
-                # Append assistant message with tool_calls
-                messages.append(
-                    Message(
-                        role=Role.ASSISTANT,
-                        content=response.content,
-                        tool_calls=response.tool_calls,
-                    )
-                )
-
-                # Append tool result message
                 tool_output = result.output if result.success else f"Error: {result.error}"
                 messages.append(
                     Message(

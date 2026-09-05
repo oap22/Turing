@@ -114,13 +114,22 @@ class ProcessTool(Tool):
 
     async def _list_processes(self, **_kwargs: Any) -> ToolResult:
         """List running processes sorted by CPU usage."""
-        procs: list[dict[str, Any]] = []
-        for proc in psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent", "status"]):
-            try:
-                info = proc.info
-                procs.append(info)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
+
+        # Walking every process reads a /proc entry per PID — tens of
+        # milliseconds on a busy machine, and entirely synchronous. Run it in a
+        # worker thread so the scan doesn't stall the event loop.
+        def _scan() -> list[dict[str, Any]]:
+            found: list[dict[str, Any]] = []
+            for proc in psutil.process_iter(
+                ["pid", "name", "cpu_percent", "memory_percent", "status"]
+            ):
+                try:
+                    found.append(proc.info)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            return found
+
+        procs: list[dict[str, Any]] = await asyncio.to_thread(_scan)
 
         # Sort by CPU percent descending.
         procs.sort(key=lambda p: p.get("cpu_percent", 0) or 0, reverse=True)
@@ -146,7 +155,15 @@ class ProcessTool(Tool):
             return ToolResult(success=False, output="", error="No PID provided")
 
         proc = psutil.Process(int(pid))
+        # Sampling CPU percent over an interval is a blocking sleep inside
+        # psutil, so it is taken off the event loop rather than stalling every
+        # other task for 100ms. Kept outside oneshot(): the sample spans the
+        # interval and would otherwise be served from that block's cache.
+        cpu_pct = await asyncio.to_thread(proc.cpu_percent, interval=0.1)
         with proc.oneshot():
+            # memory_info() is not covered by oneshot()'s cache, so calling it
+            # per line re-read /proc/<pid>/statm each time.
+            mem = proc.memory_info()
             info_lines = [
                 f"Process Information (PID {pid})",
                 f"{'=' * 40}",
@@ -155,10 +172,10 @@ class ProcessTool(Tool):
                 f"  PID:            {proc.pid}",
                 f"  PPID:           {proc.ppid()}",
                 f"  Username:       {proc.username()}",
-                f"  CPU %:          {proc.cpu_percent(interval=0.1):.1f}%",
+                f"  CPU %:          {cpu_pct:.1f}%",
                 f"  Memory %:       {proc.memory_percent():.1f}%",
-                f"  Memory (RSS):   {_format_bytes(proc.memory_info().rss)}",
-                f"  Memory (VMS):   {_format_bytes(proc.memory_info().vms)}",
+                f"  Memory (RSS):   {_format_bytes(mem.rss)}",
+                f"  Memory (VMS):   {_format_bytes(mem.vms)}",
                 f"  Threads:        {proc.num_threads()}",
                 f"  Created:        {_format_timestamp(proc.create_time())}",
             ]

@@ -172,6 +172,38 @@ class TestRequestShaping:
         assert tool_msg["content"][0]["content"] == "result"
 
     @pytest.mark.asyncio
+    async def test_parallel_tool_results_coalesce_into_one_user_turn(
+        self, provider: ClaudeProvider
+    ) -> None:
+        """All results answering one assistant turn ride in a single message.
+
+        The API expects every tool_result for a parallel tool call in one user
+        turn; splitting them across turns teaches the model to stop issuing
+        parallel calls.
+        """
+        calls = [ToolCall(id=f"call_{i}", name="t", arguments={}) for i in range(3)]
+        provider._client.messages.create = AsyncMock(return_value=_make_response())
+        await provider.complete(
+            [
+                Message(role=Role.USER, content="run three"),
+                Message(role=Role.ASSISTANT, content="", tool_calls=calls),
+                *[Message(role=Role.TOOL, content="ok", tool_call_id=c.id) for c in calls],
+                Message(role=Role.USER, content="follow-up"),
+            ]
+        )
+        msgs = provider._client.messages.create.call_args.kwargs["messages"]
+
+        results = [m for m in msgs if isinstance(m["content"], list) and m["content"]]
+        tool_turns = [m for m in results if m["content"][0].get("type") == "tool_result"]
+        assert len(tool_turns) == 1, "the three results belong to one user turn"
+        assert [b["tool_use_id"] for b in tool_turns[0]["content"]] == [c.id for c in calls]
+
+        # One tool_result per tool_use, and the plain follow-up stays separate.
+        assistant = next(m for m in msgs if m["role"] == "assistant")
+        assert sum(1 for b in assistant["content"] if b["type"] == "tool_use") == 3
+        assert msgs[-1]["content"] == "follow-up"
+
+    @pytest.mark.asyncio
     async def test_tool_result_missing_id_defaults_to_empty(self, provider: ClaudeProvider) -> None:
         provider._client.messages.create = AsyncMock(return_value=_make_response())
         await provider.complete([Message(role=Role.TOOL, content="r", tool_call_id=None)])
@@ -313,14 +345,35 @@ class TestRetryAndErrors:
     async def test_connection_error_retries_then_raises_after_max(
         self, provider: ClaudeProvider, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        async def fake_sleep(_d: float) -> None:
-            pass
+        sleeps: list[float] = []
+
+        async def fake_sleep(d: float) -> None:
+            sleeps.append(d)
 
         monkeypatch.setattr("turing.llm.cloud.asyncio.sleep", fake_sleep)
         provider._client.messages.create = AsyncMock(side_effect=_connection_error())
         with pytest.raises(anthropic.APIConnectionError):
             await provider.complete([Message(role=Role.USER, content="hi")])
         assert provider._client.messages.create.await_count == 3
+        # Back-off spaces out the *next* attempt, so the final failure raises
+        # immediately instead of waiting out a delay nothing follows.
+        assert sleeps == [1.0, 2.0]
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_exhausted_does_not_sleep_after_last_attempt(
+        self, provider: ClaudeProvider, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sleeps: list[float] = []
+
+        async def fake_sleep(d: float) -> None:
+            sleeps.append(d)
+
+        monkeypatch.setattr("turing.llm.cloud.asyncio.sleep", fake_sleep)
+        provider._client.messages.create = AsyncMock(side_effect=_rate_limit_error())
+        with pytest.raises(anthropic.RateLimitError):
+            await provider.complete([Message(role=Role.USER, content="hi")])
+        assert provider._client.messages.create.await_count == 3
+        assert sleeps == [1.0, 2.0]
 
     @pytest.mark.asyncio
     async def test_api_status_error_not_retried(

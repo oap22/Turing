@@ -103,26 +103,33 @@ class ClaudeProvider(LLMProvider):
 
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRIES):
+            # The back-off exists to space out the *next* attempt, so there is
+            # nothing to wait for once the last one has failed. Sleeping there
+            # anyway just delayed the exception — on the default settings that
+            # was a 4s pause added to every exhausted retry, and the router's
+            # local→cloud fail-open path pays it while a user waits.
+            is_last_attempt = attempt == _MAX_RETRIES - 1
+            delay = 0.0 if is_last_attempt else _BASE_DELAY * (2**attempt)
             try:
                 return await self._client.messages.create(**kwargs)
             except anthropic.RateLimitError as exc:
                 last_exc = exc
-                delay = _BASE_DELAY * (2**attempt)
                 logger.warning(
                     "claude_rate_limited",
                     attempt=attempt + 1,
                     delay=delay,
                 )
-                await asyncio.sleep(delay)
+                if delay:
+                    await asyncio.sleep(delay)
             except anthropic.APIConnectionError as exc:
                 last_exc = exc
-                delay = _BASE_DELAY * (2**attempt)
                 logger.warning(
                     "claude_connection_error",
                     attempt=attempt + 1,
                     delay=delay,
                 )
-                await asyncio.sleep(delay)
+                if delay:
+                    await asyncio.sleep(delay)
             except anthropic.APIStatusError as exc:
                 # Non-retryable API errors (auth, bad request, etc.)
                 logger.error(
@@ -148,18 +155,25 @@ class ClaudeProvider(LLMProvider):
                 continue
 
             if msg.role == Role.TOOL:
-                api_msgs.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": msg.tool_call_id or "",
-                                "content": msg.content,
-                            }
-                        ],
-                    }
-                )
+                block = {
+                    "type": "tool_result",
+                    "tool_use_id": msg.tool_call_id or "",
+                    "content": msg.content,
+                }
+                # Every tool_result answering one assistant turn belongs in a
+                # single user message. Emitting one message per result splits
+                # the reply to a parallel tool call across several turns, which
+                # teaches the model to stop issuing parallel calls — so results
+                # for a run of tool messages are coalesced here.
+                if (
+                    api_msgs
+                    and api_msgs[-1]["role"] == "user"
+                    and isinstance(api_msgs[-1]["content"], list)
+                    and api_msgs[-1]["content"][0].get("type") == "tool_result"
+                ):
+                    api_msgs[-1]["content"].append(block)
+                else:
+                    api_msgs.append({"role": "user", "content": [block]})
                 continue
 
             if msg.role == Role.ASSISTANT and msg.tool_calls:

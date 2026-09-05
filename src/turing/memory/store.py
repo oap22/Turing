@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 import aiosqlite
 import structlog
@@ -21,8 +24,15 @@ CREATE TABLE IF NOT EXISTS conversations (
     summary TEXT DEFAULT ''
 );
 
-CREATE INDEX IF NOT EXISTS idx_conversations_channel
-    ON conversations(channel_id);
+-- Composite: `get_active_conversation` runs on every inbound message and does
+-- WHERE channel_id = ? ORDER BY last_message_at DESC LIMIT 1. With only a
+-- channel_id index SQLite matches the channel then sorts every one of that
+-- channel's conversations in a temp B-tree just to take the first row. The
+-- second column makes the index itself supply the order, so the LIMIT stops
+-- after one row. Supersedes the channel-only index, which was its prefix.
+CREATE INDEX IF NOT EXISTS idx_conversations_channel_recent
+    ON conversations(channel_id, last_message_at DESC);
+DROP INDEX IF EXISTS idx_conversations_channel;
 
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,8 +45,13 @@ CREATE TABLE IF NOT EXISTS messages (
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_messages_conversation
-    ON messages(conversation_id);
+-- Composite: both message readers filter by conversation_id and order by
+-- timestamp, so the pair lets the index answer the ORDER BY too. Supersedes
+-- the conversation-only index, which was its prefix. The standalone timestamp
+-- index stays — cross-conversation time scans still use it.
+CREATE INDEX IF NOT EXISTS idx_messages_conversation_time
+    ON messages(conversation_id, timestamp);
+DROP INDEX IF EXISTS idx_messages_conversation;
 CREATE INDEX IF NOT EXISTS idx_messages_timestamp
     ON messages(timestamp);
 
@@ -77,6 +92,14 @@ CREATE TABLE IF NOT EXISTS task_outcomes (
     created_at TIMESTAMP NOT NULL
 );
 
+-- `get_task_outcomes` filters on tool_used and orders by created_at. Without
+-- an index it was a full table scan plus a temp-B-tree sort — the one query
+-- here with no index at all.
+CREATE INDEX IF NOT EXISTS idx_task_outcomes_tool_created
+    ON task_outcomes(tool_used, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_outcomes_created
+    ON task_outcomes(created_at DESC);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TIMESTAMP NOT NULL,
@@ -90,10 +113,34 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp
-    ON audit_log(timestamp);
-CREATE INDEX IF NOT EXISTS idx_audit_log_user
-    ON audit_log(user_id);
+    ON audit_log(timestamp DESC);
+-- Composite for the user-filtered audit query, which always orders by time.
+-- Supersedes the user-only index, which was its prefix.
+CREATE INDEX IF NOT EXISTS idx_audit_log_user_time
+    ON audit_log(user_id, timestamp DESC);
+DROP INDEX IF EXISTS idx_audit_log_user;
 """
+
+# Connection-level tuning applied once per connection, before any query runs.
+#
+# ``synchronous=NORMAL`` is the standard companion to WAL: the WAL still makes
+# the database crash-safe against process death, and NORMAL only relaxes the
+# fsync on each commit, which risks losing the most recent transactions on an
+# OS crash or power cut — not corruption. Turing runs on Raspberry Pis writing
+# to SD cards, where that fsync is the single most expensive thing a write
+# does, and the data at stake is chat history rather than a ledger.
+#
+# The rest are pure memory-for-speed trades: a 64 MiB page cache (negative =
+# KiB rather than pages), temp B-trees built in RAM instead of on the SD card,
+# and a 128 MiB memory-map window so reads skip a copy through the OS buffer.
+_PRAGMA_SQL: tuple[str, ...] = (
+    "PRAGMA journal_mode=WAL",
+    "PRAGMA foreign_keys=ON",
+    "PRAGMA synchronous=NORMAL",
+    "PRAGMA cache_size=-65536",
+    "PRAGMA temp_store=MEMORY",
+    "PRAGMA mmap_size=134217728",
+)
 
 
 class MemoryStore:
@@ -110,8 +157,9 @@ class MemoryStore:
         if self._db is None:
             self._db = await aiosqlite.connect(self._db_path)
             self._db.row_factory = aiosqlite.Row
-            await self._db.execute("PRAGMA journal_mode=WAL")
-            await self._db.execute("PRAGMA foreign_keys=ON")
+            # One executescript instead of one awaited call per PRAGMA — each
+            # aiosqlite call is a thread handoff, so batching matters even here.
+            await self._db.executescript(";\n".join(_PRAGMA_SQL))
         await self._db.executescript(_SCHEMA_SQL)
         await self._db.commit()
         logger.info("memory_store_initialized", db_path=self._db_path)
@@ -233,6 +281,34 @@ class MemoryStore:
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
+
+    async def get_messages_by_ids(self, message_ids: Sequence[int]) -> dict[int, dict[str, Any]]:
+        """Fetch many messages at once, keyed by id.
+
+        The semantic-search path used to call :meth:`get_message_by_id` once
+        per vector hit. Every aiosqlite call is a handoff to the connection's
+        worker thread, so the cost there is dominated by the *number* of calls
+        rather than by the queries themselves — ten hits meant twenty round
+        trips. This collapses them into one.
+
+        Ids that do not resolve are simply absent from the returned mapping,
+        which mirrors ``get_message_by_id`` returning ``None``. Returning a
+        dict rather than a list lets callers preserve their own ordering
+        (relevance, say) instead of inheriting the database's.
+        """
+        if not message_ids:
+            return {}
+
+        # De-duplicate while keeping the query small; SQLITE_MAX_VARIABLE_NUMBER
+        # is 999 on older builds, and callers pass search-result-sized batches.
+        unique_ids = list(dict.fromkeys(message_ids))
+        placeholders = ",".join("?" * len(unique_ids))
+        cursor = await self.db.execute(
+            f"SELECT * FROM messages WHERE id IN ({placeholders})",
+            tuple(unique_ids),
+        )
+        rows = await cursor.fetchall()
+        return {row["id"]: dict(row) for row in rows}
 
     async def search_messages(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
         """Full-text search over message content."""

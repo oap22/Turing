@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import time
 from pathlib import Path
@@ -88,10 +89,18 @@ class SystemInfoTool(Tool):
 
     async def _cpu_usage(self, **_kwargs: Any) -> ToolResult:
         """Get CPU usage information."""
-        cpu_percent = psutil.cpu_percent(interval=0.5)
+        # psutil's `interval` argument is a blocking time.sleep — 0.5s + 0.1s
+        # here. Called directly from a coroutine it stalls the whole event
+        # loop for 600ms, freezing Discord I/O, the gateway, and mesh
+        # heartbeats along with it. The two samples are independent, so they
+        # run concurrently in worker threads: same measurement, 600ms of
+        # blocking becomes ~500ms of waiting that other tasks can use.
+        cpu_percent, per_cpu = await asyncio.gather(
+            asyncio.to_thread(psutil.cpu_percent, interval=0.5),
+            asyncio.to_thread(psutil.cpu_percent, interval=0.1, percpu=True),
+        )
         cpu_count_logical = psutil.cpu_count(logical=True)
         cpu_count_physical = psutil.cpu_count(logical=False)
-        per_cpu = psutil.cpu_percent(interval=0.1, percpu=True)
 
         try:
             freq = psutil.cpu_freq()

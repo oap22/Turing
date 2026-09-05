@@ -8,9 +8,10 @@ mitigating message replay even if a signing key briefly leaks.
 
 from __future__ import annotations
 
+import heapq
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -30,8 +31,19 @@ class MeshMessage:
     timestamp_ms: int
 
     def to_bytes(self) -> bytes:
-        d = asdict(self)
-        d["payload"] = self.payload.hex()
+        # Built by hand rather than with dataclasses.asdict(): asdict() walks
+        # the instance recursively and deep-copies every field, which costs
+        # ~24x more than the literal below for a flat frozen dataclass. This
+        # runs on every message that crosses the bus, and every signature
+        # covers its output. Keys stay sorted to match sort_keys=True, so the
+        # encoding is byte-identical to what asdict() produced.
+        d = {
+            "payload": self.payload.hex(),
+            "request_id": self.request_id,
+            "sender_id": self.sender_id,
+            "subject": self.subject,
+            "timestamp_ms": self.timestamp_ms,
+        }
         return json.dumps(d, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     @classmethod
@@ -64,6 +76,11 @@ class ReplayWindow:
         self._ttl_ms = ttl_ms
         self._now_ms = now_ms
         self._seen: dict[str, int] = {}
+        # Min-heap of (timestamp_ms, request_id), mirroring `_seen`. Eviction
+        # only ever removes the oldest entries, so a heap lets `_evict` stop at
+        # the first entry still inside the window instead of scanning every
+        # tracked id on every message. See `_evict`.
+        self._expiry: list[tuple[int, str]] = []
 
     def observe(self, *, request_id: str, timestamp_ms: int) -> None:
         now = self._now_ms()
@@ -88,9 +105,24 @@ class ReplayWindow:
             raise ReplayError(f"replay of request_id={request_id!r}")
 
         self._seen[request_id] = timestamp_ms
+        heapq.heappush(self._expiry, (timestamp_ms, request_id))
 
     def _evict(self, now: int) -> None:
+        """Drop every tracked id whose timestamp has fallen out of the window.
+
+        Ordering the pending expiries in a heap makes this cost proportional
+        to the number of ids actually expiring, rather than to the number
+        being tracked. The previous full-dict scan ran on every ``observe``,
+        so a busy node paid O(tracked ids) per message just to discover that
+        nothing had expired yet.
+        """
         cutoff = now - self._ttl_ms
-        expired = [rid for rid, ts in self._seen.items() if ts < cutoff]
-        for rid in expired:
-            del self._seen[rid]
+        expiry = self._expiry
+        seen = self._seen
+        while expiry and expiry[0][0] < cutoff:
+            timestamp_ms, request_id = heapq.heappop(expiry)
+            # An id can only be re-added after its previous entry expired, so
+            # a heap entry whose timestamp no longer matches `_seen` is stale
+            # and must not evict the newer observation that replaced it.
+            if seen.get(request_id) == timestamp_ms:
+                del seen[request_id]

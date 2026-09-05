@@ -223,6 +223,40 @@ class TestGetProcessInfo:
         assert result.success is True
         assert result.output.count("[access denied]") == 2
 
+    async def test_cpu_percent_sampled_outside_oneshot(self, process_tool: ProcessTool):
+        """CPU% must be sampled before entering oneshot(), or it reads 0.0.
+
+        ``oneshot()`` memoises the stat file that backs ``cpu_times``, so an
+        interval sample taken inside the block compares a cached reading
+        against itself and always yields 0.0 — the tool reported every
+        process as idle. Sampling first also keeps psutil's blocking sleep
+        off the event loop.
+        """
+        proc = _fake_process()
+        order: list[str] = []
+        proc.cpu_percent.side_effect = lambda **_: (order.append("cpu_percent"), 12.5)[1]
+        proc.oneshot.side_effect = lambda: (order.append("oneshot"), MagicMock())[1]
+
+        with patch("turing.tools.process.psutil.Process", return_value=proc):
+            result = await process_tool.execute(action="get_process_info", pid=1)
+
+        assert result.success is True
+        assert order == ["cpu_percent", "oneshot"], (
+            f"cpu_percent must be sampled before oneshot() is entered, got {order}"
+        )
+
+    async def test_memory_info_read_once(self, process_tool: ProcessTool):
+        """RSS and VMS come from a single memory_info() call.
+
+        memory_info() is not covered by oneshot()'s cache, so reading it per
+        line re-opened /proc/<pid>/statm for each field.
+        """
+        proc = _fake_process()
+        with patch("turing.tools.process.psutil.Process", return_value=proc):
+            result = await process_tool.execute(action="get_process_info", pid=1)
+        assert result.success is True
+        assert proc.memory_info.call_count == 1
+
 
 # ---------------------------------------------------------------------------
 # kill_process

@@ -51,10 +51,23 @@ CREATE INDEX IF NOT EXISTS idx_telemetry_event_type
 """
 
 
+# Rows examined per eviction pass. At steady state an append pushes the total
+# over the cap by roughly one row, so a single short batch covers it; the loop
+# only iterates when a large backlog has to be shed at once.
+_EVICT_BATCH = 128
+
+
 class RingBuffer:
     def __init__(self, config: RingBufferConfig) -> None:
         self._config = config
         self._db: aiosqlite.Connection | None = None
+        # Running byte total, kept in step with the table. The size cap used to
+        # be enforced with `SELECT SUM(bytes)` over the whole table on every
+        # append — an O(rows) scan per event, so ingesting n events cost O(n²).
+        # Tracking the total here makes the common case (still under the cap) a
+        # comparison against an integer. It is seeded from the table on open,
+        # so it survives restarts against a persisted database.
+        self._total_bytes = 0
 
     # ── lifecycle ──────────────────────────────────────────────────────
 
@@ -64,6 +77,18 @@ class RingBuffer:
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(_SCHEMA)
         await self._db.commit()
+        self._total_bytes = await self._sum_bytes()
+
+    async def _sum_bytes(self, where: str = "", params: tuple[Any, ...] = ()) -> int:
+        """Total of the ``bytes`` column, optionally filtered."""
+        assert self._db is not None
+        cur = await self._db.execute(
+            f"SELECT COALESCE(SUM(bytes), 0) AS total FROM telemetry_events {where}",
+            params,
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return int(row["total"]) if row is not None else 0
 
     async def close(self) -> None:
         if self._db is not None:
@@ -99,38 +124,54 @@ class RingBuffer:
             ),
         )
         await self._db.commit()
+        self._total_bytes += row_bytes
         await self._enforce_size_cap()
 
     async def _enforce_size_cap(self) -> None:
+        """FIFO-evict the oldest rows once the byte total exceeds the cap.
+
+        Rows are dropped while their running total stays within the excess —
+        the same boundary the previous window-function query used, so eviction
+        picks exactly the same rows. What changed is the cost: this walks only
+        the rows it is about to delete instead of scanning the whole table
+        twice per append.
+        """
         assert self._db is not None
-        cur = await self._db.execute(
-            "SELECT COALESCE(SUM(bytes), 0) AS total FROM telemetry_events"
-        )
-        row = await cur.fetchone()
-        await cur.close()
-        if row is None or row["total"] <= self._config.max_bytes:
+        excess = self._total_bytes - self._config.max_bytes
+        if excess <= 0:
             return
-        # Delete oldest rows until under the cap.
-        await self._db.execute(
-            """
-            DELETE FROM telemetry_events
-            WHERE id IN (
-                SELECT id FROM telemetry_events
-                ORDER BY id ASC
-                LIMIT (
-                    SELECT COUNT(*) FROM (
-                        SELECT id, SUM(bytes) OVER (ORDER BY id ASC) AS running
-                        FROM telemetry_events
-                    )
-                    WHERE running <= (
-                        SELECT COALESCE(SUM(bytes), 0) - ? FROM telemetry_events
-                    )
-                )
+
+        doomed: list[int] = []
+        running = 0
+        freed = 0
+        done = False
+        while not done:
+            cur = await self._db.execute(
+                "SELECT id, bytes FROM telemetry_events WHERE id > ? ORDER BY id ASC LIMIT ?",
+                (doomed[-1] if doomed else -1, _EVICT_BATCH),
             )
-            """,
-            (self._config.max_bytes,),
+            batch = await cur.fetchall()
+            await cur.close()
+            if not batch:
+                break
+            for row in batch:
+                running += int(row["bytes"])
+                if running > excess:
+                    done = True
+                    break
+                doomed.append(int(row["id"]))
+                freed = running
+
+        if not doomed:
+            return
+
+        placeholders = ",".join("?" * len(doomed))
+        await self._db.execute(
+            f"DELETE FROM telemetry_events WHERE id IN ({placeholders})",
+            tuple(doomed),
         )
         await self._db.commit()
+        self._total_bytes -= freed
 
     # ── pruning ────────────────────────────────────────────────────────
 
@@ -139,11 +180,16 @@ class RingBuffer:
         cutoff_ms = (now_ms if now_ms is not None else int(time.time() * 1000)) - (
             self._config.retention_seconds * 1000
         )
+        # Measure before deleting so the running total stays in step with the
+        # table; the TTL sweep is periodic, so the extra query is not on any
+        # hot path.
+        pruned_bytes = await self._sum_bytes("WHERE timestamp_ms < ?", (cutoff_ms,))
         cur = await self._db.execute(
             "DELETE FROM telemetry_events WHERE timestamp_ms < ?",
             (cutoff_ms,),
         )
         await self._db.commit()
+        self._total_bytes -= pruned_bytes
         return cur.rowcount or 0
 
     # ── reads ──────────────────────────────────────────────────────────
