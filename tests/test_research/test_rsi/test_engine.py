@@ -14,9 +14,12 @@ from typing import TYPE_CHECKING
 import pytest
 
 from turing.research.contracts import ContractViolationError
+from turing.research.rsi import engine as engine_module
 from turing.research.rsi.contracts import EngineResult
 from turing.research.rsi.engine import (
+    DEFAULT_MAX_OUTPUT_BYTES,
     DRAIN_GRACE_SECONDS,
+    OUTPUT_LIMIT_EXIT,
     ClaudeCliEngine,
     FakeEngine,
     ok_result,
@@ -113,6 +116,45 @@ class TestClaudeCliEngine:
         assert lines[:2] == ["-p", "the prompt"]
         assert "--output-format" in lines
 
+    async def test_real_cli_output_overflow_is_an_explicit_failure(self, tmp_path: Path) -> None:
+        fake = tmp_path / "claude"
+        fake.write_text(
+            f"#!/bin/sh\nhead -c {DEFAULT_MAX_OUTPUT_BYTES + 1} /dev/zero\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        result = await ClaudeCliEngine(str(fake)).run("p", cwd=tmp_path, timeout_seconds=30)
+        assert result.exit_code == OUTPUT_LIMIT_EXIT
+        assert not result.timed_out
+        assert len(result.stdout.encode()) <= DEFAULT_MAX_OUTPUT_BYTES
+        assert "output limit exceeded" in result.stderr
+
+    async def test_engine_maps_simultaneous_timeout_and_overflow_flags(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        fake = tmp_path / "claude"
+        fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake.chmod(0o755)
+
+        original_run_capped = engine_module.run_capped
+
+        async def capped(proc, **kwargs):
+            cleaned = await original_run_capped(proc, **kwargs)
+            return engine_module.CappedOutput(
+                exit_code=124,
+                stdout=cleaned.stdout + b"partial",
+                stderr=cleaned.stderr + b"diagnostic",
+                timed_out=True,
+                pipe_abandoned=False,
+                output_limit_exceeded=True,
+            )
+
+        monkeypatch.setattr(engine_module, "run_capped", capped)
+        result = await ClaudeCliEngine(str(fake)).run("p", cwd=tmp_path, timeout_seconds=5)
+        assert result.exit_code == OUTPUT_LIMIT_EXIT
+        assert not result.timed_out
+        assert "output limit exceeded" in result.stderr
+
     @pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX")
     async def test_timeout_kills_process_group(self, tmp_path: Path) -> None:
         # The stand-in spawns a grandchild that would outlive a plain kill of
@@ -204,3 +246,168 @@ class TestProcessGroupBoundary:
         assert capped.exit_code == 3 and not capped.timed_out
         assert capped.pipe_abandoned
         assert capped.stdout == b"partial\n"
+
+
+async def _spawn_shell(command: str, tmp_path: Path) -> asyncio.subprocess.Process:
+    return await asyncio.create_subprocess_shell(
+        command,
+        cwd=str(tmp_path),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+
+
+class TestCappedOutput:
+    @pytest.mark.parametrize(
+        ("command", "stream", "expected"),
+        [
+            ("printf 12345678", "stdout", b"12345678"),
+            ("printf 12345678 >&2", "stderr", b"12345678"),
+        ],
+    )
+    async def test_at_cap_is_exact_and_not_overflow(
+        self, tmp_path: Path, command: str, stream: str, expected: bytes
+    ) -> None:
+        proc = await _spawn_shell(command, tmp_path)
+        capped = await run_capped(proc, timeout_seconds=5, max_output_bytes=8)
+        assert capped.exit_code == 0
+        assert not capped.output_limit_exceeded
+        assert getattr(capped, stream) == expected
+
+    @pytest.mark.parametrize("command", ["printf 123456789", "printf 123456789 >&2"])
+    async def test_cap_plus_one_is_overflow_and_bounded(self, tmp_path: Path, command: str) -> None:
+        proc = await _spawn_shell(command, tmp_path)
+        capped = await run_capped(proc, timeout_seconds=5, max_output_bytes=8)
+        assert capped.exit_code == OUTPUT_LIMIT_EXIT
+        assert capped.output_limit_exceeded
+        assert len(capped.stdout) <= 8
+        assert len(capped.stderr) <= 8
+
+    async def test_combined_streams_use_individual_caps(self, tmp_path: Path) -> None:
+        proc = await _spawn_shell("printf 1234; printf 5678 >&2", tmp_path)
+        capped = await run_capped(proc, timeout_seconds=5, max_output_bytes=4)
+        assert capped.exit_code == 0
+        assert not capped.output_limit_exceeded
+        assert capped.stdout == b"1234"
+        assert capped.stderr == b"5678"
+
+    async def test_overflow_kills_waiting_process_promptly(self, tmp_path: Path) -> None:
+        proc = await _spawn_shell("printf 123456789; sleep 30", tmp_path)
+        started = time.monotonic()
+        capped = await run_capped(proc, timeout_seconds=30, max_output_bytes=8)
+        assert time.monotonic() - started < 5
+        assert capped.output_limit_exceeded and capped.exit_code == OUTPUT_LIMIT_EXIT
+        assert proc.returncode is not None
+        assert len(capped.stdout) <= 8 and len(capped.stderr) <= 8
+
+    async def test_zero_exit_after_overflow_is_still_failure(self, tmp_path: Path) -> None:
+        proc = await _spawn_shell("printf 123456789; exit 0", tmp_path)
+        capped = await run_capped(proc, timeout_seconds=5, max_output_bytes=8)
+        assert capped.output_limit_exceeded and capped.exit_code == OUTPUT_LIMIT_EXIT
+
+    async def test_capture_buffer_never_exceeds_cap(self, tmp_path: Path, monkeypatch) -> None:
+        high_water: list[int] = []
+
+        class TrackingBuffer(bytearray):
+            def extend(self, data: bytes | bytearray) -> None:
+                super().extend(data)
+                high_water.append(len(self))
+
+        monkeypatch.setattr(engine_module, "bytearray", TrackingBuffer, raising=False)
+        proc = await _spawn_shell("head -c 100 /dev/zero", tmp_path)
+        capped = await run_capped(proc, timeout_seconds=5, max_output_bytes=8)
+        assert capped.output_limit_exceeded
+        assert high_water and max(high_water) <= 8
+
+    @pytest.mark.parametrize("invalid", [0, -1, True, False])
+    async def test_invalid_limit_cleans_up_spawned_process(
+        self, tmp_path: Path, invalid: object
+    ) -> None:
+        proc = await _spawn_shell("sleep 30", tmp_path)
+        with pytest.raises(ContractViolationError, match="max_output_bytes"):
+            await run_capped(proc, timeout_seconds=5, max_output_bytes=invalid)  # type: ignore[arg-type]
+        assert proc.returncode is not None
+
+    async def test_timeout_then_cleanup_overflow_preserves_both_flags(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        original_pump = engine_module._pump
+
+        async def delayed_pump(*args, **kwargs):
+            await asyncio.sleep(0.1)
+            await original_pump(*args, **kwargs)
+
+        monkeypatch.setattr(engine_module, "_pump", delayed_pump)
+        proc = await _spawn_shell("printf 123456789; sleep 30", tmp_path)
+        capped = await run_capped(proc, timeout_seconds=0.01, grace_seconds=1, max_output_bytes=8)
+        assert capped.timed_out
+        assert capped.output_limit_exceeded
+        assert capped.exit_code == OUTPUT_LIMIT_EXIT
+
+    async def test_cancellation_during_process_wait_cleans_up(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        wait_entry = asyncio.Event()
+        original_wait_exited = engine_module._wait_exited
+
+        async def tracked_wait_exited(*args, **kwargs):
+            wait_entry.set()
+            return await original_wait_exited(*args, **kwargs)
+
+        monkeypatch.setattr(engine_module, "_wait_exited", tracked_wait_exited)
+        proc = await _spawn_shell("sleep 30", tmp_path)
+        task = asyncio.create_task(run_capped(proc, timeout_seconds=30, max_output_bytes=8))
+        await asyncio.wait_for(wait_entry.wait(), timeout=2)
+        assert proc.returncode is None
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert proc.returncode is not None
+
+    @pytest.mark.skipif(shutil.which("setsid") is None, reason="needs setsid(1)")
+    async def test_cancellation_during_post_exit_drain_cleans_up_readers(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        proc = await _spawn_shell("setsid sh -c 'sleep 30' & echo $! > stray.pid; exit 0", tmp_path)
+        original_pump = engine_module._pump
+        reader_tasks: list[asyncio.Task[object]] = []
+        drain_entry = asyncio.Event()
+
+        async def tracked_pump(*args, **kwargs):
+            task = asyncio.current_task()
+            if task is not None:
+                reader_tasks.append(task)
+            return await original_pump(*args, **kwargs)
+
+        original_wait = engine_module.asyncio.wait
+
+        async def tracked_wait(tasks, *args, **kwargs):
+            task_list = list(tasks)
+            if task_list and all(
+                getattr(task.get_coro(), "__name__", "") == "tracked_pump" for task in task_list
+            ):
+                drain_entry.set()
+            return await original_wait(task_list, *args, **kwargs)
+
+        monkeypatch.setattr(engine_module, "_pump", tracked_pump)
+        monkeypatch.setattr(engine_module.asyncio, "wait", tracked_wait)
+        task = asyncio.create_task(
+            run_capped(proc, timeout_seconds=30, grace_seconds=5, max_output_bytes=8)
+        )
+        for _ in range(100):
+            if (tmp_path / "stray.pid").exists():
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.wait_for(drain_entry.wait(), timeout=2)
+        task.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int((tmp_path / "stray.pid").read_text().strip()), signal.SIGKILL)
+        assert proc.returncode is not None
+        assert len(reader_tasks) == 2
+        assert all(reader_task.done() for reader_task in reader_tasks)

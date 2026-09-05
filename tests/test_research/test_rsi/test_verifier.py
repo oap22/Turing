@@ -15,8 +15,14 @@ from typing import TYPE_CHECKING
 import pytest
 
 from turing.research.contracts import ContractViolationError, FrozenVerifierError
+from turing.research.rsi import verifier as verifier_module
 from turing.research.rsi.contracts import VERIFIER_LOCK_FILENAME, VerifierSpec, sha256_text
-from turing.research.rsi.engine import DRAIN_GRACE_SECONDS
+from turing.research.rsi.engine import (
+    DEFAULT_MAX_OUTPUT_BYTES,
+    DRAIN_GRACE_SECONDS,
+    OUTPUT_LIMIT_EXIT,
+    CappedOutput,
+)
 from turing.research.rsi.verifier import (
     VERIFIER_TIMEOUT_EXIT,
     load_verifier_lock,
@@ -66,6 +72,72 @@ class TestRunVerifier:
     async def test_non_positive_timeout_refused(self, sandbox: Path) -> None:
         with pytest.raises(ContractViolationError):
             await run_verifier(VerifierSpec(command="true"), sandbox, 0)
+
+    async def test_output_overflow_discards_score_even_when_process_exits_zero(
+        self, sandbox: Path
+    ) -> None:
+        out = await run_verifier(
+            VerifierSpec(
+                command=(
+                    "printf 'score=100\\n'; "
+                    f"head -c {DEFAULT_MAX_OUTPUT_BYTES + 1} /dev/zero; "
+                    "printf '\\nscore=100\\n'"
+                )
+            ),
+            sandbox,
+            30,
+        )
+        assert not out.passed
+        assert out.exit_code == OUTPUT_LIMIT_EXIT
+        assert out.score is None
+        assert "output limit exceeded" in out.stdout_tail
+
+    async def test_stderr_overflow_fails_with_valid_small_stdout_score(
+        self, sandbox: Path, monkeypatch
+    ) -> None:
+        observed: CappedOutput | None = None
+        original_run_capped = verifier_module.run_capped
+
+        async def observe(proc, **kwargs):
+            nonlocal observed
+            observed = await original_run_capped(proc, **kwargs)
+            return observed
+
+        monkeypatch.setattr(verifier_module, "run_capped", observe)
+        out = await run_verifier(
+            VerifierSpec(
+                command=f"printf 'score=7\\n'; head -c {DEFAULT_MAX_OUTPUT_BYTES + 1} /dev/zero >&2"
+            ),
+            sandbox,
+            30,
+        )
+        assert not out.passed
+        assert out.exit_code == OUTPUT_LIMIT_EXIT
+        assert out.score is None
+        assert "output limit exceeded" in out.stdout_tail
+        assert observed is not None and b"score=7\n" in observed.stdout
+
+    async def test_verifier_maps_simultaneous_timeout_and_overflow_flags(
+        self, sandbox: Path, monkeypatch
+    ) -> None:
+        original_run_capped = verifier_module.run_capped
+
+        async def capped(proc, **kwargs):
+            cleaned = await original_run_capped(proc, **kwargs)
+            return CappedOutput(
+                exit_code=124,
+                stdout=cleaned.stdout + b"score=100\n",
+                stderr=cleaned.stderr,
+                timed_out=True,
+                pipe_abandoned=False,
+                output_limit_exceeded=True,
+            )
+
+        monkeypatch.setattr(verifier_module, "run_capped", capped)
+        out = await run_verifier(VerifierSpec(command="true"), sandbox, 5)
+        assert not out.passed
+        assert out.exit_code == OUTPUT_LIMIT_EXIT
+        assert out.score is None
 
 
 class TestWriteOrLoadVerifier:
