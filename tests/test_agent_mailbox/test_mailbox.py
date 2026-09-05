@@ -97,6 +97,75 @@ def test_dedicated_store_rejects_existing_application_database(tmp_path: Path) -
         Mailbox(path, "workflow", "alice")
 
 
+@pytest.mark.parametrize("statement", ["PRAGMA user_version=7", "PRAGMA application_id=1933"])
+def test_rejects_sqlite_metadata_without_mutating_existing_file(
+    tmp_path: Path, statement: str
+) -> None:
+    path = tmp_path / "metadata.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(statement)
+    before = path.read_bytes()
+
+    with pytest.raises(MailboxError, match="separate mailbox database"):
+        Mailbox(path, "workflow", "alice")
+
+    assert path.read_bytes() == before
+
+
+def test_rejects_sqlite_sequence_residue_without_mutating_existing_file(tmp_path: Path) -> None:
+    path = tmp_path / "residue.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE old(id INTEGER PRIMARY KEY AUTOINCREMENT)")
+        connection.execute("DROP TABLE old")
+    before = path.read_bytes()
+
+    with pytest.raises(MailboxError, match="empty dedicated mailbox store"):
+        Mailbox(path, "workflow", "alice")
+
+    assert path.read_bytes() == before
+
+
+def test_rejects_incomplete_mailbox_marker_without_repairing_file(tmp_path: Path) -> None:
+    path = tmp_path / "marker-only.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE mailbox_schema "
+            "(id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)"
+        )
+        connection.execute("INSERT INTO mailbox_schema VALUES (1, 1)")
+    before = path.read_bytes()
+
+    with pytest.raises(MailboxError, match="incomplete"):
+        Mailbox(path, "workflow", "alice")
+
+    assert path.read_bytes() == before
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+        ).fetchall() == [("mailbox_schema",)]
+
+
+@pytest.mark.parametrize(
+    "version", [pytest.param(1.9, id="fractional"), pytest.param(float("inf"), id="infinite")]
+)
+def test_schema_version_requires_exact_integer(tmp_path: Path, version: float) -> None:
+    path = tmp_path / "version.db"
+    Mailbox(path, "workflow", "alice")
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE mailbox_schema SET version = ? WHERE id = 1", (version,))
+    before = path.read_bytes()
+
+    with pytest.raises(MailboxError, match="schema version"):
+        Mailbox(path, "workflow", "alice")
+
+    assert path.read_bytes() == before
+
+
+def test_in_memory_database_is_rejected() -> None:
+    with pytest.raises(MailboxError, match="durable file"):
+        Mailbox(":memory:", "workflow", "alice")
+
+
 def test_database_path_is_bound_across_working_directory_changes(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -207,3 +276,27 @@ def test_cli_round_trip_and_json_errors(tmp_path: Path) -> None:
     deep_error = run("send", "--to", "bob", "--text", "bad", "--data", deeply_nested)
     assert deep_error.returncode == 1
     assert json.loads(deep_error.stdout)["error_type"] == "MailboxError"
+
+    duplicate = run(
+        "send",
+        "--to",
+        "bob",
+        "--text",
+        "duplicate",
+        "--data",
+        '{"x":1,"x":2}',
+    )
+    assert duplicate.returncode == 1
+    assert "duplicate object key" in json.loads(duplicate.stdout)["error"]
+    nested_duplicate = run(
+        "send",
+        "--to",
+        "bob",
+        "--text",
+        "duplicate",
+        "--data-stdin",
+        input_text='{"outer":{"x":1,"x":2}}',
+    )
+    assert nested_duplicate.returncode == 1
+    assert "duplicate object key" in json.loads(nested_duplicate.stdout)["error"]
+    assert len(Mailbox(path, "workflow", "bob").inbox()) == 1

@@ -20,6 +20,15 @@ class _ArgumentParser(argparse.ArgumentParser):
         raise _UsageError(message)
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in parsed:
+            raise MailboxError(f"--data contains duplicate object key {key!r}")
+        parsed[key] = value
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the parser used by both the installed command and ``-m``."""
 
@@ -80,7 +89,7 @@ def _parse_data(args: argparse.Namespace) -> dict[str, Any] | None:
     else:
         return None
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
     except RecursionError as exc:
         raise MailboxError("--data is too deeply nested for JSON") from exc
     except json.JSONDecodeError as exc:
