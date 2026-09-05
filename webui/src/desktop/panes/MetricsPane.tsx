@@ -12,6 +12,9 @@
 // The flywheel pane can point it too, via an in-app click event rather than
 // the file (paneLink.ts) — the two share one request slot, so whichever
 // spoke last wins, and this pane never writes `.viewer.json` back.
+// The run-selection state machine (auto resolution, the 8-line cap, sticky
+// empty on clear) lives in `runSelection.ts` and per-run color stickiness in
+// `seriesColors.ts`, both pure and unit-tested; this file is the wiring.
 //
 // **The contract this pane keeps.** A run's chart is built only from bytes of
 // ONE file generation, applied in order: `fs_tail` reports the chunk's start
@@ -58,7 +61,31 @@ import {
   type RunVerdict,
   type ViewerFile,
 } from "./metrics";
-import { resolveRunRequest, subscribeMetricsTarget, type RunRequest } from "./paneLink";
+import {
+  // aliased: the local memo below owns the bare name
+  activePaths as activePathsOf,
+  autoPath,
+  canPick,
+  clearAll,
+  INITIAL_SELECTION,
+  isHeldByAuto,
+  lineCount,
+  MAX_LINES,
+  removePath,
+  toggleAuto,
+  togglePin,
+  type RunSelection,
+} from "./runSelection";
+import {
+  assignColors,
+  colorForSlot,
+  type ColorAssignment,
+} from "./seriesColors";
+import {
+  resolveRunRequest,
+  subscribeMetricsTarget,
+  type RunRequest,
+} from "./paneLink";
 
 interface Entry {
   rel_path: string;
@@ -109,7 +136,9 @@ interface RunState {
 }
 
 function identOf(chunk: TailChunk): string | null {
-  return chunk.dev === null || chunk.ino === null ? null : `${chunk.dev}:${chunk.ino}`;
+  return chunk.dev === null || chunk.ino === null
+    ? null
+    : `${chunk.dev}:${chunk.ino}`;
 }
 
 /**
@@ -123,7 +152,9 @@ function firstLineIsObject(data: string): boolean {
   if (first === undefined) return true;
   try {
     const parsed: unknown = JSON.parse(first);
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
+    return (
+      typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+    );
   } catch {
     return false;
   }
@@ -162,7 +193,10 @@ const BADGE_CLASSES: Record<BadgeState, string> = {
  * they share a badge colour but not a sentence, so the first read has to land
  * even when it lands on nothing.
  */
-function sameVerdict(a: RunVerdict | null | undefined, b: RunVerdict | null): boolean {
+function sameVerdict(
+  a: RunVerdict | null | undefined,
+  b: RunVerdict | null,
+): boolean {
   if (a === undefined) return false;
   if (a === null || b === null) return a === b;
   return (
@@ -175,30 +209,27 @@ function sameVerdict(a: RunVerdict | null | undefined, b: RunVerdict | null): bo
   );
 }
 
-interface RunMultiSelectProps {
+interface RunPickerProps {
   runFiles: Entry[];
-  selected: string[];
-  onChange: (selected: string[]) => void;
+  selection: RunSelection;
+  onToggleAuto: () => void;
+  onTogglePin: (path: string) => void;
 }
 
-// Custom multi-select listbox standing in for `<select multiple size={4}>` —
-// same visual vocabulary as Select.tsx (bordered term-panel box, term-raised/
-// term-accent highlighted rows), same `string[]` state and "auto" sentinel.
-// Each row is an independent toggle rather than a single commit-on-Enter
-// cursor, so this doesn't reuse Select.tsx's single-select state machine.
-function RunMultiSelect({ runFiles, selected, onChange }: RunMultiSelectProps) {
-  const options = [
-    { value: "auto", label: "auto (newest)" },
-    ...runFiles.map((f) => ({ value: f.rel_path, label: runIdOf(f.rel_path) })),
-  ];
-
-  function toggle(value: string) {
-    if (selected.includes(value)) {
-      onChange(selected.filter((v) => v !== value));
-    } else {
-      onChange([...selected, value]);
-    }
-  }
+// Hand-rolled listbox standing in for `<select multiple size={4}>` — WKWebView
+// draws its own OS bezel around the native control and frequently ignores
+// author `option:checked` backgrounds, so (same reasoning as Select.tsx) this
+// is built from toggleable rows CSS can actually reach. Each row is an
+// independent toggle rather than a single commit-on-Enter cursor, so it
+// doesn't reuse Select.tsx's single-select state machine.
+function RunPicker({
+  runFiles,
+  selection,
+  onToggleAuto,
+  onTogglePin,
+}: RunPickerProps) {
+  const held = autoPath(selection, runFiles);
+  const heldLabel = held ? runIdOf(held) : null;
 
   return (
     <ul
@@ -209,24 +240,55 @@ function RunMultiSelect({ runFiles, selected, onChange }: RunMultiSelectProps) {
       // doesn't reflow.
       className="max-h-[88px] min-w-[160px] overflow-auto border border-term-edge bg-term-panel"
     >
-      {options.map((opt) => {
-        const isSelected = selected.includes(opt.value);
+      <li role="presentation">
+        <button
+          type="button"
+          role="option"
+          aria-selected={selection.auto}
+          onClick={onToggleAuto}
+          title={heldLabel ?? undefined}
+          className={`block w-full whitespace-nowrap px-2 py-0.5 text-left text-xs ${
+            selection.auto ? "bg-term-raised text-term-accent" : "text-term-fg"
+          }`}
+        >
+          {/* Auto resolves visibly: naming the run it currently points at is
+              what keeps it from reading as a second, mystery selection. */}
+          {heldLabel ? `auto → ${heldLabel}` : "auto (no runs)"}
+        </button>
+      </li>
+      {runFiles.map((f) => {
+        const path = f.rel_path;
+        const label = runIdOf(path);
+        const pinned = selection.pinned.includes(path);
+        const dimmed = isHeldByAuto(selection, runFiles, path);
+        const enabled = canPick(selection, runFiles, path);
         return (
-          <li key={opt.value} role="presentation">
+          <li key={path} role="presentation">
             <button
               type="button"
               role="option"
-              aria-selected={isSelected}
-              onClick={() => toggle(opt.value)}
+              aria-selected={pinned}
+              disabled={!enabled}
+              onClick={() => onTogglePin(path)}
               // The label is a full run path and the box is ~160px wide, so
-              // rows clip. A tooltip means a clipped row is still
-              // identifiable without horizontal scrolling.
-              title={opt.label}
+              // rows clip; the tooltip keeps a clipped row identifiable. The
+              // auto-held row stays clickable even though it's dimmed —
+              // clicking it promotes the run to an explicit pin, which is a
+              // real action, not a disabled control.
+              title={
+                dimmed
+                  ? `${label} — held by auto; click to pin it explicitly`
+                  : label
+              }
               className={`block w-full whitespace-nowrap px-2 py-0.5 text-left text-xs ${
-                isSelected ? "bg-term-raised text-term-accent" : "text-term-fg"
-              }`}
+                pinned
+                  ? "bg-term-raised text-term-accent"
+                  : dimmed
+                    ? "text-term-dim italic"
+                    : "text-term-fg"
+              } ${enabled ? "" : "cursor-not-allowed opacity-40"}`}
             >
-              {opt.label}
+              {label}
             </button>
           </li>
         );
@@ -240,7 +302,7 @@ export default function MetricsPane() {
   // once cannot claim the same ids.
   const paneId = useId();
   const [runFiles, setRunFiles] = useState<Entry[]>([]);
-  const [selected, setSelected] = useState<string[]>(["auto"]);
+  const [selection, setSelection] = useState<RunSelection>(INITIAL_SELECTION);
   const runsRef = useRef<Map<string, RunState>>(new Map());
   const [tick, setTick] = useState(0);
   const forceRender = (updater: (n: number) => number) => setTick(updater);
@@ -427,8 +489,12 @@ export default function MetricsPane() {
       return;
     }
     const ident = identOf(chunk);
-    const generationChanged = run.ident !== null && ident !== null && ident !== run.ident;
-    const reset = chunk.start === 0 && run.offset > 0 && (generationChanged || chunk.restarted);
+    const generationChanged =
+      run.ident !== null && ident !== null && ident !== run.ident;
+    const reset =
+      chunk.start === 0 &&
+      run.offset > 0 &&
+      (generationChanged || chunk.restarted);
     const append = !reset && !generationChanged && chunk.start === run.offset;
     if (!reset && !append) {
       if (generationChanged) {
@@ -487,7 +553,9 @@ export default function MetricsPane() {
   // reading of "this pane has no evidence either way", but they do not read
   // as the same sentence (see `clauseOf` in metrics.ts: only one of them is a
   // fact about the run).
-  const [verdicts, setVerdicts] = useState<Record<string, RunVerdict | null>>({});
+  const [verdicts, setVerdicts] = useState<Record<string, RunVerdict | null>>(
+    {},
+  );
 
   async function loadVerdict(path: string) {
     let parsed: RunVerdict | null = null;
@@ -506,16 +574,27 @@ export default function MetricsPane() {
     // every append of a live run whose directory has no verdict in it. Keeping
     // the same object when nothing changed keeps that from being a re-render
     // per solver step for a value that reads `null` either way.
-    setVerdicts((prev) => (sameVerdict(prev[path], parsed) ? prev : { ...prev, [path]: parsed }));
+    setVerdicts((prev) =>
+      sameVerdict(prev[path], parsed) ? prev : { ...prev, [path]: parsed },
+    );
   }
 
-  const activePaths = useMemo(() => {
-    const newest = runFiles[0]?.rel_path;
-    const pinned = selected.filter((s) => s !== "auto");
-    const paths = new Set(pinned);
-    if (selected.includes("auto") && newest) paths.add(newest);
-    return Array.from(paths);
-  }, [runFiles, selected]);
+  const activePaths = useMemo(
+    () => activePathsOf(selection, runFiles),
+    [selection, runFiles],
+  );
+
+  // Sticky per-run colors. `assignColors` is idempotent for a given key set —
+  // re-running it on its own output returns that output — so threading the
+  // previous assignment through a ref is safe under StrictMode's double
+  // render, and a run keeps its color across metric-tab switches and across
+  // other runs being added or removed.
+  const colorsRef = useRef<ColorAssignment>(new Map());
+  const colors = useMemo(() => {
+    const next = assignColors(colorsRef.current, activePaths);
+    colorsRef.current = next;
+    return next;
+  }, [activePaths]);
 
   useEffect(() => {
     for (const path of activePaths) {
@@ -581,7 +660,19 @@ export default function MetricsPane() {
     // still satisfy it (and a newer request can still replace it).
     if (matched.length === 0) return;
     runsHonoredFor.current = runRequest;
-    setSelected(matched);
+    // A manual `clear` is sticky against the FILE (runSelection.ts's
+    // `cleared`) — `.viewer.json` is rewritten at every round boundary and
+    // must not undo an operator's empty chart — but a flywheel click is the
+    // operator acting, so it always lands. `matched` is capped the same way
+    // `applyViewerRuns` caps a label list: never more lines than colors.
+    setSelection((sel) => {
+      if (sel.cleared && runRequest.source === "viewer") return sel;
+      return {
+        auto: false,
+        pinned: matched.slice(0, MAX_LINES),
+        cleared: false,
+      };
+    });
   }, [runRequest, runFiles]);
 
   // Flywheel → metrics: a `[metrics]` click in an expanded round lands here as
@@ -602,10 +693,10 @@ export default function MetricsPane() {
    * later — cannot fire then and rearrange a chart the operator has since
    * chosen by hand; and it bumps the delivery stamp, so an in-flight
    * `.viewer.json` read cannot resolve over it either. */
-  function selectRuns(next: string[]) {
+  function operatorSelect(update: (sel: RunSelection) => RunSelection) {
     deliverySeq.current += 1;
     setRunRequest(null);
-    setSelected(next);
+    setSelection(update);
   }
 
   useEffect(() => {
@@ -624,7 +715,10 @@ export default function MetricsPane() {
     // one, and the stale resolution below must not touch the run slot.
     const seq = ++deliverySeq.current;
     try {
-      const text = await inv<string>("fs_read_text", { root: RESULTS_ROOT, rel: VIEWER_FILE_REL });
+      const text = await inv<string>("fs_read_text", {
+        root: RESULTS_ROOT,
+        rel: VIEWER_FILE_REL,
+      });
       const parsed = parseViewerFile(text);
       if (!parsed) return;
       // Titles need nothing else to exist, so they apply immediately.
@@ -635,7 +729,11 @@ export default function MetricsPane() {
       // supersedes this delivery. A file without a usable `runs` key asks
       // nothing about runs and must not evict a click that did — and a read
       // that has been superseded mid-flight must not evict anything at all.
-      if (parsed.runs && parsed.runs.length > 0 && seq === deliverySeq.current) {
+      if (
+        parsed.runs &&
+        parsed.runs.length > 0 &&
+        seq === deliverySeq.current
+      ) {
         setRunRequest({ source: "viewer", runs: parsed.runs });
       }
     } catch {
@@ -646,58 +744,61 @@ export default function MetricsPane() {
   useEffect(() => {
     void loadViewerFile();
     let cancelled = false;
-    const sub = subscribe<{ root: string; rel_path: string }>("fs-change", (payload) => {
-      if (cancelled || payload.root !== RESULTS_ROOT) return;
-      if (payload.rel_path === VIEWER_FILE_REL) {
-        void loadViewerFile();
-        return;
-      }
-      // Either half of a run's pair of files changing re-reads BOTH. The badge
-      // is a claim about a verdict and a log *together*, and each file can move
-      // without producing an event of its own for the other:
-      //
-      //   * The verdict can be rotated away with no event at all. A re-drive
-      //     moves the metrics trio and the verdict together into `prior-N/`;
-      //     `fsroots.rs` skips any path that is not a file by the time the
-      //     handler runs, and the verdict's old path is precisely that — so
-      //     the only event a re-drive produces for this directory is one for
-      //     the new `metrics.jsonl`. Re-reading the verdict on the run's own
-      //     event is what stops the badge sitting green over a directory the
-      //     verdict has left.
-      //   * A run append can be dropped: the watcher debounces repeat writes to
-      //     one path inside 300 ms, which a solver stepping faster than ~3 Hz
-      //     hits routinely. If the dropped write was the last one, the verdict
-      //     event that follows it is the pane's only remaining chance to catch
-      //     up — without the re-tail the badge stays amber forever on a run
-      //     that is perfectly clean.
-      if (runsRef.current.has(payload.rel_path)) {
-        void tailRun(payload.rel_path);
-        void loadVerdict(payload.rel_path);
-        return;
-      }
-      // A run file this pane has never listed: it was created after the
-      // mount-time walk — a live round's first solver step, exactly the run
-      // an operator clicks [metrics] on. Without a re-list it would never
-      // enter `runFiles`: auto-follow would sit on an older run and a
-      // pending request naming it would stay unhonoured forever.
-      if (
-        isChartRunFile(payload.rel_path) &&
-        !runFilesRef.current.some((e) => e.rel_path === payload.rel_path)
-      ) {
-        scheduleRunListRefresh();
-        return;
-      }
-      // The loop writes `metrics.verdict.json` once the attempt ends, i.e.
-      // while this pane is already open on the run — so the badge has to
-      // arrive on a watcher event, not only on mount.
-      for (const runPath of runsRef.current.keys()) {
-        if (payload.rel_path === verdictPathOf(runPath)) {
-          void loadVerdict(runPath);
-          void tailRun(runPath);
+    const sub = subscribe<{ root: string; rel_path: string }>(
+      "fs-change",
+      (payload) => {
+        if (cancelled || payload.root !== RESULTS_ROOT) return;
+        if (payload.rel_path === VIEWER_FILE_REL) {
+          void loadViewerFile();
           return;
         }
-      }
-    });
+        // Either half of a run's pair of files changing re-reads BOTH. The badge
+        // is a claim about a verdict and a log *together*, and each file can move
+        // without producing an event of its own for the other:
+        //
+        //   * The verdict can be rotated away with no event at all. A re-drive
+        //     moves the metrics trio and the verdict together into `prior-N/`;
+        //     `fsroots.rs` skips any path that is not a file by the time the
+        //     handler runs, and the verdict's old path is precisely that — so
+        //     the only event a re-drive produces for this directory is one for
+        //     the new `metrics.jsonl`. Re-reading the verdict on the run's own
+        //     event is what stops the badge sitting green over a directory the
+        //     verdict has left.
+        //   * A run append can be dropped: the watcher debounces repeat writes to
+        //     one path inside 300 ms, which a solver stepping faster than ~3 Hz
+        //     hits routinely. If the dropped write was the last one, the verdict
+        //     event that follows it is the pane's only remaining chance to catch
+        //     up — without the re-tail the badge stays amber forever on a run
+        //     that is perfectly clean.
+        if (runsRef.current.has(payload.rel_path)) {
+          void tailRun(payload.rel_path);
+          void loadVerdict(payload.rel_path);
+          return;
+        }
+        // A run file this pane has never listed: it was created after the
+        // mount-time walk — a live round's first solver step, exactly the run
+        // an operator clicks [metrics] on. Without a re-list it would never
+        // enter `runFiles`: auto-follow would sit on an older run and a
+        // pending request naming it would stay unhonoured forever.
+        if (
+          isChartRunFile(payload.rel_path) &&
+          !runFilesRef.current.some((e) => e.rel_path === payload.rel_path)
+        ) {
+          scheduleRunListRefresh();
+          return;
+        }
+        // The loop writes `metrics.verdict.json` once the attempt ends, i.e.
+        // while this pane is already open on the run — so the badge has to
+        // arrive on a watcher event, not only on mount.
+        for (const runPath of runsRef.current.keys()) {
+          if (payload.rel_path === verdictPathOf(runPath)) {
+            void loadVerdict(runPath);
+            void tailRun(runPath);
+            return;
+          }
+        }
+      },
+    );
     return () => {
       cancelled = true;
       sub.unsubscribe();
@@ -747,20 +848,41 @@ export default function MetricsPane() {
       id: `${run.path}::${activeSeries}`,
       label: `${run.label}/${titles[activeSeries] ?? activeSeries}`,
       points: seriesOf(run.points).get(activeSeries) ?? [],
+      color: colorForSlot(colors.get(run.path) ?? 0),
+      // The legend `×` always means "this line goes away" — including for
+      // auto's line, which it switches auto off to remove.
+      onRemove: () =>
+        operatorSelect((sel) => removePath(sel, runFilesRef.current, run.path)),
     }));
-  }, [activeRuns, activeSeries, titles]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeRuns, activeSeries, titles, colors]);
+
+  const lines = lineCount(selection, runFiles);
 
   return (
     <div className="flex h-full flex-col text-xs">
       <div className="flex items-center gap-2 border-b border-term-edge p-2">
-        <span className="text-[10px] uppercase tracking-wider text-term-dim">runs</span>
-        {/* WKWebView draws its own OS bezel around `<select multiple>` and
-            frequently ignores author `option:checked` backgrounds, so — same
-            reasoning as Select.tsx — this is a hand-rolled multi-select
-            listbox instead of a native control CSS can't fully reach. Same
-            `string[]` contract and "auto" sentinel as before, just built from
-            toggleable rows. */}
-        <RunMultiSelect runFiles={runFiles} selected={selected} onChange={selectRuns} />
+        <span className="text-[10px] uppercase tracking-wider text-term-dim">
+          runs ({lines}/{MAX_LINES})
+        </span>
+        <RunPicker
+          runFiles={runFiles}
+          selection={selection}
+          onToggleAuto={() =>
+            operatorSelect((sel) => toggleAuto(sel, runFiles))
+          }
+          onTogglePin={(path) =>
+            operatorSelect((sel) => togglePin(sel, runFiles, path))
+          }
+        />
+        <button
+          type="button"
+          onClick={() => operatorSelect(clearAll)}
+          disabled={lines === 0}
+          className="shrink-0 border border-term-edge px-2 py-0.5 text-[11px] lowercase text-term-dim hover:text-term-accent disabled:opacity-40 disabled:hover:text-term-dim"
+        >
+          clear
+        </button>
         {/* One badge per charted run, each naming its own run in the tooltip.
             A single badge over a multi-run overlay would attribute one run's
             verdict to another — the same lie the ETA strip's run label exists
@@ -774,8 +896,17 @@ export default function MetricsPane() {
           <div className="flex max-h-[88px] shrink-0 flex-col gap-px overflow-auto">
             {activeRuns.map((run) => {
               const verdict = verdicts[run.path];
-              const state = badgeStateOf(verdict, run.points.length, run.lastDigest);
-              const title = badgeTitleOf(state, verdict, run.label, RESULTS_ROOT);
+              const state = badgeStateOf(
+                verdict,
+                run.points.length,
+                run.lastDigest,
+              );
+              const title = badgeTitleOf(
+                state,
+                verdict,
+                run.label,
+                RESULTS_ROOT,
+              );
               const describedById = `${paneId}-verdict-${run.path}`;
               return (
                 // Fragment rather than a wrapper element: the chips are the
@@ -802,7 +933,10 @@ export default function MetricsPane() {
                         an attribute are unreadable in exactly the case this
                         badge exists for: one red chip in a stack, and no way to
                         say which run failed without a mouse. */}
-                    {badgeLabelOf(state)} <span className="opacity-70">{badgeRunTailOf(run.label)}</span>
+                    {badgeLabelOf(state)}{" "}
+                    <span className="opacity-70">
+                      {badgeRunTailOf(run.label)}
+                    </span>
                   </button>
                   <span id={describedById} className="sr-only">
                     {title}
@@ -813,10 +947,17 @@ export default function MetricsPane() {
           </div>
         )}
         {eta && etaRun && (
-          <div data-testid="metrics-eta" className="ml-2 truncate font-mono text-term-dim">
+          <div
+            data-testid="metrics-eta"
+            className="ml-2 truncate font-mono text-term-dim"
+          >
             <span title={etaRun.label}>{etaRun.label}</span>
-            <span className="ml-3">steps/s: {eta.stepsPerSec?.toFixed(2) ?? "—"}</span>
-            <span className="ml-3">eta: {eta.etaSec !== null ? `${Math.round(eta.etaSec)}s` : "—"}</span>
+            <span className="ml-3">
+              steps/s: {eta.stepsPerSec?.toFixed(2) ?? "—"}
+            </span>
+            <span className="ml-3">
+              eta: {eta.etaSec !== null ? `${Math.round(eta.etaSec)}s` : "—"}
+            </span>
             <span className="ml-3">last step: {eta.lastStep ?? "—"}</span>
           </div>
         )}
@@ -841,10 +982,12 @@ export default function MetricsPane() {
         ))}
       </div>
       <div className="min-h-0 flex-1 p-2">
-        {activeSeries ? (
+        {activeSeries && chartSeries.length > 0 ? (
           <Chart series={chartSeries} />
         ) : (
-          <div className="p-4 text-term-dim">no metrics yet</div>
+          <div className="p-4 text-term-dim">
+            {lines === 0 ? "no runs selected" : "no metrics yet"}
+          </div>
         )}
       </div>
     </div>

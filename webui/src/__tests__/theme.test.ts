@@ -7,6 +7,7 @@
 // in-memory implementation for these tests rather than touch the shared
 // `vite.config.ts`/`test-setup.ts`.
 
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyTheme, THEMES } from "../desktop/theme";
 
@@ -58,4 +59,36 @@ describe("THEMES", () => {
   it("includes the default 'turing' theme", () => {
     expect(THEMES.some((t) => t.id === "turing")).toBe(true);
   });
+});
+
+// Chart.tsx strokes curves with `var(--t-series-N)`, so a theme that forgets
+// the palette would draw invisible lines — and repeated values would put two
+// overlaid runs in the same color, which is exactly what the palette exists to
+// prevent. Neither jsdom nor a `?raw` import gives the test the stylesheet
+// (vitest stubs CSS imports to ""), so read the source file — vitest's cwd is
+// the `webui` package root.
+describe("chart series palette", () => {
+  const css = readFileSync("src/index.css", "utf8");
+
+  function blockFor(themeId: string): string {
+    const selector = themeId === "turing" ? ":root" : `[data-theme="${themeId}"]`;
+    const start = css.indexOf(`${selector} {`);
+    expect(start, `no CSS block for ${themeId}`).toBeGreaterThan(-1);
+    return css.slice(start, css.indexOf("}", start));
+  }
+
+  for (const theme of THEMES) {
+    it(`${theme.id} defines 8 distinct series colors`, () => {
+      const block = blockFor(theme.id);
+      const colors = Array.from({ length: 8 }, (_, i) => {
+        const match = block.match(new RegExp(`--t-series-${i + 1}:\\s*([^;]+);`));
+        expect(match, `${theme.id} is missing --t-series-${i + 1}`).not.toBeNull();
+        return match![1].trim();
+      });
+      expect(new Set(colors).size).toBe(8);
+      // Series 1 is the theme accent, so single-run charts keep their color.
+      const accent = block.match(/--t-accent:\s*([^;]+);/)?.[1].trim();
+      expect(colors[0]).toBe(accent);
+    });
+  }
 });

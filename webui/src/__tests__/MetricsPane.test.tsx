@@ -8,7 +8,14 @@
 // first, which is the ordering the auto-follow defect depended on.
 
 import { createElement } from "react";
-import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { invMock, fsChangeHandlers } = vi.hoisted(() => ({
@@ -17,13 +24,18 @@ const { invMock, fsChangeHandlers } = vi.hoisted(() => ({
   // the initial load and never touch these; the verdict-badge tests below
   // deliver a change through them, which is how the real watcher reaches the
   // pane (`fsroots.rs` emits one event per created/modified file).
-  fsChangeHandlers: [] as Array<(payload: { root: string; rel_path: string }) => void>,
+  fsChangeHandlers: [] as Array<
+    (payload: { root: string; rel_path: string }) => void
+  >,
 }));
 
 vi.mock("../desktop/tauri", () => ({
   isTauri: () => true,
   inv: (cmd: string, args?: Record<string, unknown>) => invMock(cmd, args),
-  subscribe: (_event: string, handler: (payload: { root: string; rel_path: string }) => void) => {
+  subscribe: (
+    _event: string,
+    handler: (payload: { root: string; rel_path: string }) => void,
+  ) => {
     fsChangeHandlers.push(handler);
     return { unsubscribe: () => {}, ready: Promise.resolve() };
   },
@@ -32,11 +44,17 @@ vi.mock("../desktop/tauri", () => ({
 import MetricsPane from "../desktop/panes/MetricsPane";
 // Not mocked: publishing here reaches the pane through the same module the
 // flywheel pane's [metrics] link publishes through.
-import { __resetPaneLinkForTests, publishMetricsTarget } from "../desktop/panes/paneLink";
+import {
+  __resetPaneLinkForTests,
+  publishMetricsTarget,
+} from "../desktop/panes/paneLink";
 
 const LOOP = "loop-probe";
 const R0 = `${LOOP}/round-00/attempts`;
 const R1 = `${LOOP}/round-01/attempts`;
+// The auto row names the run it currently follows (the newest listed file)
+// rather than reading a generic "auto (newest)" — see RunPicker.
+const AUTO_R1 = `auto → ${R1}/cuda/matmul-speedup`;
 
 /**
  * A `metrics.jsonl` chain: one JSON object per solver step.
@@ -51,11 +69,24 @@ const R1 = `${LOOP}/round-01/attempts`;
  * — and as the fake `fs_tail` below requires, since (like the real one) it
  * hands back whole lines only.
  */
-function chain(steps: number, progressStep: number, speedup: number, tag = "seed"): string {
-  return Array.from({ length: steps }, (_, i) => `${chainLine(i, progressStep, speedup, tag)}\n`).join("");
+function chain(
+  steps: number,
+  progressStep: number,
+  speedup: number,
+  tag = "seed",
+): string {
+  return Array.from(
+    { length: steps },
+    (_, i) => `${chainLine(i, progressStep, speedup, tag)}\n`,
+  ).join("");
 }
 
-function chainLine(i: number, progressStep: number, speedup: number, tag: string): string {
+function chainLine(
+  i: number,
+  progressStep: number,
+  speedup: number,
+  tag: string,
+): string {
   return JSON.stringify({
     step: i + 1,
     total_steps: 10,
@@ -84,21 +115,37 @@ function summary(extra: Record<string, unknown>): string {
 // Newest-mtime first, exactly as `fs_list` returns it — so index 0 (what
 // auto-follow charts) is the round summary a completed round writes last.
 const TREE: Array<[string, string]> = [
-  [`${LOOP}/round-01/metrics.json`, summary({ round_index: 1, attempts: 3, tokens: 1320 })],
-  [`${R1}/cuda/matmul-speedup/metrics.json`, summary({ problem_id: "cuda/matmul-speedup", best_score: 2.4 })],
+  [
+    `${LOOP}/round-01/metrics.json`,
+    summary({ round_index: 1, attempts: 3, tokens: 1320 }),
+  ],
+  [
+    `${R1}/cuda/matmul-speedup/metrics.json`,
+    summary({ problem_id: "cuda/matmul-speedup", best_score: 2.4 }),
+  ],
   [`${R1}/cuda/matmul-speedup/metrics.jsonl`, chain(4, 0.12, 2.4, "r1cuda")],
-  [`${R1}/flat-baseline/metrics.json`, summary({ problem_id: "flat-baseline", best_score: 2.05 })],
+  [
+    `${R1}/flat-baseline/metrics.json`,
+    summary({ problem_id: "flat-baseline", best_score: 2.05 }),
+  ],
   [`${R1}/flat-baseline/metrics.jsonl`, chain(3, 0.09, 2.05, "r1flat")],
   [`${LOOP}/round-00/metrics.json`, summary({ round_index: 0, attempts: 4 })],
   // A rotated, superseded chain. `_viewer_runs` omits it, and its path begins
   // with the directory of the live run right below it.
-  [`${R0}/cuda/matmul-speedup/prior-1/metrics.jsonl`, chain(2, 0.5, 9.9, "r0prior")],
+  [
+    `${R0}/cuda/matmul-speedup/prior-1/metrics.jsonl`,
+    chain(2, 0.5, 9.9, "r0prior"),
+  ],
   [`${R0}/cuda/matmul-speedup/metrics.jsonl`, chain(5, 0.07, 1.7, "r0cuda")],
   [`${R0}/bad-instrument/metrics.jsonl`, chain(2, 0.03, 1.1, "r0bad")],
 ];
 
-const RUN_FILES = TREE.map(([p]) => p).filter((p) => p.endsWith("metrics.jsonl"));
-const SUMMARY_FILES = TREE.map(([p]) => p).filter((p) => p.endsWith("metrics.json"));
+const RUN_FILES = TREE.map(([p]) => p).filter((p) =>
+  p.endsWith("metrics.jsonl"),
+);
+const SUMMARY_FILES = TREE.map(([p]) => p).filter((p) =>
+  p.endsWith("metrics.json"),
+);
 
 let viewerJson: string | null = null;
 // The results root, mutable so a test can model what the loop does to it
@@ -151,36 +198,49 @@ function fakeTail(rel: string, offset: number) {
   const raw = data.slice(start);
   const nl = raw.lastIndexOf("\n");
   const buf = nl < 0 ? "" : raw.slice(0, nl + 1);
-  return { data: buf, offset: start + buf.length, start, dev: 1, ino: inodeOf(rel), restarted };
+  return {
+    data: buf,
+    offset: start + buf.length,
+    start,
+    dev: 1,
+    ino: inodeOf(rel),
+    restarted,
+  };
 }
 
 function installFs() {
-  invMock.mockImplementation(async (cmd: string, args: Record<string, unknown> = {}) => {
-    if (cmd === "fs_watch") return null;
-    if (cmd === "fs_list") {
-      return [...contents.keys()].map((rel, i) => ({
-        rel_path: rel,
-        is_dir: false,
-        size: (contents.get(rel) ?? "").length,
-        mtime_ms: 2_000_000 - i,
-      }));
-    }
-    if (cmd === "fs_read_text") {
-      if (args.rel === ".viewer.json" && viewerJson !== null) return viewerJson;
-      const verdict = verdictFiles.get(String(args.rel));
-      if (verdict !== undefined) return verdict;
-      throw new Error(`path does not exist: ${String(args.rel)}`);
-    }
-    if (cmd === "fs_tail") return fakeTail(String(args.rel), Number(args.offset ?? 0));
-    throw new Error(`unexpected command ${cmd}`);
-  });
+  invMock.mockImplementation(
+    async (cmd: string, args: Record<string, unknown> = {}) => {
+      if (cmd === "fs_watch") return null;
+      if (cmd === "fs_list") {
+        return [...contents.keys()].map((rel, i) => ({
+          rel_path: rel,
+          is_dir: false,
+          size: (contents.get(rel) ?? "").length,
+          mtime_ms: 2_000_000 - i,
+        }));
+      }
+      if (cmd === "fs_read_text") {
+        if (args.rel === ".viewer.json" && viewerJson !== null)
+          return viewerJson;
+        const verdict = verdictFiles.get(String(args.rel));
+        if (verdict !== undefined) return verdict;
+        throw new Error(`path does not exist: ${String(args.rel)}`);
+      }
+      if (cmd === "fs_tail")
+        return fakeTail(String(args.rel), Number(args.offset ?? 0));
+      throw new Error(`unexpected command ${cmd}`);
+    },
+  );
 }
 
 /** The y-axis tick labels of the chart, as numbers — the domain the drawn
  * curve spans. Points from a rotated-away generation stapled in front of the
  * live one show up here as a domain that reaches down to the old values. */
 function yTicks(): number[] {
-  return Array.from(document.querySelectorAll('svg text[x="4"]')).map((t) => Number(t.textContent));
+  return Array.from(document.querySelectorAll('svg text[x="4"]')).map((t) =>
+    Number(t.textContent),
+  );
 }
 
 function tailedPaths(): string[] {
@@ -190,7 +250,9 @@ function tailedPaths(): string[] {
 }
 
 function runOptions(): HTMLElement[] {
-  return within(screen.getByRole("listbox", { name: "runs" })).getAllByRole("option");
+  return within(screen.getByRole("listbox", { name: "runs" })).getAllByRole(
+    "option",
+  );
 }
 
 function selectedRunLabels(): string[] {
@@ -238,11 +300,16 @@ beforeEach(() => {
  */
 function emitFsChange(relPath: string) {
   if (!contents.has(relPath) && !verdictFiles.has(relPath)) return;
-  for (const handler of fsChangeHandlers) handler({ root: "results", rel_path: relPath });
+  for (const handler of fsChangeHandlers)
+    handler({ root: "results", rel_path: relPath });
 }
 
 /** The body `results.write_attempt_verdict` writes. */
-function verdictJson(state: string, linesChecked: number, chainHead: string | null): string {
+function verdictJson(
+  state: string,
+  linesChecked: number,
+  chainHead: string | null,
+): string {
   return JSON.stringify({
     schema_version: 1,
     state,
@@ -281,7 +348,7 @@ describe("MetricsPane — summaries are not runs (defect A)", () => {
     await waitFor(() => expect(runOptions().length).toBe(RUN_FILES.length + 1));
 
     const labels = runOptions().map((o) => o.textContent ?? "");
-    expect(labels[0]).toBe("auto (newest)");
+    expect(labels[0]).toBe(AUTO_R1);
     // The old label — the first path segment — made every one of these read
     // `loop-probe`; each run must now name its own round and problem id.
     expect(labels.slice(1).sort()).toEqual(
@@ -301,11 +368,19 @@ describe("MetricsPane — summaries are not runs (defect A)", () => {
     // The defect in one assertion: `fs_list` is newest-first and
     // `loop-probe/round-01/metrics.json` is index 0, so the pre-fix pane
     // tailed a pretty-printed object and charted nothing.
-    await waitFor(() => expect(tailedPaths()).toContain(`${R1}/cuda/matmul-speedup/metrics.jsonl`));
+    await waitFor(() =>
+      expect(tailedPaths()).toContain(
+        `${R1}/cuda/matmul-speedup/metrics.jsonl`,
+      ),
+    );
     for (const s of SUMMARY_FILES) expect(tailedPaths()).not.toContain(s);
 
     // And the pane is not stuck on "no metrics yet" for a completed round.
-    await waitFor(() => expect(screen.getByRole("button", { name: "progress" })).toBeInTheDocument());
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "progress" }),
+      ).toBeInTheDocument(),
+    );
     expect(screen.queryByText("no metrics yet")).toBeNull();
   });
 });
@@ -326,7 +401,9 @@ describe("MetricsPane — .viewer.json runs (defect 1)", () => {
     );
     // `.../matmul-speedup/prior-1` starts with a named directory but is a
     // different, superseded run — a prefix match would have charted it.
-    expect(selectedRunLabels()).not.toContain(`${R0}/cuda/matmul-speedup/prior-1`);
+    expect(selectedRunLabels()).not.toContain(
+      `${R0}/cuda/matmul-speedup/prior-1`,
+    );
   });
 
   it("is not satisfied by the loop name alone (the pre-fix comparison)", async () => {
@@ -336,7 +413,7 @@ describe("MetricsPane — .viewer.json runs (defect 1)", () => {
     await waitFor(() => expect(runOptions().length).toBe(RUN_FILES.length + 1));
     // No run matches, so the default "auto" selection survives rather than
     // every run being swept in by a first-segment comparison.
-    await waitFor(() => expect(selectedRunLabels()).toEqual(["auto (newest)"]));
+    await waitFor(() => expect(selectedRunLabels()).toEqual([AUTO_R1]));
   });
 
   it("applies a titles map to the charted series label", async () => {
@@ -367,10 +444,14 @@ describe("MetricsPane — chart keys (defect B)", () => {
     });
     const { container } = render(createElement(MetricsPane));
 
-    await waitFor(() => expect(container.querySelectorAll("polyline").length).toBe(2));
+    await waitFor(() =>
+      expect(container.querySelectorAll("polyline").length).toBe(2),
+    );
     for (const name of ["speedup_ratio", "consumed_steps", "progress"]) {
       screen.getByRole("button", { name }).click();
-      await waitFor(() => expect(container.querySelectorAll("polyline").length).toBe(2));
+      await waitFor(() =>
+        expect(container.querySelectorAll("polyline").length).toBe(2),
+      );
     }
   });
 });
@@ -414,21 +495,29 @@ describe("MetricsPane — verdict badge (RES-18)", () => {
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
 
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
     expect(badge()).toHaveTextContent("chain ok");
     // The qualifier is the point of the badge: a green chip that stopped
     // there would be read as "these numbers are real".
     const title = badge().getAttribute("title") ?? "";
-    expect(title).toContain("not proof the numbers are authentic or meaningful");
+    expect(title).toContain(
+      "not proof the numbers are authentic or meaningful",
+    );
     // Runnable as printed: rooted where the pane is actually reading.
-    expect(title).toContain(`python -m turing.research.loop.verify results/${RUN}`);
+    expect(title).toContain(
+      `python -m turing.research.loop.verify results/${RUN}`,
+    );
   });
 
   it("reads unverified when the loop left no verdict beside the run", async () => {
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
 
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "unverified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "unverified"),
+    );
   });
 
   it("reads stale when the verdict describes a different number of lines", async () => {
@@ -442,7 +531,10 @@ describe("MetricsPane — verdict badge (RES-18)", () => {
   it("reads stale when the head matches nothing this pane has parsed", async () => {
     // Same line count, different bytes: a re-drive that happened to produce a
     // log of the same length is a different log, and only the digest says so.
-    verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2, headOf("some-other-run", 2)));
+    verdictFiles.set(
+      RUN_VERDICT,
+      verdictJson("ok", 2, headOf("some-other-run", 2)),
+    );
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
 
@@ -454,30 +546,40 @@ describe("MetricsPane — verdict badge (RES-18)", () => {
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
 
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "failed"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "failed"),
+    );
   });
 
   it("picks the verdict up when the loop writes it mid-session", async () => {
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "unverified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "unverified"),
+    );
 
     // The attempt ends: `write_attempt_verdict` lands the file and the
     // watcher reports it. The operator must not have to reopen the pane.
     verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2, RUN_HEAD));
     emitFsChange(RUN_VERDICT);
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
   });
 
   it("re-reads the verdict when it is rewritten", async () => {
     verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2, RUN_HEAD));
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
 
     verdictFiles.set(RUN_VERDICT, verdictJson("failed", 2, RUN_HEAD));
     emitFsChange(RUN_VERDICT);
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "failed"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "failed"),
+    );
   });
 
   it("gives each pinned run its own badge, named in its own visible text", async () => {
@@ -495,9 +597,14 @@ describe("MetricsPane — verdict badge (RES-18)", () => {
     viewerJson = JSON.stringify({ runs: [RUN, `${R1}/flat-baseline`] });
     render(createElement(MetricsPane));
 
-    await waitFor(() => expect(screen.getAllByTestId("metrics-verdict").length).toBe(2));
+    await waitFor(() =>
+      expect(screen.getAllByTestId("metrics-verdict").length).toBe(2),
+    );
     const chips = screen.getAllByTestId("metrics-verdict");
-    const states = chips.map((b) => [b.getAttribute("data-run"), b.getAttribute("data-state")]);
+    const states = chips.map((b) => [
+      b.getAttribute("data-run"),
+      b.getAttribute("data-state"),
+    ]);
     expect(states).toContainEqual([RUN, "verified"]);
     expect(states).toContainEqual([`${R1}/flat-baseline`, "failed"]);
 
@@ -506,7 +613,9 @@ describe("MetricsPane — verdict badge (RES-18)", () => {
     expect(texts.join("|")).toContain("bad-instrument");
     expect(texts.join("|")).toContain("flat-baseline");
     // And the red chip names ITS run in its own text — the case this exists for.
-    const failed = chips.find((b) => b.getAttribute("data-state") === "failed")!;
+    const failed = chips.find(
+      (b) => b.getAttribute("data-state") === "failed",
+    )!;
     expect(failed.textContent).toContain("flat-baseline");
     expect(failed.textContent).not.toContain("bad-instrument");
   });
@@ -516,7 +625,9 @@ describe("MetricsPane — verdict badge (RES-18)", () => {
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
 
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
     // A `title` on a `<span>` reaches a mouse and nothing else; the qualifier
     // is the part of this badge that must not be mouse-only.
     expect(badge().tagName).toBe("BUTTON");
@@ -535,7 +646,9 @@ describe("MetricsPane — verdict badge (RES-18)", () => {
     });
     render(createElement(MetricsPane));
 
-    await waitFor(() => expect(screen.getAllByTestId("metrics-verdict").length).toBe(3));
+    await waitFor(() =>
+      expect(screen.getAllByTestId("metrics-verdict").length).toBe(3),
+    );
     const column = screen.getAllByTestId("metrics-verdict")[0].parentElement!;
     expect(column.className).toMatch(/max-h-/);
     expect(column.className).toMatch(/overflow-/);
@@ -549,10 +662,12 @@ describe("MetricsPane — verdict badge (RES-18)", () => {
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
     const base = invMock.getMockImplementation()!;
-    invMock.mockImplementation(async (cmd: string, args: Record<string, unknown> = {}) => {
-      if (cmd === "fs_read_text" && args.rel === RUN_VERDICT) await held;
-      return base(cmd, args);
-    });
+    invMock.mockImplementation(
+      async (cmd: string, args: Record<string, unknown> = {}) => {
+        if (cmd === "fs_read_text" && args.rel === RUN_VERDICT) await held;
+        return base(cmd, args);
+      },
+    );
 
     render(createElement(MetricsPane));
     await waitFor(() => expect(badge()).toBeInTheDocument());
@@ -561,7 +676,9 @@ describe("MetricsPane — verdict badge (RES-18)", () => {
     expect(title).not.toContain("never recorded a check here");
 
     release();
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
   });
 
   it("says nothing was ever checked once the read comes back empty, not that it is still reading", async () => {
@@ -573,10 +690,12 @@ describe("MetricsPane — verdict badge (RES-18)", () => {
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
     const base = invMock.getMockImplementation()!;
-    invMock.mockImplementation(async (cmd: string, args: Record<string, unknown> = {}) => {
-      if (cmd === "fs_read_text" && args.rel === RUN_VERDICT) await held;
-      return base(cmd, args);
-    });
+    invMock.mockImplementation(
+      async (cmd: string, args: Record<string, unknown> = {}) => {
+        if (cmd === "fs_read_text" && args.rel === RUN_VERDICT) await held;
+        return base(cmd, args);
+      },
+    );
 
     render(createElement(MetricsPane));
     await waitFor(() => expect(badge()).toBeInTheDocument());
@@ -584,7 +703,9 @@ describe("MetricsPane — verdict badge (RES-18)", () => {
 
     release();
     await waitFor(() =>
-      expect(badge().getAttribute("title")).toContain("never recorded a check here"),
+      expect(badge().getAttribute("title")).toContain(
+        "never recorded a check here",
+      ),
     );
     expect(badge().getAttribute("title")).not.toContain("reading the verdict");
     expect(badge()).toHaveAttribute("data-state", "unverified");
@@ -615,7 +736,9 @@ describe("MetricsPane — a re-drive rotates the run out from under the badge", 
     verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2, RUN_HEAD));
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
 
     rotate("");
     // What the watcher actually reports: creations at the destinations and at
@@ -626,16 +749,22 @@ describe("MetricsPane — a re-drive rotates the run out from under the badge", 
     emitFsChange(RUN_VERDICT);
     emitFsChange(RUN_FILE);
 
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "unverified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "unverified"),
+    );
   });
 
   it("drops the superseded generation's points instead of stapling new ones to them", async () => {
     verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2, RUN_HEAD));
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
     expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 2");
-    expect(screen.getByRole("button", { name: "progress" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "progress" }),
+    ).toBeInTheDocument();
 
     // The new attempt's first line lands, and it measures something else —
     // a different solver on the same problem id. The new file is shorter than
@@ -643,10 +772,16 @@ describe("MetricsPane — a re-drive rotates the run out from under the badge", 
     // either alone must reset the run: appending the chunk would chart a
     // rotated-away attempt with a new one stapled to its end, and would keep
     // offering the old attempt's series as tabs.
-    rotate(`${JSON.stringify({ step: 1, total_steps: 4, restarted: 1, _chain: "0:redrive" })}\n`);
+    rotate(
+      `${JSON.stringify({ step: 1, total_steps: 4, restarted: 1, _chain: "0:redrive" })}\n`,
+    );
     emitFsChange(RUN_FILE);
 
-    await waitFor(() => expect(screen.getByRole("button", { name: "restarted" })).toBeInTheDocument());
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "restarted" }),
+      ).toBeInTheDocument(),
+    );
     expect(screen.queryByRole("button", { name: "progress" })).toBeNull();
     expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 1");
     expect(badge()).toHaveAttribute("data-state", "unverified");
@@ -656,14 +791,23 @@ describe("MetricsPane — a re-drive rotates the run out from under the badge", 
     verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2, RUN_HEAD));
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
 
     // Not a re-drive: something rewrote the file in place with less in it.
     // The identity is unchanged, so this is the case `restarted` exists for.
-    contents.set(RUN_FILE, `${JSON.stringify({ step: 1, total_steps: 4, rewritten: 1, _chain: "0:again" })}\n`);
+    contents.set(
+      RUN_FILE,
+      `${JSON.stringify({ step: 1, total_steps: 4, rewritten: 1, _chain: "0:again" })}\n`,
+    );
     emitFsChange(RUN_FILE);
 
-    await waitFor(() => expect(screen.getByRole("button", { name: "rewritten" })).toBeInTheDocument());
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "rewritten" }),
+      ).toBeInTheDocument(),
+    );
     expect(screen.queryByRole("button", { name: "progress" })).toBeNull();
     expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 1");
     // The old verdict is still beside the file, and it is now about bytes
@@ -678,18 +822,28 @@ describe("MetricsPane — a re-drive rotates the run out from under the badge", 
     verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2, RUN_HEAD));
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
     const tailsBefore = tailedPaths().filter((p) => p === RUN_FILE).length;
 
     contents.delete(RUN_FILE);
     verdictFiles.set(RUN_VERDICT, verdictJson("failed", 2, RUN_HEAD));
     emitFsChange(RUN_VERDICT);
 
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "failed"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "failed"),
+    );
     // The re-tail was issued and rejected; the points survived it.
-    await waitFor(() => expect(tailedPaths().filter((p) => p === RUN_FILE).length).toBe(tailsBefore + 1));
+    await waitFor(() =>
+      expect(tailedPaths().filter((p) => p === RUN_FILE).length).toBe(
+        tailsBefore + 1,
+      ),
+    );
     expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 2");
-    expect(screen.getByRole("button", { name: "progress" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "progress" }),
+    ).toBeInTheDocument();
   });
 });
 
@@ -719,7 +873,9 @@ describe("MetricsPane — a replacement file at least as long as the held offset
     verdictFiles.set(RUN_VERDICT, verdictJson("ok", 1, headOf("r0bad", 1)));
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
     const oldLen = contents.get(RUN_FILE)!.length;
 
     // Trio and verdict move into `prior-1/`; the new writer's first line lands
@@ -728,22 +884,31 @@ describe("MetricsPane — a replacement file at least as long as the held offset
     expect(gen2.length).toBe(oldLen);
     redrive(gen2);
     emitFsChange(RUN_FILE);
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "unverified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "unverified"),
+    );
 
     // Steps 2 and 3 of the new attempt, then the loop's verdict for it.
     contents.set(RUN_FILE, chain(3, 0.03, NEW_SPEEDUP, "redrive"));
     emitFsChange(RUN_FILE);
     verdictFiles.set(RUN_VERDICT, verdictJson("ok", 3, headOf("redrive", 3)));
     emitFsChange(RUN_VERDICT);
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
     expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 3");
 
     // What is under that green badge must be the new generation ALONE. With
     // the old line 1 stapled in front, the speedup curve would reach down to
     // 2.5 and its axis would say so.
     screen.getByRole("button", { name: "speedup_ratio" }).click();
-    await waitFor(() => expect(document.querySelectorAll("polyline").length).toBe(1));
-    expect(document.querySelector("polyline")!.getAttribute("points")!.split(" ").length).toBe(3);
+    await waitFor(() =>
+      expect(document.querySelectorAll("polyline").length).toBe(1),
+    );
+    expect(
+      document.querySelector("polyline")!.getAttribute("points")!.split(" ")
+        .length,
+    ).toBe(3);
     const ticks = yTicks();
     expect(ticks.length).toBeGreaterThan(0);
     for (const t of ticks) expect(t).toBeGreaterThan(7);
@@ -754,7 +919,9 @@ describe("MetricsPane — a replacement file at least as long as the held offset
     verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2, headOf("r0bad", 2)));
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
     const oldLen = contents.get(RUN_FILE)!.length;
 
     // The new attempt's line 2 ends exactly where the old file ended, and the
@@ -766,14 +933,25 @@ describe("MetricsPane — a replacement file at least as long as the held offset
     verdictFiles.set(RUN_VERDICT, verdictJson("ok", 3, headOf("redrive", 3)));
     emitFsChange(RUN_VERDICT);
 
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
-    await waitFor(() => expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 3"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("metrics-eta")).toHaveTextContent(
+        "last step: 3",
+      ),
+    );
     screen.getByRole("button", { name: "speedup_ratio" }).click();
-    await waitFor(() => expect(document.querySelectorAll("polyline").length).toBe(1));
+    await waitFor(() =>
+      expect(document.querySelectorAll("polyline").length).toBe(1),
+    );
     // Three points, all of them the new generation's — not old lines 1–2
     // with new line 3 stapled on, which would satisfy the line count and the
     // digest both and still be a chart of two runs.
-    expect(document.querySelector("polyline")!.getAttribute("points")!.split(" ").length).toBe(3);
+    expect(
+      document.querySelector("polyline")!.getAttribute("points")!.split(" ")
+        .length,
+    ).toBe(3);
     const ticks = yTicks();
     expect(ticks.length).toBeGreaterThan(0);
     for (const t of ticks) expect(t).toBeGreaterThan(7);
@@ -786,7 +964,9 @@ describe("MetricsPane — a rewrite of the same inode, longer than what the pane
     verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2, headOf("r0bad", 2)));
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
     const oldLen = contents.get(RUN_FILE)!.length;
 
     // `cp other/metrics.jsonl metrics.jsonl`: truncate + write, SAME inode,
@@ -800,13 +980,20 @@ describe("MetricsPane — a rewrite of the same inode, longer than what the pane
     emitFsChange(RUN_FILE);
     verdictFiles.set(RUN_VERDICT, verdictJson("ok", 3, headOf("rewrite", 3)));
     emitFsChange(RUN_VERDICT);
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
 
     // The rewrite alone — not old lines 1–2 with the rewrite's line 3 stapled
     // on under a green badge (which the digest and line count both allow).
     screen.getByRole("button", { name: "speedup_ratio" }).click();
-    await waitFor(() => expect(document.querySelectorAll("polyline").length).toBe(1));
-    expect(document.querySelector("polyline")!.getAttribute("points")!.split(" ").length).toBe(3);
+    await waitFor(() =>
+      expect(document.querySelectorAll("polyline").length).toBe(1),
+    );
+    expect(
+      document.querySelector("polyline")!.getAttribute("points")!.split(" ")
+        .length,
+    ).toBe(3);
     const ticks = yTicks();
     expect(ticks.length).toBeGreaterThan(0);
     for (const t of ticks) expect(t).toBeGreaterThan(9);
@@ -816,18 +1003,26 @@ describe("MetricsPane — a rewrite of the same inode, longer than what the pane
     contents.set(RUN_FILE, chain(2, 0.03, 2.5, "r0bad"));
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
-    await waitFor(() => expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 2"));
+    await waitFor(() =>
+      expect(screen.getByTestId("metrics-eta")).toHaveTextContent(
+        "last step: 2",
+      ),
+    );
     const base = invMock.getMockImplementation()!;
-    invMock.mockImplementation(async (cmd: string, args: Record<string, unknown> = {}) => {
-      const r = await base(cmd, args);
-      return cmd === "fs_tail" ? { ...r, dev: 2 } : r;
-    });
+    invMock.mockImplementation(
+      async (cmd: string, args: Record<string, unknown> = {}) => {
+        const r = await base(cmd, args);
+        return cmd === "fs_tail" ? { ...r, dev: 2 } : r;
+      },
+    );
     // Same length, same `ino`, different `dev`: with `dev` ignored this reads
     // as "nothing new" and the old numbers stay on the chart.
     contents.set(RUN_FILE, chain(2, 0.03, 7.5, "other"));
     emitFsChange(RUN_FILE);
     screen.getByRole("button", { name: "speedup_ratio" }).click();
-    await waitFor(() => expect(yTicks().every((t) => t > 7) && yTicks().length > 0).toBe(true));
+    await waitFor(() =>
+      expect(yTicks().every((t) => t > 7) && yTicks().length > 0).toBe(true),
+    );
   });
 });
 
@@ -836,7 +1031,9 @@ describe("MetricsPane — two events for one run a few milliseconds apart", () =
     // Attempt running: 2 lines charted, no verdict yet.
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "unverified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "unverified"),
+    );
     expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 2");
 
     // The solver writes line 3 (its event is emitted — this solver is slower
@@ -848,29 +1045,40 @@ describe("MetricsPane — two events for one run a few milliseconds apart", () =
     verdictFiles.set(RUN_VERDICT, verdictJson("ok", 3, headOf("r0bad", 3)));
     emitFsChange(RUN_VERDICT);
 
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
     expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 3");
     screen.getByRole("button", { name: "progress" }).click();
-    await waitFor(() => expect(document.querySelectorAll("polyline").length).toBe(1));
+    await waitFor(() =>
+      expect(document.querySelectorAll("polyline").length).toBe(1),
+    );
     // All three points, once each: the same bytes were not applied twice, and
     // the second read did not wipe the first's points down to one.
-    expect(document.querySelector("polyline")!.getAttribute("points")!.split(" ").length).toBe(3);
+    expect(
+      document.querySelector("polyline")!.getAttribute("points")!.split(" ")
+        .length,
+    ).toBe(3);
   });
 
   it("issues at most one fs_tail at a time per run, and one follow-up for a burst", async () => {
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "unverified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "unverified"),
+    );
     const before = tailedPaths().filter((p) => p === RUN_FILE).length;
 
     // Hold every read open, fire a burst of events, then release.
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
     const base = invMock.getMockImplementation()!;
-    invMock.mockImplementation(async (cmd: string, args: Record<string, unknown> = {}) => {
-      if (cmd === "fs_tail" && args.rel === RUN_FILE) await held;
-      return base(cmd, args);
-    });
+    invMock.mockImplementation(
+      async (cmd: string, args: Record<string, unknown> = {}) => {
+        if (cmd === "fs_tail" && args.rel === RUN_FILE) await held;
+        return base(cmd, args);
+      },
+    );
     contents.set(RUN_FILE, chain(3, 0.03, 1.1, "r0bad"));
     emitFsChange(RUN_FILE);
     emitFsChange(RUN_FILE);
@@ -881,9 +1089,15 @@ describe("MetricsPane — two events for one run a few milliseconds apart", () =
     expect(tailedPaths().filter((p) => p === RUN_FILE).length).toBe(before + 1);
 
     release();
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
     // …into exactly one follow-up read once it landed.
-    await waitFor(() => expect(tailedPaths().filter((p) => p === RUN_FILE).length).toBe(before + 2));
+    await waitFor(() =>
+      expect(tailedPaths().filter((p) => p === RUN_FILE).length).toBe(
+        before + 2,
+      ),
+    );
     expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 3");
   });
 });
@@ -892,7 +1106,11 @@ describe("MetricsPane — the bytes at the end of the file", () => {
   it("charts a line split across two reads once, and is not stuck stale after the mid-write read", async () => {
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
-    await waitFor(() => expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 2"));
+    await waitFor(() =>
+      expect(screen.getByTestId("metrics-eta")).toHaveTextContent(
+        "last step: 2",
+      ),
+    );
 
     // The watcher fires while the writer is mid-line: the file ends in half
     // of line 3. `fs_tail` holds the fragment back, so the pane still holds
@@ -901,7 +1119,11 @@ describe("MetricsPane — the bytes at the end of the file", () => {
     const twoLines = chain(2, 0.03, 1.1, "r0bad");
     contents.set(RUN_FILE, `${twoLines}${line3.slice(0, 20)}`);
     emitFsChange(RUN_FILE);
-    await waitFor(() => expect(tailedPaths().filter((p) => p === RUN_FILE).length).toBeGreaterThanOrEqual(2));
+    await waitFor(() =>
+      expect(
+        tailedPaths().filter((p) => p === RUN_FILE).length,
+      ).toBeGreaterThanOrEqual(2),
+    );
     expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 2");
 
     // The writer finishes the line and the attempt ends. Line 3 arrives whole
@@ -910,18 +1132,27 @@ describe("MetricsPane — the bytes at the end of the file", () => {
     emitFsChange(RUN_FILE);
     verdictFiles.set(RUN_VERDICT, verdictJson("ok", 3, headOf("r0bad", 3)));
     emitFsChange(RUN_VERDICT);
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
     expect(screen.getByTestId("metrics-eta")).toHaveTextContent("last step: 3");
     screen.getByRole("button", { name: "progress" }).click();
-    await waitFor(() => expect(document.querySelectorAll("polyline").length).toBe(1));
-    expect(document.querySelector("polyline")!.getAttribute("points")!.split(" ").length).toBe(3);
+    await waitFor(() =>
+      expect(document.querySelectorAll("polyline").length).toBe(1),
+    );
+    expect(
+      document.querySelector("polyline")!.getAttribute("points")!.split(" ")
+        .length,
+    ).toBe(3);
   });
 
   it("reads stale, not chain ok, once an unparseable line follows the checked one", async () => {
     verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2, RUN_HEAD));
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
 
     // Garbage appended after the verdict. `verify` on disk would say FAILED;
     // the pane cannot know that, but it must not keep saying chain ok over a
@@ -938,7 +1169,9 @@ describe("MetricsPane — the bytes at the end of the file", () => {
     verdictFiles.set(RUN_VERDICT, verdictJson("ok", 2, RUN_HEAD));
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
 
     // A lone `\n` after the verdict. The writer never emits an interior blank
     // line and `verify` on disk treats one as a malformed record; the pane
@@ -966,7 +1199,8 @@ describe("MetricsPane — flywheel round clicks vs .viewer.json (#390 item 3)", 
 
   /** The watcher reporting a `.viewer.json` save, exactly as the pane hears it. */
   function emitViewerChange() {
-    for (const handler of fsChangeHandlers) handler({ root: "results", rel_path: ".viewer.json" });
+    for (const handler of fsChangeHandlers)
+      handler({ root: "results", rel_path: ".viewer.json" });
   }
 
   it("applies a round click as the run selection", async () => {
@@ -974,18 +1208,24 @@ describe("MetricsPane — flywheel round clicks vs .viewer.json (#390 item 3)", 
     await waitFor(() => expect(runOptions().length).toBe(RUN_FILES.length + 1));
 
     clickRound(0);
-    await waitFor(() => expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort()));
-    expect(selectedRunLabels()).not.toContain(`${R0}/cuda/matmul-speedup/prior-1`);
+    await waitFor(() =>
+      expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort()),
+    );
+    expect(selectedRunLabels()).not.toContain(
+      `${R0}/cuda/matmul-speedup/prior-1`,
+    );
     // The runs, not the series: the operator's tab choice is not the click's
     // to change.
-    expect(selectedRunLabels()).not.toContain("auto (newest)");
+    expect(selectedRunLabels().some((l) => l.startsWith("auto"))).toBe(false);
 
     // And the click stayed in-process: the app never writes `.viewer.json`
     // (or anything else) to express it — the file is the agent → app
     // direction only. Every command this pane ever issued is a read.
     for (const [cmd, args] of invMock.mock.calls) {
       expect(["fs_watch", "fs_list", "fs_tail", "fs_read_text"]).toContain(cmd);
-      if ((args as Record<string, unknown> | undefined)?.rel === ".viewer.json") {
+      if (
+        (args as Record<string, unknown> | undefined)?.rel === ".viewer.json"
+      ) {
         expect(cmd).toBe("fs_read_text");
       }
     }
@@ -995,24 +1235,32 @@ describe("MetricsPane — flywheel round clicks vs .viewer.json (#390 item 3)", 
     render(createElement(MetricsPane));
     await waitFor(() => expect(runOptions().length).toBe(RUN_FILES.length + 1));
     clickRound(0);
-    await waitFor(() => expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort()));
+    await waitFor(() =>
+      expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort()),
+    );
 
     // An agent writes the file after the click. The agent channel is a later
     // action, so it wins — the app never wrote the file, so nothing the click
     // did can have stomped what the agent said.
     viewerJson = JSON.stringify({ runs: [`${R1}/flat-baseline`] });
     emitViewerChange();
-    await waitFor(() => expect(selectedRunLabels()).toEqual([`${R1}/flat-baseline`]));
+    await waitFor(() =>
+      expect(selectedRunLabels()).toEqual([`${R1}/flat-baseline`]),
+    );
   });
 
   it("lets a second click supersede the .viewer.json request again", async () => {
     render(createElement(MetricsPane));
     await waitFor(() => expect(runOptions().length).toBe(RUN_FILES.length + 1));
     clickRound(0);
-    await waitFor(() => expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort()));
+    await waitFor(() =>
+      expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort()),
+    );
     viewerJson = JSON.stringify({ runs: [`${R1}/flat-baseline`] });
     emitViewerChange();
-    await waitFor(() => expect(selectedRunLabels()).toEqual([`${R1}/flat-baseline`]));
+    await waitFor(() =>
+      expect(selectedRunLabels()).toEqual([`${R1}/flat-baseline`]),
+    );
 
     clickRound(1);
     await waitFor(() =>
@@ -1025,14 +1273,18 @@ describe("MetricsPane — flywheel round clicks vs .viewer.json (#390 item 3)", 
   it("degrades an unmappable round to keeping the current chart, not to a blank pane", async () => {
     viewerJson = JSON.stringify({ runs: [`${R1}/flat-baseline`] });
     render(createElement(MetricsPane));
-    await waitFor(() => expect(selectedRunLabels()).toEqual([`${R1}/flat-baseline`]));
+    await waitFor(() =>
+      expect(selectedRunLabels()).toEqual([`${R1}/flat-baseline`]),
+    );
 
     // A round with no metrics on this machine. Nothing matches, so nothing is
     // honoured: the selection, the series tabs, and the chart all stay.
     clickRound(42);
     await act(async () => {});
     expect(selectedRunLabels()).toEqual([`${R1}/flat-baseline`]);
-    expect(screen.getByRole("button", { name: "progress" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "progress" }),
+    ).toBeInTheDocument();
     expect(screen.queryByText("no metrics yet")).toBeNull();
   });
 
@@ -1040,10 +1292,14 @@ describe("MetricsPane — flywheel round clicks vs .viewer.json (#390 item 3)", 
     render(createElement(MetricsPane));
     await waitFor(() => expect(runOptions().length).toBe(RUN_FILES.length + 1));
     clickRound(0);
-    await waitFor(() => expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort()));
+    await waitFor(() =>
+      expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort()),
+    );
 
     // A titles-only save asks nothing about runs; the click's selection stays.
-    viewerJson = JSON.stringify({ titles: { progress: "progress toward target" } });
+    viewerJson = JSON.stringify({
+      titles: { progress: "progress toward target" },
+    });
     emitViewerChange();
     await act(async () => {});
     expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort());
@@ -1058,7 +1314,7 @@ describe("MetricsPane — flywheel round clicks vs .viewer.json (#390 item 3)", 
     // link is deliberately offered on rounds with no round.json yet.
     clickRound(2);
     await act(async () => {});
-    expect(selectedRunLabels()).toEqual(["auto (newest)"]);
+    expect(selectedRunLabels()).toEqual([AUTO_R1]);
 
     // The solver's first append creates the file; the watcher reports it.
     // The run list was walked once at mount, so honouring the click now
@@ -1068,7 +1324,9 @@ describe("MetricsPane — flywheel round clicks vs .viewer.json (#390 item 3)", 
     emitFsChange(newRun);
 
     await waitFor(() =>
-      expect(selectedRunLabels()).toEqual([`${LOOP}/round-02/attempts/fresh-problem`]),
+      expect(selectedRunLabels()).toEqual([
+        `${LOOP}/round-02/attempts/fresh-problem`,
+      ]),
     );
   });
 
@@ -1077,7 +1335,9 @@ describe("MetricsPane — flywheel round clicks vs .viewer.json (#390 item 3)", 
     await waitFor(() => expect(runOptions().length).toBe(RUN_FILES.length + 1));
     // Default selection is `auto`: the pane charts the newest listed run.
     await waitFor(() =>
-      expect(screen.getByTestId("metrics-eta")).toHaveTextContent(`${R1}/cuda/matmul-speedup`),
+      expect(screen.getByTestId("metrics-eta")).toHaveTextContent(
+        `${R1}/cuda/matmul-speedup`,
+      ),
     );
 
     // A new round's first run file lands — newest mtime, so `fs_list` would
@@ -1104,16 +1364,20 @@ describe("MetricsPane — flywheel round clicks vs .viewer.json (#390 item 3)", 
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
     const base = invMock.getMockImplementation()!;
-    invMock.mockImplementation(async (cmd: string, args: Record<string, unknown> = {}) => {
-      if (cmd === "fs_read_text" && args.rel === ".viewer.json") await held;
-      return base(cmd, args);
-    });
+    invMock.mockImplementation(
+      async (cmd: string, args: Record<string, unknown> = {}) => {
+        if (cmd === "fs_read_text" && args.rel === ".viewer.json") await held;
+        return base(cmd, args);
+      },
+    );
     emitViewerChange();
 
     // The operator clicks a round while that read is still in flight — the
     // click is the LATER action.
     clickRound(0);
-    await waitFor(() => expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort()));
+    await waitFor(() =>
+      expect(selectedRunLabels().sort()).toEqual([...ROUND_0_RUNS].sort()),
+    );
 
     // The stale read resolves. It must not clobber the click.
     release();
@@ -1129,12 +1393,16 @@ describe("MetricsPane — flywheel round clicks vs .viewer.json (#390 item 3)", 
     // Round 2 has no files yet, so the click stays pending.
     clickRound(2);
     await act(async () => {});
-    expect(selectedRunLabels()).toEqual(["auto (newest)"]);
+    expect(selectedRunLabels()).toEqual([AUTO_R1]);
 
     // The operator picks a run by hand. That is now the last action.
-    const flat = runOptions().find((o) => o.textContent === `${R1}/flat-baseline`)!;
+    const flat = runOptions().find(
+      (o) => o.textContent === `${R1}/flat-baseline`,
+    )!;
     act(() => flat.click());
-    await waitFor(() => expect(selectedRunLabels()).toContain(`${R1}/flat-baseline`));
+    await waitFor(() =>
+      expect(selectedRunLabels()).toContain(`${R1}/flat-baseline`),
+    );
 
     // Round 2's first file lands later. The superseded click must not fire
     // now and rearrange a chart the operator chose by hand.
@@ -1143,7 +1411,8 @@ describe("MetricsPane — flywheel round clicks vs .viewer.json (#390 item 3)", 
     emitFsChange(newRun);
     await waitFor(() => expect(runOptions().length).toBe(RUN_FILES.length + 2));
     expect(selectedRunLabels().sort()).toEqual(
-      ["auto (newest)", `${R1}/flat-baseline`].sort(),
+      // (The fake `fs_list` appends new files, so auto still names R1 here.)
+      [AUTO_R1, `${R1}/flat-baseline`].sort(),
     );
   });
 });
@@ -1159,15 +1428,17 @@ describe("MetricsPane — concurrent run-list walks", () => {
     const base = invMock.getMockImplementation()!;
     let releaseStale: (() => void) | null = null;
     let heldOne = false;
-    invMock.mockImplementation(async (cmd: string, args: Record<string, unknown> = {}) => {
-      if (cmd === "fs_list" && !heldOne) {
-        heldOne = true;
-        const snapshot = await base(cmd, args);
-        await new Promise<void>((r) => (releaseStale = r));
-        return snapshot;
-      }
-      return base(cmd, args);
-    });
+    invMock.mockImplementation(
+      async (cmd: string, args: Record<string, unknown> = {}) => {
+        if (cmd === "fs_list" && !heldOne) {
+          heldOne = true;
+          const snapshot = await base(cmd, args);
+          await new Promise<void>((r) => (releaseStale = r));
+          return snapshot;
+        }
+        return base(cmd, args);
+      },
+    );
 
     // Walk 1: run file X lands; the watcher re-walks; the response hangs
     // holding a snapshot that contains X but not Y.
@@ -1202,7 +1473,9 @@ describe("MetricsPane — a missed run event must not pin the badge amber", () =
   it("catches up on the run when the loop's final verdict lands", async () => {
     viewerJson = JSON.stringify({ runs: [RUN] });
     render(createElement(MetricsPane));
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "unverified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "unverified"),
+    );
 
     // The solver writes its final line, and the watcher drops the event: the
     // real handler debounces writes to one path inside 300 ms, which a solver
@@ -1214,6 +1487,8 @@ describe("MetricsPane — a missed run event must not pin the badge amber", () =
     verdictFiles.set(RUN_VERDICT, verdictJson("ok", 3, headOf("r0bad", 3)));
     emitFsChange(RUN_VERDICT);
 
-    await waitFor(() => expect(badge()).toHaveAttribute("data-state", "verified"));
+    await waitFor(() =>
+      expect(badge()).toHaveAttribute("data-state", "verified"),
+    );
   });
 });
