@@ -233,6 +233,10 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
       },
       onExit: (code) => {
         if (disposedRef.current) return;
+        // Rust removes the PTY registry entry before emitting `pty-exit`.
+        // Once this pane is dead, later fit/visibility passes must not send a
+        // resize for that stale id and turn a clean exit into a red error.
+        idRef.current = null;
         if (code !== null && code !== 0) setExitCode(code);
         term.write("\r\n[exited]");
         setDead(true);
@@ -290,6 +294,10 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
       // been opened and fit() since spawn started). Re-sync once we have an
       // id and current terminal metrics, regardless of which raced which —
       // the `visible` effect below also resyncs on every later show.
+      // `adopt()` can synchronously report an exit that arrived while spawn
+      // was in flight; in that case onExit clears idRef and there is no live
+      // PTY left to resize or write to.
+      if (idRef.current === null) return;
       resizePty(id, term.cols, term.rows);
 
       if (runner && !runner.autorun) {
