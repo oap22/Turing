@@ -4,12 +4,12 @@ import { execFileSync } from "node:child_process";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   __resetResultsRootForTests,
-  AGENT_SANDBOX,
   RESULTS_ROOT_TOKEN,
   resolveRunner,
   resultsRoot,
   RUNNERS,
   substituteResultsRoot,
+  shellQuote,
 } from "../desktop/runners";
 
 describe("RUNNERS", () => {
@@ -33,30 +33,32 @@ describe("RUNNERS", () => {
     expect(groups).toEqual(new Set(["agents", "verify", "remote", "docs"]));
   });
 
-  // The agent runners exist to stop permission prompts, so each must carry
-  // the results-root grant — and only the sandbox one may skip prompts, and
-  // only from inside its sandbox directory, never from a checkout.
-  it("grants claude runners the results root and confines prompt-skipping to the sandbox", () => {
+  it("grants claude runners the results root without bypassing permission checks", () => {
     for (const id of ["claude", "claude-continue", "claude-sandbox"]) {
       const runner = RUNNERS.find((r) => r.id === id);
       expect(runner, id).toBeDefined();
       expect(runner?.command, id).toContain(`--add-dir ${RESULTS_ROOT_TOKEN}`);
       expect(runner?.group, id).toBe("agents");
     }
-    for (const r of RUNNERS) {
-      if (r.command.includes("--dangerously-skip-permissions")) {
-        expect(r.id).toBe("claude-sandbox");
-        expect(r.command).toContain(`cd ${AGENT_SANDBOX} &&`);
-        expect(r.cwd).not.toContain("Turing");
-      }
-    }
+    const scratch = RUNNERS.find((r) => r.id === "claude-sandbox")!;
+    expect(scratch.label).toContain("scratch workspace");
+    expect(scratch.command).toContain('cd "$HOME/turing-workspace" &&');
+    expect(scratch.cwd).not.toContain("Turing");
+    expect(RUNNERS.every((r) => !r.command.includes("--dangerously-skip-permissions"))).toBe(true);
   });
 
   it("substitutes the results root into the claude runners", async () => {
     const runner = RUNNERS.find((r) => r.id === "claude")!;
     const resolved = await resolveRunner(runner);
     expect(resolved.command).not.toContain(RESULTS_ROOT_TOKEN);
-    expect(resolved.command).toMatch(/--add-dir \S+research-results/);
+    expect(resolved.command).toContain("--add-dir ~/research-results");
+  });
+
+  it("shell-quotes configured paths before command execution", () => {
+    expect(shellQuote("/tmp/a $(touch pwned) ' quote")).toBe(
+      `'/tmp/a $(touch pwned) '"'"' quote'`,
+    );
+    expect(shellQuote("~/a $HOME `id`")).toBe('"$HOME/a \\$HOME \\`id\\`"');
   });
 
   // Both remote streamers carry placeholders, so they must be pre-typed for

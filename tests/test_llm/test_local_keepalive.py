@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from turing.__main__ import _should_warm_local
 from turing.llm.base import Message, Role
 from turing.llm.local import OllamaProvider
 
@@ -103,3 +104,10 @@ class TestWarmup:
         p = _provider()
         p._client.generate = AsyncMock(side_effect=ConnectionError("no ollama"))
         assert await p.warmup() is False
+
+
+def test_cloud_only_routing_skips_local_warmup() -> None:
+    assert _should_warm_local("cloud", True) is False
+    assert _should_warm_local("auto", True) is True
+    assert _should_warm_local("local", True) is True
+    assert _should_warm_local("auto", False) is False

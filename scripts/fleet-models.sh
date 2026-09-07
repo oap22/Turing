@@ -100,6 +100,12 @@ validate_host() {
         exit 2
     fi
 }
+validate_keep_alive() {
+    if [[ ! "$1" =~ ^(-1|[0-9]+(ms|s|m|h))$ ]]; then
+        echo "fleet-models: refusing keep-alive '$1'" >&2
+        exit 2
+    fi
+}
 
 ssh_target() { if [[ -n "$USER_OPT" ]]; then echo "${USER_OPT}@$1"; else echo "$1"; fi; }
 
@@ -119,7 +125,7 @@ pull_cmd() {
     # no-op even on Ollama versions that re-verify layers on every pull.
     local out="" m
     for m in "$@"; do
-        out+="if ollama list 2>/dev/null | awk 'NR>1 {print \$1}' | grep -qx '$m'; then echo \"[$m] present\"; else echo \"[$m] pulling\"; ollama pull '$m'; fi; "
+        out+="if ollama list 2>/dev/null | awk 'NR>1 {print \$1}' | grep -Fqx '$m'; then echo \"[$m] present\"; else echo \"[$m] pulling\"; ollama pull '$m'; fi; "
     done
     echo "$out"
 }
@@ -141,11 +147,9 @@ EOF
 
 prune_cmd() {
     # $@ = models to keep. Removes everything else this node holds.
-    local keep_re="" m
-    for m in "$@"; do keep_re+="^${m}\$|"; done
-    keep_re="${keep_re%|}"
-    if [[ -z "$keep_re" ]]; then keep_re='^$'; fi
-    echo "for m in \$(ollama list 2>/dev/null | awk 'NR>1 {print \$1}'); do if ! echo \"\$m\" | grep -Eq '$keep_re'; then echo \"[\$m] removing\"; ollama rm \"\$m\"; else echo \"[\$m] kept\"; fi; done"
+    local keep_words="" m
+    for m in "$@"; do keep_words+="${m}\\n"; done
+    echo "for m in \$(ollama list 2>/dev/null | awk 'NR>1 {print \$1}'); do if ! printf '$keep_words' | grep -Fqx \"\$m\"; then echo \"[\$m] removing\"; ollama rm \"\$m\"; else echo \"[\$m] kept\"; fi; done"
 }
 
 # run_on_hosts CMD_BUILDER HOST... — the builder receives the host and prints
@@ -205,6 +209,7 @@ case "$COMMAND" in
         run_on_hosts build ${HOSTS[@]+"${HOSTS[@]}"}
         ;;
     expose)
+        validate_keep_alive "$KEEP_ALIVE"
         build() { expose_cmd; }
         # `${arr[@]+"${arr[@]}"}`: an empty array is "unbound" under `set -u`
         # on the macOS bash 3.2 this runs from; the guard expands to nothing.

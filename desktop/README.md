@@ -38,10 +38,13 @@ which builds the Apple Silicon `.dmg` and attaches it (plus a `.sha256`) to
 a GitHub Release. Install is drag-to-Applications. The bundle is ad-hoc
 signed and not notarized, so the first launch of a downloaded copy needs a
 one-time right-click → Open (Gatekeeper quarantine). A `workflow_dispatch`
-run builds the same artifact without publishing a release.
+run builds the same artifact without publishing a release. Release tags must
+be strict `desktop-vMAJOR.MINOR.PATCH` values matching both version manifests;
+the workflow refuses mismatches instead of publishing a mislabeled bundle.
 
 ```bash
-git tag desktop-v0.1.1 && git push origin desktop-v0.1.1
+# First bump both tauri.conf.json and src-tauri/Cargo.toml to the same version.
+git tag desktop-v0.1.0 && git push origin desktop-v0.1.0
 ```
 
 ## Agents in panes
@@ -53,7 +56,7 @@ into a terminal pane with the filesystem access it needs already granted:
 |---|---|
 | `claude (repo)` | `claude --add-dir <results root>` in the Turing checkout. The agent can read and write `~/research-results` (the directory the metrics/images panes watch) without a per-file prompt. |
 | `claude (repo, continue last)` | Same, resuming the previous session. |
-| `claude (sandbox, no prompts)` | `claude --dangerously-skip-permissions` inside `~/turing-workspace` — a throwaway directory outside every checkout, the same parent `scripts/rsi-loop.sh` uses. No prompts at all, no access to your repos beyond what you paste in. |
+| `claude (scratch workspace)` | Claude inside `~/turing-workspace`, outside every checkout. This is organizational convenience, not an OS sandbox; normal permission prompts still apply. |
 | `codex (repo)` | Codex CLI in the checkout. |
 
 To stop the repo runner from asking before every `pytest` / `ruff` / `git

@@ -147,7 +147,7 @@ class TestPeerModelPool:
 
         result = await pool.complete([Message(role=Role.USER, content="hi")])
         assert result.content == "local"
-        assert pool.describe()["target"] == "local:no-peer-has-model"
+        assert pool.describe()["target"] == "local:no-healthy-peer-has-model"
 
     @pytest.mark.asyncio
     async def test_peer_failure_retries_locally_once(self) -> None:
@@ -164,6 +164,83 @@ class TestPeerModelPool:
         assert result.content == "local"
         remote.complete.assert_awaited_once()
         local.complete.assert_awaited_once()
+
+        # A live Turing heartbeat may keep advertising a dead Ollama. The
+        # next request must not pay that endpoint's timeout again.
+        await pool.complete([Message(role=Role.USER, content="again")])
+        remote.complete.assert_awaited_once()
+        assert local.complete.await_count == 2
+        assert pool.describe()["quarantined_hosts"] == ["http://host:11434"]
+
+    @pytest.mark.asyncio
+    async def test_peer_failure_tries_another_peer_before_local(self) -> None:
+        local = _provider("local")
+        local.list_models = AsyncMock(return_value=[])
+        dead = _provider("dead")
+        dead.complete = AsyncMock(side_effect=ConnectionError("down"))
+        healthy = _provider("healthy")
+        providers = {"http://a:11434": dead, "http://b:11434": healthy}
+        pool = PeerModelPool(local, model=MODEL, provider_factory=lambda host, _m: providers[host])
+        pool.attach_peers(
+            lambda: [
+                _peer("a", host="http://a:11434", load=0.1),
+                _peer("b", host="http://b:11434", load=0.2),
+            ]
+        )
+        await pool.refresh_local_models()
+
+        result = await pool.complete([Message(role=Role.USER, content="hi")])
+
+        assert result.content == "healthy"
+        dead.complete.assert_awaited_once()
+        healthy.complete.assert_awaited_once()
+        local.complete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stream_peer_failure_before_output_falls_back_local(self) -> None:
+        local = _provider("local")
+        local.list_models = AsyncMock(return_value=[])
+        remote = _provider("remote")
+
+        async def failed_stream(*_args: object, **_kwargs: object):
+            if False:
+                yield ""
+            raise ConnectionError("peer down")
+
+        async def local_stream(*_args: object, **_kwargs: object):
+            yield "local"
+
+        remote.stream = failed_stream
+        local.stream = local_stream
+        pool = PeerModelPool(local, model=MODEL, provider_factory=lambda _h, _m: remote)
+        pool.attach_peers(lambda: [_peer("a")])
+        await pool.refresh_local_models()
+
+        assert [part async for part in pool.stream([])] == ["local"]
+
+    @pytest.mark.asyncio
+    async def test_stream_failure_after_output_does_not_mix_models(self) -> None:
+        local = _provider("local")
+        local.list_models = AsyncMock(return_value=[])
+        remote = _provider("remote")
+
+        async def partial_stream(*_args: object, **_kwargs: object):
+            yield "peer"
+            raise ConnectionError("peer died mid-stream")
+
+        async def local_stream(*_args: object, **_kwargs: object):
+            yield "local"
+
+        remote.stream = partial_stream
+        local.stream = local_stream
+        pool = PeerModelPool(local, model=MODEL, provider_factory=lambda _h, _m: remote)
+        pool.attach_peers(lambda: [_peer("a")])
+        await pool.refresh_local_models()
+
+        stream = pool.stream([])
+        assert await anext(stream) == "peer"
+        with pytest.raises(ConnectionError):
+            await anext(stream)
 
     @pytest.mark.asyncio
     async def test_local_failure_propagates_for_the_router(self) -> None:

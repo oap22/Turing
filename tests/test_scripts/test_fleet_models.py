@@ -85,6 +85,18 @@ class TestValidation:
         assert res.returncode == 2
         assert "refusing host" in res.stderr
 
+    @pytest.mark.parametrize("bad", ["1h' | id; #", "forever", "$(id)", "1 h"])
+    def test_rejects_unsafe_keep_alive_values(self, bad: str) -> None:
+        res = run("expose", "--dry-run", "--keep-alive", bad, "jetson-1")
+        assert res.returncode == 2
+        assert "refusing keep-alive" in res.stderr
+
+    def test_model_matching_is_literal_not_regex(self) -> None:
+        pull = run("pull", "--dry-run", "--models", "qwen2.5:7b", "jetson-1")
+        prune = run("prune", "--dry-run", "--keep", "qwen2.5:7b", "jetson-1")
+        assert "grep -Fqx 'qwen2.5:7b'" in pull.stdout
+        assert 'grep -Fqx "$m"' in prune.stdout
+
     def test_prune_without_keep_refuses(self) -> None:
         res = run("prune", "--dry-run", "jetson-1")
         assert res.returncode == 2

@@ -20,8 +20,9 @@ Decision order for a request:
    local provider. A cold cache never sends traffic off-box.
 2. Otherwise pick the peer with the model whose advertised host is set and
    whose heartbeat is fresh, preferring the lowest 1-minute load per core.
-3. If the peer call fails, retry once locally (Ollama will pull-on-demand or
-   fail clearly), and let the router take it from there.
+3. If a peer call fails, quarantine that endpoint briefly and try another
+   eligible peer before falling back locally. The router still owns the final
+   local-to-cloud fallback.
 
 Nothing here pulls models. Placement is an operator decision made with
 ``scripts/fleet-models.sh``; this module only routes to where they already are.
@@ -29,6 +30,7 @@ Nothing here pulls models. Placement is an operator decision made with
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -42,6 +44,8 @@ if TYPE_CHECKING:
     from turing.mesh.node import PeerInfo
 
 logger = structlog.get_logger(__name__)
+
+PEER_FAILURE_BACKOFF = 60.0
 
 
 def peer_load(peer: PeerInfo) -> float:
@@ -57,14 +61,21 @@ def peer_load(peer: PeerInfo) -> float:
     return float(getattr(specs, "loadavg_1m", 0.0) or 0.0) / cores
 
 
-def select_peer(peers: Iterable[PeerInfo], model: str) -> PeerInfo | None:
+def select_peer(
+    peers: Iterable[PeerInfo], model: str, *, excluded_hosts: set[str] | None = None
+) -> PeerInfo | None:
     """Pick the freshest, least-loaded peer that advertises ``model``.
 
     Pure so it can be tested without a mesh. Peers with no advertised Ollama
     host are skipped — a host of ``http://localhost:11434`` would only ever
     point back at ourselves.
     """
-    candidates = [p for p in peers if p.ollama_host and model in p.models and not p.is_stale]
+    excluded = excluded_hosts or set()
+    candidates = [
+        p
+        for p in peers
+        if p.ollama_host and p.ollama_host not in excluded and model in p.models and not p.is_stale
+    ]
     if not candidates:
         return None
     return min(candidates, key=lambda p: (peer_load(p), p.name))
@@ -85,6 +96,9 @@ class PeerModelPool(LLMProvider):
         self._factory = provider_factory
         # host -> provider, so a peer's HTTP client is built once, not per turn.
         self._peer_providers: dict[str, LLMProvider] = {}
+        # Failed Ollama endpoints remain excluded even while their Turing
+        # heartbeat is live and still advertises the last known model list.
+        self._peer_failed_until: dict[str, float] = {}
         # None = not yet checked; treat as "have it" (never leave the box on a guess).
         self._local_has_model: bool | None = None
         self._peers_fn: Callable[[], Iterable[PeerInfo]] = lambda: ()
@@ -132,19 +146,38 @@ class PeerModelPool(LLMProvider):
 
     # ── selection ───────────────────────────────────────────────────────
 
-    def select(self) -> tuple[LLMProvider, str]:
-        """Return ``(provider, reason)`` for the next request."""
+    def _select_target(self) -> tuple[LLMProvider, str, str | None]:
         if self._local_has_model is not False:
-            return self._local, "local"
-        peer = select_peer(self._peers_fn(), self._model)
+            return self._local, "local", None
+        now = time.monotonic()
+        self._peer_failed_until = {
+            host: until for host, until in self._peer_failed_until.items() if until > now
+        }
+        peer = select_peer(
+            self._peers_fn(), self._model, excluded_hosts=set(self._peer_failed_until)
+        )
         if peer is None:
-            return self._local, "local:no-peer-has-model"
+            return self._local, "local:no-healthy-peer-has-model", None
         host = peer.ollama_host or ""
         provider = self._peer_providers.get(host)
         if provider is None:
             provider = self._factory(host, self._model)
             self._peer_providers[host] = provider
-        return provider, f"peer:{peer.name}"
+        return provider, f"peer:{peer.name}", host
+
+    def select(self) -> tuple[LLMProvider, str]:
+        """Return ``(provider, reason)`` for the next request."""
+        provider, reason, _host = self._select_target()
+        return provider, reason
+
+    def _quarantine(self, host: str, reason: str) -> None:
+        self._peer_failed_until[host] = time.monotonic() + PEER_FAILURE_BACKOFF
+        logger.warning(
+            "peer_pool.peer_quarantined",
+            target=reason,
+            seconds=PEER_FAILURE_BACKOFF,
+            exc_info=True,
+        )
 
     # ── LLMProvider ─────────────────────────────────────────────────────
 
@@ -156,31 +189,25 @@ class PeerModelPool(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
     ) -> LLMResponse:
-        provider, reason = self.select()
-        logger.info("peer_pool.route", model=self._model, target=reason)
-        try:
-            return await provider.complete(
-                messages=messages,
-                system=system,
-                tools=tools,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
-        except Exception:
-            if provider is self._local:
-                raise
-            # A peer that just died is the common case here; its heartbeat
-            # will lapse within a minute. Serve this turn locally rather
-            # than fail it, and let the router's own fallback chain handle a
-            # local failure on top.
-            logger.warning("peer_pool.peer_failed_retrying_local", target=reason, exc_info=True)
-            return await self._local.complete(
-                messages=messages,
-                system=system,
-                tools=tools,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
+        provider, reason, host = self._select_target()
+        while True:
+            logger.info("peer_pool.route", model=self._model, target=reason)
+            try:
+                return await provider.complete(
+                    messages=messages,
+                    system=system,
+                    tools=tools,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+            except Exception:
+                if provider is self._local:
+                    raise
+                assert host is not None
+                self._quarantine(host, reason)
+                provider, reason, host = self._select_target()
+                # Try another healthy peer if one exists; otherwise the
+                # selector returns local and the router sees any local error.
 
     async def stream(
         self,
@@ -189,15 +216,28 @@ class PeerModelPool(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
     ) -> AsyncIterator[str]:
-        provider, reason = self.select()
-        logger.info("peer_pool.route", model=self._model, target=reason, stream=True)
-        async for delta in provider.stream(
-            messages=messages,
-            system=system,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        ):
-            yield delta
+        provider, reason, host = self._select_target()
+        while True:
+            logger.info("peer_pool.route", model=self._model, target=reason, stream=True)
+            yielded = False
+            try:
+                async for delta in provider.stream(
+                    messages=messages,
+                    system=system,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                ):
+                    yielded = True
+                    yield delta
+                return
+            except Exception:
+                # Once any bytes reached the caller, switching models would
+                # splice two unrelated generations into one response.
+                if provider is self._local or yielded:
+                    raise
+                assert host is not None
+                self._quarantine(host, reason)
+                provider, reason, host = self._select_target()
 
     async def health_check(self) -> bool:
         return await self._local.health_check()
@@ -212,4 +252,5 @@ class PeerModelPool(LLMProvider):
             "local_has_model": self._local_has_model,
             "target": reason,
             "peer_hosts": sorted(self._peer_providers),
+            "quarantined_hosts": sorted(self._peer_failed_until),
         }

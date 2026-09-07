@@ -28,6 +28,11 @@ logger = structlog.get_logger("turing")
 _background_tasks: set[asyncio.Task[None]] = set()
 
 
+def _should_warm_local(routing_mode: str, warmup_enabled: bool) -> bool:
+    """Do not load a local model that cloud-only routing will never use."""
+    return warmup_enabled and routing_mode != "cloud"
+
+
 async def _run(config: TuringConfig) -> None:
     """Initialize all components and run the application."""
 
@@ -89,7 +94,7 @@ async def _run(config: TuringConfig) -> None:
         # turn is slower than the ones after it.
         if peer_pool is not None:
             await peer_pool.refresh_local_models()
-        if config.ollama_warmup:
+        if _should_warm_local(config.llm_routing_mode, config.ollama_warmup):
             await local_provider.warmup()
 
     warm_task = asyncio.create_task(_warm_local_tier(), name="ollama-warmup")
