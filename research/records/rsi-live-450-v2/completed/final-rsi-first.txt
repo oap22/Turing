@@ -1,0 +1,59 @@
+........................................................................ [ 18%]
+......................................................................F. [ 36%]
+......ss..............s................................................. [ 54%]
+........................................................................ [ 73%]
+........................................................................ [ 91%]
+.......................s.........                                        [100%]
+=================================== FAILURES ===================================
+_____________ TestClaudeCliEngine.test_timeout_kills_process_group _____________
+
+self = <tests.test_research.test_rsi.test_engine.TestClaudeCliEngine object at 0x10c2e2950>
+tmp_path = PosixPath('/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-205/test_timeout_kills_process_gro0')
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX")
+    async def test_timeout_kills_process_group(self, tmp_path: Path) -> None:
+        # The stand-in spawns a grandchild that would outlive a plain kill of
+        # the child; killing the group must take it down too.
+        fake = tmp_path / "claude"
+        fake.write_text(
+            "#!/bin/sh\n(sleep 30; echo late) &\necho $! > child.pid\nsleep 30\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        engine = ClaudeCliEngine(str(fake))
+        result = await engine.run("p", cwd=tmp_path, timeout_seconds=0.3)
+        assert result.timed_out
+        assert result.exit_code == 124
+        assert result.wall_seconds < 10
+    
+>       pid = int((tmp_path / "child.pid").read_text().strip())
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_research/test_rsi/test_engine.py:175: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/opt/homebrew/Cellar/python@3.11/3.11.14_2/Frameworks/Python.framework/Versions/3.11/lib/python3.11/pathlib.py:1058: in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = PosixPath('/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-205/test_timeout_kills_process_gro0/child.pid')
+mode = 'r', buffering = -1, encoding = 'locale', errors = None, newline = None
+
+    def open(self, mode='r', buffering=-1, encoding=None,
+             errors=None, newline=None):
+        """
+        Open the file pointed by this path and return a file object, as
+        the built-in open() function does.
+        """
+        if "b" not in mode:
+            encoding = io.text_encoding(encoding)
+>       return io.open(self, mode, buffering, encoding, errors, newline)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       FileNotFoundError: [Errno 2] No such file or directory: '/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-205/test_timeout_kills_process_gro0/child.pid'
+
+/opt/homebrew/Cellar/python@3.11/3.11.14_2/Frameworks/Python.framework/Versions/3.11/lib/python3.11/pathlib.py:1044: FileNotFoundError
+----------------------------- Captured stdout call -----------------------------
+2026-09-06 21:23:18 [warning  ] rsi.engine.timed_out           timeout=0.3 wall_seconds=0.3555240830173716
+=========================== short test summary info ============================
+FAILED tests/test_research/test_rsi/test_engine.py::TestClaudeCliEngine::test_timeout_kills_process_group
+1 failed, 388 passed, 4 skipped in 58.57s

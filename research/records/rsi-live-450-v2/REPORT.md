@@ -27,7 +27,7 @@ Three Luna xhigh specialists implemented and independently reviewed bounded area
 
 - **#451:** explicit Codex CLI engine, fixed Luna/xhigh settings, bounded subprocess output/time, owning-checkout Python source resolution, no silent engine fallback.
 - **#452/#456:** reconstruct pending self-edit judgments across invocation boundaries, retain the original judgment window, refuse unverifiable scaffold authority and refuse resume after a failed rollback.
-- **#453:** real RSI candidate snapshots trajectory bytes, detects mutation, quarantines changed evidence and restores trusted history before recording a void round. It covers engine writes and writes arriving during verification. Final review additionally reproduced a same-stat mutation during scaffold editing; that correction is tracked below.
+- **#453:** real RSI candidate snapshots trajectory bytes, detects mutation, quarantines changed evidence and restores trusted history before recording a void round. It covers engine writes and writes arriving during verification. Final review additionally reproduced a same-stat mutation during scaffold editing. The final guard rejects that proposal, restores trusted history, and also restores history when the proposal raises an exception after writing it.
 - **#454:** native engine/verifier setup, persisted parameters, exact verifier quoting, safe results-root shell substitution, and visible PTY startup/resize errors with caught cleanup failures.
 - **#455:** all-engine-failed invocations and failed rollbacks return nonzero status; normal no-op STOP resumes retain their separate execution semantics.
 
@@ -37,7 +37,7 @@ The launcher evaluates only newly completed rounds, requires the latest round to
 
 Computer use opened the test macOS bundle, created a dedicated RSI workstation, and launched `/tmp/r450` followed by corrective `/tmp/r450b` in its terminal. The terminal visibly showed the correct engine, source paths, caps and run start; process inspection confirmed the exact model argv. The completed result is established by the supervisor trajectory and process record.
 
-After the run, the app was quit and rebuilt from the isolated worktree. Computer use then created `RSI Codex verified 450`: empty verifier submission showed `verifier command is required`; selecting Codex displayed fixed Luna/xhigh/workspace-write; the saved terminal command contained `--engine codex` and the exact verifier. Reopening retained those settings. The command stays prefilled and requires Enter; no extra model run was started.
+After the run, the app was quit and rebuilt from the isolated worktree. Computer use then created `RSI Codex verified 450`: empty verifier submission showed `verifier command is required`; selecting Codex displayed fixed Luna/xhigh/workspace-write; the saved terminal command contained `--engine codex` and the exact verifier. Reopening retained those settings. The rebuilt flywheel pane selected `loop-rsi-turing-rsi-450-v2` and displayed the accepted round with score 1, exit 0 and void false. Its expanded view reported no `round.json`, so per-round detail navigation remains limited for this CLI record format. The command stays prefilled and requires Enter; no extra model run was started.
 
 The installed `/Applications/turing.app` was not replaced. The inspected test bundle is `desktop/src-tauri/target/release/bundle/macos/turing.app` in the primary repository's build cache. The runner's normal cwd still points to the saved primary checkout; live campaign commands explicitly selected the isolated branch because primary main has an unrelated unresolved merge.
 
@@ -50,3 +50,13 @@ Observed baseline terminal rendering sometimes required a focus/layout refresh, 
 The live run used `self-edit-every=0`. Proposal, judgment, rollback and resume are tested deterministically, but a controlled live candidate/incumbent scaffold evaluation (S03), noise-floor measurement and general-quality improvement remain unproven. This is also not a hardened hostile-process security boundary: the engine shares the user's account and the guard detects and restores evidence at defined phase boundaries.
 
 Review tier: **human review mandatory**, because the combined production diff exceeds 400 lines. No merge, release or installation is implied by local green checks. Hosted CI status is recorded in the draft PR.
+
+## Final review and broader checks
+
+The scaffold-proposal correction was independently attacked with a two-invocation probe: the offending edit is rejected, `self_edits=0`, incumbent best score remains 1, and resume contains only legitimate scores. Ordinary self-edits still work. Proposal exceptions restore trajectory history and preserve quarantine evidence before propagating the original error. The final trajectory regression file has eight passing tests.
+
+The broader Python run produced 3,644 passes, five skips and two socket-bind failures in 137.54 seconds. Both failing tests passed unchanged when rerun with loopback access (2 passed in 1.38 seconds); the sandbox was denying bind before the tested behavior. The dial-guard failure also reproduced on unchanged baseline. The gateway test skipped on the baseline because no generated SPA bundle existed there. Full mypy passes across 277 source files; Ruff lint/format checks cover all 562 Python source/test files.
+
+The first final RSI confirmation produced 388 passes, four skips and one failure in the unchanged 300 ms Claude timeout test: the process was killed before its `child.pid` file existed. The exact test passed on immediate isolated rerun without edits. Its execution code is unchanged from baseline. The first failure and rerun are retained, rather than erased or addressed by weakening the test. A quiet final confirmation is recorded below.
+
+Final confirmation on integrated source 7d409c9: **389 passed, 4 skipped in 55.31 seconds**. No code or test edits were made between the timeout-test failure and this passing confirmation. Human review and hosted CI remain release gates.
