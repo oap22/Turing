@@ -31,6 +31,68 @@ npm ci
 npm run dev     # = `tauri dev`; boots the webui Vite dev server, then the window
 ```
 
+## Download (no toolchain)
+
+Pushing a `desktop-v*` tag runs `.github/workflows/desktop-release.yml`,
+which builds the Apple Silicon `.dmg` and attaches it (plus a `.sha256`) to
+a GitHub Release. Install is drag-to-Applications. The bundle is ad-hoc
+signed and not notarized, so the first launch of a downloaded copy needs a
+one-time right-click → Open (Gatekeeper quarantine). A `workflow_dispatch`
+run builds the same artifact without publishing a release. Release tags must
+be strict `desktop-vMAJOR.MINOR.PATCH` values matching both version manifests;
+the workflow refuses mismatches instead of publishing a mislabeled bundle.
+
+```bash
+# First bump both tauri.conf.json and src-tauri/Cargo.toml to the same version.
+git tag desktop-v0.1.0 && git push origin desktop-v0.1.0
+```
+
+## Agents in panes
+
+The launcher (⌘P) has an **agents** group that opens a coding agent straight
+into a terminal pane with the filesystem access it needs already granted:
+
+| runner | what it does |
+|---|---|
+| `claude (repo)` | `claude --add-dir <results root>` in the Turing checkout. The agent can read and write `~/research-results` (the directory the metrics/images panes watch) without a per-file prompt. |
+| `claude (repo, continue last)` | Same, resuming the previous session. |
+| `claude (scratch workspace)` | Claude inside `~/turing-workspace`, outside every checkout. This is organizational convenience, not an OS sandbox; normal permission prompts still apply. |
+| `codex (repo)` | Codex CLI in the checkout. |
+
+To stop the repo runner from asking before every `pytest` / `ruff`, give the
+checkout a narrowly scoped project permission profile at
+`.claude/settings.json` (the directory is gitignored, so it stays yours).
+This is a convenience allowlist, not an OS sandbox. It permits reads and
+repeatable verification commands, while edits and repository mutations still
+remain outside the allowlist and are not pre-approved; the host can prompt or
+deny them according to its permission policy. A profile that covers the
+project's own tooling without pre-approving destructive actions looks like:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Read", "Glob", "Grep",
+      "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)",
+      "Bash(gh pr view:*)", "Bash(gh pr checks:*)",
+      "Bash(pytest:*)", "Bash(.venv/bin/pytest:*)", "Bash(ruff:*)", "Bash(mypy:*)",
+      "Bash(npm run:*)", "Bash(npm test:*)", "Bash(npx vitest:*)",
+      "Bash(cargo build:*)", "Bash(cargo test:*)", "Bash(cargo clippy:*)",
+      "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(grep:*)", "Bash(rg:*)"
+    ],
+    "deny": [
+      "Bash(git add:*)", "Bash(git commit:*)", "Bash(git checkout:*)",
+      "Bash(git switch:*)", "Bash(git push:*)", "Bash(git reset:*)",
+      "Bash(git clean:*)", "Bash(rm -rf:*)", "Bash(sudo:*)"
+    ]
+  }
+}
+```
+
+Terminal output from an agent is coalesced on the Rust side (`pty.rs`): a
+burst of small reads becomes a handful of IPC events per frame instead of
+one per line, which is what keeps a streaming transcript from stuttering.
+
 ## Updating the installed app
 
 **From inside the app:** press `u` on the home screen (⌘0). That runs

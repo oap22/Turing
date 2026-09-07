@@ -17,7 +17,7 @@ export interface Runner {
   label: string;
   command: string;
   cwd?: string;
-  group: "verify" | "research" | "remote" | "docs";
+  group: "verify" | "research" | "remote" | "docs" | "agents";
   autorun: boolean;
 }
 
@@ -57,7 +57,54 @@ export function substituteResultsRoot(command: string, root: string): string {
 // there is no Tauri runtime (tests, browser) or the command fails.
 const DEFAULT_RESULTS_ROOT = "~/research-results";
 
+// A scratch directory outside every checkout. This is convenience, not a
+// security boundary: the launched agent keeps its normal permission prompts.
+export const AGENT_SANDBOX = "~/turing-workspace";
+
 export const RUNNERS: readonly Runner[] = [
+  // ── agents ────────────────────────────────────────────────────────────
+  // Coding agents launched straight into a pane, with the filesystem access
+  // they actually need granted up front so the session does not stall on
+  // permission prompts. Inside the repo, a local `.claude/settings.json` can
+  // pre-approve the project's own build/test/lint commands and
+  // `--add-dir` lets the agent read and write the results root the metrics
+  // and images panes watch. Nothing here bypasses permission checks.
+  {
+    id: "claude",
+    label: "claude (repo)",
+    command: `claude --add-dir ${RESULTS_ROOT_TOKEN}`,
+    cwd: REPO,
+    group: "agents",
+    autorun: true,
+  },
+  {
+    id: "claude-continue",
+    label: "claude (repo, continue last)",
+    command: `claude --continue --add-dir ${RESULTS_ROOT_TOKEN}`,
+    cwd: REPO,
+    group: "agents",
+    autorun: true,
+  },
+  {
+    id: "claude-sandbox",
+    label: "claude (scratch workspace)",
+    // The scratch directory may not exist yet and `pty_spawn` refuses a
+    // missing cwd, so create it from a cwd that always exists. A cwd is not
+    // confinement; Claude still enforces its normal permission prompts.
+    command: `mkdir -p "$HOME/turing-workspace" && cd "$HOME/turing-workspace" && claude --add-dir ${RESULTS_ROOT_TOKEN}`,
+    cwd: "~",
+    group: "agents",
+    autorun: true,
+  },
+  {
+    id: "codex",
+    label: "codex (repo)",
+    command: "codex",
+    cwd: REPO,
+    group: "agents",
+    autorun: true,
+  },
+  // ── verify ────────────────────────────────────────────────────────────
   {
     id: "pytest",
     label: "pytest",
@@ -198,6 +245,16 @@ export async function resolveRunner(runner: Runner): Promise<Runner> {
     command: substituteResultsRoot(runner.command, root),
     cwd: runner.cwd?.split(RESULTS_ROOT_TOKEN).join(root),
   };
+}
+
+/** Quote untrusted configuration for the zsh command string. */
+export function shellQuote(value: string): string {
+  if (value === "~") return '"$HOME"';
+  if (value.startsWith("~/")) {
+    const suffix = value.slice(2).replace(/[\\"$`]/g, "\\$&");
+    return `"$HOME/${suffix}"`;
+  }
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
 /** Test seam: drops the cached lookup so a fresh config can be asserted. */

@@ -25,18 +25,22 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import threading
 import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from turing.llm.endpoints import validate_ollama_endpoint
 from turing.mesh.node import MeshNode, PeerInfo
 from turing.specs.collector import NodeSpecs, collect_specs
 from turing.transport.envelope import MeshMessage
 from turing.transport.signed_transport import SignedTransport, UntrustedSenderError
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from turing.coordinator.alerts.dispatcher import AlertDispatcher
 
 logger = structlog.get_logger("turing.mesh.presence")
@@ -58,7 +62,168 @@ DEFAULT_HEARTBEAT_MIN_INTERVAL = 1.0
 # envelopes (issue #348). v2 added the ``specs`` block (#215). Unsigned v1/v2
 # nodes are no longer interoperable — their frames fail envelope decoding and
 # are dropped (fail-closed; mixed fleets must upgrade together).
+# The ``models`` / ``ollama_host`` fields (peer model routing) are additive
+# and optional, so they ride v3 unchanged: a v3 node without them simply
+# advertises no models.
 SCHEMA_VERSION = 3
+
+# The pulled-model list changes when an operator runs `ollama pull`, not
+# every 10 s; re-asking Ollama on every heartbeat would be pointless load
+# on the node that can least afford it.
+MODEL_SAMPLE_INTERVAL = 60.0
+# Ollama's completion timeout is intentionally much longer than this probe:
+# discovering local models is optional presence metadata and must not hold
+# startup behind an unreachable Ollama endpoint.
+MODEL_SAMPLE_TIMEOUT = 2.0
+
+
+class ModelSamplerContractError(TypeError):
+    """Raised when a model sampler depends on the application's event loop."""
+
+
+_BACKGROUND_LOOP_SAFE = "__turing_background_loop_safe__"
+
+
+def background_loop_safe_model_sampler(
+    sampler: Callable[[], Awaitable[list[str]]],
+) -> Callable[[], Awaitable[list[str]]]:
+    """Mark a callback as safe to execute on a private event loop.
+
+    The caller owns this assertion. The callback must not await Futures or
+    Tasks created by the application's loop, and must not depend on mutable
+    async-client state shared with that loop. This explicit opt-in keeps
+    unsupported loop-affine callbacks from silently becoming empty metadata.
+    """
+    setattr(sampler, _BACKGROUND_LOOP_SAFE, True)
+    return sampler
+
+
+def _dedicated_ollama_sampler(
+    sampler: Callable[[], Awaitable[list[str]]],
+) -> Callable[[], Awaitable[list[str]]]:
+    """Adapt the production Ollama method to an isolated client.
+
+    ``OllamaProvider`` owns one async client for normal completions. Reusing
+    that client from the detached sampler would bind its connection pool to
+    the wrong event loop, so presence gives the model inventory probe a fresh
+    client that is created and closed inside the worker loop. Other callbacks
+    retain the explicit loop-independent contract and are run unchanged.
+    """
+    owner = getattr(sampler, "__self__", None)
+    owner_type = type(owner)
+    if (
+        owner is None
+        or owner_type.__module__ != "turing.llm.local"
+        or owner_type.__name__ != "OllamaProvider"
+    ):
+        return sampler
+    host = getattr(owner, "host", None)
+    if not isinstance(host, str):
+        return sampler
+    shared_client = getattr(owner, "_client", None)
+    shared_http_client = getattr(shared_client, "_client", None)
+    timeout = getattr(shared_http_client, "timeout", 120.0)
+
+    async def sample() -> list[str]:
+        import ollama
+
+        client = ollama.AsyncClient(host=host, timeout=timeout)
+        try:
+            result = await client.list()
+            raw = (
+                result.get("models", [])
+                if isinstance(result, dict)
+                else getattr(result, "models", [])
+            )
+            names: list[str] = []
+            for entry in raw or []:
+                name = (
+                    entry.get("model") or entry.get("name")
+                    if isinstance(entry, dict)
+                    else getattr(entry, "model", None) or getattr(entry, "name", None)
+                )
+                if name:
+                    names.append(str(name))
+            return names
+        finally:
+            await client.close()
+
+    setattr(sample, _BACKGROUND_LOOP_SAFE, True)
+    return sample
+
+
+class _DetachedModelSampler:
+    """Run an optional model probe outside the application's event loop.
+
+    A provider callback is arbitrary user/plugin code and may suppress task
+    cancellation forever. Running it on a daemon thread with its own event
+    loop means the presence heartbeat and ``asyncio.run`` teardown never wait
+    for that callback. Results and exceptions are captured as data and only a
+    thread-safe completion notification crosses back to the app loop. The
+    callback must therefore be independent of the application's event loop;
+    loop-affine Futures and Tasks are rejected explicitly.
+    """
+
+    def __init__(
+        self,
+        sampler: Callable[[], Awaitable[list[str]]],
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        self._sampler = sampler
+        self._loop = loop
+        self._completion = asyncio.Event()
+        self.result: list[str] | None = None
+        self.error: BaseException | None = None
+        self.ignored = False
+        self.completed = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="presence-model-sample",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    async def wait(self) -> None:
+        """Wait for completion notification on the owning event loop."""
+        await self._completion.wait()
+
+    def discard(self) -> None:
+        """Ignore this probe without trying to stop its arbitrary callback."""
+        self.ignored = True
+
+    async def _invoke(self) -> list[str]:
+        try:
+            sampled = await self._sampler()
+        except RuntimeError as exc:
+            if "different loop" in str(exc):
+                raise ModelSamplerContractError(
+                    "model sampler must not await a Future or Task owned by "
+                    "the application's event loop"
+                ) from exc
+            raise
+        if not isinstance(sampled, list) or not all(isinstance(model, str) for model in sampled):
+            raise ModelSamplerContractError("model sampler must return list[str]")
+        return sampled
+
+    def _notify_completion(self) -> None:
+        if not self._loop.is_closed():
+            self._completion.set()
+
+    def _run(self) -> None:
+        try:
+            self.result = asyncio.run(self._invoke())
+        except BaseException as exc:
+            # The sampler's exception is data for the presence cache. Never
+            # re-raise it on the daemon thread or create an unobserved task.
+            self.error = exc
+        finally:
+            self.completed = True
+            # The application loop may already be shutting down. The
+            # captured result/error remains safely owned by this handle.
+            with contextlib.suppress(RuntimeError):
+                self._loop.call_soon_threadsafe(self._notify_completion)
 
 
 class PresenceService:
@@ -89,6 +254,22 @@ class PresenceService:
         # Running count of frames the transport rejected (bad signature,
         # untrusted/unbound sender, replay, garbage bytes).
         self._rejected_count = 0
+        # Optional async sampler of this node's pulled models (the local
+        # Ollama provider's ``list_models``), cached between samples.
+        self._model_sampler: Callable[[], Awaitable[list[str]]] | None = None
+        self._models_sampled_at: float | None = None
+        # A timed-out sampler is deliberately left detached from the
+        # heartbeat task: third-party clients may suppress cancellation, and
+        # awaiting them would turn the optional metadata probe back into a
+        # startup/shutdown blocker. The handle's daemon runner also keeps
+        # asyncio.run teardown independent from that arbitrary callback.
+        self._model_sample: _DetachedModelSampler | None = None
+        # Keep one reference to a detached worker even after its result is no
+        # longer relevant. An unkillable callback must finish before another
+        # sampler can be installed, preventing replacement from accumulating
+        # resource-owning daemon threads.
+        self._active_model_sample: _DetachedModelSampler | None = None
+        self._model_sampler_generation = 0
 
     @property
     def is_running(self) -> bool:
@@ -107,6 +288,143 @@ class PresenceService:
         attached here rather than passed to ``__init__``.
         """
         self._alert_dispatcher = dispatcher
+
+    def set_model_sampler(self, sampler: Callable[[], Awaitable[list[str]]] | None) -> None:
+        """Late-bind a loop-independent pulled-model sampler.
+
+        The sampler runs on a private event loop, so it must not await a
+        Future or Task owned by the application's loop. Replacing a sampler
+        while its detached callback is still running is rejected: arbitrary
+        cancellation-resistant callbacks cannot be stopped safely, and
+        allowing replacement would accumulate live worker threads.
+        """
+        self._reap_active_model_sample()
+        if self._active_model_sample is not None:
+            raise RuntimeError(
+                "cannot replace model sampler while its detached callback is still active"
+            )
+        self._discard_model_sample()
+        adapted = _dedicated_ollama_sampler(sampler) if sampler is not None else None
+        if (
+            adapted is sampler
+            and sampler is not None
+            and not getattr(sampler, _BACKGROUND_LOOP_SAFE, False)
+        ):
+            raise ModelSamplerContractError(
+                "model sampler must opt in with background_loop_safe_model_sampler"
+            )
+        self._model_sampler = adapted
+        self._model_sampler_generation += 1
+        self._models_sampled_at = None
+
+    def _reap_active_model_sample(self) -> None:
+        handle = self._active_model_sample
+        if handle is not None and handle.completed:
+            self._active_model_sample = None
+
+    def _discard_model_sample(
+        self,
+        handle: _DetachedModelSampler | None = None,
+        generation: int | None = None,
+    ) -> None:
+        """Detach a probe without waiting for arbitrary sampler code."""
+        current = self._model_sample
+        if handle is not None and (
+            current is not handle or generation != self._model_sampler_generation
+        ):
+            return
+        self._model_sample = None
+        if current is not None:
+            current.discard()
+
+    async def _sample_self_models(self) -> list[str]:
+        """Refresh ``node.self_models`` at most every ``MODEL_SAMPLE_INTERVAL``.
+
+        A sampler failure keeps the last known list: a transient Ollama
+        hiccup must not make peers believe our models vanished.
+        """
+        if self._model_sampler is None:
+            return self._node.self_models
+        self._reap_active_model_sample()
+        generation = self._model_sampler_generation
+        now = time.monotonic()
+        if (
+            self._models_sampled_at is not None
+            and (now - self._models_sampled_at) < MODEL_SAMPLE_INTERVAL
+        ):
+            return self._node.self_models
+
+        # ``stop()`` detaches the current handle but retains an unfinished
+        # worker slot. A restart must not launch a second sampler while that
+        # cancellation-resistant callback is still alive.
+        if self._active_model_sample is not None:
+            self._models_sampled_at = now
+            return self._node.self_models
+
+        # A previous probe may still be running after its deadline. Never
+        # start a duplicate or await a cancellation-resistant sampler.
+        if self._model_sample is not None:
+            handle = self._model_sample
+            self._models_sampled_at = now
+            if handle.completed:
+                self._model_sample = None
+                self._active_model_sample = None
+                handle.discard()
+            return self._node.self_models
+
+        handle = _DetachedModelSampler(
+            self._model_sampler,
+            asyncio.get_running_loop(),
+        )
+        self._model_sample = handle
+        self._active_model_sample = handle
+        handle.start()
+        waiter = asyncio.create_task(handle.wait(), name="presence-model-sample-wait")
+        try:
+            done, _pending = await asyncio.wait({waiter}, timeout=MODEL_SAMPLE_TIMEOUT)
+        except BaseException:
+            # The heartbeat/start caller itself may be cancelled while the
+            # optional probe is waiting. The waiter is ordinary app-owned
+            # cancellation-safe code; the sampler remains outside this loop.
+            waiter.cancel()
+            with contextlib.suppress(BaseException):
+                await waiter
+            self._discard_model_sample(handle, generation)
+            raise
+        if not done:
+            waiter.cancel()
+            with contextlib.suppress(BaseException):
+                await waiter
+            if self._model_sample is handle and generation == self._model_sampler_generation:
+                handle.discard()
+                self._models_sampled_at = now
+            return self._node.self_models
+
+        if (
+            self._model_sample is not handle
+            or generation != self._model_sampler_generation
+            or handle.ignored
+        ):
+            return self._node.self_models
+        self._model_sample = None
+        self._active_model_sample = None
+        try:
+            if handle.error is not None:
+                raise handle.error
+            sampled = handle.result
+            if sampled is None:
+                raise RuntimeError("model sampler completed without a result")
+            self._node.self_models = sorted(set(sampled))
+        except ModelSamplerContractError as exc:
+            logger.error(
+                "presence_model_sampler_contract_violation",
+                error=str(exc),
+                exc_info=True,
+            )
+        except Exception:
+            logger.warning("presence_model_sample_failed", exc_info=True)
+        self._models_sampled_at = now
+        return self._node.self_models
 
     async def start(self) -> None:
         if self._running:
@@ -157,6 +475,7 @@ class PresenceService:
         await self._cancel_tasks()
 
     async def _cancel_tasks(self) -> None:
+        self._discard_model_sample()
         for task in (self._heartbeat_task, self._prune_task):
             if task is not None:
                 task.cancel()
@@ -230,6 +549,7 @@ class PresenceService:
         # Mirror self-specs onto the MeshNode so the gateway's ``/peers``
         # self-row reflects live values without a second sample.
         self._node.self_specs = specs
+        models = await self._sample_self_models()
         payload: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "node_id": self._node.node_id,
@@ -237,6 +557,8 @@ class PresenceService:
             "capabilities": self._node.capabilities,
             "ts_ms": int(time.time() * 1000),
             "specs": specs.to_dict() if specs is not None else None,
+            "models": models,
+            "ollama_host": self._node.ollama_host,
         }
         await self._transport.publish(self._envelope(HEARTBEAT_SUBJECT, payload))
 
@@ -300,11 +622,35 @@ class PresenceService:
                 parsed_specs = None
         else:
             parsed_specs = None
+        raw_models = msg.get("models")
+        models = (
+            [str(m) for m in raw_models if isinstance(m, str)]
+            if isinstance(raw_models, list)
+            else []
+        )
+        raw_host = msg.get("ollama_host")
+        ollama_host: str | None = None
+        if raw_host is not None:
+            try:
+                validated_host = validate_ollama_endpoint(raw_host, field="peer Ollama endpoint")
+            except ValueError:
+                logger.warning("presence_peer_endpoint_rejected", sender_id=sender_id)
+            else:
+                if validated_host in self._node.ollama_peer_allowlist:
+                    ollama_host = validated_host
+                else:
+                    logger.warning(
+                        "presence_peer_endpoint_not_allowlisted",
+                        sender_id=sender_id,
+                        host=validated_host,
+                    )
         peer = PeerInfo(
             node_id=sender_id,
             name=str(msg.get("node_name", sender_id)),
             capabilities=list(msg.get("capabilities", []) or []),
             specs=parsed_specs,
+            models=models,
+            ollama_host=ollama_host,
         )
         self._node.add_peer(peer)
         if self._alert_dispatcher is not None:

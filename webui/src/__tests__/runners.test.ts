@@ -9,6 +9,7 @@ import {
   resultsRoot,
   RUNNERS,
   substituteResultsRoot,
+  shellQuote,
 } from "../desktop/runners";
 
 describe("RUNNERS", () => {
@@ -27,9 +28,37 @@ describe("RUNNERS", () => {
     }
   });
 
-  it("uses every group present in the runner table (the spec's table has no 'research' entries, only verify/remote/docs)", () => {
+  it("uses every group present in the runner table (the spec's table has no 'research' entries, only agents/verify/remote/docs)", () => {
     const groups = new Set(RUNNERS.map((r) => r.group));
-    expect(groups).toEqual(new Set(["verify", "remote", "docs"]));
+    expect(groups).toEqual(new Set(["agents", "verify", "remote", "docs"]));
+  });
+
+  it("grants claude runners the results root without bypassing permission checks", () => {
+    for (const id of ["claude", "claude-continue", "claude-sandbox"]) {
+      const runner = RUNNERS.find((r) => r.id === id);
+      expect(runner, id).toBeDefined();
+      expect(runner?.command, id).toContain(`--add-dir ${RESULTS_ROOT_TOKEN}`);
+      expect(runner?.group, id).toBe("agents");
+    }
+    const scratch = RUNNERS.find((r) => r.id === "claude-sandbox")!;
+    expect(scratch.label).toContain("scratch workspace");
+    expect(scratch.command).toContain('cd "$HOME/turing-workspace" &&');
+    expect(scratch.cwd).not.toContain("Turing");
+    expect(RUNNERS.every((r) => !r.command.includes("--dangerously-skip-permissions"))).toBe(true);
+  });
+
+  it("substitutes the results root into the claude runners", async () => {
+    const runner = RUNNERS.find((r) => r.id === "claude")!;
+    const resolved = await resolveRunner(runner);
+    expect(resolved.command).not.toContain(RESULTS_ROOT_TOKEN);
+    expect(resolved.command).toContain("--add-dir ~/research-results");
+  });
+
+  it("shell-quotes configured paths before command execution", () => {
+    expect(shellQuote("/tmp/a $(touch pwned) ' quote")).toBe(
+      `'/tmp/a $(touch pwned) '"'"' quote'`,
+    );
+    expect(shellQuote("~/a $HOME `id`")).toBe('"$HOME/a \\$HOME \\`id\\`"');
   });
 
   // Both remote streamers carry placeholders, so they must be pre-typed for

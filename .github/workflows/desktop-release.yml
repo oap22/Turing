@@ -1,0 +1,113 @@
+name: Desktop release
+
+# Builds the macOS desktop app (Apple Silicon) as a .dmg and attaches it to a
+# GitHub Release, so installing on another Mac is "download, drag, right-click
+# → Open" instead of "clone the repo and build Rust". Triggered by pushing a
+# `desktop-v*` tag; `workflow_dispatch` builds the artifact without a release
+# for a trial run.
+#
+# Signing: the bundle is ad-hoc signed (`signingIdentity: "-"` in
+# tauri.conf.json), not notarized. Gatekeeper will quarantine the download
+# and ask for a one-time right-click → Open; that is documented in
+# desktop/README.md. Linux/Windows lanes live in ci.yml (PRs #410/#412).
+
+on:
+  push:
+    tags: ["desktop-v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    outputs:
+      dmg: ${{ steps.name.outputs.dmg }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            webui/package-lock.json
+            desktop/package-lock.json
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Install webui deps
+        working-directory: webui
+        run: npm ci --legacy-peer-deps
+
+      - name: Install desktop deps
+        working-directory: desktop
+        run: npm ci
+
+      - name: Validate release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tauri_version="$(node -p "require('./desktop/src-tauri/tauri.conf.json').version")"
+          cargo_version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' desktop/src-tauri/Cargo.toml | head -n1)"
+          test -n "$tauri_version" && test "$tauri_version" = "$cargo_version"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            [[ "$GITHUB_REF_NAME" =~ ^desktop-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]
+            test "${BASH_REMATCH[1]}" = "$tauri_version"
+          fi
+          echo "value=$tauri_version" >> "$GITHUB_OUTPUT"
+
+      - name: Build app + dmg
+        # `build` chains the webui build via tauri.conf.json's beforeBuildCommand.
+        working-directory: desktop
+        run: npm run build -- --bundles app,dmg
+
+      - name: Name the artifact
+        id: name
+        run: |
+          set -euo pipefail
+          dmg="$(ls desktop/src-tauri/target/release/bundle/dmg/*.dmg | head -n1)"
+          out="turing-v${{ steps.version.outputs.value }}-macos-arm64.dmg"
+          cp "$dmg" "$out"
+          shasum -a 256 "$out" > "$out.sha256"
+          echo "dmg=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.dmg }}
+          path: |
+            ${{ steps.name.outputs.dmg }}
+            ${{ steps.name.outputs.dmg }}.sha256
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/desktop-v')
+    needs: macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.macos.outputs.dmg }}
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DMG: ${{ needs.macos.outputs.dmg }}
+        run: gh release create "$GITHUB_REF_NAME" "$DMG" "$DMG.sha256" --verify-tag --generate-notes

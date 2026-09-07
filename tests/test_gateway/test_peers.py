@@ -92,6 +92,8 @@ class TestPeersIncludesSpecs:
                 name="pi-beta",
                 capabilities=["search"],
                 specs=_specs(model_name="Raspberry Pi 4", cpu_percent=20.5, temp_celsius=55.5),
+                models=["qwen2.5:7b"],
+                ollama_host="http://peer-pi:11434",
             )
         )
         # Mac peer: no temp.
@@ -157,6 +159,12 @@ class TestPeersIncludesSpecs:
         body = client.get("/peers").json()
         for p in body["peers"]:
             assert {"node_id", "node_name", "self", "capabilities", "last_seen"} <= p.keys()
+
+    def test_model_inventory_and_ollama_endpoint_are_not_public(self, client: TestClient) -> None:
+        body = client.get("/peers").json()
+        for peer in body["peers"]:
+            assert "models" not in peer
+            assert "ollama_host" not in peer
 
     def test_every_peer_carries_stale_boolean(self, client: TestClient) -> None:
         body = client.get("/peers").json()

@@ -30,6 +30,12 @@ class TestDefaults:
             cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.ollama_host == "http://localhost:11434"
 
+    def test_peer_allowlist_is_empty_by_default(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.ollama_peer_allowlist == []
+        assert cfg.ollama_advertise_host is None
+
     def test_default_ollama_model(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
             cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
@@ -253,6 +259,57 @@ class TestMeshSigningConfig:
         ):
             cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.mesh_trusted_keys == {"pi-alpha": "aa11", "pi-beta": "bb22"}
+
+
+class TestOllamaPeerEndpointAuthority:
+    """Signed presence advertises only endpoints explicitly authorized by config."""
+
+    def test_private_endpoint_is_allowed_when_exactly_allowlisted(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "TURING_OLLAMA_ADVERTISE_HOST": "http://192.168.1.20:11434",
+                "TURING_OLLAMA_PEER_ALLOWLIST": '["http://192.168.1.20:11434"]',
+            },
+            clear=True,
+        ):
+            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.ollama_advertise_host == "http://192.168.1.20:11434"
+        assert cfg.ollama_peer_allowlist == ["http://192.168.1.20:11434"]
+
+    def test_advertisement_must_be_exactly_allowlisted(self) -> None:
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "TURING_OLLAMA_ADVERTISE_HOST": "http://192.168.1.20:11434",
+                    "TURING_OLLAMA_PEER_ALLOWLIST": '["http://192.168.1.21:11434"]',
+                },
+                clear=True,
+            ),
+            pytest.raises(ValueError, match="must be included exactly"),
+        ):
+            TuringConfig(_env_file=None)  # type: ignore[call-arg]
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "http://user:password@peer:11434",
+            "http://peer:11434/api/tags",
+            "http://peer:11434?redirect=http://evil",
+            "file:///tmp/ollama",
+        ],
+    )
+    def test_allowlist_rejects_unsafe_endpoint_forms(self, bad: str) -> None:
+        with (
+            patch.dict(
+                "os.environ",
+                {"TURING_OLLAMA_PEER_ALLOWLIST": f'["{bad}"]'},
+                clear=True,
+            ),
+            pytest.raises(ValueError),
+        ):
+            TuringConfig(_env_file=None)  # type: ignore[call-arg]
 
 
 class TestOperatorNtfyTopic:

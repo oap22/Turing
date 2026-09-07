@@ -4,14 +4,16 @@
 // pane below renders the *same* component the browser tab UI uses, just fed
 // from `surface` instead of App's own hooks.
 
-import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useReducer, useRef, useState } from "react";
 import type { ChatSession, QueueItem } from "../ws";
 import type { GraphState } from "../graph/types";
 import type { PeerSpecsRow } from "../specs/types";
 import type { TraceEvent } from "../trace/types";
 import QueuePane from "../queue/QueuePane";
 import ChatPane from "../chat/ChatPane";
-import ObservabilityView from "../ObservabilityView";
+// Lazy for the same reason as in App.tsx: reactflow is the heaviest
+// dependency in the tree and `obs` is launcher-only.
+const ObservabilityView = lazy(() => import("../ObservabilityView"));
 import { WS_STATUS_LABEL, type WsStatus } from "../App";
 import Cheatsheet from "./Cheatsheet";
 import Launcher from "./Launcher";
@@ -394,13 +396,15 @@ function PaneBody({
       return <ChatPane sessions={surface.chat.sessions} />;
     case "obs":
       return (
-        <ObservabilityView
-          graphState={surface.obs.graphState}
-          highlightedEdge={surface.obs.highlightedEdge}
-          specsRows={surface.obs.specsRows}
-          liveTrace={surface.obs.liveTrace}
-          onTraceSelect={surface.obs.onTraceSelect}
-        />
+        <Suspense fallback={null}>
+          <ObservabilityView
+            graphState={surface.obs.graphState}
+            highlightedEdge={surface.obs.highlightedEdge}
+            specsRows={surface.obs.specsRows}
+            liveTrace={surface.obs.liveTrace}
+            onTraceSelect={surface.obs.onTraceSelect}
+          />
+        </Suspense>
       );
     case "metrics":
       return <MetricsPane />;

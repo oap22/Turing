@@ -140,7 +140,9 @@ def create_app(
         keeps fresh (ADR-0008). Includes this node as the first entry so
         the operator UI graph can render the full mesh without a second
         request. Public so the fleet health check can hit it without
-        threading the bearer token through curl.
+        threading the bearer token through curl. Deliberately omits the
+        internal model inventory and Ollama endpoint fields: those are
+        routing authority and network details, not public peer metadata.
         """
         self_specs = getattr(mesh_node, "self_specs", None) if mesh_node else None
         result: list[dict] = [

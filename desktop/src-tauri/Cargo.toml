@@ -31,3 +31,15 @@ http = "1"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Release profile tuned for the shipped bundle: whole-program LTO and a single
+# codegen unit let the optimiser see across tauri/wry/tokio, `strip` drops the
+# symbol table (roughly halves the binary), and `panic = "abort"` removes the
+# unwinding tables nothing here catches. Build time goes up; startup, binary
+# size and download size go down.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

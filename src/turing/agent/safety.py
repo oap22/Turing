@@ -120,10 +120,16 @@ class SafetyGate:
                     risk_level="high",
                 )
 
-        # Step 2: Process tool deny for kill/manage actions.
+        # Step 2: Process tool deny for kill/manage actions. The operator
+        # auto-approve flag applies here as well as in step 4, so it is one
+        # switch and not a half-switch that still stalls process management.
         if tool_name == "process":
             action = arguments.get("action", "")
-            if action in ("kill_process", "manage_service") and not self._is_admin(user_id):
+            if (
+                action in ("kill_process", "manage_service")
+                and not self._is_admin(user_id)
+                and not self._auto_approve_high_risk(user_id)
+            ):
                 return SafetyCheckResult(
                     decision=SafetyDecision.NEEDS_CONFIRMATION,
                     reason=f"Action '{action}' requires admin confirmation",
@@ -140,6 +146,12 @@ class SafetyGate:
                 return SafetyCheckResult(
                     decision=SafetyDecision.APPROVED,
                     reason="Approved: user is admin",
+                    risk_level=risk_level,
+                )
+            if self._auto_approve_high_risk(user_id):
+                return SafetyCheckResult(
+                    decision=SafetyDecision.APPROVED,
+                    reason="Approved: safety_auto_approve_high_risk operator authority",
                     risk_level=risk_level,
                 )
             return SafetyCheckResult(
@@ -192,6 +204,24 @@ class SafetyGate:
 
         # Default: treat unknown tools as high risk.
         return "high"
+
+    def _auto_approve_high_risk(self, user_id: str) -> bool:
+        """Authorize the convenience flag only for an explicit operator.
+
+        The flag is not an authentication mechanism.  It is useful on a
+        single-operator node only when the caller is either in the configured
+        admin list or matches the separately configured operator identity.
+        Reached only *after* the deny-list and the admin check, so a denied
+        command stays denied whatever this flag says.
+        """
+        # `is True`, not truthiness: tests hand this gate a MagicMock config,
+        # and an auto-created attribute must read as "off", never "on".
+        if getattr(self.config, "safety_auto_approve_high_risk", False) is not True:
+            return False
+        if self._is_admin(user_id):
+            return True
+        operator_id = getattr(self.config, "safety_single_operator_user_id", None)
+        return isinstance(operator_id, str) and bool(operator_id) and user_id == operator_id
 
     def _is_admin(self, user_id: str) -> bool:
         """Check whether the user is an admin.
