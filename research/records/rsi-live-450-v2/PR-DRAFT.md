@@ -15,7 +15,7 @@ The first live attempt is preserved as invalid verifier evidence: pytest importe
 
 This establishes a specific code repair, not causal scaffold self-improvement. Live scaffold editing was disabled; proposal/judgment/rollback/resume correctness is tested deterministically. The installed app and unrelated unresolved merge in the primary checkout were left intact.
 
-Review tier: **human review mandatory** (production diff exceeds 400 lines). Draft pending human review and hosted CI; no release or merge implied.
+Review tier: **human review mandatory** (production diff exceeds 400 lines). The human owner explicitly authorized publication and merge after a fresh Luna xhigh review/fix cycle is clean. That fresh review and hosted CI are in progress; enforced repository requirements will be honored.
 
 Closes #450
 Closes #451

@@ -1,6 +1,6 @@
 # Turing RSI live application test (#450)
 
-Status: native live correction accepted; implementation and local verification complete; PR draft prepared locally; publication awaiting explicit authorization.
+Status: native live correction accepted; implementation and local verification complete; publication and conditional merge authorized; fresh adversarial review and hosted CI underway.
 
 User authorization: run Turing with computer use, thoroughly test its RSI workflow, and use GPT-5.6 Luna at xhigh to implement app improvements; user additionally confirmed Codex support.
 

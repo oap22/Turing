@@ -64,3 +64,7 @@ Final confirmation on integrated source 7d409c9: **389 passed, 4 skipped in 55.3
 ## Publication status
 
 Implementation and evidence are committed on `oap22/450-rsi-live-test`. Automatic approval review rejected the combined commit/push because publication of code and experiment records to GitHub lacked explicit user authorization. The local commit was then completed separately. No push or PR was created. `PR-DRAFT.md` is the prepared description; publication requires user approval. The main checkout and installed app remain untouched.
+
+## Authorized publication and fresh review
+
+The owner subsequently explicitly authorized publication, another Luna xhigh adversarial review/fix cycle, and merge through the PR after that review is clean. This supersedes the publication blocker above. Three fresh reviewers cover trajectory/scaffold authority, Codex/CLI boundaries, and native desktop configuration separately. Hosted CI and enforced repository requirements still apply; no administrator bypass is authorized.
