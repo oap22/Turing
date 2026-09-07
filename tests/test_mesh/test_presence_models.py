@@ -195,6 +195,101 @@ class TestModelAdvertisement:
             await pres_a.stop()
             await pres_b.stop()
 
+    async def test_cancellation_resistant_sampler_cannot_block_stop_or_publish_late_data(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Detached probes suppress late results and exceptions safely."""
+        fleet = _Fleet(["a", "b"])
+        node_a = _node("a", "jetson-1", advertise="http://jetson-1:11434")
+        node_b = _node("b", "jetson-2", allowed_hosts=["http://jetson-1:11434"])
+        pres_a = _presence(node_a, fleet)
+        pres_b = _presence(node_b, fleet)
+        monkeypatch.setattr("turing.mesh.presence.MODEL_SAMPLE_TIMEOUT", 0.01)
+        sampler_started = asyncio.Event()
+        sampler_cancelled = asyncio.Event()
+
+        async def cancellation_resistant_sampler() -> list[str]:
+            sampler_started.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                sampler_cancelled.set()
+                await asyncio.sleep(0.05)
+                raise RuntimeError("late sampler failure") from None
+            return ["late-model"]
+
+        pres_a.set_model_sampler(cancellation_resistant_sampler)
+        await pres_b.start()
+        try:
+            await asyncio.wait_for(pres_a.start(), timeout=0.2)
+            await sampler_started.wait()
+            sample_task = pres_a._model_sample_task
+            assert sample_task is not None and not sample_task.done()
+            peer = node_b.get_peer("a")
+            assert peer is not None
+            assert peer.models == []
+
+            # A late result cannot replace a cached model list after timeout.
+            node_a.self_models = ["previous-model"]
+            pres_a._models_sampled_at = None
+            await asyncio.wait_for(pres_a._publish_heartbeat(), timeout=0.2)
+            peer = node_b.get_peer("a")
+            assert peer is not None
+            assert peer.models == ["previous-model"]
+
+            # stop() detaches without waiting for cancellation-resistant code.
+            started = time.monotonic()
+            await asyncio.wait_for(pres_a.stop(), timeout=0.2)
+            assert time.monotonic() - started < 0.2
+            await sampler_cancelled.wait()
+            with pytest.raises(RuntimeError, match="late sampler failure"):
+                await asyncio.shield(sample_task)
+            assert node_a.self_models == ["previous-model"]
+        finally:
+            await pres_b.stop()
+
+    async def test_cancellation_resistant_late_result_is_ignored(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A detached successful probe cannot overwrite cached publication."""
+        fleet = _Fleet(["a", "b"])
+        node_a = _node("a", "jetson-1", advertise="http://jetson-1:11434")
+        node_b = _node("b", "jetson-2", allowed_hosts=["http://jetson-1:11434"])
+        pres_a = _presence(node_a, fleet)
+        pres_b = _presence(node_b, fleet)
+        monkeypatch.setattr("turing.mesh.presence.MODEL_SAMPLE_TIMEOUT", 0.01)
+
+        async def late_sampler() -> list[str]:
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.05)
+                return ["late-model"]
+            return ["late-model"]
+
+        pres_a.set_model_sampler(late_sampler)
+        await pres_b.start()
+        try:
+            await pres_a.start()
+            sample_task = pres_a._model_sample_task
+            assert sample_task is not None and not sample_task.done()
+            node_a.self_models = ["previous-model"]
+            pres_a._models_sampled_at = None
+            await asyncio.wait_for(pres_a._publish_heartbeat(), timeout=0.2)
+            peer = node_b.get_peer("a")
+            assert peer is not None
+            assert peer.models == ["previous-model"]
+
+            started = time.monotonic()
+            await asyncio.wait_for(pres_a.stop(), timeout=0.2)
+            assert time.monotonic() - started < 0.2
+            assert await asyncio.wait_for(asyncio.shield(sample_task), timeout=0.2) == [
+                "late-model"
+            ]
+            assert node_a.self_models == ["previous-model"]
+        finally:
+            await pres_b.stop()
+
     async def test_no_sampler_means_empty_models(self) -> None:
         fleet = _Fleet(["a"])
         pres_a = _presence(_node("a", "jetson-1"), fleet)
