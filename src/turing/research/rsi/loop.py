@@ -77,11 +77,10 @@ What this module guarantees:
   line, whatever the agent wrote to metrics/NOTES/SCAFFOLD.
 * Rollback is judged across invocations: a pending self-edit is rebuilt
   from the trajectory (``self_edit`` without a later ``rollback`` /
-  ``self_edit_kept`` / ``rollback_failed`` for its SHA) on resume. The
-  rollback itself does not depend on a clean index (it restores the parent's
-  ``SCAFFOLD.md`` and commits only that path); if it still fails the loop
-  stops (``rollback_failed``) rather than continuing under an edit the rule
-  said to discard.
+  ``self_edit_kept`` for its SHA) on resume. The rollback itself does not
+  depend on a clean index (it restores the parent's ``SCAFFOLD.md`` and
+  commits only that path); if it fails, a persisted ``rollback_failed`` is a
+  terminal refusal rather than permission to continue under the edit.
 
 What it does not do:
 
@@ -1348,7 +1347,14 @@ class RsiLoop:
                 else:
                     pending_window = raw_window
                     pending_window_source = "recorded"
-            elif event.event in {"rollback", "rollback_failed", "self_edit_kept"}:
+            elif event.event == "rollback_failed":
+                judged = event.details.get("reverted") or event.details.get("scaffold_sha")
+                if judged is not None and str(judged) == pending_sha:
+                    raise ContractViolationError(
+                        f"pending self-edit {pending_sha[:12]} has a persisted rollback_failed; "
+                        "refusing to resume under an edit the prior run could not undo"
+                    )
+            elif event.event in {"rollback", "self_edit_kept"}:
                 judged = event.details.get("reverted") or event.details.get("scaffold_sha")
                 if judged is not None and str(judged) == pending_sha:
                     pending_sha = None

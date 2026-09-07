@@ -8,9 +8,9 @@ import pytest
 
 from turing.research.contracts import ContractViolationError
 from turing.research.rsi.engine import FakeEngine
-from turing.research.rsi.loop import DEFAULT_SCAFFOLD, SCAFFOLD_FILENAME
+from turing.research.rsi.loop import DEFAULT_SCAFFOLD, SCAFFOLD_FILENAME, StopReason
 
-from .test_loop import StubSelfEdit, _config, _events, _loop, run_git, score_step
+from .test_loop import StubSelfEdit, _config, _events, _git, _loop, run_git, score_step
 
 
 async def test_pending_window_survives_schedule_changes_and_disabled_proposals(rsi_dirs) -> None:
@@ -137,3 +137,42 @@ async def test_pending_edit_blob_mismatch_refuses_resume(rsi_dirs) -> None:
             verifier=None,
         ).run()
     assert "scaffold" in str(exc_info.value)
+
+
+async def test_persisted_rollback_failure_refuses_resume(rsi_dirs) -> None:
+    results = rsi_dirs.results
+
+    def agent_commit(cwd):
+        (cwd / "junk.txt").write_text("agent commit\n")
+        _git(cwd, "add", "junk.txt")
+        _git(cwd, "commit", "-q", "-m", "agent junk")
+
+    first = await _loop(
+        rsi_dirs,
+        FakeEngine(script=[score_step(5, results=results, extra=agent_commit)]),
+        config=_config(rsi_dirs, rounds=1),
+    ).run()
+    assert first.rounds_run == 1
+    bogus = (await run_git(rsi_dirs.sandbox, "rev-parse", "HEAD", check=True)).stdout.strip()
+    with (results / "trajectory.json").open("a", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps({"event": "self_edit", "round": 1, "ts": 1, "scaffold_sha": bogus}) + "\n"
+        )
+
+    failed = await _loop(
+        rsi_dirs,
+        FakeEngine(script=[score_step(0, results=results)]),
+        config=_config(rsi_dirs, rounds=1, self_edit_every=1, self_edit_budget=0),
+        verifier=None,
+    ).run()
+    assert failed.stop_reason is StopReason.ROLLBACK_FAILED
+    assert any(event["event"] == "rollback_failed" for event in _events(results))
+
+    with pytest.raises(ContractViolationError, match="persisted rollback_failed"):
+        await _loop(
+            rsi_dirs,
+            FakeEngine(script=[score_step(0, results=results)]),
+            config=_config(rsi_dirs, rounds=1, self_edit_every=0, self_edit_budget=0),
+            self_edit=None,
+            verifier=None,
+        ).run()
