@@ -16,9 +16,11 @@ from turing.agent.executor import Executor
 from turing.agent.safety import SafetyDecision, SafetyGate
 from turing.agent_mailbox import Mailbox
 from turing.config import TuringConfig
-from turing.llm.base import LLMProvider, LLMResponse, ToolCall
+from turing.llm.base import LLMProvider, LLMResponse, Message, Role, ToolCall
+from turing.llm.pool import PeerModelPool
 from turing.llm.router import LLMRouter
 from turing.memory.retriever import RetrievalResult
+from turing.mesh.node import PeerInfo
 from turing.tools.agent_mailbox import AgentMailboxTool, register_agent_mailbox_tool
 from turing.tools.base import ToolRegistry, ToolResult
 
@@ -148,6 +150,56 @@ async def test_startup_registration_is_optional_and_binds_configured_identity(
     assert tool._mailbox.workflow == "workflow-1"
     assert tool._mailbox.agent == "turing-local"
     assert tool._mailbox.registered_provider == "turing"
+
+
+@pytest.mark.asyncio
+async def test_registered_mailbox_tool_survives_peer_pool_local_routing(
+    config: TuringConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The mailbox tool remains attached when local routing selects a peer."""
+    fake_module = types.ModuleType("turing.agent_mailbox")
+    fake_module.Mailbox = FakeMailbox  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "turing.agent_mailbox", fake_module)
+    config.ollama_tools_enabled = True
+
+    registry = ToolRegistry()
+    mailbox_tool = await register_agent_mailbox_tool(registry, config)
+    assert mailbox_tool is not None
+    definitions = registry.get_definitions()
+    assert [definition.name for definition in definitions] == ["agent_mailbox"]
+
+    cloud = AsyncMock(spec=LLMProvider)
+    local = AsyncMock(spec=LLMProvider)
+    local.list_models = AsyncMock(return_value=[])
+    peer = AsyncMock(spec=LLMProvider)
+    peer.complete = AsyncMock(return_value=LLMResponse(content="peer response", model="qwen"))
+    pool = PeerModelPool(
+        local,
+        model="qwen2.5:7b",
+        provider_factory=lambda _host, _model: peer,
+        allowed_peer_hosts=["http://peer:11434"],
+    )
+    pool.attach_peers(
+        lambda: [
+            PeerInfo(
+                node_id="peer-node",
+                name="peer",
+                models=["qwen2.5:7b"],
+                ollama_host="http://peer:11434",
+            )
+        ]
+    )
+
+    router = LLMRouter(cloud, pool, routing_mode="local_only", local_tools_enabled=True)
+    result = await router.route(
+        [Message(role=Role.USER, content="send a note to peer")], tools=definitions
+    )
+
+    assert result.content == "peer response"
+    peer.complete.assert_awaited_once()
+    assert peer.complete.call_args.kwargs["tools"] == definitions
+    local.complete.assert_not_awaited()
 
 
 @pytest.mark.asyncio

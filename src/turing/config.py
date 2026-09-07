@@ -327,6 +327,7 @@ class TuringConfig(BaseSettings):
         if self.agent_mailbox_db is not None:
             self.agent_mailbox_db = self.agent_mailbox_db.expanduser().resolve()
             self.agent_mailbox_db.parent.mkdir(parents=True, exist_ok=True)
+        return self
 
     @model_validator(mode="after")
     def _validate_ollama_peer_authority(self) -> TuringConfig:
