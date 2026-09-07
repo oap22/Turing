@@ -71,6 +71,7 @@ logger = structlog.get_logger(__name__)
 __all__ = [
     "STDOUT_TAIL_CHARS",
     "VERIFIER_TIMEOUT_EXIT",
+    "canonical_verifier_files",
     "load_verifier_lock",
     "run_verifier",
     "sandbox_file_tokens",
@@ -134,6 +135,40 @@ def sandbox_file_tokens(command: str, sandbox: Path) -> list[str]:
     return named
 
 
+def canonical_verifier_files(
+    spec: VerifierSpec, sandbox: Path, *, locked_files: set[str] | tuple[str, ...] = ()
+) -> frozenset[str]:
+    """Return the effective canonical pin set for a verifier specification.
+
+    The command's first token is auto-pinned only when it names a regular file
+    inside the sandbox. On resume, ``locked_files`` preserves that fact when
+    the file was deleted before the comparison; the subsequent lock check can
+    then report tampering instead of misreporting a pin-set mismatch.
+    """
+    files = {Path(rel).as_posix() for rel in spec.files}
+    first = None
+    try:
+        tokens = shlex.split(spec.command)
+    except ValueError:
+        tokens = []
+    if tokens:
+        candidate = Path(tokens[0])
+        if not candidate.is_absolute() and ".." not in candidate.parts:
+            full = sandbox / candidate
+            if full.is_file():
+                try:
+                    full.resolve().relative_to(sandbox.resolve())
+                except ValueError:
+                    pass
+                else:
+                    first = candidate.as_posix()
+            elif candidate.as_posix() in {Path(rel).as_posix() for rel in locked_files}:
+                first = candidate.as_posix()
+    if first is not None:
+        files.add(first)
+    return frozenset(files)
+
+
 def write_or_load_verifier(
     spec: VerifierSpec | None, sandbox: Path, *, now_ms: int | None = None
 ) -> tuple[VerifierLock, VerifierSpec]:
@@ -160,7 +195,11 @@ def write_or_load_verifier(
         check_verifier_lock(
             existing, sandbox, expected_command=None if spec is None else spec.command
         )
-        if spec is not None and set(spec.files) - set(existing.file_sha256s):
+        locked_files = {Path(rel).as_posix() for rel in existing.file_sha256s}
+        if (
+            spec is not None
+            and canonical_verifier_files(spec, sandbox, locked_files=locked_files) != locked_files
+        ):
             raise FrozenVerifierError(
                 "--verifier files differ from the locked verifier's pinned files in "
                 f"{VERIFIER_LOCK_FILENAME}; the lock wins and a different pin set is refused"

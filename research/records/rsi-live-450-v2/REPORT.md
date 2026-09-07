@@ -15,6 +15,10 @@ The native Turing terminal launched a real Codex Luna xhigh round that repaired 
 
 The corrected attempt took 440.672 seconds (7.34 minutes), estimated 12 minutes. Model settings were `gpt-5.6-luna`, `xhigh`, `workspace-write`; no fallback to Claude. The native shell resolved Codex 0.153.0 through `~/.npm-global/bin/codex`. Subscription dollar usage and provider seed were unavailable. Engine source was clean commit 1cc5b07; candidate source was committed at b8d6720 with an empty source diff. `log_run.py check` passes after the verification section was completed.
 
+## Launcher provenance hardening
+
+The completed v2 run was launched with launcher code from engine source commit `1cc5b07`, before the seed and clean-start guards and before/after source identity fields added in this follow-up. The actual candidate seed `1e623e8` was manually verified at launch, and the preserved source commits and candidate patch remain part of the completed evidence. Existing completed metrics, evaluator files, trajectory, and source artifacts are historical evidence and are not rewritten. Future launcher invocations now refuse a different or dirty candidate source seed before starting Codex and record source identities before and after the run. These guards do not retroactively alter the completed run evidence.
+
 ## The failed first attempt
 
 The first attempt ran for 1086 seconds (18.10 minutes). Round 1 exhausted its 600-second engine cap. Round 2 was interrupted after the lead found a verifier configuration mistake: pytest's baseline pyproject `pythonpath` overrode the candidate PYTHONPATH. The verifier failures from that attempt are **invalid evidence about the patch**. The run and partial patch remain preserved under `../rsi-live-450/` and `~/research-results/2026-09-06-turing-rsi-450-live/`; it is not reported as success.

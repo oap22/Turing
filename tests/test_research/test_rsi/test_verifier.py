@@ -194,6 +194,31 @@ class TestWriteOrLoadVerifier:
                 VerifierSpec(command="cat a.txt", files=("a.txt", "b.txt")), sandbox
             )
 
+    def test_resume_with_omitted_pinned_file_is_refused(self, sandbox: Path) -> None:
+        (sandbox / "a.txt").write_text("a")
+        (sandbox / "b.txt").write_text("b")
+        write_or_load_verifier(
+            VerifierSpec(command="echo score=1", files=("a.txt", "b.txt")),
+            sandbox,
+            now_ms=5,
+        )
+        with pytest.raises(FrozenVerifierError, match="pinned files"):
+            write_or_load_verifier(VerifierSpec(command="echo score=1", files=("a.txt",)), sandbox)
+
+    def test_resume_keeps_auto_first_token_pin_when_explicit_files_are_subset(
+        self, sandbox: Path
+    ) -> None:
+        (sandbox / "verify.sh").write_text("echo score=1\n")
+        (sandbox / "a.txt").write_text("a")
+        written, _ = write_or_load_verifier(
+            VerifierSpec(command="./verify.sh", files=("a.txt",)), sandbox, now_ms=5
+        )
+        loaded, _ = write_or_load_verifier(
+            VerifierSpec(command="./verify.sh", files=("a.txt",)), sandbox
+        )
+        assert set(written.file_sha256s) == {"a.txt", "verify.sh"}
+        assert loaded == written
+
     def test_resume_with_changed_pinned_file_is_refused(self, sandbox: Path) -> None:
         (sandbox / "verify.sh").write_text("echo score=1\n")
         write_or_load_verifier(

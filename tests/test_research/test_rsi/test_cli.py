@@ -353,6 +353,32 @@ class TestResumeVerifier:
         assert code == EXIT_USAGE
         assert "--verifier-file differs from the locked verifier" in capsys.readouterr().out
 
+    def test_omitted_verifier_file_on_resume_refused(
+        self, rsi_dirs: RsiDirs, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv(ALLOW_FAKE_ENGINE_ENV, "1")
+        (rsi_dirs.sandbox / "PROBLEM.md").write_text("goal\n")
+        (rsi_dirs.sandbox / "a.txt").write_text("a\n")
+        (rsi_dirs.sandbox / "b.txt").write_text("b\n")
+        write_or_load_verifier(
+            VerifierSpec(command="echo score=1", files=("a.txt", "b.txt")),
+            rsi_dirs.sandbox,
+            now_ms=1,
+        )
+        code = main(
+            _argv(
+                rsi_dirs,
+                "--engine",
+                "fake",
+                "--verifier",
+                "echo score=1",
+                "--verifier-file",
+                "a.txt",
+            )
+        )
+        assert code == EXIT_USAGE
+        assert "--verifier-file differs from the locked verifier" in capsys.readouterr().out
+
     def test_tampered_pinned_file_exits_stopped(
         self, rsi_dirs: RsiDirs, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:

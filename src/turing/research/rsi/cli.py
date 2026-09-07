@@ -99,7 +99,11 @@ from turing.research.rsi.taxonomy import (
     TAXONOMY_FILENAME,
     TAXONOMY_VERSION,
 )
-from turing.research.rsi.verifier import load_verifier_lock, sandbox_file_tokens
+from turing.research.rsi.verifier import (
+    canonical_verifier_files,
+    load_verifier_lock,
+    sandbox_file_tokens,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -420,7 +424,9 @@ def _plan_existing_lock(
             f"--verifier differs from the locked verifier in {sandbox / VERIFIER_LOCK_FILENAME}; "
             "the lock wins. Resume without --verifier, or start a new slug for a new verifier."
         )
-    if spec is not None and set(spec.files) - set(pinned):
+    if spec is not None and canonical_verifier_files(
+        spec, sandbox, locked_files=set(pinned)
+    ) != set(pinned):
         refusals.append(
             "--verifier-file differs from the locked verifier's pinned files in "
             f"{VERIFIER_LOCK_FILENAME}; the lock wins and a different pin set is refused"
