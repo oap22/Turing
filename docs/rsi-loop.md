@@ -7,7 +7,7 @@ codes mean.
 
 - **Code:** `src/turing/research/rsi/` (entry point `python -m turing.research.rsi`).
 - **Bash predecessor and bridge:** `scripts/rsi-loop.sh` — the desktop still
-  types this script into a terminal pane; with `--verifier`, with
+  types this script into a terminal pane; with `--engine`, `--verifier`, with
   `TURING_RSI_ENGINE=python`, or on a slug whose sandbox already holds
   `VERIFIER.json`, it hands off to the Python engine.
 - **Decision record:** `docs/adr/0011-autonomous-research-agent-retarget.md`
@@ -38,10 +38,25 @@ Each **round** the loop builds a prompt — `SCAFFOLD.md` verbatim, then the
 round text the bash script always used (do one focused iteration, append one
 `metrics.jsonl` line, save plots, update `NOTES.md`, commit, create `STOP` if
 done), then the verifier command the round will be graded by, with the explicit
-statement that **the loop measures the score, not the agent** — runs
-`claude -p <prompt> --permission-mode bypassPermissions --output-format text`
-in the sandbox with a wall-clock cap, then runs the verifier, then runs the
-cheat detector, then appends one line to `trajectory.json`.
+statement that **the loop measures the score, not the agent** — runs the
+selected CLI in the sandbox with a wall-clock cap, then runs the verifier, then
+runs the cheat detector, then appends one line to `trajectory.json`.
+
+### Engines
+
+The default engine is Claude, preserving the original Python and bash behavior:
+`claude -p <prompt> --permission-mode bypassPermissions --output-format text`.
+Pass `--engine codex` to use the fixed Codex campaign engine. It invokes the
+installed `codex exec` executable with `-m gpt-5.6-luna`,
+`-c 'model_reasoning_effort="xhigh"'`, and `--sandbox workspace-write`, using
+the round sandbox as its working directory. The Python CLI adds only the
+configured results directory with `--add-dir`, so Codex can append the watched
+results while its workspace-write policy remains in force. Dry-run prints that
+path. The process uses the same bounded output capture, hard timeout,
+process-group cleanup, and cancellation cleanup as the Claude engine. If
+`codex` cannot be started or exits unsuccessfully, the round records an engine
+failure; it never falls back to Claude or another model. `--engine fake` remains
+restricted to dry runs and explicitly enabled demos.
 
 Running as **root** (an agent container, not a Mac), the CLI refuses
 `bypassPermissions` outright and the round ends as `engine_error` in under a
@@ -273,9 +288,23 @@ scripts/rsi-loop.sh --slug sort-bench --results-root ~/turing-results \
   --problem '…' --verifier 'python grade.py' --verifier-file grade.py
 ```
 
+To run a round with the fixed Codex engine, select it explicitly:
+
+```bash
+scripts/rsi-loop.sh --slug sort-bench --results-root ~/turing-results \
+  --workspace-root ~/turing-workspace --engine codex \
+  --problem '…' --verifier 'python grade.py' --verifier-file grade.py
+```
+
+The script forwards `--engine`, `--workspace-root`,
+`--round-timeout-seconds`, and `--verifier-timeout-seconds` to the Python
+engine. It prepends the script's owning checkout to `PYTHONPATH` even when
+`TURING_RSI_PYTHON` points at a shared or external interpreter, so the bridge
+cannot accidentally load another Turing checkout.
+
 The script switches from its original bash loop to the Python engine when
-`--verifier` is given, when `TURING_RSI_ENGINE=python` is set, **or when the
-slug's sandbox already holds `VERIFIER.json`** — so the desktop's own argv
+`--engine` or `--verifier` is given, when `TURING_RSI_ENGINE=python` is set,
+**or when the slug's sandbox already holds `VERIFIER.json`** — so the desktop's own argv
 (`--slug`, `--results-root`, `--rounds`, `--problem`, no `--verifier`) resumes
 a locked slug on the Python engine instead of silently dropping back to the
 unverified bash loop. On a slug that has never been locked and with none of

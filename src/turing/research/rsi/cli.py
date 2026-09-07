@@ -40,6 +40,9 @@ What this module guarantees:
 * ``--engine fake`` is refused unless ``--dry-run`` or the environment
   variable ``TURING_RSI_ALLOW_FAKE_ENGINE=1`` is set, so a demo engine can
   never be picked by accident for a real run.
+* ``--engine codex`` selects the fixed ``gpt-5.6-luna`` / ``xhigh`` Codex
+  configuration with the ``workspace-write`` sandbox. A missing Codex CLI is
+  reported as an engine failure; it never falls back to Claude.
 * Exit codes: 0 normal completion, 2 usage / pre-flight refusal, 3 the loop
   stopped on a cheat or tamper (:data:`EXIT_STOPPED`), 130 interrupted by
   Ctrl-C (:data:`EXIT_INTERRUPTED`; no trajectory line is written for the
@@ -257,10 +260,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--engine",
-        choices=("claude", "fake"),
+        choices=("claude", "codex", "fake"),
         default="claude",
         help=(
-            "which engine runs a round; 'fake' is for --dry-run and demos only and is refused "
+            "which engine runs a round; 'codex' uses the fixed gpt-5.6-luna/xhigh "
+            "workspace-write configuration; 'fake' is for --dry-run and demos only and is refused "
             f"otherwise unless {ALLOW_FAKE_ENGINE_ENV}=1"
         ),
     )
@@ -467,7 +471,7 @@ class Plan:
             f"rounds: {rounds}",
             f"start round: {start}",
             f"resuming: {'yes' if self.resuming else 'no'}",
-            f"engine: {self.engine}",
+            f"engine: {_engine_display(self.engine, results_dir=cfg.results_dir)}",
             f"verifier lock: {self.verifier_status}",
             f"taxonomy: version {TAXONOMY_VERSION}, digest {TAXONOMY_DIGEST}, "
             f"{TAXONOMY_FILENAME} {self.taxonomy_status}",
@@ -583,17 +587,37 @@ def resolve_plan(
 # --------------------------------------------------------------------------- #
 
 
-def _build_engine(name: str) -> Engine:
+def _build_engine(name: str, *, results_dir: Path | None = None) -> Engine:
     if name == "claude":
         from turing.research.rsi.engine import ClaudeCliEngine
 
         return ClaudeCliEngine()
+    if name == "codex":
+        from turing.research.rsi.engine import CodexCliEngine
+
+        add_dirs = () if results_dir is None else (results_dir,)
+        return CodexCliEngine(add_dirs=add_dirs)
     if name == "fake":
         from turing.research.rsi.engine import FakeEngine, ok_result
 
         # A demo engine that "does nothing" every round; the verifier still grades it.
         return FakeEngine(default=ok_result())
     raise ContractViolationError(f"unknown engine {name!r}")
+
+
+def _engine_display(name: str, *, results_dir: Path | None = None) -> str:
+    """Render the selected engine and any fixed runtime identity for dry-run."""
+    if name != "codex":
+        return name
+    from turing.research.rsi.engine import CODEX_MODEL, CODEX_REASONING_EFFORT, CODEX_SANDBOX
+
+    add_dir = ""
+    if results_dir is not None:
+        add_dir = f", add_dir={results_dir}"
+    return (
+        f"codex (model={CODEX_MODEL}, reasoning_effort={CODEX_REASONING_EFFORT}, "
+        f"sandbox={CODEX_SANDBOX}{add_dir})"
+    )
 
 
 async def _run(
@@ -603,7 +627,7 @@ async def _run(
     from turing.research.rsi.loop import RsiLoop
     from turing.research.rsi.scaffold import ScaffoldSelfEditStep
 
-    engine = _build_engine(engine_name)
+    engine = _build_engine(engine_name, results_dir=config.results_dir)
     self_edit = (
         ScaffoldSelfEditStep(engine, config, config.sandbox_dir)
         if config.self_edit_every > 0 and config.self_edit_budget > 0
