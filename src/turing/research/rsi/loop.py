@@ -768,7 +768,71 @@ class RsiLoop:
                 append_jsonl(self.trajectory_path, record.to_json_line())
                 stop = StopReason.VERIFIER_TAMPERED
                 break
+
+            # The agent must not be able to add, replace, or delete the
+            # supervisor-owned history before reconciliation appends its own
+            # scaffold event.  Metrics remain agent-owned and are still read
+            # below as normal.
+            trajectory_tamper = self.cheat.trajectory_change(
+                self.results, snapshot, trajectory=self.trajectory_path
+            )
+            if trajectory_tamper is not None:
+                had_metrics, agent_score, report_problem = self._agent_metrics(
+                    round_no, metrics_before
+                )
+                verdict = await self.cheat.verdict_after(
+                    sandbox=self.sandbox,
+                    results=self.results,
+                    snapshot=snapshot,
+                    lock=lock,
+                    measured=None,
+                    agent_reported_score=agent_score,
+                    lock_sha256=self.lock_sha256,
+                    self_report_problem=report_problem,
+                )
+                evidence = self.cheat.quarantine_trajectory(
+                    self.results, snapshot, round_no, trajectory=self.trajectory_path
+                )
+                self._append_event(
+                    "trajectory_tampered",
+                    round_no,
+                    {"detail": trajectory_tamper, "evidence": evidence, "after": "engine"},
+                )
+                categories = classify_round(
+                    engine_exit=result.exit_code,
+                    timed_out=result.timed_out,
+                    verifier=None,
+                    previous_score=previous_score,
+                    best_score=best_score,
+                    had_metrics_line=had_metrics,
+                    cheat=verdict,
+                    prior_pass=prior_pass,
+                )
+                record = RoundRecord(
+                    round=round_no,
+                    started=started,
+                    ended=max(ended, int(self.clock()), started),
+                    exit=result.exit_code,
+                    categories=categories,
+                    scaffold_sha=scaffold_sha,
+                    void=verdict.fired,
+                    agent_reported_score=agent_score,
+                )
+                records.append(record)
+                append_jsonl(self.trajectory_path, record.to_json_line())
+                rounds_run += 1
+                stop = (
+                    StopReason.VERIFIER_TAMPERED
+                    if FailureCategory.VERIFIER_TAMPERED in verdict.categories
+                    else StopReason.CHEAT_DETECTED
+                )
+                break
+
             await self._reconcile_scaffold(round_no, when="after_engine")
+            # ``_reconcile_scaffold`` may append a supervisor event.  Make that
+            # expected append part of the baseline before the detector checks
+            # the agent's result-directory writes.
+            snapshot = self.cheat.refresh_trajectory(snapshot, trajectory=self.trajectory_path)
 
             outcome: VerifierOutcome | None = await run_verifier(
                 spec, self.sandbox, cfg.verifier_timeout_seconds
@@ -784,6 +848,23 @@ class RsiLoop:
                 lock_sha256=self.lock_sha256,
                 self_report_problem=report_problem,
             )
+            # ``verdict_after`` observes supervisor-owned trajectory tampering,
+            # but its verdict must not leave forged history in place.  Restore
+            # the snapshot taken after the loop's own scaffold reconciliation
+            # before appending the void record, so resume can only trust the
+            # quarantined pre-round history.
+            trajectory_tamper = self.cheat.trajectory_change(
+                self.results, snapshot, trajectory=self.trajectory_path
+            )
+            if trajectory_tamper is not None:
+                evidence = self.cheat.quarantine_trajectory(
+                    self.results, snapshot, round_no, trajectory=self.trajectory_path
+                )
+                self._append_event(
+                    "trajectory_tampered",
+                    round_no,
+                    {"detail": trajectory_tamper, "evidence": evidence, "after": "verifier"},
+                )
             categories = classify_round(
                 engine_exit=result.exit_code,
                 timed_out=result.timed_out,
