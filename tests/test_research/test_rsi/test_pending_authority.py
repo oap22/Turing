@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
 
 from turing.research.contracts import ContractViolationError
+from turing.research.rsi import cli
+from turing.research.rsi.cli import ALLOW_FAKE_ENGINE_ENV, EXIT_ENGINE_FAILURE
 from turing.research.rsi.engine import FakeEngine
 from turing.research.rsi.loop import DEFAULT_SCAFFOLD, SCAFFOLD_FILENAME, StopReason
 
@@ -166,6 +169,7 @@ async def test_persisted_rollback_failure_refuses_resume(rsi_dirs) -> None:
         verifier=None,
     ).run()
     assert failed.stop_reason is StopReason.ROLLBACK_FAILED
+    assert failed.exit_code == EXIT_ENGINE_FAILURE
     assert any(event["event"] == "rollback_failed" for event in _events(results))
 
     with pytest.raises(ContractViolationError, match="persisted rollback_failed"):
@@ -176,3 +180,57 @@ async def test_persisted_rollback_failure_refuses_resume(rsi_dirs) -> None:
             self_edit=None,
             verifier=None,
         ).run()
+
+
+def test_exported_cli_returns_failure_on_rollback_failed(rsi_dirs, monkeypatch) -> None:
+    results = rsi_dirs.results
+
+    def agent_commit(cwd):
+        (cwd / "junk.txt").write_text("agent commit\n")
+        _git(cwd, "add", "junk.txt")
+        _git(cwd, "commit", "-q", "-m", "agent junk")
+
+    async def seed() -> None:
+        first = await _loop(
+            rsi_dirs,
+            FakeEngine(script=[score_step(5, results=results, extra=agent_commit)]),
+            config=_config(rsi_dirs, rounds=1, self_edit_every=0),
+        ).run()
+        assert first.rounds_run == 1
+
+    asyncio.run(seed())
+    bogus = _git(rsi_dirs.sandbox, "rev-parse", "HEAD")
+    with (results / "trajectory.json").open("a", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps({"event": "self_edit", "round": 1, "ts": 1, "scaffold_sha": bogus})
+            + "\n"
+        )
+
+    monkeypatch.setenv(ALLOW_FAKE_ENGINE_ENV, "1")
+    monkeypatch.setattr(
+        cli,
+        "_build_engine",
+        lambda _name, *, results_dir=None: FakeEngine(
+            script=[score_step(0, results=results)]
+        ),
+    )
+    code = cli.main(
+        [
+            "--slug",
+            rsi_dirs.config.slug,
+            "--results-root",
+            str(rsi_dirs.config.results_root),
+            "--workspace-root",
+            str(rsi_dirs.config.workspace_root),
+            "--engine",
+            "fake",
+            "--rounds",
+            "1",
+            "--self-edit-every",
+            "1",
+            "--self-edit-budget",
+            "0",
+        ]
+    )
+
+    assert code == EXIT_ENGINE_FAILURE

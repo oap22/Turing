@@ -237,6 +237,10 @@ class LoopOutcome:
     def exit_code(self) -> int:
         if self.stop_reason in (StopReason.VERIFIER_TAMPERED, StopReason.CHEAT_DETECTED):
             return EXIT_CHEAT
+        if self.stop_reason is StopReason.ROLLBACK_FAILED:
+            # Continuing under an edit the loop failed to undo is a terminal
+            # invocation failure, even when the round's engine succeeded.
+            return EXIT_ENGINE_FAILURE
         if self.rounds_run > 0 and self.engine_failures >= self.rounds_run:
             return EXIT_ENGINE_FAILURE
         return EXIT_OK
