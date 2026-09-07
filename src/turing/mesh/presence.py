@@ -70,6 +70,10 @@ SCHEMA_VERSION = 3
 # every 10 s; re-asking Ollama on every heartbeat would be pointless load
 # on the node that can least afford it.
 MODEL_SAMPLE_INTERVAL = 60.0
+# Ollama's completion timeout is intentionally much longer than this probe:
+# discovering local models is optional presence metadata and must not hold
+# startup behind an unreachable Ollama endpoint.
+MODEL_SAMPLE_TIMEOUT = 2.0
 
 
 class PresenceService:
@@ -143,7 +147,8 @@ class PresenceService:
         ):
             return self._node.self_models
         try:
-            self._node.self_models = sorted(set(await self._model_sampler()))
+            sampled = await asyncio.wait_for(self._model_sampler(), MODEL_SAMPLE_TIMEOUT)
+            self._node.self_models = sorted(set(sampled))
         except Exception:
             logger.warning("presence_model_sample_failed", exc_info=True)
         self._models_sampled_at = now

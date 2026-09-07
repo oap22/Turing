@@ -350,6 +350,12 @@ class TestPeerModelPool:
         assert await anext(stream) == "peer"
         with pytest.raises(ConnectionError):
             await anext(stream)
+        assert pool.describe()["quarantined_hosts"] == [HOST]
+
+        # The failed endpoint stays quarantined even though the stream had
+        # already yielded output, so the next request cannot reselect it.
+        assert [part async for part in pool.stream([])] == ["local"]
+        assert pool.describe()["target"] == "local:no-healthy-peer-has-model"
 
     @pytest.mark.asyncio
     async def test_local_failure_propagates_for_the_router(self) -> None:

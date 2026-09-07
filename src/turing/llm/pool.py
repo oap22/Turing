@@ -294,10 +294,12 @@ class PeerModelPool(LLMProvider):
             except Exception:
                 # Once any bytes reached the caller, switching models would
                 # splice two unrelated generations into one response.
-                if provider is self._local or yielded:
+                if provider is self._local:
                     raise
                 assert host is not None
                 self._quarantine(host, reason)
+                if yielded:
+                    raise
                 provider, reason, host = self._select_target()
 
     async def health_check(self) -> bool:

@@ -157,6 +157,44 @@ class TestModelAdvertisement:
         sampler.side_effect = ConnectionError("ollama restarting")
         assert await pres_a._sample_self_models() == ["gemma3:1b"]
 
+    async def test_slow_sampler_does_not_block_start_and_publishes_last_known_models(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Presence startup bounds optional Ollama discovery and keeps metadata safe."""
+        fleet = _Fleet(["a", "b"])
+        node_a = _node("a", "jetson-1", advertise="http://jetson-1:11434")
+        node_b = _node("b", "jetson-2", allowed_hosts=["http://jetson-1:11434"])
+        pres_a = _presence(node_a, fleet)
+        pres_b = _presence(node_b, fleet)
+        monkeypatch.setattr("turing.mesh.presence.MODEL_SAMPLE_TIMEOUT", 0.01)
+
+        async def slow_failing_sampler() -> list[str]:
+            await asyncio.sleep(10)
+            raise ConnectionError("ollama unreachable")
+
+        pres_a.set_model_sampler(slow_failing_sampler)
+        await pres_b.start()
+        await asyncio.wait_for(pres_a.start(), timeout=0.2)
+        try:
+            # The timed-out optional probe publishes a safe empty list rather
+            # than delaying the real heartbeat/startup path.
+            peer = node_b.get_peer("a")
+            assert peer is not None
+            assert peer.models == []
+            assert node_a.self_models == []
+
+            # Once a model list exists, the same timeout/failure preserves it
+            # in the next heartbeat instead of advertising a false empty list.
+            node_a.self_models = ["qwen2.5:7b"]
+            pres_a._models_sampled_at = None
+            await pres_a._publish_heartbeat()
+            peer = node_b.get_peer("a")
+            assert peer is not None
+            assert peer.models == ["qwen2.5:7b"]
+        finally:
+            await pres_a.stop()
+            await pres_b.stop()
+
     async def test_no_sampler_means_empty_models(self) -> None:
         fleet = _Fleet(["a"])
         pres_a = _presence(_node("a", "jetson-1"), fleet)
