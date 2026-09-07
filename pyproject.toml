@@ -41,7 +41,7 @@ dev = [
     "pytest-timeout>=2.4.0",
     "ruff",
     "mypy",
-    "alembic>=1.18.4",
+    "alembic>=1.19.1",
     "types-psutil",
     "types-PyYAML",
     "testcontainers>=4.15.0",
