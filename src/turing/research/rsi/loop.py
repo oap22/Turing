@@ -117,7 +117,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import structlog
 
 from turing.research.contracts import ContractViolationError, FrozenVerifierError
-from turing.research.rsi.cheat import CheatDetector, lock_file_mismatch, run_git
+from turing.research.rsi.cheat import CheatDetector, CheatSnapshot, lock_file_mismatch, run_git
 from turing.research.rsi.contracts import (
     VERIFIER_LOCK_FILENAME,
     VERIFIER_LOCK_MARKER,
@@ -976,19 +976,9 @@ class RsiLoop:
             else:
                 consecutive_failures = 0
 
-            # Judge a pending edit from its accumulated evidence, which can span
-            # invocations. Proposal timing remains on the existing invocation
-            # schedule so a restart does not create an extra edit as a side effect
-            # of catching up on a completed judgment window.
-            if pending is not None and len(pending.rounds_after) >= pending.judgment_window:
-                judged = await self._judge_pending(pending, round_no)
-                if judged == "failed":
-                    stop = StopReason.ROLLBACK_FAILED
-                    break
-                if judged == "rolled_back":
-                    rollbacks += 1
-                pending = None
-
+            # Proposal timing remains on the existing invocation schedule so a
+            # restart does not create an extra edit as a side effect of catching
+            # up on a completed judgment window.
             if (
                 cfg.self_edit_every
                 and rounds_run % cfg.self_edit_every == 0
@@ -1259,7 +1249,7 @@ class RsiLoop:
     async def _cleanup_cancelled_self_edit(
         self,
         before: _TreeState,
-        results_before: Any,
+        results_before: CheatSnapshot,
         round_no: int,
         lock: VerifierLock,
     ) -> None:
