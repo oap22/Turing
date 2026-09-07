@@ -167,6 +167,73 @@ class TestModelAdvertisement:
         sampler.side_effect = ConnectionError("ollama restarting")
         assert await pres_a._sample_self_models() == ["gemma3:1b"]
 
+    async def test_loop_affine_sampler_fails_clearly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A sampler awaiting an app-loop Future is rejected, not silently accepted."""
+        fleet = _Fleet(["a"])
+        node_a = _node("a", "jetson-1")
+        pres_a = _presence(node_a, fleet)
+        app_loop = asyncio.get_running_loop()
+        app_future = app_loop.create_future()
+        contract_errors: list[tuple[str, dict[str, Any]]] = []
+
+        async def loop_affine_sampler() -> list[str]:
+            await app_future
+            return ["never-advertised"]
+
+        monkeypatch.setattr(
+            "turing.mesh.presence.logger.error",
+            lambda event, **fields: contract_errors.append((event, fields)),
+        )
+        pres_a.set_model_sampler(loop_affine_sampler)
+        assert await pres_a._sample_self_models() == []
+        assert contract_errors
+        event, fields = contract_errors[0]
+        assert event == "presence_model_sampler_contract_violation"
+        assert "application's event loop" in str(fields)
+        assert pres_a._active_model_sample is None
+
+    async def test_sampler_replacement_is_rejected_while_detached_worker_lives(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unkillable old sampler cannot be replaced by another live worker."""
+        fleet = _Fleet(["a"])
+        pres_a = _presence(_node("a", "jetson-1"), fleet)
+        monkeypatch.setattr("turing.mesh.presence.MODEL_SAMPLE_TIMEOUT", 0.01)
+        sampler_started = threading.Event()
+        sampler_release = threading.Event()
+        sampler_finished = threading.Event()
+
+        async def cancellation_resistant_sampler() -> list[str]:
+            sampler_started.set()
+            while not sampler_release.is_set():
+                await asyncio.sleep(0.005)
+            sampler_finished.set()
+            return ["late-model"]
+
+        pres_a.set_model_sampler(cancellation_resistant_sampler)
+        try:
+            assert await pres_a._sample_self_models() == []
+            await _wait_for_thread_event(sampler_started)
+            handle = pres_a._active_model_sample
+            assert handle is not None and not handle.completed
+            with pytest.raises(RuntimeError, match="still active"):
+                pres_a.set_model_sampler(AsyncMock(return_value=["replacement"]))
+
+            sampler_release.set()
+            await _wait_for_thread_event(sampler_finished)
+            for _ in range(100):
+                if handle.completed:
+                    break
+                await asyncio.sleep(0.005)
+            assert handle.completed
+            pres_a.set_model_sampler(AsyncMock(return_value=["replacement"]))
+            assert await pres_a._sample_self_models() == ["replacement"]
+        finally:
+            sampler_release.set()
+            await _wait_for_thread_event(sampler_finished)
+            if pres_a.is_running:
+                await pres_a.stop()
+
     async def test_slow_sampler_does_not_block_start_and_publishes_last_known_models(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

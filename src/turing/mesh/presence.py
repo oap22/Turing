@@ -77,6 +77,10 @@ MODEL_SAMPLE_INTERVAL = 60.0
 MODEL_SAMPLE_TIMEOUT = 2.0
 
 
+class ModelSamplerContractError(TypeError):
+    """Raised when a model sampler depends on the application's event loop."""
+
+
 class _DetachedModelSampler:
     """Run an optional model probe outside the application's event loop.
 
@@ -84,7 +88,9 @@ class _DetachedModelSampler:
     cancellation forever. Running it on a daemon thread with its own event
     loop means the presence heartbeat and ``asyncio.run`` teardown never wait
     for that callback. Results and exceptions are captured as data and only a
-    thread-safe completion notification crosses back to the app loop.
+    thread-safe completion notification crosses back to the app loop. The
+    callback must therefore be independent of the application's event loop;
+    loop-affine Futures and Tasks are rejected explicitly.
     """
 
     def __init__(
@@ -117,7 +123,18 @@ class _DetachedModelSampler:
         self.ignored = True
 
     async def _invoke(self) -> list[str]:
-        return await self._sampler()
+        try:
+            sampled = await self._sampler()
+        except RuntimeError as exc:
+            if "different loop" in str(exc):
+                raise ModelSamplerContractError(
+                    "model sampler must not await a Future or Task owned by "
+                    "the application's event loop"
+                ) from exc
+            raise
+        if not isinstance(sampled, list) or not all(isinstance(model, str) for model in sampled):
+            raise ModelSamplerContractError("model sampler must return list[str]")
+        return sampled
 
     def _notify_completion(self) -> None:
         if not self._loop.is_closed():
@@ -176,6 +193,11 @@ class PresenceService:
         # startup/shutdown blocker. The handle's daemon runner also keeps
         # asyncio.run teardown independent from that arbitrary callback.
         self._model_sample: _DetachedModelSampler | None = None
+        # Keep one reference to a detached worker even after its result is no
+        # longer relevant. An unkillable callback must finish before another
+        # sampler can be installed, preventing replacement from accumulating
+        # resource-owning daemon threads.
+        self._active_model_sample: _DetachedModelSampler | None = None
 
     @property
     def is_running(self) -> bool:
@@ -196,10 +218,27 @@ class PresenceService:
         self._alert_dispatcher = dispatcher
 
     def set_model_sampler(self, sampler: Callable[[], Awaitable[list[str]]] | None) -> None:
-        """Late-bind the pulled-model sampler advertised in heartbeats."""
+        """Late-bind a loop-independent pulled-model sampler.
+
+        The sampler runs on a private event loop, so it must not await a
+        Future or Task owned by the application's loop. Replacing a sampler
+        while its detached callback is still running is rejected: arbitrary
+        cancellation-resistant callbacks cannot be stopped safely, and
+        allowing replacement would accumulate live worker threads.
+        """
+        self._reap_active_model_sample()
+        if self._active_model_sample is not None:
+            raise RuntimeError(
+                "cannot replace model sampler while its detached callback is still active"
+            )
         self._discard_model_sample()
         self._model_sampler = sampler
         self._models_sampled_at = None
+
+    def _reap_active_model_sample(self) -> None:
+        handle = self._active_model_sample
+        if handle is not None and handle.completed:
+            self._active_model_sample = None
 
     def _discard_model_sample(self) -> None:
         """Detach a probe without waiting for arbitrary sampler code."""
@@ -216,6 +255,7 @@ class PresenceService:
         """
         if self._model_sampler is None:
             return self._node.self_models
+        self._reap_active_model_sample()
         now = time.monotonic()
         if (
             self._models_sampled_at is not None
@@ -230,6 +270,7 @@ class PresenceService:
             self._models_sampled_at = now
             if handle.completed:
                 self._model_sample = None
+                self._active_model_sample = None
                 handle.discard()
             return self._node.self_models
 
@@ -238,6 +279,7 @@ class PresenceService:
             asyncio.get_running_loop(),
         )
         self._model_sample = handle
+        self._active_model_sample = handle
         handle.start()
         waiter = asyncio.create_task(handle.wait(), name="presence-model-sample-wait")
         try:
@@ -260,6 +302,7 @@ class PresenceService:
             return self._node.self_models
 
         self._model_sample = None
+        self._active_model_sample = None
         try:
             if handle.error is not None:
                 raise handle.error
@@ -267,6 +310,12 @@ class PresenceService:
             if sampled is None:
                 raise RuntimeError("model sampler completed without a result")
             self._node.self_models = sorted(set(sampled))
+        except ModelSamplerContractError as exc:
+            logger.error(
+                "presence_model_sampler_contract_violation",
+                error=str(exc),
+                exc_info=True,
+            )
         except Exception:
             logger.warning("presence_model_sample_failed", exc_info=True)
         self._models_sampled_at = now
