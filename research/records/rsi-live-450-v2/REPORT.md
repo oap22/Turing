@@ -49,7 +49,7 @@ Observed baseline terminal rendering sometimes required a focus/layout refresh, 
 
 The live run used `self-edit-every=0`. Proposal, judgment, rollback and resume are tested deterministically, but a controlled live candidate/incumbent scaffold evaluation (S03), noise-floor measurement and general-quality improvement remain unproven. This is also not a hardened hostile-process security boundary: the engine shares the user's account and the guard detects and restores evidence at defined phase boundaries.
 
-Review tier: **human review mandatory**, because the combined production diff exceeds 400 lines. No merge, release or installation is implied by local green checks. Hosted CI status is recorded in the draft PR.
+Review tier: **human review mandatory**, because the combined production diff exceeds 400 lines. No merge, release or installation is implied by local green checks. The draft PR description is prepared locally; hosted CI has not started.
 
 ## Final review and broader checks
 
@@ -60,3 +60,7 @@ The broader Python run produced 3,644 passes, five skips and two socket-bind fai
 The first final RSI confirmation produced 388 passes, four skips and one failure in the unchanged 300 ms Claude timeout test: the process was killed before its `child.pid` file existed. The exact test passed on immediate isolated rerun without edits. Its execution code is unchanged from baseline. The first failure and rerun are retained, rather than erased or addressed by weakening the test. A quiet final confirmation is recorded below.
 
 Final confirmation on integrated source 7d409c9: **389 passed, 4 skipped in 55.31 seconds**. No code or test edits were made between the timeout-test failure and this passing confirmation. Human review and hosted CI remain release gates.
+
+## Publication status
+
+Implementation and evidence are committed on `oap22/450-rsi-live-test`. Automatic approval review rejected the combined commit/push because publication of code and experiment records to GitHub lacked explicit user authorization. The local commit was then completed separately. No push or PR was created. `PR-DRAFT.md` is the prepared description; publication requires user approval. The main checkout and installed app remain untouched.
