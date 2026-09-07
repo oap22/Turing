@@ -12,7 +12,7 @@ Module map (each states what it guarantees and what it does not):
   — the frozen types and the closed failure taxonomy every other module codes
   against.
 - :mod:`~turing.research.rsi.engine` — the :class:`Engine` protocol's
-  implementations (``claude -p`` and a scripted fake).
+  implementations (``claude -p``, ``codex exec``, and a scripted fake).
 - :mod:`~turing.research.rsi.verifier` — the verifier lock on disk and the
   loop-side measurement of the score.
 - :mod:`~turing.research.rsi.cheat` — the per-round cheat detector and the
@@ -26,7 +26,14 @@ filesystem until :meth:`RsiLoop.prepare` or :func:`cli.main` is called.
 """
 
 from turing.research.rsi.cheat import CheatDetector, CheatSnapshot, GitResult, git_env, run_git
-from turing.research.rsi.cli import EXIT_INTERRUPTED, EXIT_STOPPED, EXIT_USAGE, Plan, resolve_plan
+from turing.research.rsi.cli import (
+    EXIT_ENGINE_FAILURE,
+    EXIT_INTERRUPTED,
+    EXIT_STOPPED,
+    EXIT_USAGE,
+    Plan,
+    resolve_plan,
+)
 from turing.research.rsi.cli import main as cli_main
 from turing.research.rsi.contracts import (
     BASH_TRAJECTORY_KEYS,
@@ -53,7 +60,13 @@ from turing.research.rsi.contracts import (
     sha256_file,
     sha256_text,
 )
-from turing.research.rsi.engine import ClaudeCliEngine, FakeCall, FakeEngine, ok_result
+from turing.research.rsi.engine import (
+    ClaudeCliEngine,
+    CodexCliEngine,
+    FakeCall,
+    FakeEngine,
+    ok_result,
+)
 from turing.research.rsi.loop import (
     EXIT_OK,
     LoopOutcome,
@@ -95,6 +108,7 @@ from turing.research.rsi.verifier import (
 __all__ = [
     "BASH_TRAJECTORY_KEYS",
     "DEFAULT_SCAFFOLD_TEXT",
+    "EXIT_ENGINE_FAILURE",
     "EXIT_INTERRUPTED",
     "EXIT_OK",
     "EXIT_STOPPED",
@@ -109,6 +123,7 @@ __all__ = [
     "CheatSnapshot",
     "CheatVerdict",
     "ClaudeCliEngine",
+    "CodexCliEngine",
     "ContractViolationError",
     "Engine",
     "EngineResult",

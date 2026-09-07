@@ -54,9 +54,10 @@ What it does not do:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import stat
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
@@ -88,6 +89,7 @@ __all__ = [
     "CheatDetector",
     "CheatSnapshot",
     "GitResult",
+    "TrajectorySnapshot",
     "git_env",
     "lock_file_mismatch",
     "run_git",
@@ -98,6 +100,7 @@ ALLOWED_RESULTS_SUFFIXES: frozenset[str] = frozenset(
     {".png", ".svg", ".json", ".md", ".txt", ".csv"}
 )
 ALLOWED_RESULTS_NAMES: frozenset[str] = frozenset({"metrics.jsonl"})
+TRAJECTORY_FILENAME: str = "trajectory.json"
 #: How far above the measured score a self-reported score may sit before it
 #: counts as an inflated claim. Wide on purpose (see the module docstring);
 #: a claim *below* the measured score never fires.
@@ -248,10 +251,19 @@ class CheatSnapshot:
 
     results_files: Mapping[str, tuple[int, int]]
     results_symlinks: frozenset[str] = field(default_factory=frozenset)
+    trajectory: TrajectorySnapshot = field(default_factory=lambda: TrajectorySnapshot("missing"))
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "results_files", MappingProxyType(dict(self.results_files)))
         object.__setattr__(self, "results_symlinks", frozenset(self.results_symlinks))
+
+
+@dataclass(frozen=True, slots=True)
+class TrajectorySnapshot:
+    """The exact pre-round state of supervisor-owned ``trajectory.json`` evidence."""
+
+    kind: str
+    content: bytes | str | int | None = None
 
 
 def _walk_entries(root: Path) -> list[Path]:
@@ -275,7 +287,30 @@ def _walk_files(root: Path) -> list[Path]:
 class CheatDetector:
     """Stateless; the loop keeps the snapshot between ``snapshot_before`` and ``verdict_after``."""
 
-    def snapshot_before(self, sandbox: Path, results: Path) -> CheatSnapshot:
+    @staticmethod
+    def snapshot_trajectory(path: Path) -> TrajectorySnapshot:
+        """Capture trajectory state without following a symlink or directory."""
+        try:
+            st = path.lstat()
+        except FileNotFoundError:
+            return TrajectorySnapshot("missing")
+        except OSError as exc:
+            return TrajectorySnapshot("unreadable", repr(exc))
+        if stat.S_ISREG(st.st_mode):
+            try:
+                return TrajectorySnapshot("regular", path.read_bytes())
+            except OSError as exc:
+                return TrajectorySnapshot("unreadable", repr(exc))
+        if stat.S_ISLNK(st.st_mode):
+            try:
+                return TrajectorySnapshot("symlink", os.readlink(path))
+            except OSError as exc:
+                return TrajectorySnapshot("unreadable", repr(exc))
+        return TrajectorySnapshot("special", st.st_mode)
+
+    def snapshot_before(
+        self, sandbox: Path, results: Path, *, trajectory: Path | None = None
+    ) -> CheatSnapshot:
         files: dict[str, tuple[int, int]] = {}
         links: set[str] = set()
         for path in _walk_entries(results):
@@ -290,7 +325,83 @@ class CheatDetector:
         logger.debug(
             "rsi.cheat.snapshot", results=str(results), files=len(files), sandbox=str(sandbox)
         )
-        return CheatSnapshot(results_files=files, results_symlinks=frozenset(links))
+        trajectory_path = trajectory or results / TRAJECTORY_FILENAME
+        return CheatSnapshot(
+            results_files=files,
+            results_symlinks=frozenset(links),
+            trajectory=self.snapshot_trajectory(trajectory_path),
+        )
+
+    def refresh_trajectory(self, snapshot: CheatSnapshot, *, trajectory: Path) -> CheatSnapshot:
+        """Refresh only trajectory state after a supervisor-owned event is appended."""
+        return replace(snapshot, trajectory=self.snapshot_trajectory(trajectory))
+
+    def trajectory_change(
+        self,
+        results: Path,
+        snapshot: CheatSnapshot,
+        *,
+        trajectory: Path | None = None,
+    ) -> str | None:
+        """Return a reason if the round changed supervisor-owned trajectory evidence."""
+        path = trajectory or results / TRAJECTORY_FILENAME
+        current = self.snapshot_trajectory(path)
+        if current == snapshot.trajectory:
+            return None
+        return (
+            f"supervisor-owned {path.name} changed during the round "
+            f"({snapshot.trajectory.kind} -> {current.kind})"
+        )
+
+    def quarantine_trajectory(
+        self,
+        results: Path,
+        snapshot: CheatSnapshot,
+        round_no: int,
+        *,
+        trajectory: Path | None = None,
+    ) -> str | None:
+        """Preserve changed trajectory bytes, then restore the trusted pre-round state."""
+        path = trajectory or results / TRAJECTORY_FILENAME
+        expected = snapshot.trajectory
+        current = self.snapshot_trajectory(path)
+        if current == expected:
+            return None
+
+        results.mkdir(parents=True, exist_ok=True)
+        evidence = self._next_trajectory_evidence_path(results, round_no)
+        if current.kind == "regular" and isinstance(current.content, bytes):
+            evidence.write_bytes(current.content)
+        else:
+            evidence.write_text(
+                json.dumps(
+                    {"kind": current.kind, "content": current.content},
+                    sort_keys=True,
+                    default=str,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+        _remove_path(path)
+        if expected.kind == "regular" and isinstance(expected.content, bytes):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(expected.content)
+        elif expected.kind == "symlink" and isinstance(expected.content, str):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(expected.content, path)
+        return evidence.relative_to(results).as_posix()
+
+    @staticmethod
+    def _next_trajectory_evidence_path(results: Path, round_no: int) -> Path:
+        for attempt in range(1, 10_000):
+            suffix = "" if attempt == 1 else f"-{attempt}"
+            candidate = results / f"trajectory.tamper-round-{round_no}{suffix}.json"
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
+                return candidate
+        raise ContractViolationError("could not allocate a trajectory tamper evidence path")
 
     def results_changes(self, results: Path, snapshot: CheatSnapshot) -> list[str]:
         """Results-dir entries created, removed, or whose ``(mtime_ns, size)`` moved since ``snapshot``.
@@ -362,6 +473,12 @@ class CheatDetector:
         if escapes:
             categories.add(FailureCategory.SANDBOX_ESCAPE)
             reasons.extend(escapes)
+
+        # The trajectory is supervisor-owned evidence, unlike agent metrics.
+        trajectory_tamper = self.trajectory_change(results, snapshot)
+        if trajectory_tamper is not None:
+            categories.add(FailureCategory.CHEAT_DETECTED)
+            reasons.append(trajectory_tamper)
 
         # (c) score integrity
         if self_report_problem:
@@ -450,3 +567,16 @@ def _is_within(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _remove_path(path: Path) -> None:
+    """Remove a trajectory path without following a symlink."""
+    try:
+        if path.is_symlink() or not path.is_dir():
+            path.unlink()
+            return
+    except FileNotFoundError:
+        return
+    for child in path.iterdir():
+        _remove_path(child)
+    path.rmdir()

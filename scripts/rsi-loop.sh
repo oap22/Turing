@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The RSI workstation loop engine: a continuous Claude Code loop that
+# The RSI workstation loop engine: a continuous Claude Code/Codex loop that
 # iterates on a problem statement round after round inside a dedicated
 # sandbox directory, streaming metrics.jsonl / trajectory.json / plots into
 # a results directory the desktop's panes watch live.
@@ -22,6 +22,7 @@
 # that has never been locked, this script runs the bash loop below,
 # unchanged. It execs the Python engine, `python -m turing.research.rsi`,
 # forwarding every flag, when any of these holds:
+#   * `--engine <name>` is given (a first run of the Python engine);
 #   * `--verifier <cmd>` is given (a first run of the Python engine);
 #   * `TURING_RSI_ENGINE=python` is set;
 #   * the slug's sandbox already holds VERIFIER.json — the marker that this
@@ -38,8 +39,9 @@
 # slug exits 2.
 #
 # Interpreter: `.venv/bin/python` under the repo when present, else
-# `TURING_RSI_PYTHON` if set, else `python3` with the repo's `src/` on
-# PYTHONPATH (src layout; a bare `python3` cannot import `turing` otherwise).
+# `TURING_RSI_PYTHON` if set, else `python3`. In every case the owning
+# checkout's `src/` is prepended to PYTHONPATH so an external/shared
+# interpreter cannot import another Turing checkout.
 
 set -euo pipefail
 
@@ -53,8 +55,12 @@ usage: rsi-loop.sh --slug <slug> --results-root <dir> [--problem <text>] [--roun
   --rounds <n>           default 10; 0 means unlimited
   --dry-run              print the resolved plan and exit without touching disk
 
-Python engine (python -m turing.research.rsi; selected by --verifier, by TURING_RSI_ENGINE=python,
+Python engine (python -m turing.research.rsi; selected by --engine/--verifier, by TURING_RSI_ENGINE=python,
 or automatically when ~/turing-workspace/rsi-<slug>/VERIFIER.json already exists):
+  --engine <name>        claude (default), codex (gpt-5.6-luna/xhigh), or fake (demo-gated)
+  --workspace-root <dir> sandboxes live under here as rsi-<slug>
+  --round-timeout-seconds <n>     wall-clock cap per engine round (default 1800)
+  --verifier-timeout-seconds <n> wall-clock cap per verifier run (default 600)
   --verifier <cmd>       frozen verifier command, run from the sandbox after every round;
                          required on the first run, locked into VERIFIER.json
   --verifier-file <rel>  sandbox file whose sha256 joins the lock; repeatable. Only the
@@ -72,6 +78,9 @@ PROBLEM=""
 ROUNDS=10
 DRY_RUN=0
 VERIFIER=""
+ENGINE=""
+WORKSPACE_ROOT=""
+WORKSPACE_ROOT_SET=0
 PY_ONLY_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -100,7 +109,16 @@ while [[ $# -gt 0 ]]; do
       VERIFIER="${2:-}"
       shift 2
       ;;
-    --verifier-file|--self-edit-every|--self-edit-budget|--noise-floor)
+    --engine)
+      ENGINE="${2:-}"
+      shift 2
+      ;;
+    --workspace-root)
+      WORKSPACE_ROOT="${2:-}"
+      WORKSPACE_ROOT_SET=1
+      shift 2
+      ;;
+    --round-timeout-seconds|--verifier-timeout-seconds|--verifier-file|--self-edit-every|--self-edit-budget|--noise-floor)
       PY_ONLY_ARGS+=("$1" "${2:-}")
       shift 2
       ;;
@@ -146,25 +164,35 @@ if [[ "$RESULTS_ROOT" != /* ]]; then
   RESULTS_ROOT="$PWD/$RESULTS_ROOT"
 fi
 
-SANDBOX="$HOME/turing-workspace/rsi-$SLUG"
+if [[ -z "$WORKSPACE_ROOT" ]]; then
+  WORKSPACE_ROOT="$HOME/turing-workspace"
+elif [[ "$WORKSPACE_ROOT" == "~"* ]]; then
+  WORKSPACE_ROOT="${HOME}${WORKSPACE_ROOT:1}"
+fi
+if [[ "$WORKSPACE_ROOT" != /* ]]; then
+  WORKSPACE_ROOT="$PWD/$WORKSPACE_ROOT"
+fi
+
+SANDBOX="$WORKSPACE_ROOT/rsi-$SLUG"
 
 # Bridge to the Python engine. Everything below this block is the original
-# bash loop and runs only when nothing selected the Python engine: no
-# --verifier, no TURING_RSI_ENGINE=python, and no VERIFIER.json in the
-# sandbox. The desktop's argv contract sees no change on an unlocked slug.
-if [[ -n "$VERIFIER" || "${TURING_RSI_ENGINE:-}" == "python" || -f "$SANDBOX/VERIFIER.json" ]]; then
+# bash loop and runs only when no Python-only flag or engine selection is
+# present, TURING_RSI_ENGINE is not python, and no VERIFIER.json exists in
+# the sandbox. The desktop's original argv sees no change on an unlocked slug.
+if [[ -n "$ENGINE" || "$WORKSPACE_ROOT_SET" -eq 1 || -n "$VERIFIER" || "${TURING_RSI_ENGINE:-}" == "python" || -f "$SANDBOX/VERIFIER.json" || ${#PY_ONLY_ARGS[@]} -gt 0 ]]; then
   REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
   if [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then
     PYTHON="$REPO_ROOT/.venv/bin/python"
   elif [[ -n "${TURING_RSI_PYTHON:-}" ]]; then
     PYTHON="$TURING_RSI_PYTHON"
   else
     PYTHON="python3"
-    export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
   fi
-  PY_ARGS=(--slug "$SLUG" --results-root "$RESULTS_ROOT" --rounds "$ROUNDS")
+  PY_ARGS=(--slug "$SLUG" --results-root "$RESULTS_ROOT" --workspace-root "$WORKSPACE_ROOT" --rounds "$ROUNDS")
   [[ -n "$PROBLEM" ]] && PY_ARGS+=(--problem "$PROBLEM")
   [[ -n "$VERIFIER" ]] && PY_ARGS+=(--verifier "$VERIFIER")
+  [[ -n "$ENGINE" ]] && PY_ARGS+=(--engine "$ENGINE")
   [[ "$DRY_RUN" -eq 1 ]] && PY_ARGS+=(--dry-run)
   if [[ ${#PY_ONLY_ARGS[@]} -gt 0 ]]; then
     PY_ARGS+=("${PY_ONLY_ARGS[@]}")

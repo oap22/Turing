@@ -1,0 +1,19 @@
+{
+  "issue": 453,
+  "baseline_sha": "05ab64d",
+  "engine": "codex",
+  "model": "gpt-5.6-luna",
+  "reasoning_effort": "xhigh",
+  "rounds": 1,
+  "self_edit_every": 0,
+  "round_timeout_seconds": 600,
+  "verifier_timeout_seconds": 120,
+  "workspace_root": "/private/tmp/turing-rsi450/workspace",
+  "results_root": "/Users/owenpacetti/research-results",
+  "slug": "turing-rsi-450-v2",
+  "comparison": "external deterministic baseline and candidate correctness checks",
+  "dollar_cost": null,
+  "cost_source": "existing subscription; actual metering unavailable",
+  "seed_candidate": "1e623e8",
+  "corrects_run": "2026-09-06-turing-rsi-450-live"
+}

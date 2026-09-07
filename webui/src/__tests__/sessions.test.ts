@@ -158,13 +158,18 @@ describe("five-workspace sessions: reseeded once, then left alone", () => {
     // The slug/problem live only in the loop terminal's leaf params, so a
     // reseed that rebuilt from `defaultLayout()` would quietly demote an rsi
     // experiment to an ordinary desktop with the same name.
-    const store = createRsiSession(emptyStore(), "sweep", rsiLayout("sweep-1", "make it faster"));
+    const config = { engine: "codex" as const, verifier: "pytest tests/" };
+    const store = createRsiSession(
+      emptyStore(),
+      "sweep",
+      rsiLayout("sweep-1", "make it faster", config),
+    );
     const storage = unseededStorage();
     saveSessions(storage, store);
 
     const restored = activeSession(loadSessions(storage));
     expect(restored?.kind).toBe("rsi");
-    expect(shapeOf(restored!.layout)).toBe(shapeOf(rsiLayout("sweep-1", "make it faster")));
+    expect(shapeOf(restored!.layout)).toBe(shapeOf(rsiLayout("sweep-1", "make it faster", config)));
   });
 
   it("survives a close in a populated non-trailing workspace with all five workspaces intact", () => {

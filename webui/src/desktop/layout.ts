@@ -10,6 +10,8 @@
 // file in `layoutRequest.ts`) checks against the same list the type is built
 // from. Declaring the union separately would let the two drift apart, and the
 // drift would only show up as a silently-rejected pane name.
+import type { RsiConfig } from "./rsi";
+
 export const PANE_TYPES = [
   "term",
   "queue",
@@ -133,10 +135,16 @@ export function defaultLayout(): LayoutState {
 // sandbox by hand. ws1 (metrics/images/flywheel) and ws2 (agents/agentfeed)
 // are identical to `defaultLayout()`'s — those are the panes that watch the
 // loop's results stream in, unchanged by what's driving it.
-export function rsiLayout(slug: string, problem: string): LayoutState {
+export function rsiLayout(slug: string, problem: string, config?: RsiConfig): LayoutState {
   const state = emptyLayout();
 
-  const loopTerm = leaf("term", nextId(), { rsi: { slug, problem } });
+  const rsi = {
+    slug,
+    problem,
+    ...(config?.engine ? { engine: config.engine } : {}),
+    ...(config?.verifier ? { verifier: config.verifier } : {}),
+  };
+  const loopTerm = leaf("term", nextId(), { rsi });
   const scratchTerm = leaf("term", nextId());
   const ws0Root = split("h", 0.6, loopTerm, scratchTerm);
 

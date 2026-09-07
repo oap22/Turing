@@ -26,6 +26,33 @@ export const REPO = "~/Developer/active/Turing";
 /** Stands in for the configured `results` root until `resolveRunner()` runs. */
 export const RESULTS_ROOT_TOKEN = "<RESULTS_ROOT>";
 
+const SAFE_SHELL_PATH = /^(?:~(?:[A-Za-z0-9._-]+)?|\/?[A-Za-z0-9._-]+)(?:\/[A-Za-z0-9._-]+)*$/;
+
+function shellQuoteSingleExact(text: string): string {
+  return "'" + text.replaceAll("'", "'\\''") + "'";
+}
+
+/**
+ * Quote a configured path as part of a shell word while retaining tilde
+ * expansion. The root token is also used with a literal `/suffix`, so the
+ * quoted root must remain concatenable with that suffix.
+ */
+export function shellQuoteResultsRoot(path: string): string {
+  if (SAFE_SHELL_PATH.test(path)) return path;
+
+  const tilde = path.match(/^~(?:[A-Za-z0-9._-]+)?(?=\/|$)/)?.[0];
+  if (tilde && path[tilde.length] === "/") {
+    return `${tilde}/` + shellQuoteSingleExact(path.slice(tilde.length + 1));
+  }
+  if (tilde === path) return tilde;
+  return shellQuoteSingleExact(path);
+}
+
+/** Replace command-line result-root tokens; callers pass cwd separately. */
+export function substituteResultsRoot(command: string, root: string): string {
+  return command.split(RESULTS_ROOT_TOKEN).join(shellQuoteResultsRoot(root));
+}
+
 // Mirrors `default_roots()` in `desktop/src-tauri/src/config.rs`; used when
 // there is no Tauri runtime (tests, browser) or the command fails.
 const DEFAULT_RESULTS_ROOT = "~/research-results";
@@ -168,7 +195,7 @@ export async function resolveRunner(runner: Runner): Promise<Runner> {
   const root = await resultsRoot();
   return {
     ...runner,
-    command: runner.command.split(RESULTS_ROOT_TOKEN).join(root),
+    command: substituteResultsRoot(runner.command, root),
     cwd: runner.cwd?.split(RESULTS_ROOT_TOKEN).join(root),
   };
 }

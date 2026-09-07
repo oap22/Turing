@@ -77,11 +77,10 @@ What this module guarantees:
   line, whatever the agent wrote to metrics/NOTES/SCAFFOLD.
 * Rollback is judged across invocations: a pending self-edit is rebuilt
   from the trajectory (``self_edit`` without a later ``rollback`` /
-  ``self_edit_kept`` / ``rollback_failed`` for its SHA) on resume. The
-  rollback itself does not depend on a clean index (it restores the parent's
-  ``SCAFFOLD.md`` and commits only that path); if it still fails the loop
-  stops (``rollback_failed``) rather than continuing under an edit the rule
-  said to discard.
+  ``self_edit_kept`` for its SHA) on resume. The rollback itself does not
+  depend on a clean index (it restores the parent's ``SCAFFOLD.md`` and
+  commits only that path); if it fails, a persisted ``rollback_failed`` is a
+  terminal refusal rather than permission to continue under the edit.
 
 What it does not do:
 
@@ -101,6 +100,7 @@ What it does not do:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -117,7 +117,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import structlog
 
 from turing.research.contracts import ContractViolationError, FrozenVerifierError
-from turing.research.rsi.cheat import CheatDetector, lock_file_mismatch, run_git
+from turing.research.rsi.cheat import CheatDetector, CheatSnapshot, lock_file_mismatch, run_git
 from turing.research.rsi.contracts import (
     VERIFIER_LOCK_FILENAME,
     VERIFIER_LOCK_MARKER,
@@ -164,6 +164,7 @@ logger = structlog.get_logger(__name__)
 __all__ = [
     "DEFAULT_SCAFFOLD",
     "EXIT_CHEAT",
+    "EXIT_ENGINE_FAILURE",
     "EXIT_OK",
     "MAX_CONSECUTIVE_ENGINE_FAILURES",
     "METRICS_FILENAME",
@@ -189,6 +190,7 @@ TRAJECTORY_FILENAME: str = "trajectory.json"
 METRICS_FILENAME: str = "metrics.jsonl"
 MAX_CONSECUTIVE_ENGINE_FAILURES: int = 3
 EXIT_OK: int = 0
+EXIT_ENGINE_FAILURE: int = 1
 EXIT_CHEAT: int = 3
 _REDACTED: str = "<redacted>"
 #: Largest pre-existing dirty file whose bytes are kept for restoring after a rejected self-edit.
@@ -198,6 +200,9 @@ _REGULAR_FILE_MODE: str = "100644"
 _NEEDLE_MAX_BYTES: int = 1024 * 1024
 #: Shortest pinned-file body worth redacting; anything shorter would mangle ordinary text.
 _NEEDLE_MIN_CHARS: int = 8
+#: Minimum evidence window used when an older self-edit event has no persisted
+#: schedule and the current invocation has proposals disabled.
+_LEGACY_PENDING_WINDOW: int = 1
 #: Events that carry the loop-owned scaffold blob id.
 _SCAFFOLD_EVENTS: frozenset[str] = frozenset(
     {"scaffold_seeded", "self_edit", "rollback", "scaffold_drift"}
@@ -225,11 +230,20 @@ class LoopOutcome:
     best_score: float | None
     self_edits: int
     rollbacks: int
+    #: Number of rounds whose engine timed out or exited non-zero in this invocation.
+    #: Historical trajectory rows are intentionally excluded from this count.
+    engine_failures: int = 0
 
     @property
     def exit_code(self) -> int:
         if self.stop_reason in (StopReason.VERIFIER_TAMPERED, StopReason.CHEAT_DETECTED):
             return EXIT_CHEAT
+        if self.stop_reason is StopReason.ROLLBACK_FAILED:
+            # Continuing under an edit the loop failed to undo is a terminal
+            # invocation failure, even when the round's engine succeeded.
+            return EXIT_ENGINE_FAILURE
+        if self.rounds_run > 0 and self.engine_failures >= self.rounds_run:
+            return EXIT_ENGINE_FAILURE
         return EXIT_OK
 
 
@@ -408,6 +422,8 @@ class _TreeState:
 class _PendingEdit:
     sha: str
     committed_after_round: int
+    judgment_window: int
+    judgment_window_source: str
     best_before: float | None
     passed_before: bool
     prior_scores: tuple[float, ...]
@@ -501,8 +517,11 @@ class RsiLoop:
         startup_round = max(0, state.next_round - 1)
         self._check_lock_provenance(state, first_lock=first_lock, round_no=startup_round)
         await self._adopt_scaffold(state, startup_round)
-        await self._reconcile_scaffold(startup_round, when="startup")
         self._pending = await self._rebuild_pending(state)
+        # Validate pending-edit provenance before restoring an event-owned blob;
+        # a missing commit must refuse the resume rather than reconstructing an
+        # unjudged scaffold and continuing under it.
+        await self._reconcile_scaffold(startup_round, when="startup")
         logger.info(
             "rsi.loop.prepared",
             sandbox=str(self.sandbox),
@@ -701,6 +720,7 @@ class RsiLoop:
         start = state.next_round
         round_no = start
         rounds_run = 0
+        engine_failures = 0
         consecutive_failures = 0
         self_edits = 0
         rollbacks = 0
@@ -715,6 +735,20 @@ class RsiLoop:
                 logger.info("rsi.loop.stop_file", sandbox=str(self.sandbox), round=round_no)
                 stop = StopReason.STOP_FILE
                 break
+
+            # A prior invocation may have recorded all evidence for a pending
+            # edit and then exited before it could append the judgment event.
+            # Resolve that historical window before starting another engine
+            # round. The round carrying the last piece of evidence owns the
+            # event's round number, including when this is a restart.
+            if pending is not None and len(pending.rounds_after) >= pending.judgment_window:
+                judged = await self._judge_pending(pending, pending.rounds_after[-1].round)
+                if judged == "failed":
+                    stop = StopReason.ROLLBACK_FAILED
+                    break
+                if judged == "rolled_back":
+                    rollbacks += 1
+                pending = None
 
             logger.info("rsi.round.start", round=round_no, slug=cfg.slug)
             await self._reconcile_scaffold(round_no, when="before_round")
@@ -753,7 +787,71 @@ class RsiLoop:
                 append_jsonl(self.trajectory_path, record.to_json_line())
                 stop = StopReason.VERIFIER_TAMPERED
                 break
+
+            # The agent must not be able to add, replace, or delete the
+            # supervisor-owned history before reconciliation appends its own
+            # scaffold event.  Metrics remain agent-owned and are still read
+            # below as normal.
+            trajectory_tamper = self.cheat.trajectory_change(
+                self.results, snapshot, trajectory=self.trajectory_path
+            )
+            if trajectory_tamper is not None:
+                had_metrics, agent_score, report_problem = self._agent_metrics(
+                    round_no, metrics_before
+                )
+                verdict = await self.cheat.verdict_after(
+                    sandbox=self.sandbox,
+                    results=self.results,
+                    snapshot=snapshot,
+                    lock=lock,
+                    measured=None,
+                    agent_reported_score=agent_score,
+                    lock_sha256=self.lock_sha256,
+                    self_report_problem=report_problem,
+                )
+                evidence = self.cheat.quarantine_trajectory(
+                    self.results, snapshot, round_no, trajectory=self.trajectory_path
+                )
+                self._append_event(
+                    "trajectory_tampered",
+                    round_no,
+                    {"detail": trajectory_tamper, "evidence": evidence, "after": "engine"},
+                )
+                categories = classify_round(
+                    engine_exit=result.exit_code,
+                    timed_out=result.timed_out,
+                    verifier=None,
+                    previous_score=previous_score,
+                    best_score=best_score,
+                    had_metrics_line=had_metrics,
+                    cheat=verdict,
+                    prior_pass=prior_pass,
+                )
+                record = RoundRecord(
+                    round=round_no,
+                    started=started,
+                    ended=max(ended, int(self.clock()), started),
+                    exit=result.exit_code,
+                    categories=categories,
+                    scaffold_sha=scaffold_sha,
+                    void=verdict.fired,
+                    agent_reported_score=agent_score,
+                )
+                records.append(record)
+                append_jsonl(self.trajectory_path, record.to_json_line())
+                rounds_run += 1
+                stop = (
+                    StopReason.VERIFIER_TAMPERED
+                    if FailureCategory.VERIFIER_TAMPERED in verdict.categories
+                    else StopReason.CHEAT_DETECTED
+                )
+                break
+
             await self._reconcile_scaffold(round_no, when="after_engine")
+            # ``_reconcile_scaffold`` may append a supervisor event.  Make that
+            # expected append part of the baseline before the detector checks
+            # the agent's result-directory writes.
+            snapshot = self.cheat.refresh_trajectory(snapshot, trajectory=self.trajectory_path)
 
             outcome: VerifierOutcome | None = await run_verifier(
                 spec, self.sandbox, cfg.verifier_timeout_seconds
@@ -769,6 +867,23 @@ class RsiLoop:
                 lock_sha256=self.lock_sha256,
                 self_report_problem=report_problem,
             )
+            # ``verdict_after`` observes supervisor-owned trajectory tampering,
+            # but its verdict must not leave forged history in place.  Restore
+            # the snapshot taken after the loop's own scaffold reconciliation
+            # before appending the void record, so resume can only trust the
+            # quarantined pre-round history.
+            trajectory_tamper = self.cheat.trajectory_change(
+                self.results, snapshot, trajectory=self.trajectory_path
+            )
+            if trajectory_tamper is not None:
+                evidence = self.cheat.quarantine_trajectory(
+                    self.results, snapshot, round_no, trajectory=self.trajectory_path
+                )
+                self._append_event(
+                    "trajectory_tampered",
+                    round_no,
+                    {"detail": trajectory_tamper, "evidence": evidence, "after": "verifier"},
+                )
             categories = classify_round(
                 engine_exit=result.exit_code,
                 timed_out=result.timed_out,
@@ -825,7 +940,22 @@ class RsiLoop:
             if pending is not None:
                 pending.rounds_after.append(record)
 
+            # A terminal engine failure still produced a verifier observation.
+            # Settle a pending self-edit whose evidence window closes on this
+            # round before the consecutive-failure guard stops the invocation;
+            # otherwise a restart would run one more round under an edit that
+            # was already due for judgment.
+            if pending is not None and len(pending.rounds_after) >= pending.judgment_window:
+                judged = await self._judge_pending(pending, round_no)
+                if judged == "failed":
+                    stop = StopReason.ROLLBACK_FAILED
+                    break
+                if judged == "rolled_back":
+                    rollbacks += 1
+                pending = None
+
             if result.timed_out or result.exit_code != 0:
+                engine_failures += 1
                 consecutive_failures += 1
                 logger.warning(
                     "rsi.round.engine_failed",
@@ -846,53 +976,50 @@ class RsiLoop:
             else:
                 consecutive_failures = 0
 
-            # Self-edit scheduling: judge the previous edit first, then maybe propose.
-            if cfg.self_edit_every and rounds_run % cfg.self_edit_every == 0:
-                if pending is not None and len(pending.rounds_after) >= cfg.self_edit_every:
-                    judged = await self._judge_pending(pending, round_no)
-                    if judged == "failed":
-                        stop = StopReason.ROLLBACK_FAILED
-                        break
-                    if judged == "rolled_back":
-                        rollbacks += 1
-                    pending = None
-                if (
-                    self.self_edit is not None
-                    and self_edits < cfg.self_edit_budget
-                    and pending is None
-                ):
-                    try:
-                        sha = await self._self_edit(records, round_no, best_score, lock)
-                    except FrozenVerifierError as exc:
-                        # I1/I5: the step (or its own guard) touched the verifier; stop, restore nothing.
-                        logger.error("rsi.self_edit.tampered", round=round_no, detail=str(exc))
-                        self._append_event(
-                            "verifier_tampered",
-                            round_no,
-                            {"detail": str(exc), "after": "self_edit"},
-                        )
-                        stop = StopReason.VERIFIER_TAMPERED
-                        break
-                    if sha is not None:
-                        self_edits += 1
-                        counted = [r for r in records if not r.void]
-                        pending = _PendingEdit(
-                            sha=sha,
-                            committed_after_round=round_no,
-                            best_before=best_score,
-                            passed_before=bool(counted and counted[-1].passed),
-                            prior_scores=tuple(
-                                r.score for r in counted if r.passed and r.score is not None
-                            ),
-                        )
-                    tamper = self._lock_mismatch(lock)
-                    if tamper is not None:
-                        # I1 after a self-edit: the round already ran, so log an event and stop.
-                        self._append_event(
-                            "verifier_tampered", round_no, {"detail": tamper, "after": "self_edit"}
-                        )
-                        stop = StopReason.VERIFIER_TAMPERED
-                        break
+            # Proposal timing remains on the existing invocation schedule so a
+            # restart does not create an extra edit as a side effect of catching
+            # up on a completed judgment window.
+            if (
+                cfg.self_edit_every
+                and rounds_run % cfg.self_edit_every == 0
+                and self.self_edit is not None
+                and self_edits < cfg.self_edit_budget
+                and pending is None
+            ):
+                try:
+                    sha = await self._self_edit(records, round_no, best_score, lock)
+                except FrozenVerifierError as exc:
+                    # I1/I5: the step (or its own guard) touched the verifier; stop, restore nothing.
+                    logger.error("rsi.self_edit.tampered", round=round_no, detail=str(exc))
+                    self._append_event(
+                        "verifier_tampered",
+                        round_no,
+                        {"detail": str(exc), "after": "self_edit"},
+                    )
+                    stop = StopReason.VERIFIER_TAMPERED
+                    break
+                if sha is not None:
+                    self_edits += 1
+                    counted = [r for r in records if not r.void]
+                    pending = _PendingEdit(
+                        sha=sha,
+                        committed_after_round=round_no,
+                        judgment_window=cfg.self_edit_every,
+                        judgment_window_source="recorded",
+                        best_before=best_score,
+                        passed_before=bool(counted and counted[-1].passed),
+                        prior_scores=tuple(
+                            r.score for r in counted if r.passed and r.score is not None
+                        ),
+                    )
+                tamper = self._lock_mismatch(lock)
+                if tamper is not None:
+                    # I1 after a self-edit: the round already ran, so log an event and stop.
+                    self._append_event(
+                        "verifier_tampered", round_no, {"detail": tamper, "after": "self_edit"}
+                    )
+                    stop = StopReason.VERIFIER_TAMPERED
+                    break
 
             round_no += 1
 
@@ -912,6 +1039,7 @@ class RsiLoop:
             best_score=best_score,
             self_edits=self_edits,
             rollbacks=rollbacks,
+            engine_failures=engine_failures,
         )
 
     # ------------------------------------------------------------- helpers
@@ -1040,13 +1168,50 @@ class RsiLoop:
         before = await self._tree_state()
         results_before = self.cheat.snapshot_before(self.sandbox, self.results)
         logger.info("rsi.self_edit.start", round=round_no, head=before.head[:12])
-        sha = await self.self_edit.propose(inputs)
+        try:
+            sha = await self.self_edit.propose(inputs)
+        except asyncio.CancelledError:
+            await self._cleanup_cancelled_self_edit(before, results_before, round_no, lock)
+            raise
+        except Exception:
+            # A failing proposal can still have written supervisor-owned
+            # history before raising (for example, while rejecting a guarded
+            # verifier edit). Restore that history before the failure escapes.
+            if (
+                self.cheat.trajectory_change(
+                    self.results, results_before, trajectory=self.trajectory_path
+                )
+                is not None
+            ):
+                self.cheat.quarantine_trajectory(
+                    self.results, results_before, round_no, trajectory=self.trajectory_path
+                )
+            raise
+        trajectory_tamper = self.cheat.trajectory_change(
+            self.results, results_before, trajectory=self.trajectory_path
+        )
+        trajectory_reason: str | None = None
+        if trajectory_tamper is not None:
+            evidence = self.cheat.quarantine_trajectory(
+                self.results, results_before, round_no, trajectory=self.trajectory_path
+            )
+            trajectory_reason = (
+                f"{trajectory_tamper}; quarantined evidence={evidence or '<unavailable>'}"
+            )
         # I3: the results dir is outside the sandbox's git status, so it is
         # compared separately; a self-edit that wrote there loses its edit.
         results_changed = self.cheat.results_changes(self.results, results_before)
-        kept, rejection = await self._verify_self_edit(
-            before, sha, lock, results_changed=results_changed
-        )
+        try:
+            kept, rejection = await self._verify_self_edit(
+                before,
+                sha,
+                lock,
+                results_changed=results_changed,
+                trajectory_changed=trajectory_reason,
+            )
+        except asyncio.CancelledError:
+            await self._cleanup_cancelled_self_edit(before, results_before, round_no, lock)
+            raise
         if rejection is not None:
             self._append_event(
                 "self_edit_rejected", round_no, {"proposed": sha, "reason": rejection}
@@ -1055,16 +1220,85 @@ class RsiLoop:
         if kept is None:
             logger.info("rsi.self_edit.no_change", round=round_no)
             return None
-        blob = await run_git(
-            self.sandbox, "rev-parse", "--verify", "-q", f"{kept}:{SCAFFOLD_FILENAME}", check=True
-        )
+        try:
+            blob = await run_git(
+                self.sandbox,
+                "rev-parse",
+                "--verify",
+                "-q",
+                f"{kept}:{SCAFFOLD_FILENAME}",
+                check=True,
+            )
+        except asyncio.CancelledError:
+            await self._cleanup_cancelled_self_edit(before, results_before, round_no, lock)
+            raise
         self.scaffold_blob = blob.stdout.strip()
         self.scaffold_sha = kept
         self._append_event(
-            "self_edit", round_no, {"scaffold_sha": kept, "scaffold_blob": self.scaffold_blob}
+            "self_edit",
+            round_no,
+            {
+                "scaffold_sha": kept,
+                "scaffold_blob": self.scaffold_blob,
+                "judgment_window": self.config.self_edit_every,
+            },
         )
         logger.info("rsi.self_edit.kept", round=round_no, scaffold_sha=kept[:12])
         return kept
+
+    async def _cleanup_cancelled_self_edit(
+        self,
+        before: _TreeState,
+        results_before: CheatSnapshot,
+        round_no: int,
+        lock: VerifierLock,
+    ) -> None:
+        """Restore supervisor history after cancellation without hiding verifier tamper.
+
+        ``CancelledError`` inherits ``BaseException`` and otherwise bypasses the
+        proposal failure guard. Preserve changed trajectory bytes as evidence,
+        then discard an ordinary partial proposal. A verifier or pinned-file
+        mutation is deliberately left for the normal lock check to stop on.
+        """
+        try:
+            if (
+                self.cheat.trajectory_change(
+                    self.results, results_before, trajectory=self.trajectory_path
+                )
+                is not None
+            ):
+                evidence = self.cheat.quarantine_trajectory(
+                    self.results, results_before, round_no, trajectory=self.trajectory_path
+                )
+                logger.warning(
+                    "rsi.self_edit.cancelled_history_restored",
+                    round=round_no,
+                    evidence=evidence,
+                )
+
+            guarded = {VERIFIER_LOCK_FILENAME, *lock.file_sha256s}
+            changed = set(await self._changed_since(before))
+            head_now = (await run_git(self.sandbox, "rev-parse", "HEAD")).stdout.strip()
+            if head_now != before.head:
+                diff = await run_git(self.sandbox, "diff", "--name-only", before.head, head_now)
+                if diff.ok:
+                    changed.update(p for p in diff.stdout.splitlines() if p.strip())
+                else:
+                    changed.update(guarded)
+            if changed & guarded:
+                logger.warning(
+                    "rsi.self_edit.cancelled_verifier_tamper",
+                    round=round_no,
+                    paths=sorted(changed & guarded),
+                )
+                return
+            await self._discard_to(before)
+        except BaseException as exc:
+            logger.warning(
+                "rsi.self_edit.cancelled_cleanup_failed",
+                round=round_no,
+                error=repr(exc),
+            )
 
     def _verifier_needles(self, lock: VerifierLock) -> list[str]:
         """Everything I4 keeps out of the summary: command, hashes, lock text, pinned file bodies."""
@@ -1172,6 +1406,7 @@ class RsiLoop:
         lock: VerifierLock,
         *,
         results_changed: Sequence[str] = (),
+        trajectory_changed: str | None = None,
     ) -> tuple[str | None, str | None]:
         """I3: keep ``sha`` only if it changed exactly SCAFFOLD.md and touched nothing else.
 
@@ -1179,7 +1414,9 @@ class RsiLoop:
         that changed nothing. ``results_changed`` lists results-dir entries
         the step created or modified; any such entry rejects the edit (the
         results themselves are never discarded — ``metrics.jsonl`` and the
-        desktop's files are not the loop's to delete).
+        desktop's files are not the loop's to delete). ``trajectory_changed``
+        carries the content-based supervisor-history failure after its changed
+        bytes have been quarantined.
 
         Raises:
             FrozenVerifierError: the step touched ``VERIFIER.json`` or a
@@ -1202,7 +1439,9 @@ class RsiLoop:
                 "it pins); the tree is left untouched for inspection and the loop stops"
             )
         reason: str | None = None
-        if results_changed:
+        if trajectory_changed is not None:
+            reason = trajectory_changed
+        elif results_changed:
             reason = f"self-edit wrote to the results dir: {sorted(results_changed)}"
         elif sha is None:
             if changed or head_after != before.head:
@@ -1278,29 +1517,96 @@ class RsiLoop:
         """The newest ``self_edit`` not yet judged, reconstructed from the trajectory."""
         pending_sha: str | None = None
         pending_round = 0
+        pending_blob: str | None = None
+        pending_window: int | None = None
+        pending_window_source = "recorded"
         for event in state.events:
-            if event.event == "self_edit" and event.details.get("scaffold_sha"):
-                pending_sha = str(event.details["scaffold_sha"])
+            if event.event == "self_edit":
+                raw_sha = event.details.get("scaffold_sha")
+                if raw_sha is None or not str(raw_sha).strip():
+                    raise ContractViolationError(
+                        f"self-edit event at round {event.round} is missing scaffold_sha; "
+                        "refusing to resume without rollback provenance"
+                    )
+                pending_sha = str(raw_sha).strip()
                 pending_round = event.round
-            elif event.event in {"rollback", "rollback_failed", "self_edit_kept"}:
+                raw_blob = event.details.get("scaffold_blob")
+                pending_blob = None if raw_blob is None else str(raw_blob).strip()
+                raw_window = event.details.get("judgment_window")
+                if raw_window is None:
+                    # Events written before #456 did not persist their window.
+                    # Preserve the old invocation's usual behavior when the
+                    # operator still supplies a schedule, but use one round as
+                    # a visible fail-safe when proposals are now disabled.
+                    if self.config.self_edit_every > 0:
+                        pending_window = self.config.self_edit_every
+                        pending_window_source = "legacy_config"
+                    else:
+                        pending_window = _LEGACY_PENDING_WINDOW
+                        pending_window_source = "legacy_minimum"
+                elif (
+                    isinstance(raw_window, bool)
+                    or not isinstance(raw_window, int)
+                    or raw_window <= 0
+                ):
+                    raise ContractViolationError(
+                        f"self-edit event at round {event.round} has invalid judgment_window "
+                        f"{raw_window!r}; refusing to resume without rollback provenance"
+                    )
+                else:
+                    pending_window = raw_window
+                    pending_window_source = "recorded"
+            elif event.event == "rollback_failed":
+                judged = event.details.get("reverted") or event.details.get("scaffold_sha")
+                if judged is not None and str(judged) == pending_sha:
+                    raise ContractViolationError(
+                        f"pending self-edit {pending_sha[:12]} has a persisted rollback_failed; "
+                        "refusing to resume under an edit the prior run could not undo"
+                    )
+            elif event.event in {"rollback", "self_edit_kept"}:
                 judged = event.details.get("reverted") or event.details.get("scaffold_sha")
                 if judged is not None and str(judged) == pending_sha:
                     pending_sha = None
+                    pending_blob = None
+                    pending_window = None
         if pending_sha is None:
             return None
         ancestor = await run_git(self.sandbox, "merge-base", "--is-ancestor", pending_sha, "HEAD")
         if not ancestor.ok:
-            logger.warning(
-                "rsi.self_edit.pending_dropped",
-                scaffold_sha=pending_sha[:12],
-                hint="the edit's commit is no longer in HEAD's history",
+            raise ContractViolationError(
+                f"pending self-edit {pending_sha[:12]} is no longer in HEAD's history; "
+                "refusing to resume without rollback provenance"
             )
-            return None
+        committed_blob = await run_git(
+            self.sandbox,
+            "rev-parse",
+            "--verify",
+            "-q",
+            f"{pending_sha}:{SCAFFOLD_FILENAME}",
+        )
+        committed_blob_text = committed_blob.stdout.strip()
+        if not committed_blob.ok or not committed_blob_text:
+            raise ContractViolationError(
+                f"pending self-edit {pending_sha[:12]} has no verifiable {SCAFFOLD_FILENAME}; "
+                "refusing to resume without rollback provenance"
+            )
+        if pending_blob is not None and pending_blob != committed_blob_text:
+            raise ContractViolationError(
+                f"pending self-edit {pending_sha[:12]} records scaffold blob {pending_blob[:12]}, "
+                f"but its commit contains {committed_blob_text[:12]}; refusing to resume"
+            )
+        if pending_window is None:
+            raise ContractViolationError(
+                f"pending self-edit {pending_sha[:12]} has no judgment window; "
+                "refusing to resume without rollback provenance"
+            )
         counted_before = [r for r in state.records if not r.void and r.round <= pending_round]
         scores_before = [r.score for r in counted_before if r.passed and r.score is not None]
         pending = _PendingEdit(
             sha=pending_sha,
             committed_after_round=pending_round,
+            judgment_window=pending_window,
+            judgment_window_source=pending_window_source,
             best_before=max(scores_before) if scores_before else None,
             passed_before=bool(counted_before and counted_before[-1].passed),
             prior_scores=tuple(scores_before),
@@ -1310,6 +1616,8 @@ class RsiLoop:
             "rsi.self_edit.pending_resumed",
             scaffold_sha=pending_sha[:12],
             rounds_after=len(pending.rounds_after),
+            judgment_window=pending.judgment_window,
+            judgment_window_source=pending.judgment_window_source,
         )
         return pending
 
@@ -1343,6 +1651,8 @@ class RsiLoop:
                 round_no,
                 {
                     "scaffold_sha": pending.sha,
+                    "judgment_window": pending.judgment_window,
+                    "judgment_window_source": pending.judgment_window_source,
                     "best_before": pending.best_before,
                     "best_after": best_after,
                 },
@@ -1364,6 +1674,8 @@ class RsiLoop:
             {
                 "reverted": pending.sha,
                 "revert_sha": revert_sha,
+                "judgment_window": pending.judgment_window,
+                "judgment_window_source": pending.judgment_window_source,
                 "best_before": pending.best_before,
                 "best_after": best_after,
                 "scaffold_sha": revert_sha,

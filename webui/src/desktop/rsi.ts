@@ -9,6 +9,20 @@
 
 import { REPO, RESULTS_ROOT_TOKEN, type Runner } from "./runners";
 
+export type RsiEngine = "claude" | "codex";
+
+export interface RsiConfig {
+  engine: RsiEngine;
+  verifier: string;
+}
+
+// Verifiers are pre-typed into a PTY. A literal newline would submit the
+// command before the rest of it was typed, so reject multiline commands rather
+// than silently changing their meaning.
+export function isValidRsiVerifier(text: string): boolean {
+  return text.trim() !== "" && !/[\r\n]/.test(text);
+}
+
 // Lowercases, collapses anything outside [a-z0-9] into single hyphens, and
 // trims. Used both as the workstation's sandbox directory name
 // (~/turing-workspace/rsi-<slug>) and as the results subdirectory
@@ -31,20 +45,40 @@ export function shellQuoteSingle(text: string): string {
   return "'" + collapsed.replaceAll("'", "'\\''") + "'";
 }
 
+// Verifier commands are executable syntax, not prose. Preserve repeated
+// spaces, tabs, and quoted literals exactly while still making one shell argv.
+export function shellQuoteSingleExact(text: string): string {
+  return "'" + text.replaceAll("'", "'\\''") + "'";
+}
+
 export interface RsiParams {
   slug: string;
   problem: string;
+  // Optional keeps layouts created before the engine/verifier controls were
+  // added readable. New RSI workstations always write both values.
+  engine?: RsiEngine;
+  verifier?: string;
 }
 
 export function isRsiParams(x: unknown): x is RsiParams {
   if (!x || typeof x !== "object") return false;
   const o = x as Record<string, unknown>;
-  return (
+  if (
     typeof o.slug === "string" &&
     /^[a-z0-9-]+$/.test(o.slug) &&
     typeof o.problem === "string" &&
     o.problem !== ""
-  );
+  ) {
+    if (o.engine !== undefined && o.engine !== "claude" && o.engine !== "codex") return false;
+    if (
+      o.verifier !== undefined &&
+      (typeof o.verifier !== "string" || !isValidRsiVerifier(o.verifier))
+    ) {
+      return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 // The runner TermPane pre-types for an RSI workstation's loop terminal.
@@ -53,10 +87,26 @@ export function isRsiParams(x: unknown): x is RsiParams {
 // that spends API money the moment the pane mounts. The user reviews the
 // pre-typed command and presses Enter themselves.
 export function rsiRunner(params: RsiParams): Runner {
+  const configArgs = [
+    params.engine ? `--engine ${params.engine}` : "",
+    params.verifier ? `--verifier ${shellQuoteSingleExact(params.verifier)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const command = [
+    "scripts/rsi-loop.sh",
+    `--slug ${params.slug}`,
+    `--results-root ${RESULTS_ROOT_TOKEN}`,
+    "--rounds 10",
+    `--problem ${shellQuoteSingle(params.problem)}`,
+    configArgs,
+  ]
+    .filter(Boolean)
+    .join(" ");
   return {
     id: `rsi-${params.slug}`,
     label: `rsi loop: ${params.slug}`,
-    command: `scripts/rsi-loop.sh --slug ${params.slug} --results-root ${RESULTS_ROOT_TOKEN} --rounds 10 --problem ${shellQuoteSingle(params.problem)}`,
+    command,
     cwd: REPO,
     group: "research",
     autorun: false,

@@ -21,6 +21,7 @@ from turing.research.rsi.engine import (
     DRAIN_GRACE_SECONDS,
     OUTPUT_LIMIT_EXIT,
     ClaudeCliEngine,
+    CodexCliEngine,
     FakeEngine,
     ok_result,
     run_capped,
@@ -174,6 +175,107 @@ class TestClaudeCliEngine:
         pid = int((tmp_path / "child.pid").read_text().strip())
         # After a group kill the grandchild is gone (or a zombie awaiting its
         # dead parent's reaper); a live sleep would still answer signal 0.
+        alive = True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            alive = False
+        if alive:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+                assert fh.read().split(")")[-1].split()[0] in {"Z", "X"}
+
+
+class TestCodexCliEngine:
+    def test_argv_uses_the_fixed_luna_configuration(self) -> None:
+        engine = CodexCliEngine("codex")
+        assert engine.argv("hello world") == [
+            "codex",
+            "exec",
+            "-m",
+            "gpt-5.6-luna",
+            "-c",
+            'model_reasoning_effort="xhigh"',
+            "--sandbox",
+            "workspace-write",
+            "--color",
+            "never",
+            "hello world",
+        ]
+
+    def test_empty_binary_refused(self) -> None:
+        with pytest.raises(ContractViolationError):
+            CodexCliEngine("")
+
+    async def test_missing_binary_is_reported_not_raised(self, tmp_path: Path) -> None:
+        result = await CodexCliEngine(str(tmp_path / "definitely-not-here")).run(
+            "p", cwd=tmp_path, timeout_seconds=5
+        )
+        assert result.exit_code == 127
+        assert not result.timed_out
+        assert "could not start" in result.stderr
+
+    async def test_runs_real_subprocess_with_exact_argv(self, tmp_path: Path) -> None:
+        fake = tmp_path / "codex"
+        fake.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\"\nexit 7\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+
+        results_dir = tmp_path / "results"
+        result = await CodexCliEngine(str(fake), add_dirs=(results_dir,)).run(
+            "the prompt", cwd=tmp_path, timeout_seconds=10
+        )
+
+        assert result.exit_code == 7
+        assert not result.timed_out
+        assert result.stdout.splitlines() == [
+            "exec",
+            "-m",
+            "gpt-5.6-luna",
+            "-c",
+            'model_reasoning_effort="xhigh"',
+            "--sandbox",
+            "workspace-write",
+            "--color",
+            "never",
+            "--add-dir",
+            str(results_dir),
+            "the prompt",
+        ]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX")
+    async def test_timeout_kills_real_codex_process(self, tmp_path: Path) -> None:
+        fake = tmp_path / "codex"
+        fake.write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
+        fake.chmod(0o755)
+
+        result = await CodexCliEngine(str(fake)).run("p", cwd=tmp_path, timeout_seconds=0.3)
+
+        assert result.timed_out
+        assert result.exit_code == 124
+        assert result.wall_seconds < 10
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX")
+    async def test_cancellation_kills_real_codex_process(self, tmp_path: Path) -> None:
+        fake = tmp_path / "codex"
+        fake.write_text(
+            "#!/bin/sh\necho $$ > codex.pid\nsleep 30\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        task = asyncio.create_task(
+            CodexCliEngine(str(fake)).run("p", cwd=tmp_path, timeout_seconds=30)
+        )
+        for _ in range(100):
+            if (tmp_path / "codex.pid").exists():
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        pid = int((tmp_path / "codex.pid").read_text().strip())
         alive = True
         try:
             os.kill(pid, 0)

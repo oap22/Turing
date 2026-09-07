@@ -30,6 +30,7 @@ import {
   type LayoutState,
   type Node,
 } from "./layout";
+import { isRsiParams, type RsiParams } from "./rsi";
 
 export const SESSIONS_KEY = "turing.sessions.v1";
 // Marks that the one-time reseed below has already run for this profile. Its
@@ -244,15 +245,12 @@ export function deserializeSessions(s: string): SessionStore | null {
 // nowhere but the loop terminal's leaf params, so reseeding one without
 // recovering these first would silently demote it to an ordinary desktop
 // with the same name.
-function findRsiParams(root: Node | null): { slug: string; problem: string } | null {
+function findRsiParams(root: Node | null): RsiParams | null {
   if (!root) return null;
   if (root.kind === "split") return findRsiParams(root.a) ?? findRsiParams(root.b);
   const rsi = root.params?.rsi;
   if (rsi && typeof rsi === "object") {
-    const o = rsi as Record<string, unknown>;
-    if (typeof o.slug === "string" && typeof o.problem === "string") {
-      return { slug: o.slug, problem: o.problem };
-    }
+    if (isRsiParams(rsi)) return rsi;
   }
   return null;
 }
@@ -267,7 +265,7 @@ function findRsiParams(root: Node | null): { slug: string; problem: string } | n
 // params in the same workstation would be unusual (nothing creates more than
 // one), but if it ever happened, keeping the lowest-indexed workspace's
 // params is at least deterministic.
-function findRsiParamsInLayout(layout: LayoutState): { slug: string; problem: string } | null {
+function findRsiParamsInLayout(layout: LayoutState): RsiParams | null {
   for (const ws of layout.workspaces) {
     const found = findRsiParams(ws.root ?? null);
     if (found) return found;
@@ -294,9 +292,12 @@ export function reseedLayouts(store: SessionStore, now: number = Date.now()): Se
   const sessions: Record<string, Session> = {};
   for (const [id, session] of Object.entries(store.sessions)) {
     const rsi = session.kind === "rsi" ? findRsiParamsInLayout(session.layout) : null;
+    const config = rsi?.engine || rsi?.verifier
+      ? { engine: rsi.engine ?? ("claude" as const), verifier: rsi.verifier ?? "" }
+      : undefined;
     sessions[id] = {
       ...session,
-      layout: rsi ? rsiLayout(rsi.slug, rsi.problem) : defaultLayout(),
+      layout: rsi ? rsiLayout(rsi.slug, rsi.problem, config) : defaultLayout(),
       updatedAt: now,
     };
   }

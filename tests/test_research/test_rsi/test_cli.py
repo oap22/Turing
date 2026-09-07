@@ -138,6 +138,29 @@ class TestDryRun:
         assert code == EXIT_OK
         assert "engine: fake" in capsys.readouterr().out
 
+    def test_codex_dry_run_reports_fixed_runtime_identity(
+        self, rsi_dirs: RsiDirs, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        code = main(
+            _argv(
+                rsi_dirs,
+                "--engine",
+                "codex",
+                "--verifier",
+                "true",
+                "--problem",
+                "x",
+                "--dry-run",
+            )
+        )
+        out = capsys.readouterr().out
+        assert code == EXIT_OK
+        assert (
+            "engine: codex (model=gpt-5.6-luna, reasoning_effort=xhigh, "
+            "sandbox=workspace-write, add_dir=" in out
+        )
+        assert f"add_dir={rsi_dirs.results}" in out
+
     def test_dry_run_lists_every_refusal_the_run_would_apply(
         self, rsi_dirs: RsiDirs, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -325,6 +348,32 @@ class TestResumeVerifier:
                 "echo score=1",
                 "--verifier-file",
                 "extra.txt",
+            )
+        )
+        assert code == EXIT_USAGE
+        assert "--verifier-file differs from the locked verifier" in capsys.readouterr().out
+
+    def test_omitted_verifier_file_on_resume_refused(
+        self, rsi_dirs: RsiDirs, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv(ALLOW_FAKE_ENGINE_ENV, "1")
+        (rsi_dirs.sandbox / "PROBLEM.md").write_text("goal\n")
+        (rsi_dirs.sandbox / "a.txt").write_text("a\n")
+        (rsi_dirs.sandbox / "b.txt").write_text("b\n")
+        write_or_load_verifier(
+            VerifierSpec(command="echo score=1", files=("a.txt", "b.txt")),
+            rsi_dirs.sandbox,
+            now_ms=1,
+        )
+        code = main(
+            _argv(
+                rsi_dirs,
+                "--engine",
+                "fake",
+                "--verifier",
+                "echo score=1",
+                "--verifier-file",
+                "a.txt",
             )
         )
         assert code == EXIT_USAGE
@@ -807,3 +856,70 @@ class TestBashBridge:
             "rounds: 10",
             "resuming: no",
         ]
+
+    def test_codex_engine_forwards_workspace_and_timeout_flags(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        custom_workspace = tmp_path / "custom-workspace"
+        home.mkdir()
+        out = self._run(
+            home,
+            tmp_path,
+            "--slug",
+            "codex",
+            "--results-root",
+            str(tmp_path / "res"),
+            "--workspace-root",
+            str(custom_workspace),
+            "--engine",
+            "codex",
+            "--round-timeout-seconds",
+            "12",
+            "--verifier-timeout-seconds",
+            "7",
+            "--verifier",
+            "true",
+            "--problem",
+            "goal",
+            "--dry-run",
+        )
+        assert f"sandbox: {custom_workspace / 'rsi-codex'}" in out
+        assert (
+            "engine: codex (model=gpt-5.6-luna, reasoning_effort=xhigh, "
+            "sandbox=workspace-write, add_dir=" in out
+        )
+        assert f"add_dir={tmp_path / 'res' / 'loop-rsi-codex'}" in out
+        assert "timeouts: round 12s, verifier 7s" in out
+
+    def test_external_python_cannot_shadow_the_owning_checkout(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        poison = tmp_path / "poison"
+        poison_rsi = poison / "turing" / "research" / "rsi"
+        poison_rsi.mkdir(parents=True)
+        for package in (poison / "turing", poison / "turing" / "research", poison_rsi):
+            (package / "__init__.py").write_text("\n")
+        (poison_rsi / "cli.py").write_text(
+            "raise RuntimeError('imported a shadow Turing checkout')\n"
+        )
+
+        out = self._run(
+            home,
+            tmp_path,
+            "--slug",
+            "owning",
+            "--results-root",
+            str(tmp_path / "res"),
+            "--engine",
+            "codex",
+            "--verifier",
+            "true",
+            "--problem",
+            "goal",
+            "--dry-run",
+            env={"PYTHONPATH": str(poison)},
+        )
+
+        assert (
+            "engine: codex (model=gpt-5.6-luna, reasoning_effort=xhigh, "
+            "sandbox=workspace-write, add_dir=" in out
+        )

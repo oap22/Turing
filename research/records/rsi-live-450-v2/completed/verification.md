@@ -1,0 +1,8 @@
+
+## Verification
+
+Supervisor completed one round, exit 0, passed true, void false, score 1. The source-selected frozen verifier passed; independent review ran the candidate trajectory tests (5 passed) and reviewed normal, special-file, late-write and legitimate supervisor event handling. The immutable baseline fails six of eight external cases; the seeded partial candidate fails only the late verifier-write case. Final integrated branch passes 386 tests plus 4 skipped, including all eight external cases. The evaluator asserts imported module locations inside pytest, and its four manifest hashes were independently checked. The launcher rejects no-new-round, event-only and pass-then-fail outcomes.
+
+This corrects the invalid v1 verifier import path; v1 is preserved as an interrupted negative run. This is evidence of a specific Turing code improvement produced by a real Codex Luna xhigh round, not causal evidence that scaffold self-editing improves agent quality. v2 self-edit-every is 0; recursive proposal, judgment, rollback and resume behavior are covered by deterministic tests.
+
+Provenance: engine 1cc5b07b6a6ddaaf02b0b0996f9efe7ca70643c7 (clean at launch), candidate b8d67205615a7cea63f9431e8e7a0c1e32dc8388 (no source diff), evaluator manifest 6fc2b5ca1880fa413e9ef6872a3ed6d18a1d73d9bcb743c05e468c0477bd4c20. Runtime /Users/owenpacetti/Developer/active/Turing/.venv/bin/python (Python 3.11), native shell Codex /Users/owenpacetti/.npm-global/bin/codex 0.153.0; model gpt-5.6-luna, reasoning xhigh, workspace-write. Provider seed and marginal subscription dollar cost unavailable. Estimate 12 minutes; actual 440.672 seconds. Native Turing launch and new engine/verifier configuration inspected using computer use.

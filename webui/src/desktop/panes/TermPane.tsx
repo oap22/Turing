@@ -11,6 +11,7 @@ import { actionFor, PANE_FOCUS_EVENT, type PaneFocusDetail } from "../keymap";
 import { createPtyInput } from "../ptyInput";
 import { createPtyStream } from "../ptyStream";
 import { readTermTokens } from "../theme";
+import { formatTerminalStartupError } from "../termDiagnostics";
 import { inv, subscribe } from "../tauri";
 import type { Runner } from "../runners";
 import { resolveRunner, RUNNERS } from "../runners";
@@ -116,7 +117,26 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
   // animation frame), and both throw against a disposed Terminal — which is
   // where the unhandled `_renderer.value.dimensions` rejections came from.
   const disposedRef = useRef(false);
+  const resizeErrorReportedRef = useRef(false);
   const [dead, setDead] = useState(false);
+  const [startupError, setStartupError] = useState<string | null>(null);
+  const [exitCode, setExitCode] = useState<number | null>(null);
+
+  function reportStartupError(stage: string, error: unknown): void {
+    if (disposedRef.current) return;
+    setStartupError(formatTerminalStartupError(stage, error));
+  }
+
+  function resizePty(id: number, cols: number, rows: number): void {
+    void inv("pty_resize", { id, cols, rows }).catch((error: unknown) => {
+      // A broken resize backend should be visible once, but a healthy resize
+      // path must remain state-free and stale failures after teardown are safe
+      // to ignore.
+      if (disposedRef.current || resizeErrorReportedRef.current) return;
+      resizeErrorReportedRef.current = true;
+      reportStartupError("resize", error);
+    });
+  }
 
   useEffect(() => {
     const tableRunner: Runner | undefined = rsi
@@ -211,8 +231,13 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
       write: (data) => {
         if (!disposedRef.current) term.write(data);
       },
-      onExit: () => {
+      onExit: (code) => {
         if (disposedRef.current) return;
+        // Rust removes the PTY registry entry before emitting `pty-exit`.
+        // Once this pane is dead, later fit/visibility passes must not send a
+        // resize for that stale id and turn a clean exit into a red error.
+        idRef.current = null;
+        if (code !== null && code !== 0) setExitCode(code);
         term.write("\r\n[exited]");
         setDead(true);
       },
@@ -242,14 +267,20 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
 
       const cols = term.cols;
       const rows = term.rows;
-      const id = await inv<number>("pty_spawn", {
-        cols,
-        rows,
-        command: runner?.autorun ? runner.command : undefined,
-        cwd: runner?.cwd,
-      });
+      let id: number;
+      try {
+        id = await inv<number>("pty_spawn", {
+          cols,
+          rows,
+          command: runner?.autorun ? runner.command : undefined,
+          cwd: runner?.cwd,
+        });
+      } catch (error) {
+        if (!cancelled) reportStartupError("spawn", error);
+        return;
+      }
       if (cancelled) {
-        void inv("pty_kill", { id });
+        void inv("pty_kill", { id }).catch(() => undefined);
         return;
       }
       idRef.current = id;
@@ -263,13 +294,19 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
       // been opened and fit() since spawn started). Re-sync once we have an
       // id and current terminal metrics, regardless of which raced which —
       // the `visible` effect below also resyncs on every later show.
-      void inv("pty_resize", { id, cols: term.cols, rows: term.rows });
+      // `adopt()` can synchronously report an exit that arrived while spawn
+      // was in flight; in that case onExit clears idRef and there is no live
+      // PTY left to resize or write to.
+      if (idRef.current === null) return;
+      resizePty(id, term.cols, term.rows);
 
       if (runner && !runner.autorun) {
         input.push(runner.command);
       }
     }
-    void boot();
+    void boot().catch((error) => {
+      if (!cancelled) reportStartupError("boot", error);
+    });
 
     term.onData((data) => {
       if (idRef.current !== null) input.push(data);
@@ -292,7 +329,9 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
       document.removeEventListener("themechange", onThemeChange);
       outputSub.unsubscribe();
       exitSub.unsubscribe();
-      if (idRef.current !== null) void inv("pty_kill", { id: idRef.current });
+      if (idRef.current !== null) {
+        void inv("pty_kill", { id: idRef.current }).catch(() => undefined);
+      }
       term.dispose();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -323,7 +362,7 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
       return;
     }
     if (idRef.current !== null) {
-      void inv("pty_resize", { id: idRef.current, cols: term.cols, rows: term.rows });
+      resizePty(idRef.current, term.cols, term.rows);
     }
   }
 
@@ -342,10 +381,11 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
         // Swap the DOM renderer out for canvas before the first fit, so the
         // fit measures the grid the canvas renderer will actually paint.
         attachRenderer(term);
-      } catch {
+        openedRef.current = true;
+      } catch (error) {
+        reportStartupError("open", error);
         return;
       }
-      openedRef.current = true;
       const raf = requestAnimationFrame(() => safeFit(term, fit));
       return () => cancelAnimationFrame(raf);
     }
@@ -393,6 +433,17 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
 
   return (
     <div className="flex h-full flex-col">
+      {(startupError || exitCode !== null) && (
+        <div
+          className={`shrink-0 border-b border-term-edge px-2 py-1 text-[10px] ${
+            startupError ? "text-rose-400" : "text-term-dim"
+          }`}
+          data-testid="term-diagnostics"
+          role="status"
+        >
+          {startupError ?? `terminal exited with code ${exitCode}`}
+        </div>
+      )}
       <div ref={containerRef} className="min-h-0 flex-1" data-testid={`term-${dead ? "dead" : "live"}`} />
     </div>
   );

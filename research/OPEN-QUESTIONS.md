@@ -157,3 +157,8 @@ while the thing the artifact was supposed to guarantee does not hold.
 - **"Real research questions" are deferred to experiment 2**, not open. They have
   no built-in scoring, and sourcing them is open-ended work that would sit on the
   critical path before the noise floor.
+
+## 2026-09-06 — Follow-up from native RSI450
+
+- [ ] A controlled live candidate/incumbent scaffold evaluation is still required before claiming causal recursive improvement. This campaign repaired Turing source with live scaffold edits disabled; deterministic rollback/resume correctness is a separate claim. See [the report](records/rsi-live-450-v2/REPORT.md).
+- [ ] Baseline native terminal focus/layout refresh behavior needs a separate reproducible rendering investigation; successful model launch does not establish uninterrupted terminal rendering.

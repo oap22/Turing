@@ -7,7 +7,7 @@ codes mean.
 
 - **Code:** `src/turing/research/rsi/` (entry point `python -m turing.research.rsi`).
 - **Bash predecessor and bridge:** `scripts/rsi-loop.sh` — the desktop still
-  types this script into a terminal pane; with `--verifier`, with
+  types this script into a terminal pane; with `--engine`, `--verifier`, with
   `TURING_RSI_ENGINE=python`, or on a slug whose sandbox already holds
   `VERIFIER.json`, it hands off to the Python engine.
 - **Decision record:** `docs/adr/0011-autonomous-research-agent-retarget.md`
@@ -38,10 +38,25 @@ Each **round** the loop builds a prompt — `SCAFFOLD.md` verbatim, then the
 round text the bash script always used (do one focused iteration, append one
 `metrics.jsonl` line, save plots, update `NOTES.md`, commit, create `STOP` if
 done), then the verifier command the round will be graded by, with the explicit
-statement that **the loop measures the score, not the agent** — runs
-`claude -p <prompt> --permission-mode bypassPermissions --output-format text`
-in the sandbox with a wall-clock cap, then runs the verifier, then runs the
-cheat detector, then appends one line to `trajectory.json`.
+statement that **the loop measures the score, not the agent** — runs the
+selected CLI in the sandbox with a wall-clock cap, then runs the verifier, then
+runs the cheat detector, then appends one line to `trajectory.json`.
+
+### Engines
+
+The default engine is Claude, preserving the original Python and bash behavior:
+`claude -p <prompt> --permission-mode bypassPermissions --output-format text`.
+Pass `--engine codex` to use the fixed Codex campaign engine. It invokes the
+installed `codex exec` executable with `-m gpt-5.6-luna`,
+`-c 'model_reasoning_effort="xhigh"'`, and `--sandbox workspace-write`, using
+the round sandbox as its working directory. The Python CLI adds only the
+configured results directory with `--add-dir`, so Codex can append the watched
+results while its workspace-write policy remains in force. Dry-run prints that
+path. The process uses the same bounded output capture, hard timeout,
+process-group cleanup, and cancellation cleanup as the Claude engine. If
+`codex` cannot be started or exits unsuccessfully, the round records an engine
+failure; it never falls back to Claude or another model. `--engine fake` remains
+restricted to dry runs and explicitly enabled demos.
 
 Running as **root** (an agent container, not a Mac), the CLI refuses
 `bypassPermissions` outright and the round ends as `engine_error` in under a
@@ -64,7 +79,7 @@ numbering. The events the loop writes (each also carries `round` and `ts`):
 | `self_edit_rejected` | The self-edit touched something other than `SCAFFOLD.md` and was discarded | `proposed`, `reason` |
 | `self_edit_kept` | The rounds after a self-edit were judged and the edit survives | `scaffold_sha`, `best_before`, `best_after` |
 | `rollback` | The rounds after a self-edit were worse than the noise floor allows; the edit was reverted | `reverted`, `revert_sha`, `best_before`, `best_after`, `scaffold_sha`, `scaffold_blob` |
-| `rollback_failed` | The revert could not be applied; the loop stops (exit 0, `stop_reason=rollback_failed`) | `reverted`, `error` |
+| `rollback_failed` | The revert could not be applied; the loop stops (exit 1, `stop_reason=rollback_failed`) | `reverted`, `error` |
 | `verifier_tampered` | The lock broke at start-up (`when: startup`, written by the CLI) or right after a self-edit (`after: self_edit`); the loop stops with exit 3 | `detail` |
 
 ## The frozen verifier
@@ -203,7 +218,7 @@ internals and never reads outside the sandbox (ADR 0011 §16). Then:
   agent's staged work is left staged) and logs
   `{"event": "rollback", "reverted": <sha>, "revert_sha": …}`. An edit that
   survives its judgement window is logged as `self_edit_kept`. A revert that
-  fails to apply is logged as `rollback_failed` and the loop stops (exit 0,
+  fails to apply is logged as `rollback_failed` and the loop stops (exit 1,
   `stop_reason=rollback_failed`) rather than keep running under an edit it
   could not undo. A pending, not yet judged edit survives a resume: it is
   rebuilt from the trajectory and judged when its window closes.
@@ -273,9 +288,23 @@ scripts/rsi-loop.sh --slug sort-bench --results-root ~/turing-results \
   --problem '…' --verifier 'python grade.py' --verifier-file grade.py
 ```
 
+To run a round with the fixed Codex engine, select it explicitly:
+
+```bash
+scripts/rsi-loop.sh --slug sort-bench --results-root ~/turing-results \
+  --workspace-root ~/turing-workspace --engine codex \
+  --problem '…' --verifier 'python grade.py' --verifier-file grade.py
+```
+
+The script forwards `--engine`, `--workspace-root`,
+`--round-timeout-seconds`, and `--verifier-timeout-seconds` to the Python
+engine. It prepends the script's owning checkout to `PYTHONPATH` even when
+`TURING_RSI_PYTHON` points at a shared or external interpreter, so the bridge
+cannot accidentally load another Turing checkout.
+
 The script switches from its original bash loop to the Python engine when
-`--verifier` is given, when `TURING_RSI_ENGINE=python` is set, **or when the
-slug's sandbox already holds `VERIFIER.json`** — so the desktop's own argv
+`--engine` or `--verifier` is given, when `TURING_RSI_ENGINE=python` is set,
+**or when the slug's sandbox already holds `VERIFIER.json`** — so the desktop's own argv
 (`--slug`, `--results-root`, `--rounds`, `--problem`, no `--verifier`) resumes
 a locked slug on the Python engine instead of silently dropping back to the
 unverified bash loop. On a slug that has never been locked and with none of
@@ -314,7 +343,11 @@ round lines already in `trajectory.json` plus one (event lines are skipped);
 a different `--verifier` is refused. Before each round the loop checks for
 `<sandbox>/STOP` and stops if it exists — delete it to continue. Three
 consecutive engine failures (exit non-zero, timeout, CLI not found) abort the
-invocation.
+invocation. If every engine attempt in the invocation failed, the process
+exits 1 even when the verifier produced a passing measurement; a later
+invocation can resume from the preserved round facts. An invocation with at
+least one successful engine attempt exits 0 unless it stops for a cheat or
+tamper.
 
 Two things the resume refuses, and how to recover:
 
@@ -333,7 +366,8 @@ the bash path on a locked slug.
 
 | Code | Meaning |
 |---|---|
-| `0` | Normal completion: rounds exhausted, `STOP` file found, three consecutive engine failures, or a scaffold rollback that could not be applied (`rollback_failed`; check the log for which) |
+| `0` | Normal completion: rounds exhausted or `STOP` file found. A verifier failure alone remains a round fact and does not fail the invocation. |
+| `1` | Every engine attempt in this invocation timed out or exited unsuccessfully, or a scaffold rollback could not be applied (`rollback_failed`). The trajectory still preserves each round's measured verifier result and failure categories. |
 | `2` | Usage or pre-flight refusal, before any disk write: bad flag, missing `--problem` or `--verifier` on a first run, a different `--verifier` or `--verifier-file` set on resume, a first run that would pin no file although the command names one, a missing lock on a slug that already ran, unreadable lock, corrupt `trajectory.json`, taxonomy digest mismatch |
 | `3` | The loop stopped on a cheat or a tamper. The last trajectory line is either a void round naming the category, or — when the lock was found broken at start-up, before any round — a `{"event": "verifier_tampered", "when": "startup", …}` line. Investigate before restarting; re-running the same command does not re-lock anything |
 | `130` | Interrupted (Ctrl-C). No trajectory line is written for the round in flight. The engine's (or verifier's) process group is SIGKILLed on interrupt; a descendant that put itself in a new session (`setsid`) is outside that group and may survive — check for a still-running `claude` before restarting, because an orphaned agent writing into the sandbox during the next round reads as a tamper or escape |

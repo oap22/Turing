@@ -1,5 +1,6 @@
 // Runner table tests (issue #382).
 
+import { execFileSync } from "node:child_process";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   __resetResultsRootForTests,
@@ -7,6 +8,7 @@ import {
   resolveRunner,
   resultsRoot,
   RUNNERS,
+  substituteResultsRoot,
 } from "../desktop/runners";
 
 describe("RUNNERS", () => {
@@ -93,5 +95,42 @@ describe("RUNNERS", () => {
     expect((await resolveRunner(pull)).command).toContain("~/research-results/rosie-live/");
     const results = RUNNERS.find((r) => r.id === "research-results")!;
     expect((await resolveRunner(results)).cwd).toBe("~/research-results");
+  });
+
+  it("round-trips configured roots with shell syntax and path suffixes", () => {
+    const root = "/tmp/research results;$(printf injected)";
+    const command = substituteResultsRoot(
+      `rsi --results-root ${RESULTS_ROOT_TOKEN} tee ${RESULTS_ROOT_TOKEN}/rosie-live/metrics.jsonl`,
+      root,
+    );
+    const args = execFileSync(
+      "/bin/sh",
+      ["-c", `set -- ${command}; printf '%s\\n' "$@"`],
+      { encoding: "utf8" },
+    )
+      .trimEnd()
+      .split("\n");
+    expect(args).toEqual([
+      "rsi",
+      "--results-root",
+      root,
+      "tee",
+      `${root}/rosie-live/metrics.jsonl`,
+    ]);
+  });
+
+  it("keeps tilde expansion when a configured home path contains spaces", () => {
+    const command = substituteResultsRoot(
+      `tee ${RESULTS_ROOT_TOKEN}/rosie-live/metrics.jsonl`,
+      "~/research results",
+    );
+    const args = execFileSync(
+      "/bin/sh",
+      ["-c", `set -- ${command}; printf '%s\\n' "$@"`],
+      { encoding: "utf8", env: { ...process.env, HOME: "/tmp/fake-rsi-home" } },
+    )
+      .trimEnd()
+      .split("\n");
+    expect(args).toEqual(["tee", "/tmp/fake-rsi-home/research results/rosie-live/metrics.jsonl"]);
   });
 });

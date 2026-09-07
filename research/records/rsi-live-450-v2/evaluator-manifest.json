@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "baseline": "05ab64d",
+  "seed_candidate": "1e623e8",
+  "checks": {
+    "test_external_trajectory.py": "0f2ee842024f77be43e9272be89a8a27aa9cf9415d3041307245511264d85551",
+    "test_late_evidence.py": "29ae25db6a8128d103dbf9e63f114f828a0d307027ff4a39a0e15da2da82dd00",
+    "test_restart_evidence.py": "958de7f8a1e6d9344bc1b49d5305996b4bab27d88461a04276c7d43ff424ff11",
+    "test_source_identity.py": "2a0d586e38381e5522a2f697d41b7f00e858cd9e5e915cf1f801bc23f2d34a5e"
+  },
+  "reason": "v1 pytest config imported baseline source; v2 asserts candidate import inside pytest"
+}

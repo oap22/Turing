@@ -1,0 +1,3 @@
+{"event": "verifier_locked", "round": 0, "ts": 1788746352, "command_sha256": "94443af10cee0d3d0bfd408d740b8d61d4c4622d586d48c6fec701b116a42f0b", "file_sha256s": {"verify-rsi-450.sh": "12c689a72cb07a658c83b2c6973d3c1729c82a13530b0048d882644b69320208"}, "lock_sha256": "24f5b82635cc505b8ba13adb0d5acc832f9a37ecb19a8ce09a30f353970e4d10"}
+{"event": "scaffold_seeded", "round": 0, "ts": 1788746352, "scaffold_sha": "475fd2bbb23d80feb152fc4bc32734f8958145bf", "scaffold_blob": "1a6eea8540186eff2e123b2a4e4882410beb2fe1"}
+{"round": 1, "started": 1788746352, "ended": 1788746793, "exit": 0, "score": 1.0, "passed": true, "categories": [], "scaffold_sha": "475fd2bbb23d80feb152fc4bc32734f8958145bf", "void": false, "agent_reported_score": 1.0, "verifier_wall_seconds": 47.670853166957386}

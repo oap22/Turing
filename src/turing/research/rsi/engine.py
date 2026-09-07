@@ -1,4 +1,4 @@
-"""Engines for the RSI workstation loop: the real ``claude -p`` CLI and a scripted fake.
+"""Engines for the RSI workstation loop: Claude, Codex, and a scripted fake.
 
 An :class:`~turing.research.rsi.contracts.Engine` runs one round's prompt in
 the sandbox and reports how it ended. The loop never inspects the engine's
@@ -8,7 +8,7 @@ only obligations are: run in ``cwd``, respect the wall-clock cap, and report
 
 What this module guarantees:
 
-* :class:`ClaudeCliEngine` starts the CLI with
+* :class:`ClaudeCliEngine` and :class:`CodexCliEngine` start their CLIs with
   :func:`asyncio.create_subprocess_exec` (argv, never a shell) in its own
   session and **always** SIGKILLs that process group when the CLI is done —
   on timeout *and* on a normal exit — so no in-group child of the CLI
@@ -68,11 +68,15 @@ from turing.research.rsi.contracts import EngineResult
 logger = structlog.get_logger(__name__)
 
 __all__ = [
+    "CODEX_MODEL",
+    "CODEX_REASONING_EFFORT",
+    "CODEX_SANDBOX",
     "DEFAULT_MAX_OUTPUT_BYTES",
     "DRAIN_GRACE_SECONDS",
     "OUTPUT_LIMIT_EXIT",
     "CappedOutput",
     "ClaudeCliEngine",
+    "CodexCliEngine",
     "FakeCall",
     "FakeEngine",
     "ScriptItem",
@@ -442,6 +446,129 @@ class ClaudeCliEngine:
                 timed_out=True,
             )
         logger.info("rsi.engine.finished", exit_code=capped.exit_code, wall_seconds=round(wall, 3))
+        return EngineResult(
+            exit_code=capped.exit_code,
+            stdout=capped.stdout.decode("utf-8", "replace"),
+            stderr=capped.stderr.decode("utf-8", "replace"),
+            wall_seconds=wall,
+            timed_out=False,
+        )
+
+
+# Codex's engine identity is deliberately fixed for the RSI campaign. A
+# caller may choose Claude, Codex, or the test-only fake, but cannot silently
+# change the model or reasoning budget under the same CLI engine name.
+CODEX_MODEL: str = "gpt-5.6-luna"
+CODEX_REASONING_EFFORT: str = "xhigh"
+CODEX_SANDBOX: str = "workspace-write"
+
+
+class CodexCliEngine:
+    """Run one round with the fixed bounded Codex Luna engine.
+
+    The process is launched as ``codex exec`` in the supplied sandbox. The
+    explicit model, reasoning effort, and workspace-write sandbox are part of
+    the argv contract so a missing or unavailable Codex installation fails as
+    an engine failure; it never falls back to Claude or another model.
+    """
+
+    def __init__(self, codex_bin: str = "codex", *, add_dirs: Sequence[Path] = ()) -> None:
+        if not codex_bin:
+            raise ContractViolationError("codex_bin must be a non-empty command name")
+        self._bin = codex_bin
+        self._add_dirs = tuple(Path(directory) for directory in add_dirs)
+
+    def argv(self, prompt: str) -> list[str]:
+        argv = [
+            self._bin,
+            "exec",
+            "-m",
+            CODEX_MODEL,
+            "-c",
+            f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
+            "--sandbox",
+            CODEX_SANDBOX,
+            "--color",
+            "never",
+        ]
+        for directory in self._add_dirs:
+            argv.extend(("--add-dir", str(directory)))
+        argv.append(prompt)
+        return argv
+
+    async def run(self, prompt: str, *, cwd: Path, timeout_seconds: float) -> EngineResult:
+        if timeout_seconds <= 0:
+            raise ContractViolationError("timeout_seconds must be positive")
+        started = time.monotonic()
+        logger.info(
+            "rsi.engine.started",
+            engine="codex",
+            model=CODEX_MODEL,
+            reasoning_effort=CODEX_REASONING_EFFORT,
+            sandbox=CODEX_SANDBOX,
+            add_dirs=[str(directory) for directory in self._add_dirs],
+            cwd=str(cwd),
+        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self.argv(prompt),
+                cwd=str(cwd),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            logger.error("rsi.engine.start_failed", command=self._bin, error=str(exc))
+            return EngineResult(
+                exit_code=_EXIT_NOT_FOUND,
+                stdout="",
+                stderr=f"could not start {self._bin!r}: {exc}",
+                wall_seconds=time.monotonic() - started,
+                timed_out=False,
+            )
+        capped = await run_capped(proc, timeout_seconds=timeout_seconds)
+        wall = time.monotonic() - started
+        if capped.output_limit_exceeded:
+            diagnostic = (
+                "[rsi output limit exceeded; stdout/stderr capture was capped at "
+                f"{DEFAULT_MAX_OUTPUT_BYTES} bytes per stream]"
+            )
+            stderr = capped.stderr.decode("utf-8", "replace")
+            stderr = f"{stderr}\n{diagnostic}" if stderr else diagnostic
+            logger.warning(
+                "rsi.engine.output_limit_exceeded",
+                command=self._bin,
+                wall_seconds=wall,
+                max_output_bytes=DEFAULT_MAX_OUTPUT_BYTES,
+            )
+            return EngineResult(
+                exit_code=OUTPUT_LIMIT_EXIT,
+                stdout=capped.stdout.decode("utf-8", "replace"),
+                stderr=stderr,
+                wall_seconds=wall,
+                timed_out=False,
+            )
+        if capped.timed_out:
+            logger.warning(
+                "rsi.engine.timed_out",
+                command=self._bin,
+                wall_seconds=wall,
+                timeout=timeout_seconds,
+            )
+            return EngineResult(
+                exit_code=_EXIT_TIMED_OUT,
+                stdout=capped.stdout.decode("utf-8", "replace"),
+                stderr=capped.stderr.decode("utf-8", "replace"),
+                wall_seconds=wall,
+                timed_out=True,
+            )
+        logger.info(
+            "rsi.engine.finished",
+            command=self._bin,
+            exit_code=capped.exit_code,
+            wall_seconds=round(wall, 3),
+        )
         return EngineResult(
             exit_code=capped.exit_code,
             stdout=capped.stdout.decode("utf-8", "replace"),
