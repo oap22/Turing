@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import threading
 import time
 import uuid
 from typing import TYPE_CHECKING, Any
@@ -76,6 +77,67 @@ MODEL_SAMPLE_INTERVAL = 60.0
 MODEL_SAMPLE_TIMEOUT = 2.0
 
 
+class _DetachedModelSampler:
+    """Run an optional model probe outside the application's event loop.
+
+    A provider callback is arbitrary user/plugin code and may suppress task
+    cancellation forever. Running it on a daemon thread with its own event
+    loop means the presence heartbeat and ``asyncio.run`` teardown never wait
+    for that callback. Results and exceptions are captured as data and only a
+    thread-safe completion notification crosses back to the app loop.
+    """
+
+    def __init__(
+        self,
+        sampler: Callable[[], Awaitable[list[str]]],
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        self._sampler = sampler
+        self._loop = loop
+        self._completion = asyncio.Event()
+        self.result: list[str] | None = None
+        self.error: BaseException | None = None
+        self.ignored = False
+        self.completed = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="presence-model-sample",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    async def wait(self) -> None:
+        """Wait for completion notification on the owning event loop."""
+        await self._completion.wait()
+
+    def discard(self) -> None:
+        """Ignore this probe without trying to stop its arbitrary callback."""
+        self.ignored = True
+
+    async def _invoke(self) -> list[str]:
+        return await self._sampler()
+
+    def _notify_completion(self) -> None:
+        if not self._loop.is_closed():
+            self._completion.set()
+
+    def _run(self) -> None:
+        try:
+            self.result = asyncio.run(self._invoke())
+        except BaseException as exc:
+            # The sampler's exception is data for the presence cache. Never
+            # re-raise it on the daemon thread or create an unobserved task.
+            self.error = exc
+        finally:
+            self.completed = True
+            # The application loop may already be shutting down. The
+            # captured result/error remains safely owned by this handle.
+            with contextlib.suppress(RuntimeError):
+                self._loop.call_soon_threadsafe(self._notify_completion)
+
+
 class PresenceService:
     """Publish/subscribe peer-presence service on the signed mesh transport."""
 
@@ -111,8 +173,9 @@ class PresenceService:
         # A timed-out sampler is deliberately left detached from the
         # heartbeat task: third-party clients may suppress cancellation, and
         # awaiting them would turn the optional metadata probe back into a
-        # startup/shutdown blocker.
-        self._model_sample_task: asyncio.Task[list[str]] | None = None
+        # startup/shutdown blocker. The handle's daemon runner also keeps
+        # asyncio.run teardown independent from that arbitrary callback.
+        self._model_sample: _DetachedModelSampler | None = None
 
     @property
     def is_running(self) -> bool:
@@ -134,32 +197,16 @@ class PresenceService:
 
     def set_model_sampler(self, sampler: Callable[[], Awaitable[list[str]]] | None) -> None:
         """Late-bind the pulled-model sampler advertised in heartbeats."""
-        self._detach_model_sample_task()
+        self._discard_model_sample()
         self._model_sampler = sampler
         self._models_sampled_at = None
 
-    def _consume_model_sample(self, task: asyncio.Task[list[str]]) -> None:
-        """Retrieve detached results while deliberately ignoring late data."""
-        if self._model_sample_task is task:
-            self._model_sample_task = None
-        with contextlib.suppress(BaseException):
-            task.result()
-
-    @staticmethod
-    async def _run_model_sampler(
-        sampler: Callable[[], Awaitable[list[str]]],
-    ) -> list[str]:
-        """Adapt the provider's general awaitable to a tracked coroutine task."""
-        return await sampler()
-
-    def _detach_model_sample_task(self) -> None:
-        """Cancel an in-flight sampler without awaiting cancellation hooks."""
-        task = self._model_sample_task
-        self._model_sample_task = None
-        if task is not None:
-            if not task.done():
-                task.cancel()
-            task.add_done_callback(self._consume_model_sample)
+    def _discard_model_sample(self) -> None:
+        """Detach a probe without waiting for arbitrary sampler code."""
+        handle = self._model_sample
+        self._model_sample = None
+        if handle is not None:
+            handle.discard()
 
     async def _sample_self_models(self) -> list[str]:
         """Refresh ``node.self_models`` at most every ``MODEL_SAMPLE_INTERVAL``.
@@ -178,38 +225,47 @@ class PresenceService:
 
         # A previous probe may still be running after its deadline. Never
         # start a duplicate or await a cancellation-resistant sampler.
-        if self._model_sample_task is not None:
-            task = self._model_sample_task
+        if self._model_sample is not None:
+            handle = self._model_sample
             self._models_sampled_at = now
-            if task.done():
-                self._model_sample_task = None
-                self._consume_model_sample(task)
+            if handle.completed:
+                self._model_sample = None
+                handle.discard()
             return self._node.self_models
 
-        task = asyncio.create_task(
-            self._run_model_sampler(self._model_sampler), name="presence-model-sample"
+        handle = _DetachedModelSampler(
+            self._model_sampler,
+            asyncio.get_running_loop(),
         )
-        self._model_sample_task = task
+        self._model_sample = handle
+        handle.start()
+        waiter = asyncio.create_task(handle.wait(), name="presence-model-sample-wait")
         try:
-            done, _pending = await asyncio.wait({task}, timeout=MODEL_SAMPLE_TIMEOUT)
+            done, _pending = await asyncio.wait({waiter}, timeout=MODEL_SAMPLE_TIMEOUT)
         except BaseException:
             # The heartbeat/start caller itself may be cancelled while the
-            # optional probe is waiting. Detach it just as for a timeout so a
-            # cancellation-resistant sampler cannot become an orphan task.
-            if self._model_sample_task is task:
-                self._model_sample_task = None
-                if not task.done():
-                    task.cancel()
-                task.add_done_callback(self._consume_model_sample)
+            # optional probe is waiting. The waiter is ordinary app-owned
+            # cancellation-safe code; the sampler remains outside this loop.
+            waiter.cancel()
+            with contextlib.suppress(BaseException):
+                await waiter
+            self._discard_model_sample()
             raise
         if not done:
-            task.add_done_callback(self._consume_model_sample)
+            waiter.cancel()
+            with contextlib.suppress(BaseException):
+                await waiter
+            handle.discard()
             self._models_sampled_at = now
             return self._node.self_models
 
-        self._model_sample_task = None
+        self._model_sample = None
         try:
-            sampled = task.result()
+            if handle.error is not None:
+                raise handle.error
+            sampled = handle.result
+            if sampled is None:
+                raise RuntimeError("model sampler completed without a result")
             self._node.self_models = sorted(set(sampled))
         except Exception:
             logger.warning("presence_model_sample_failed", exc_info=True)
@@ -265,7 +321,7 @@ class PresenceService:
         await self._cancel_tasks()
 
     async def _cancel_tasks(self) -> None:
-        self._detach_model_sample_task()
+        self._discard_model_sample()
         for task in (self._heartbeat_task, self._prune_task):
             if task is not None:
                 task.cancel()
