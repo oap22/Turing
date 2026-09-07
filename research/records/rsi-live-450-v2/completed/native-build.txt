@@ -1,0 +1,40 @@
+
+> turing-desktop@0.1.0 build
+> mkdir -p src-tauri/target && touch src-tauri/target/.metadata_never_index && tauri build --bundles app
+
+        Info Looking up installed tauri packages to check mismatched versions...
+     Running beforeBuildCommand `npm --prefix ../webui run build`
+
+> turing-webui@0.1.0 build
+> tsc -b && vite build
+
+vite v8.2.2 building client environment for production...
+transforming...
+✓ 244 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                   0.63 kB │ gzip:   0.38 kB
+dist/assets/index-BAwdN2XD.css   42.13 kB │ gzip:   9.42 kB
+dist/assets/index-BBf-YRkA.js   867.17 kB │ gzip: 241.14 kB
+
+✓ built in 223ms
+[plugin builtin:vite-reporter] 
+(!) Some chunks are larger than 500 kB after minification. Consider:
+- Using dynamic import() to code-split the application
+- Use build.rolldownOptions.output.codeSplitting to improve chunking: https://rolldown.rs/reference/OutputOptions.codeSplitting
+- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.
+   Compiling turing-desktop v0.1.0 (/Users/owenpacetti/Developer/active/Turing/.worktrees/450-rsi-live-test/desktop/src-tauri)
+    Finished `release` profile [optimized] target(s) in 10.48s
+       Built application at: /Users/owenpacetti/Developer/active/Turing/desktop/src-tauri/target/release/turing-desktop
+    Bundling turing.app (/Users/owenpacetti/Developer/active/Turing/desktop/src-tauri/target/release/bundle/macos/turing.app)
+     Signing with identity "-"
+Signing with identity "-"
+Signing /Users/owenpacetti/Developer/active/Turing/desktop/src-tauri/target/release/bundle/macos/turing.app/Contents/MacOS/turing-desktop
+/Users/owenpacetti/Developer/active/Turing/desktop/src-tauri/target/release/bundle/macos/turing.app/Contents/MacOS/turing-desktop: replacing existing signature
+Signing with identity "-"
+Signing /Users/owenpacetti/Developer/active/Turing/desktop/src-tauri/target/release/bundle/macos/turing.app
+/Users/owenpacetti/Developer/active/Turing/desktop/src-tauri/target/release/bundle/macos/turing.app: replacing existing signature
+        Warn skipping app notarization, no APPLE_ID & APPLE_PASSWORD & APPLE_TEAM_ID or APPLE_API_KEY & APPLE_API_ISSUER & APPLE_API_KEY_PATH environment variables found
+    Finished 1 bundle at:
+        /Users/owenpacetti/Developer/active/Turing/desktop/src-tauri/target/release/bundle/macos/turing.app
+

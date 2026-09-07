@@ -21,6 +21,10 @@ first run is how real priors start accumulating.
 
 ---
 
+## 2026-09-06 — Native Codex RSI repairs Turing trajectory evidence
+
+A real Luna xhigh RSI round launched through Turing repaired late trajectory corruption and was accepted by the supervisor. The corrected run took 7.34 minutes against a 12-minute estimate. The original 18.10-minute attempt is preserved as invalid verifier evidence after an import-path mistake was found. Controls, exact provenance, three-specialist implementation/review, native evidence and limits are in the [campaign report](records/rsi-live-450-v2/REPORT.md). Run: `~/research-results/2026-09-06-turing-rsi-450-live-v2/`. This is engineering verification, not causal scaffold self-improvement evidence.
+
 ## 2026-09-05 — Selected graph freshness and rejected mirror prototype
 
 A selected-run watchdog recovers silent appends without duplicating healthy

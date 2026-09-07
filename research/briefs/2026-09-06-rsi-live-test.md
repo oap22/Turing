@@ -1,6 +1,6 @@
 # Turing RSI live application test (#450)
 
-Status: agreed engineering campaign; live run preparation.
+Status: native live correction accepted; final integration review in progress.
 
 User authorization: run Turing with computer use, thoroughly test its RSI workflow, and use GPT-5.6 Luna at xhigh to implement app improvements; user additionally confirmed Codex support.
 
@@ -35,7 +35,7 @@ Budget: at most three concurrent Luna xhigh specialists; initial live attempt ca
 
 ## Checkpoint
 
-Work in progress. Do not cite this document as a completed experiment. Native launch, live source improvement, verification and review remain pending.
+The detailed result, controls, failed first attempt and remaining limits are in [the campaign report](../records/rsi-live-450-v2/REPORT.md). Final integration review remains in progress.
 
 ## Corrective attempt, separately identified
 

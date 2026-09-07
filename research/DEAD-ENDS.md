@@ -49,3 +49,7 @@ Two things deliberately do **not** get copied here:
 - **Decisions superseded by the pivot** (the local LoRA flywheel, the generalist
   adapter, dollar metering, the Jetson-worker premise). Those were not tried and
   found wanting; they were retargeted. They live in ADR 0011 § Superseded.
+
+## 2026-09-06 — PYTHONPATH alone cannot select a pytest candidate
+
+The first native RSI450 run imported baseline source because its pytest config overrode PYTHONPATH. Those verifier failures are invalid candidate evidence; the interrupted run remains preserved. A separately identified correction uses an absolute pytest override and an in-pytest module-path assertion. See [the report](records/rsi-live-450-v2/REPORT.md) and `~/research-results/2026-09-06-turing-rsi-450-live/`.

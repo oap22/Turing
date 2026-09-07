@@ -251,9 +251,7 @@ class CheatSnapshot:
 
     results_files: Mapping[str, tuple[int, int]]
     results_symlinks: frozenset[str] = field(default_factory=frozenset)
-    trajectory: TrajectorySnapshot = field(
-        default_factory=lambda: TrajectorySnapshot("missing")
-    )
+    trajectory: TrajectorySnapshot = field(default_factory=lambda: TrajectorySnapshot("missing"))
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "results_files", MappingProxyType(dict(self.results_files)))
@@ -334,9 +332,7 @@ class CheatDetector:
             trajectory=self.snapshot_trajectory(trajectory_path),
         )
 
-    def refresh_trajectory(
-        self, snapshot: CheatSnapshot, *, trajectory: Path
-    ) -> CheatSnapshot:
+    def refresh_trajectory(self, snapshot: CheatSnapshot, *, trajectory: Path) -> CheatSnapshot:
         """Refresh only trajectory state after a supervisor-owned event is appended."""
         return replace(snapshot, trajectory=self.snapshot_trajectory(trajectory))
 

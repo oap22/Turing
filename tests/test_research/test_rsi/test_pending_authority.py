@@ -202,17 +202,14 @@ def test_exported_cli_returns_failure_on_rollback_failed(rsi_dirs, monkeypatch) 
     bogus = _git(rsi_dirs.sandbox, "rev-parse", "HEAD")
     with (results / "trajectory.json").open("a", encoding="utf-8") as stream:
         stream.write(
-            json.dumps({"event": "self_edit", "round": 1, "ts": 1, "scaffold_sha": bogus})
-            + "\n"
+            json.dumps({"event": "self_edit", "round": 1, "ts": 1, "scaffold_sha": bogus}) + "\n"
         )
 
     monkeypatch.setenv(ALLOW_FAKE_ENGINE_ENV, "1")
     monkeypatch.setattr(
         cli,
         "_build_engine",
-        lambda _name, *, results_dir=None: FakeEngine(
-            script=[score_step(0, results=results)]
-        ),
+        lambda _name, *, results_dir=None: FakeEngine(script=[score_step(0, results=results)]),
     )
     code = cli.main(
         [

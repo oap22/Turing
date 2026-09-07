@@ -1,0 +1,322 @@
+F.FFFFF.                                                                 [100%]
+=================================== FAILURES ===================================
+__________________ test_round_cannot_forge_trajectory[append] __________________
+
+tmp_path = PosixPath('/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_round_cannot_forge_trajec0')
+mutation = 'append'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mutation", ["append", "normal"])
+    async def test_round_cannot_forge_trajectory(tmp_path: Path, mutation: str):
+        cfg = RsiConfig(slug="external", workspace_root=tmp_path / "workspace",
+                        results_root=tmp_path / "results", rounds=1, self_edit_every=0)
+        cfg.sandbox_dir.mkdir(parents=True)
+        (cfg.sandbox_dir / "verify.sh").write_text("printf 'score=1\\n'\n")
+        trajectory = cfg.results_dir / "trajectory.json"
+    
+        def act(prompt, cwd):
+            if mutation == "append":
+                forged = {"round": 777, "started": 1, "ended": 2, "exit": 0,
+                          "score": 999.0, "passed": True, "categories": [],
+                          "scaffold_sha": None, "void": False,
+                          "agent_reported_score": None, "verifier_wall_seconds": 0.0}
+                with trajectory.open("a") as stream:
+                    stream.write(json.dumps(forged) + "\n")
+            with (cfg.results_dir / "metrics.jsonl").open("a") as stream:
+                stream.write('{"step":1,"score":1}\n')
+            return ok_result()
+    
+        outcome = await RsiLoop(cfg, engine=FakeEngine(script=[act]),
+                                verifier=VerifierSpec(command="sh verify.sh", files=("verify.sh",)),
+                                self_edit=None, cheat=CheatDetector(), problem="external check").run()
+        state = read_trajectory(trajectory)
+        if mutation == "normal":
+            assert outcome.exit_code == 0
+            assert state.best_score == 1.0
+            assert len(state.records) == 1 and not state.records[0].void
+        else:
+>           assert outcome.exit_code == 3, "trajectory mutation must stop with tamper/cheat exit"
+E           AssertionError: trajectory mutation must stop with tamper/cheat exit
+E           assert 0 == 3
+E            +  where 0 = LoopOutcome(rounds_run=1, stop_reason=<StopReason.ROUNDS_EXHAUSTED: 'rounds_exhausted'>, best_score=1.0, self_edits=0, rollbacks=0).exit_code
+
+research/records/rsi-live-450-v2/test_external_trajectory.py:43: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-09-06 21:00:37 [info     ] rsi.taxonomy.written           digest=2ee65add4eb8a03fe2466d53584904d12f7d78a374c45f74475ef646dc3dcd8d path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_round_cannot_forge_trajec0/results/loop-rsi-external/taxonomy.json
+2026-09-06 21:00:37 [info     ] rsi.verifier.locked            command_sha256=f0ea9dddeee37cac9028a9a5340a841dddf5d0d70dd6a4baf089e840fdb65e09 path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_round_cannot_forge_trajec0/workspace/rsi-external/VERIFIER.json pinned_files=['verify.sh']
+2026-09-06 21:00:37 [info     ] rsi.loop.prepared              best_score=None next_round=1 pending_self_edit=None prior_pass=False results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_round_cannot_forge_trajec0/results/loop-rsi-external sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_round_cannot_forge_trajec0/workspace/rsi-external scaffold_sha=484585aec282
+2026-09-06 21:00:37 [info     ] rsi.round.start                round=1 slug=external
+2026-09-06 21:00:37 [debug    ] rsi.cheat.snapshot             files=2 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_round_cannot_forge_trajec0/results/loop-rsi-external sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_round_cannot_forge_trajec0/workspace/rsi-external
+2026-09-06 21:00:38 [info     ] rsi.verifier.finished          exit_code=0 passed=True pipe_abandoned=False score=1.0 timed_out=False wall_seconds=0.054
+2026-09-06 21:00:38 [info     ] rsi.round.recorded             categories=[] exit_code=0 passed=True round=1 score=1.0 void=False
+2026-09-06 21:00:38 [info     ] rsi.loop.done                  best_score=1.0 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_round_cannot_forge_trajec0/results/loop-rsi-external rollbacks=0 rounds_run=1 self_edits=0 stop_reason=rounds_exhausted
+__________________ test_late_trajectory_mutation_is_restored ___________________
+
+tmp_path = PosixPath('/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_late_trajectory_mutation_0')
+
+    @pytest.mark.asyncio
+    async def test_late_trajectory_mutation_is_restored(tmp_path: Path):
+        cfg=RsiConfig(slug='late',workspace_root=tmp_path/'ws',results_root=tmp_path/'out',rounds=1,self_edit_every=0)
+        cfg.sandbox_dir.mkdir(parents=True)
+        trajectory=cfg.results_dir/'trajectory.json'
+        forged={'round':777,'started':1,'ended':2,'exit':0,'score':999.0,'passed':True,'categories':[],'scaffold_sha':None,'void':False,'agent_reported_score':None,'verifier_wall_seconds':0.0}
+        # A real verifier subprocess injects the late write after the engine-phase
+        # snapshot has been checked, deterministically exercising that boundary.
+        script=f'printf "%s\\n" \'{json.dumps(forged)}\' >> \'{trajectory}\'\nprintf "score=1\\n"\n'
+        (cfg.sandbox_dir/'verify.sh').write_text(script)
+        out=await RsiLoop(cfg,engine=FakeEngine(script=[ok_result()]),verifier=VerifierSpec(command='sh verify.sh',files=('verify.sh',)),self_edit=None,problem='late boundary probe').run()
+        state=read_trajectory(trajectory)
+>       assert out.exit_code==3
+E       AssertionError: assert 0 == 3
+E        +  where 0 = LoopOutcome(rounds_run=1, stop_reason=<StopReason.ROUNDS_EXHAUSTED: 'rounds_exhausted'>, best_score=1.0, self_edits=0, rollbacks=0).exit_code
+
+research/records/rsi-live-450-v2/test_late_evidence.py:20: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-09-06 21:00:38 [info     ] rsi.taxonomy.written           digest=2ee65add4eb8a03fe2466d53584904d12f7d78a374c45f74475ef646dc3dcd8d path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_late_trajectory_mutation_0/out/loop-rsi-late/taxonomy.json
+2026-09-06 21:00:38 [info     ] rsi.verifier.locked            command_sha256=f0ea9dddeee37cac9028a9a5340a841dddf5d0d70dd6a4baf089e840fdb65e09 path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_late_trajectory_mutation_0/ws/rsi-late/VERIFIER.json pinned_files=['verify.sh']
+2026-09-06 21:00:38 [info     ] rsi.loop.prepared              best_score=None next_round=1 pending_self_edit=None prior_pass=False results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_late_trajectory_mutation_0/out/loop-rsi-late sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_late_trajectory_mutation_0/ws/rsi-late scaffold_sha=11d837ee4142
+2026-09-06 21:00:38 [info     ] rsi.round.start                round=1 slug=late
+2026-09-06 21:00:38 [debug    ] rsi.cheat.snapshot             files=2 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_late_trajectory_mutation_0/out/loop-rsi-late sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_late_trajectory_mutation_0/ws/rsi-late
+2026-09-06 21:00:38 [info     ] rsi.verifier.finished          exit_code=0 passed=True pipe_abandoned=False score=1.0 timed_out=False wall_seconds=0.053
+2026-09-06 21:00:38 [info     ] rsi.round.recorded             categories=['no_metrics'] exit_code=0 passed=True round=1 score=1.0 void=False
+2026-09-06 21:00:38 [info     ] rsi.loop.done                  best_score=1.0 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_late_trajectory_mutation_0/out/loop-rsi-late rollbacks=0 rounds_run=1 self_edits=0 stop_reason=rounds_exhausted
+____________________ test_protect_existing_history[replace] ____________________
+
+tmp_path = PosixPath('/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_0')
+mutation = 'replace'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('mutation', ['replace', 'delete', 'truncate', 'same-stat'])
+    async def test_protect_existing_history(tmp_path: Path, mutation):
+        cfg = RsiConfig(slug='holdout', workspace_root=tmp_path / 'ws', results_root=tmp_path / 'out', rounds=1, self_edit_every=0)
+        cfg.sandbox_dir.mkdir(parents=True)
+        (cfg.sandbox_dir / 'verify.sh').write_text("printf 'score=1\\n'\n")
+        path = cfg.results_dir / 'trajectory.json'
+        spec = VerifierSpec(command='sh verify.sh', files=('verify.sh',))
+        def normal(prompt, cwd):
+            with (cfg.results_dir / 'metrics.jsonl').open('a') as f: f.write('{"score":1}\n')
+            return ok_result()
+        await RsiLoop(cfg, engine=FakeEngine(script=[normal]), verifier=spec, self_edit=None, problem='holdout').run()
+        previous = read_trajectory(path).records[0].to_json()
+        def attack(prompt, cwd):
+            old = path.read_text(); st = path.stat()
+            if mutation == 'delete': path.unlink()
+            elif mutation == 'truncate': path.write_text('')
+            else:
+                lines = [json.loads(line) for line in old.splitlines()]
+                for row in lines:
+                    if 'event' not in row: row['score'] = 9.0
+                changed = ''.join(json.dumps(row) + '\n' for row in lines)
+                if mutation == 'replace':
+                    sibling = path.with_suffix('.replacement'); sibling.write_text(changed); sibling.replace(path)
+                else:
+                    assert len(old) == len(changed)
+                    path.write_text(changed)
+                    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+            return normal(prompt, cwd)
+        out = await RsiLoop(cfg, engine=FakeEngine(script=[attack]), verifier=None, self_edit=None).run()
+        state = read_trajectory(path)
+>       assert out.exit_code == 3
+E       AssertionError: assert 0 == 3
+E        +  where 0 = LoopOutcome(rounds_run=1, stop_reason=<StopReason.ROUNDS_EXHAUSTED: 'rounds_exhausted'>, best_score=1.0, self_edits=0, rollbacks=0).exit_code
+
+research/records/rsi-live-450-v2/test_restart_evidence.py:43: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-09-06 21:00:38 [info     ] rsi.taxonomy.written           digest=2ee65add4eb8a03fe2466d53584904d12f7d78a374c45f74475ef646dc3dcd8d path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_0/out/loop-rsi-holdout/taxonomy.json
+2026-09-06 21:00:38 [info     ] rsi.verifier.locked            command_sha256=f0ea9dddeee37cac9028a9a5340a841dddf5d0d70dd6a4baf089e840fdb65e09 path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_0/ws/rsi-holdout/VERIFIER.json pinned_files=['verify.sh']
+2026-09-06 21:00:38 [info     ] rsi.loop.prepared              best_score=None next_round=1 pending_self_edit=None prior_pass=False results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_0/out/loop-rsi-holdout sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_0/ws/rsi-holdout scaffold_sha=3249a66f7ad4
+2026-09-06 21:00:38 [info     ] rsi.round.start                round=1 slug=holdout
+2026-09-06 21:00:38 [debug    ] rsi.cheat.snapshot             files=2 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_0/out/loop-rsi-holdout sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_0/ws/rsi-holdout
+2026-09-06 21:00:38 [info     ] rsi.verifier.finished          exit_code=0 passed=True pipe_abandoned=False score=1.0 timed_out=False wall_seconds=0.054
+2026-09-06 21:00:38 [info     ] rsi.round.recorded             categories=['no_metrics'] exit_code=0 passed=True round=1 score=1.0 void=False
+2026-09-06 21:00:38 [info     ] rsi.loop.done                  best_score=1.0 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_0/out/loop-rsi-holdout rollbacks=0 rounds_run=1 self_edits=0 stop_reason=rounds_exhausted
+2026-09-06 21:00:38 [info     ] rsi.taxonomy.checked           digest=2ee65add4eb8a03fe2466d53584904d12f7d78a374c45f74475ef646dc3dcd8d path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_0/out/loop-rsi-holdout/taxonomy.json
+2026-09-06 21:00:38 [info     ] rsi.verifier.loaded            path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_0/ws/rsi-holdout/VERIFIER.json pinned_files=['verify.sh']
+2026-09-06 21:00:38 [info     ] rsi.loop.prepared              best_score=1.0 next_round=2 pending_self_edit=None prior_pass=True results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_0/out/loop-rsi-holdout sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_0/ws/rsi-holdout scaffold_sha=3249a66f7ad4
+2026-09-06 21:00:38 [info     ] rsi.round.start                round=2 slug=holdout
+2026-09-06 21:00:38 [debug    ] rsi.cheat.snapshot             files=3 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_0/out/loop-rsi-holdout sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_0/ws/rsi-holdout
+2026-09-06 21:00:38 [info     ] rsi.verifier.finished          exit_code=0 passed=True pipe_abandoned=False score=1.0 timed_out=False wall_seconds=0.053
+2026-09-06 21:00:38 [info     ] rsi.round.recorded             categories=['no_metrics', 'no_progress'] exit_code=0 passed=True round=2 score=1.0 void=False
+2026-09-06 21:00:38 [info     ] rsi.loop.done                  best_score=1.0 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_0/out/loop-rsi-holdout rollbacks=0 rounds_run=1 self_edits=0 stop_reason=rounds_exhausted
+____________________ test_protect_existing_history[delete] _____________________
+
+tmp_path = PosixPath('/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_1')
+mutation = 'delete'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('mutation', ['replace', 'delete', 'truncate', 'same-stat'])
+    async def test_protect_existing_history(tmp_path: Path, mutation):
+        cfg = RsiConfig(slug='holdout', workspace_root=tmp_path / 'ws', results_root=tmp_path / 'out', rounds=1, self_edit_every=0)
+        cfg.sandbox_dir.mkdir(parents=True)
+        (cfg.sandbox_dir / 'verify.sh').write_text("printf 'score=1\\n'\n")
+        path = cfg.results_dir / 'trajectory.json'
+        spec = VerifierSpec(command='sh verify.sh', files=('verify.sh',))
+        def normal(prompt, cwd):
+            with (cfg.results_dir / 'metrics.jsonl').open('a') as f: f.write('{"score":1}\n')
+            return ok_result()
+        await RsiLoop(cfg, engine=FakeEngine(script=[normal]), verifier=spec, self_edit=None, problem='holdout').run()
+        previous = read_trajectory(path).records[0].to_json()
+        def attack(prompt, cwd):
+            old = path.read_text(); st = path.stat()
+            if mutation == 'delete': path.unlink()
+            elif mutation == 'truncate': path.write_text('')
+            else:
+                lines = [json.loads(line) for line in old.splitlines()]
+                for row in lines:
+                    if 'event' not in row: row['score'] = 9.0
+                changed = ''.join(json.dumps(row) + '\n' for row in lines)
+                if mutation == 'replace':
+                    sibling = path.with_suffix('.replacement'); sibling.write_text(changed); sibling.replace(path)
+                else:
+                    assert len(old) == len(changed)
+                    path.write_text(changed)
+                    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+            return normal(prompt, cwd)
+        out = await RsiLoop(cfg, engine=FakeEngine(script=[attack]), verifier=None, self_edit=None).run()
+        state = read_trajectory(path)
+>       assert out.exit_code == 3
+E       AssertionError: assert 0 == 3
+E        +  where 0 = LoopOutcome(rounds_run=1, stop_reason=<StopReason.ROUNDS_EXHAUSTED: 'rounds_exhausted'>, best_score=1.0, self_edits=0, rollbacks=0).exit_code
+
+research/records/rsi-live-450-v2/test_restart_evidence.py:43: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-09-06 21:00:38 [info     ] rsi.taxonomy.written           digest=2ee65add4eb8a03fe2466d53584904d12f7d78a374c45f74475ef646dc3dcd8d path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_1/out/loop-rsi-holdout/taxonomy.json
+2026-09-06 21:00:38 [info     ] rsi.verifier.locked            command_sha256=f0ea9dddeee37cac9028a9a5340a841dddf5d0d70dd6a4baf089e840fdb65e09 path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_1/ws/rsi-holdout/VERIFIER.json pinned_files=['verify.sh']
+2026-09-06 21:00:39 [info     ] rsi.loop.prepared              best_score=None next_round=1 pending_self_edit=None prior_pass=False results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_1/out/loop-rsi-holdout sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_1/ws/rsi-holdout scaffold_sha=7e7cf48cbf2b
+2026-09-06 21:00:39 [info     ] rsi.round.start                round=1 slug=holdout
+2026-09-06 21:00:39 [debug    ] rsi.cheat.snapshot             files=2 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_1/out/loop-rsi-holdout sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_1/ws/rsi-holdout
+2026-09-06 21:00:39 [info     ] rsi.verifier.finished          exit_code=0 passed=True pipe_abandoned=False score=1.0 timed_out=False wall_seconds=0.053
+2026-09-06 21:00:39 [info     ] rsi.round.recorded             categories=['no_metrics'] exit_code=0 passed=True round=1 score=1.0 void=False
+2026-09-06 21:00:39 [info     ] rsi.loop.done                  best_score=1.0 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_1/out/loop-rsi-holdout rollbacks=0 rounds_run=1 self_edits=0 stop_reason=rounds_exhausted
+2026-09-06 21:00:39 [info     ] rsi.taxonomy.checked           digest=2ee65add4eb8a03fe2466d53584904d12f7d78a374c45f74475ef646dc3dcd8d path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_1/out/loop-rsi-holdout/taxonomy.json
+2026-09-06 21:00:39 [info     ] rsi.verifier.loaded            path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_1/ws/rsi-holdout/VERIFIER.json pinned_files=['verify.sh']
+2026-09-06 21:00:39 [info     ] rsi.loop.prepared              best_score=1.0 next_round=2 pending_self_edit=None prior_pass=True results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_1/out/loop-rsi-holdout sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_1/ws/rsi-holdout scaffold_sha=7e7cf48cbf2b
+2026-09-06 21:00:39 [info     ] rsi.round.start                round=2 slug=holdout
+2026-09-06 21:00:39 [debug    ] rsi.cheat.snapshot             files=3 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_1/out/loop-rsi-holdout sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_1/ws/rsi-holdout
+2026-09-06 21:00:39 [info     ] rsi.verifier.finished          exit_code=0 passed=True pipe_abandoned=False score=1.0 timed_out=False wall_seconds=0.053
+2026-09-06 21:00:39 [info     ] rsi.round.recorded             categories=['no_metrics', 'no_progress'] exit_code=0 passed=True round=2 score=1.0 void=False
+2026-09-06 21:00:39 [info     ] rsi.loop.done                  best_score=1.0 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_1/out/loop-rsi-holdout rollbacks=0 rounds_run=1 self_edits=0 stop_reason=rounds_exhausted
+___________________ test_protect_existing_history[truncate] ____________________
+
+tmp_path = PosixPath('/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_2')
+mutation = 'truncate'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('mutation', ['replace', 'delete', 'truncate', 'same-stat'])
+    async def test_protect_existing_history(tmp_path: Path, mutation):
+        cfg = RsiConfig(slug='holdout', workspace_root=tmp_path / 'ws', results_root=tmp_path / 'out', rounds=1, self_edit_every=0)
+        cfg.sandbox_dir.mkdir(parents=True)
+        (cfg.sandbox_dir / 'verify.sh').write_text("printf 'score=1\\n'\n")
+        path = cfg.results_dir / 'trajectory.json'
+        spec = VerifierSpec(command='sh verify.sh', files=('verify.sh',))
+        def normal(prompt, cwd):
+            with (cfg.results_dir / 'metrics.jsonl').open('a') as f: f.write('{"score":1}\n')
+            return ok_result()
+        await RsiLoop(cfg, engine=FakeEngine(script=[normal]), verifier=spec, self_edit=None, problem='holdout').run()
+        previous = read_trajectory(path).records[0].to_json()
+        def attack(prompt, cwd):
+            old = path.read_text(); st = path.stat()
+            if mutation == 'delete': path.unlink()
+            elif mutation == 'truncate': path.write_text('')
+            else:
+                lines = [json.loads(line) for line in old.splitlines()]
+                for row in lines:
+                    if 'event' not in row: row['score'] = 9.0
+                changed = ''.join(json.dumps(row) + '\n' for row in lines)
+                if mutation == 'replace':
+                    sibling = path.with_suffix('.replacement'); sibling.write_text(changed); sibling.replace(path)
+                else:
+                    assert len(old) == len(changed)
+                    path.write_text(changed)
+                    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+            return normal(prompt, cwd)
+        out = await RsiLoop(cfg, engine=FakeEngine(script=[attack]), verifier=None, self_edit=None).run()
+        state = read_trajectory(path)
+>       assert out.exit_code == 3
+E       AssertionError: assert 0 == 3
+E        +  where 0 = LoopOutcome(rounds_run=1, stop_reason=<StopReason.ROUNDS_EXHAUSTED: 'rounds_exhausted'>, best_score=1.0, self_edits=0, rollbacks=0).exit_code
+
+research/records/rsi-live-450-v2/test_restart_evidence.py:43: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-09-06 21:00:39 [info     ] rsi.taxonomy.written           digest=2ee65add4eb8a03fe2466d53584904d12f7d78a374c45f74475ef646dc3dcd8d path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_2/out/loop-rsi-holdout/taxonomy.json
+2026-09-06 21:00:39 [info     ] rsi.verifier.locked            command_sha256=f0ea9dddeee37cac9028a9a5340a841dddf5d0d70dd6a4baf089e840fdb65e09 path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_2/ws/rsi-holdout/VERIFIER.json pinned_files=['verify.sh']
+2026-09-06 21:00:39 [info     ] rsi.loop.prepared              best_score=None next_round=1 pending_self_edit=None prior_pass=False results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_2/out/loop-rsi-holdout sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_2/ws/rsi-holdout scaffold_sha=3d9434a8ec5a
+2026-09-06 21:00:39 [info     ] rsi.round.start                round=1 slug=holdout
+2026-09-06 21:00:39 [debug    ] rsi.cheat.snapshot             files=2 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_2/out/loop-rsi-holdout sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_2/ws/rsi-holdout
+2026-09-06 21:00:39 [info     ] rsi.verifier.finished          exit_code=0 passed=True pipe_abandoned=False score=1.0 timed_out=False wall_seconds=0.054
+2026-09-06 21:00:39 [info     ] rsi.round.recorded             categories=['no_metrics'] exit_code=0 passed=True round=1 score=1.0 void=False
+2026-09-06 21:00:39 [info     ] rsi.loop.done                  best_score=1.0 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_2/out/loop-rsi-holdout rollbacks=0 rounds_run=1 self_edits=0 stop_reason=rounds_exhausted
+2026-09-06 21:00:39 [info     ] rsi.taxonomy.checked           digest=2ee65add4eb8a03fe2466d53584904d12f7d78a374c45f74475ef646dc3dcd8d path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_2/out/loop-rsi-holdout/taxonomy.json
+2026-09-06 21:00:39 [info     ] rsi.verifier.loaded            path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_2/ws/rsi-holdout/VERIFIER.json pinned_files=['verify.sh']
+2026-09-06 21:00:39 [info     ] rsi.loop.prepared              best_score=1.0 next_round=2 pending_self_edit=None prior_pass=True results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_2/out/loop-rsi-holdout sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_2/ws/rsi-holdout scaffold_sha=3d9434a8ec5a
+2026-09-06 21:00:39 [info     ] rsi.round.start                round=2 slug=holdout
+2026-09-06 21:00:39 [debug    ] rsi.cheat.snapshot             files=3 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_2/out/loop-rsi-holdout sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_2/ws/rsi-holdout
+2026-09-06 21:00:39 [info     ] rsi.verifier.finished          exit_code=0 passed=True pipe_abandoned=False score=1.0 timed_out=False wall_seconds=0.053
+2026-09-06 21:00:39 [info     ] rsi.round.recorded             categories=['no_metrics', 'no_progress'] exit_code=0 passed=True round=2 score=1.0 void=False
+2026-09-06 21:00:39 [info     ] rsi.loop.done                  best_score=1.0 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_2/out/loop-rsi-holdout rollbacks=0 rounds_run=1 self_edits=0 stop_reason=rounds_exhausted
+___________________ test_protect_existing_history[same-stat] ___________________
+
+tmp_path = PosixPath('/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_3')
+mutation = 'same-stat'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('mutation', ['replace', 'delete', 'truncate', 'same-stat'])
+    async def test_protect_existing_history(tmp_path: Path, mutation):
+        cfg = RsiConfig(slug='holdout', workspace_root=tmp_path / 'ws', results_root=tmp_path / 'out', rounds=1, self_edit_every=0)
+        cfg.sandbox_dir.mkdir(parents=True)
+        (cfg.sandbox_dir / 'verify.sh').write_text("printf 'score=1\\n'\n")
+        path = cfg.results_dir / 'trajectory.json'
+        spec = VerifierSpec(command='sh verify.sh', files=('verify.sh',))
+        def normal(prompt, cwd):
+            with (cfg.results_dir / 'metrics.jsonl').open('a') as f: f.write('{"score":1}\n')
+            return ok_result()
+        await RsiLoop(cfg, engine=FakeEngine(script=[normal]), verifier=spec, self_edit=None, problem='holdout').run()
+        previous = read_trajectory(path).records[0].to_json()
+        def attack(prompt, cwd):
+            old = path.read_text(); st = path.stat()
+            if mutation == 'delete': path.unlink()
+            elif mutation == 'truncate': path.write_text('')
+            else:
+                lines = [json.loads(line) for line in old.splitlines()]
+                for row in lines:
+                    if 'event' not in row: row['score'] = 9.0
+                changed = ''.join(json.dumps(row) + '\n' for row in lines)
+                if mutation == 'replace':
+                    sibling = path.with_suffix('.replacement'); sibling.write_text(changed); sibling.replace(path)
+                else:
+                    assert len(old) == len(changed)
+                    path.write_text(changed)
+                    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+            return normal(prompt, cwd)
+        out = await RsiLoop(cfg, engine=FakeEngine(script=[attack]), verifier=None, self_edit=None).run()
+        state = read_trajectory(path)
+>       assert out.exit_code == 3
+E       AssertionError: assert 0 == 3
+E        +  where 0 = LoopOutcome(rounds_run=1, stop_reason=<StopReason.ROUNDS_EXHAUSTED: 'rounds_exhausted'>, best_score=1.0, self_edits=0, rollbacks=0).exit_code
+
+research/records/rsi-live-450-v2/test_restart_evidence.py:43: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-09-06 21:00:39 [info     ] rsi.taxonomy.written           digest=2ee65add4eb8a03fe2466d53584904d12f7d78a374c45f74475ef646dc3dcd8d path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_3/out/loop-rsi-holdout/taxonomy.json
+2026-09-06 21:00:39 [info     ] rsi.verifier.locked            command_sha256=f0ea9dddeee37cac9028a9a5340a841dddf5d0d70dd6a4baf089e840fdb65e09 path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_3/ws/rsi-holdout/VERIFIER.json pinned_files=['verify.sh']
+2026-09-06 21:00:39 [info     ] rsi.loop.prepared              best_score=None next_round=1 pending_self_edit=None prior_pass=False results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_3/out/loop-rsi-holdout sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_3/ws/rsi-holdout scaffold_sha=3c8792cea126
+2026-09-06 21:00:39 [info     ] rsi.round.start                round=1 slug=holdout
+2026-09-06 21:00:39 [debug    ] rsi.cheat.snapshot             files=2 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_3/out/loop-rsi-holdout sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_3/ws/rsi-holdout
+2026-09-06 21:00:39 [info     ] rsi.verifier.finished          exit_code=0 passed=True pipe_abandoned=False score=1.0 timed_out=False wall_seconds=0.053
+2026-09-06 21:00:39 [info     ] rsi.round.recorded             categories=['no_metrics'] exit_code=0 passed=True round=1 score=1.0 void=False
+2026-09-06 21:00:39 [info     ] rsi.loop.done                  best_score=1.0 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_3/out/loop-rsi-holdout rollbacks=0 rounds_run=1 self_edits=0 stop_reason=rounds_exhausted
+2026-09-06 21:00:39 [info     ] rsi.taxonomy.checked           digest=2ee65add4eb8a03fe2466d53584904d12f7d78a374c45f74475ef646dc3dcd8d path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_3/out/loop-rsi-holdout/taxonomy.json
+2026-09-06 21:00:39 [info     ] rsi.verifier.loaded            path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_3/ws/rsi-holdout/VERIFIER.json pinned_files=['verify.sh']
+2026-09-06 21:00:40 [info     ] rsi.loop.prepared              best_score=1.0 next_round=2 pending_self_edit=None prior_pass=True results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_3/out/loop-rsi-holdout sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_3/ws/rsi-holdout scaffold_sha=3c8792cea126
+2026-09-06 21:00:40 [info     ] rsi.round.start                round=2 slug=holdout
+2026-09-06 21:00:40 [debug    ] rsi.cheat.snapshot             files=3 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_3/out/loop-rsi-holdout sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_3/ws/rsi-holdout
+2026-09-06 21:00:40 [info     ] rsi.verifier.finished          exit_code=0 passed=True pipe_abandoned=False score=1.0 timed_out=False wall_seconds=0.053
+2026-09-06 21:00:40 [info     ] rsi.round.recorded             categories=['no_metrics', 'no_progress'] exit_code=0 passed=True round=2 score=1.0 void=False
+2026-09-06 21:00:40 [info     ] rsi.loop.done                  best_score=1.0 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-176/test_protect_existing_history_3/out/loop-rsi-holdout rollbacks=0 rounds_run=1 self_edits=0 stop_reason=rounds_exhausted
+=========================== short test summary info ============================
+FAILED research/records/rsi-live-450-v2/test_external_trajectory.py::test_round_cannot_forge_trajectory[append]
+FAILED research/records/rsi-live-450-v2/test_late_evidence.py::test_late_trajectory_mutation_is_restored
+FAILED research/records/rsi-live-450-v2/test_restart_evidence.py::test_protect_existing_history[replace]
+FAILED research/records/rsi-live-450-v2/test_restart_evidence.py::test_protect_existing_history[delete]
+FAILED research/records/rsi-live-450-v2/test_restart_evidence.py::test_protect_existing_history[truncate]
+FAILED research/records/rsi-live-450-v2/test_restart_evidence.py::test_protect_existing_history[same-stat]
+6 failed, 2 passed in 2.89s

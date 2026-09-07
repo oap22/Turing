@@ -42,9 +42,7 @@ def _forged_line() -> bytes:
     )
 
 
-def _trajectory_action(
-    dirs: RsiDirs, mutation: str
-):
+def _trajectory_action(dirs: RsiDirs, mutation: str):
     def action(prompt: str, cwd: Path):
         del prompt, cwd
         trajectory = dirs.config.results_dir / "trajectory.json"
@@ -194,4 +192,6 @@ async def test_late_verifier_write_is_quarantined_before_resume(
     assert outcome.exit_code == 0
     assert outcome.best_score == 1.0
     assert state_after_resume.best_score == 1.0
-    assert all(record.round != 777 and record.score != 999.0 for record in state_after_resume.records)
+    assert all(
+        record.round != 777 and record.score != 999.0 for record in state_after_resume.records
+    )

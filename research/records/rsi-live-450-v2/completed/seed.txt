@@ -1,0 +1,40 @@
+..F.....                                                                 [100%]
+=================================== FAILURES ===================================
+__________________ test_late_trajectory_mutation_is_restored ___________________
+
+tmp_path = PosixPath('/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-174/test_late_trajectory_mutation_0')
+
+    @pytest.mark.asyncio
+    async def test_late_trajectory_mutation_is_restored(tmp_path: Path):
+        cfg=RsiConfig(slug='late',workspace_root=tmp_path/'ws',results_root=tmp_path/'out',rounds=1,self_edit_every=0)
+        cfg.sandbox_dir.mkdir(parents=True)
+        trajectory=cfg.results_dir/'trajectory.json'
+        forged={'round':777,'started':1,'ended':2,'exit':0,'score':999.0,'passed':True,'categories':[],'scaffold_sha':None,'void':False,'agent_reported_score':None,'verifier_wall_seconds':0.0}
+        # A real verifier subprocess injects the late write after the engine-phase
+        # snapshot has been checked, deterministically exercising that boundary.
+        script=f'printf "%s\\n" \'{json.dumps(forged)}\' >> \'{trajectory}\'\nprintf "score=1\\n"\n'
+        (cfg.sandbox_dir/'verify.sh').write_text(script)
+        out=await RsiLoop(cfg,engine=FakeEngine(script=[ok_result()]),verifier=VerifierSpec(command='sh verify.sh',files=('verify.sh',)),self_edit=None,problem='late boundary probe').run()
+        state=read_trajectory(trajectory)
+        assert out.exit_code==3
+        assert state.records[-1].void
+>       assert state.best_score != 999.0, 'late forged score must not survive into resume'
+E       AssertionError: late forged score must not survive into resume
+E       assert 999.0 != 999.0
+E        +  where 999.0 = TrajectoryState(records=(RoundRecord(round=777, started=1, ended=2, exit=0, score=999.0, passed=True, categories=froze...f4cec7056842c62f3868a5f85093b9c302f9d3', 'scaffold_blob': '1a6eea8540186eff2e123b2a4e4882410beb2fe1'}))), next_round=3).best_score
+
+research/records/rsi-live-450-v2/test_late_evidence.py:22: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-09-06 20:54:08 [info     ] rsi.taxonomy.written           digest=2ee65add4eb8a03fe2466d53584904d12f7d78a374c45f74475ef646dc3dcd8d path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-174/test_late_trajectory_mutation_0/out/loop-rsi-late/taxonomy.json
+2026-09-06 20:54:08 [info     ] rsi.verifier.locked            command_sha256=f0ea9dddeee37cac9028a9a5340a841dddf5d0d70dd6a4baf089e840fdb65e09 path=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-174/test_late_trajectory_mutation_0/ws/rsi-late/VERIFIER.json pinned_files=['verify.sh']
+2026-09-06 20:54:08 [info     ] rsi.loop.prepared              best_score=None next_round=1 pending_self_edit=None prior_pass=False results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-174/test_late_trajectory_mutation_0/out/loop-rsi-late sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-174/test_late_trajectory_mutation_0/ws/rsi-late scaffold_sha=4df4cec70568
+2026-09-06 20:54:08 [info     ] rsi.round.start                round=1 slug=late
+2026-09-06 20:54:08 [debug    ] rsi.cheat.snapshot             files=2 results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-174/test_late_trajectory_mutation_0/out/loop-rsi-late sandbox=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-174/test_late_trajectory_mutation_0/ws/rsi-late
+2026-09-06 20:54:08 [info     ] rsi.verifier.finished          exit_code=0 passed=True pipe_abandoned=False score=1.0 timed_out=False wall_seconds=0.054
+2026-09-06 20:54:08 [error    ] rsi.cheat.fired                categories=['cheat_detected'] reasons=('supervisor-owned trajectory.json changed during the round (regular -> regular)',)
+2026-09-06 20:54:08 [info     ] rsi.round.recorded             categories=['cheat_detected', 'no_metrics'] exit_code=0 passed=True round=1 score=1.0 void=True
+2026-09-06 20:54:08 [error    ] rsi.loop.stopped_on_cheat      reasons=('supervisor-owned trajectory.json changed during the round (regular -> regular)',) round=1
+2026-09-06 20:54:08 [info     ] rsi.loop.done                  best_score=None results=/private/var/folders/23/qrldbhs15lq2bsy8gqdkqljc0000gn/T/pytest-of-owenpacetti/pytest-174/test_late_trajectory_mutation_0/out/loop-rsi-late rollbacks=0 rounds_run=1 self_edits=0 stop_reason=cheat_detected
+=========================== short test summary info ============================
+FAILED research/records/rsi-live-450-v2/test_late_evidence.py::test_late_trajectory_mutation_is_restored
+1 failed, 7 passed in 2.03s
