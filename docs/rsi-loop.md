@@ -343,7 +343,11 @@ round lines already in `trajectory.json` plus one (event lines are skipped);
 a different `--verifier` is refused. Before each round the loop checks for
 `<sandbox>/STOP` and stops if it exists — delete it to continue. Three
 consecutive engine failures (exit non-zero, timeout, CLI not found) abort the
-invocation.
+invocation. If every engine attempt in the invocation failed, the process
+exits 1 even when the verifier produced a passing measurement; a later
+invocation can resume from the preserved round facts. An invocation with at
+least one successful engine attempt exits 0 unless it stops for a cheat or
+tamper.
 
 Two things the resume refuses, and how to recover:
 
@@ -362,7 +366,8 @@ the bash path on a locked slug.
 
 | Code | Meaning |
 |---|---|
-| `0` | Normal completion: rounds exhausted, `STOP` file found, three consecutive engine failures, or a scaffold rollback that could not be applied (`rollback_failed`; check the log for which) |
+| `0` | Normal completion: rounds exhausted, `STOP` file found, or a scaffold rollback that could not be applied (`rollback_failed`; check the log for which). A verifier failure alone remains a round fact and does not fail the invocation. |
+| `1` | Every engine attempt in this invocation timed out or exited unsuccessfully. The trajectory still preserves each round's measured verifier result and failure categories. |
 | `2` | Usage or pre-flight refusal, before any disk write: bad flag, missing `--problem` or `--verifier` on a first run, a different `--verifier` or `--verifier-file` set on resume, a first run that would pin no file although the command names one, a missing lock on a slug that already ran, unreadable lock, corrupt `trajectory.json`, taxonomy digest mismatch |
 | `3` | The loop stopped on a cheat or a tamper. The last trajectory line is either a void round naming the category, or — when the lock was found broken at start-up, before any round — a `{"event": "verifier_tampered", "when": "startup", …}` line. Investigate before restarting; re-running the same command does not re-lock anything |
 | `130` | Interrupted (Ctrl-C). No trajectory line is written for the round in flight. The engine's (or verifier's) process group is SIGKILLed on interrupt; a descendant that put itself in a new session (`setsid`) is outside that group and may survive — check for a still-running `claude` before restarting, because an orphaned agent writing into the sandbox during the next round reads as a tamper or escape |

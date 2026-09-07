@@ -24,6 +24,7 @@ from turing.research.rsi.contracts import (
 from turing.research.rsi.engine import FakeEngine, ok_result
 from turing.research.rsi.loop import (
     DEFAULT_SCAFFOLD,
+    EXIT_ENGINE_FAILURE,
     SCAFFOLD_FILENAME,
     LoopOutcome,
     RsiLoop,
@@ -606,7 +607,7 @@ class TestRounds:
         engine = FakeEngine(script=[bad, bad, bad, bad])
         outcome = await _loop(rsi_dirs, engine, config=_config(rsi_dirs, rounds=10)).run()
         assert outcome.stop_reason is StopReason.ENGINE_FAILURES
-        assert outcome.exit_code == 0
+        assert outcome.exit_code == EXIT_ENGINE_FAILURE
         assert outcome.rounds_run == 3
         assert len(engine.calls) == 3
         assert all("engine_error" in r["categories"] for r in _records(rsi_dirs.results))

@@ -43,10 +43,12 @@ What this module guarantees:
 * ``--engine codex`` selects the fixed ``gpt-5.6-luna`` / ``xhigh`` Codex
   configuration with the ``workspace-write`` sandbox. A missing Codex CLI is
   reported as an engine failure; it never falls back to Claude.
-* Exit codes: 0 normal completion, 2 usage / pre-flight refusal, 3 the loop
-  stopped on a cheat or tamper (:data:`EXIT_STOPPED`), 130 interrupted by
-  Ctrl-C (:data:`EXIT_INTERRUPTED`; no trajectory line is written for the
-  round that was in flight).
+* Exit codes: 0 normal completion (including verifier failures that may
+  recover), 1 when every engine attempt in an invocation failed, 2 usage /
+  pre-flight refusal, 3 the loop stopped on a cheat or tamper
+  (:data:`EXIT_STOPPED`), and 130 interrupted by Ctrl-C
+  (:data:`EXIT_INTERRUPTED`; no trajectory line is written for the round that
+  was in flight).
 
 What it does not do:
 
@@ -86,6 +88,7 @@ from turing.research.rsi.contracts import (
     compute_verifier_lock,
 )
 from turing.research.rsi.loop import (
+    EXIT_ENGINE_FAILURE,
     PROBLEM_FILENAME,
     TRAJECTORY_FILENAME,
     append_jsonl,
@@ -105,6 +108,7 @@ logger = structlog.get_logger(__name__)
 
 __all__ = [
     "ALLOW_FAKE_ENGINE_ENV",
+    "EXIT_ENGINE_FAILURE",
     "EXIT_INTERRUPTED",
     "EXIT_OK",
     "EXIT_STOPPED",
@@ -116,7 +120,7 @@ __all__ = [
     "resolve_plan",
 ]
 
-#: Normal completion (rounds exhausted, STOP file, or consecutive engine failures).
+#: Normal completion (rounds exhausted or STOP file; verifier failures remain round facts).
 EXIT_OK: int = 0
 #: Usage error or pre-flight refusal (bad flag, missing --problem/--verifier, taxonomy drift).
 EXIT_USAGE: int = 2

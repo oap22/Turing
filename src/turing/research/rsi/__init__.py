@@ -26,7 +26,14 @@ filesystem until :meth:`RsiLoop.prepare` or :func:`cli.main` is called.
 """
 
 from turing.research.rsi.cheat import CheatDetector, CheatSnapshot, GitResult, git_env, run_git
-from turing.research.rsi.cli import EXIT_INTERRUPTED, EXIT_STOPPED, EXIT_USAGE, Plan, resolve_plan
+from turing.research.rsi.cli import (
+    EXIT_ENGINE_FAILURE,
+    EXIT_INTERRUPTED,
+    EXIT_STOPPED,
+    EXIT_USAGE,
+    Plan,
+    resolve_plan,
+)
 from turing.research.rsi.cli import main as cli_main
 from turing.research.rsi.contracts import (
     BASH_TRAJECTORY_KEYS,
@@ -101,6 +108,7 @@ from turing.research.rsi.verifier import (
 __all__ = [
     "BASH_TRAJECTORY_KEYS",
     "DEFAULT_SCAFFOLD_TEXT",
+    "EXIT_ENGINE_FAILURE",
     "EXIT_INTERRUPTED",
     "EXIT_OK",
     "EXIT_STOPPED",

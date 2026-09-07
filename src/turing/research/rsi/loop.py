@@ -164,6 +164,7 @@ logger = structlog.get_logger(__name__)
 __all__ = [
     "DEFAULT_SCAFFOLD",
     "EXIT_CHEAT",
+    "EXIT_ENGINE_FAILURE",
     "EXIT_OK",
     "MAX_CONSECUTIVE_ENGINE_FAILURES",
     "METRICS_FILENAME",
@@ -189,6 +190,7 @@ TRAJECTORY_FILENAME: str = "trajectory.json"
 METRICS_FILENAME: str = "metrics.jsonl"
 MAX_CONSECUTIVE_ENGINE_FAILURES: int = 3
 EXIT_OK: int = 0
+EXIT_ENGINE_FAILURE: int = 1
 EXIT_CHEAT: int = 3
 _REDACTED: str = "<redacted>"
 #: Largest pre-existing dirty file whose bytes are kept for restoring after a rejected self-edit.
@@ -225,11 +227,16 @@ class LoopOutcome:
     best_score: float | None
     self_edits: int
     rollbacks: int
+    #: Number of rounds whose engine timed out or exited non-zero in this invocation.
+    #: Historical trajectory rows are intentionally excluded from this count.
+    engine_failures: int = 0
 
     @property
     def exit_code(self) -> int:
         if self.stop_reason in (StopReason.VERIFIER_TAMPERED, StopReason.CHEAT_DETECTED):
             return EXIT_CHEAT
+        if self.rounds_run > 0 and self.engine_failures >= self.rounds_run:
+            return EXIT_ENGINE_FAILURE
         return EXIT_OK
 
 
@@ -701,6 +708,7 @@ class RsiLoop:
         start = state.next_round
         round_no = start
         rounds_run = 0
+        engine_failures = 0
         consecutive_failures = 0
         self_edits = 0
         rollbacks = 0
@@ -826,6 +834,7 @@ class RsiLoop:
                 pending.rounds_after.append(record)
 
             if result.timed_out or result.exit_code != 0:
+                engine_failures += 1
                 consecutive_failures += 1
                 logger.warning(
                     "rsi.round.engine_failed",
@@ -921,6 +930,7 @@ class RsiLoop:
             best_score=best_score,
             self_edits=self_edits,
             rollbacks=rollbacks,
+            engine_failures=engine_failures,
         )
 
     # ------------------------------------------------------------- helpers
