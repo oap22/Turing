@@ -1,3 +1,7 @@
+# RESUMED explicitly by user: final review and merge in progress
+
+The user requested "resume PR #457". The pause snapshot below remains historical context. All six reproduced findings are fixed and independently re-reviewed with a clean final verdict. Final integrated source is `1317ee8`; combined RSI/evaluator checks passed **400 tests with four skips**, and frontend checks passed **733 tests in 43 files**. Native PTY replay passed. Lint, formatting, full mypy and shell checks passed. The ignored-source follow-up probe fails before and passes after, with a clean positive launch path. See FINAL-REVIEW.md and NATIVE-RECHECK.md for evidence. The remaining release sequence is to publish this final record, wait for all six CI jobs on the exact published commit, then perform the already-authorized normal PR merge. Refresh remote PR status first if resuming later; never assume an earlier green run covers the current head. Preserve the unrelated primary-checkout merge.
+
 # PAUSED by user: resume PR #457 after internet returns
 
 The user explicitly requested pausing because internet will be lost. Do not automatically resume, push, merge, or start models until they ask to continue. Earlier authorization persists: adversarial Luna xhigh review, fix reproduced findings, publish and merge through the PR when reviews and CI are clean. No further approval question is needed for that scope on resume.

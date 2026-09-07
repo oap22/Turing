@@ -2,6 +2,8 @@
 
 The native Turing terminal launched a real Codex Luna xhigh round that repaired Turing's trajectory-evidence handling. The supervisor accepted the corrected candidate with `passed=true`, `void=false`, score 1 and exit 0. This is a demonstrated software repair, not evidence that recursively edited scaffolds improve general agent quality.
 
+Latest resumed PR #457 review: all six reproduced final-round findings have fixes. The lead's integrated RSI/evaluator run on `1317ee8` passed **400 tests with four skips**; the desktop suite passed **733 tests in 43 files**, and the native exited-PTY replay passed. See [the final review record](../rsi-review-457/FINAL-REVIEW.md) for independent review, current checks and limits. Earlier stage-specific counts and publication states below are retained as history; hosted CI on the final published head is required before merge.
+
 ## Results and controls
 
 | Evaluation | Result | Meaning |

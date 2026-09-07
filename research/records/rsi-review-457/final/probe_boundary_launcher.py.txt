@@ -1,0 +1,60 @@
+from __future__ import annotations
+import importlib.util, json, subprocess, tempfile
+from pathlib import Path
+
+launcher_path = Path('/Users/owenpacetti/Developer/active/Turing/.worktrees/457-codex-contracts/research/records/rsi-live-450-v2/run_live.py')
+spec = importlib.util.spec_from_file_location('launcher_probe', launcher_path)
+assert spec and spec.loader
+launcher = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(launcher)
+
+def git(repo, *args, check=True):
+    return subprocess.run(['git', *args], cwd=repo, check=check, text=True, capture_output=True).stdout.strip()
+
+def commit(repo, msg):
+    subprocess.run(['git','add','-A'], cwd=repo, check=True)
+    subprocess.run(['git','-c','user.name=Probe','-c','user.email=probe@example.invalid','commit','-qm',msg],cwd=repo,check=True)
+    return git(repo,'rev-parse','HEAD')
+
+with tempfile.TemporaryDirectory(prefix='rsi-launcher-probe-', dir='/private/tmp') as d:
+    base = Path(d)
+    candidate = base/'candidate'; candidate.mkdir(); (candidate/'src').mkdir(); (candidate/'tests').mkdir()
+    subprocess.run(['git','init','-q'], cwd=candidate, check=True)
+    (candidate/'.gitignore').write_text('src/ignored.py\n')
+    (candidate/'src/marker.py').write_text('seed = 1\n')
+    seed = commit(candidate,'seed')
+    (candidate/'src/ignored.py').write_text("print('this ignored module changes source')\n")
+    assert git(candidate,'status','--porcelain=v1','--untracked-files=all','--','src','tests') == ''
+
+    root = base/'root'; root.mkdir(); (root/'scripts').mkdir(parents=True); (root/'research/records/rsi-live-450-v2').mkdir(parents=True)
+    subprocess.run(['git','init','-q'],cwd=root,check=True)
+    (root/'scripts/rsi-loop.sh').write_text('#!/bin/sh\nexit 0\n')
+    (root/'research/records/rsi-live-450-v2/evaluator-manifest.json').write_text('{}\n')
+    (root/'research/records/rsi-live-450-v2/launch-config.json').write_text(json.dumps({'seed_candidate':seed}))
+    commit(root,'engine')
+    state = base/'state'; (state/'workspace').mkdir(parents=True); (state/'problem-v2.txt').write_text('p\n')
+    results = base/'results'; run_dir = base/'run'; run_dir.mkdir()
+    launcher.ROOT = root; launcher.CANDIDATE = candidate; launcher.STATE = state; launcher.RESULTS = results; launcher.LAUNCH_CONFIG = root/'research/records/rsi-live-450-v2/launch-config.json'
+    import os
+    os.environ['RESEARCH_RUN_DIR'] = str(run_dir)
+    called=[]
+    real_run = launcher.subprocess.run
+    def fake_run(*args, **kwargs):
+        command = args[0]
+        if command and command[0] == 'git':
+            return real_run(*args, **kwargs)
+        called.append(command)
+        (candidate / 'src/ignored.py').write_text("print('mutated during launch')\n")
+        return subprocess.CompletedProcess(command, 0)
+    launcher.subprocess.run = fake_run
+    try:
+        try:
+            result = launcher.main()
+        except Exception as exc:
+            result = f'{type(exc).__name__}: {exc}'
+    finally:
+        launcher.subprocess.run = real_run
+    print('main_result=', result)
+    print('subprocess_calls=', len(called))
+    print('called_command=', called[0] if called else None)
+    print('metrics_exists=', (run_dir/'metrics.json').exists())
