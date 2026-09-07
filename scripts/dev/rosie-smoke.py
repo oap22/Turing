@@ -47,12 +47,24 @@ def ssh(host: str, command: str, content: str | None = None) -> str:
     )
 
 
-def validate_record(record: dict) -> None:
-    if not re.fullmatch(r"[0-9]+", str(record.get("job_id", ""))):
+def validate_record(record: object) -> None:
+    if not isinstance(record, dict):
+        raise ValueError("submission record must be a JSON object")
+    for field in ("host", "job_id", "run_id", "remote_dir", "script_sha256"):
+        if not isinstance(record.get(field), str):
+            raise ValueError(f"submission field {field} must be a string")
+    for field in ("state",):
+        if field in record and not isinstance(record[field], str):
+            raise ValueError(f"submission field {field} must be a string")
+    if "research_result" in record and not isinstance(record["research_result"], bool):
+        raise ValueError("submission field research_result must be a boolean")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", record["host"]):
+        raise ValueError("invalid SSH host alias")
+    if not re.fullmatch(r"[0-9]+", record["job_id"]):
         raise ValueError("invalid job ID; reconcile submission before collecting")
-    if not re.fullmatch(r"[0-9a-f]{32}", record.get("run_id", "")):
+    if not re.fullmatch(r"[0-9a-f]{32}", record["run_id"]):
         raise ValueError("invalid run ID")
-    if not re.fullmatch(r"/[A-Za-z0-9_./@-]+", record.get("remote_dir", "")):
+    if not re.fullmatch(r"/[A-Za-z0-9_./@-]+", record["remote_dir"]):
         raise ValueError("invalid remote directory")
     path = Path(record["remote_dir"])
     if ".." in path.parts or path.parts[-3:] != (
@@ -61,7 +73,7 @@ def validate_record(record: dict) -> None:
         record["run_id"],
     ):
         raise ValueError("remote directory is outside this smoke run")
-    if not re.fullmatch(r"[0-9a-f]{64}", record.get("script_sha256", "")):
+    if not re.fullmatch(r"[0-9a-f]{64}", record["script_sha256"]):
         raise ValueError("invalid script digest")
 
 
@@ -162,18 +174,15 @@ def _verification_record(record: dict, row: list[str], metadata: dict) -> dict:
     return {**record, "state": "verified", "accounting": row, "metadata": metadata}
 
 
-def _read_verified_snapshot(destination: Path, record: dict) -> tuple[list[str], dict]:
-    """Validate the complete marker and files of a previously published snapshot."""
-    _validate_snapshot_files(destination)
-    marker = _read_json_object(destination / "verified.json", "collected verification marker")
+def _validate_verification_marker(marker: dict, record: dict, label: str) -> tuple[list[str], dict]:
     for key, value in record.items():
         if key != "state" and marker.get(key) != value:
-            raise ValueError("existing collected snapshot does not match this submission")
+            raise ValueError(f"{label} does not match this submission")
     if marker.get("state") != "verified":
-        raise ValueError("existing collected snapshot is not verified")
+        raise ValueError(f"{label} is not verified")
     required = set(record) | {"state", "accounting", "metadata"}
     if set(marker) != required:
-        raise ValueError("existing collected verification marker has unexpected fields")
+        raise ValueError(f"{label} has unexpected fields")
 
     row = marker["accounting"]
     if (
@@ -183,12 +192,22 @@ def _read_verified_snapshot(destination: Path, record: dict) -> tuple[list[str],
         or row[1] != "COMPLETED"
         or row[2] != "0:0"
     ):
-        raise ValueError("existing collected accounting does not verify this submission")
+        raise ValueError(f"{label} accounting does not verify this submission")
 
     metadata = marker["metadata"]
     if not isinstance(metadata, dict):
-        raise ValueError("existing collected metadata is not an object")
+        raise ValueError(f"{label} metadata is not an object")
     _validate_metadata(metadata, record["job_id"], record["script_sha256"])
+    return row, metadata
+
+
+def _read_verified_snapshot(destination: Path, record: dict) -> tuple[list[str], dict]:
+    """Validate the complete marker and files of a previously published snapshot."""
+    _validate_snapshot_files(destination)
+    marker = _read_json_object(destination / "verified.json", "collected verification marker")
+    row, metadata = _validate_verification_marker(
+        marker, record, "existing collected verification marker"
+    )
     file_metadata = _read_json_object(destination / "metadata.json", "collected metadata")
     if file_metadata != metadata:
         raise ValueError("collected metadata does not match its verification marker")
@@ -214,12 +233,20 @@ def _publish_verification_record(output: Path, verification: dict) -> None:
 
 
 def collect(output: Path) -> None:
-    record = json.loads((output / "submission.json").read_text())
+    record = _read_json_object(output / "submission.json", "submission record")
     validate_record(record)
     destination = output / "collected"
-    if destination.exists():
+    verification_marker = output / "verified.json"
+    if not os.path.lexists(destination) and os.path.lexists(verification_marker):
+        marker = _read_json_object(verification_marker, "top-level verification marker")
+        _validate_verification_marker(marker, record, "top-level verification marker")
+        raise ValueError("top-level verification marker exists without collected snapshot")
+    if os.path.lexists(destination):
         row, metadata = _read_verified_snapshot(destination, record)
-        if (output / "verified.json").exists():
+        if os.path.lexists(verification_marker):
+            top_level = _read_json_object(verification_marker, "top-level verification marker")
+            if top_level != _verification_record(record, row, metadata):
+                raise ValueError("top-level verification marker does not match collected snapshot")
             raise FileExistsError(f"already collected: {destination}")
         _publish_verification_record(output, _verification_record(record, row, metadata))
         print(f"Verified job {record['job_id']} on {metadata['hostname']}; metadata: {destination}")

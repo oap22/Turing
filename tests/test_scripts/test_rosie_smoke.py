@@ -1,6 +1,8 @@
 import hashlib
 import importlib.util
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -149,6 +151,14 @@ def test_collection_resumes_after_snapshot_publish_crash(tmp_path, monkeypatch):
     smoke.collect(tmp_path)
     assert json.loads((tmp_path / "verified.json").read_text())["state"] == "verified"
 
+    inconsistent = json.loads((tmp_path / "verified.json").read_text())
+    inconsistent["job_id"] = "999"
+    (tmp_path / "verified.json").write_text(json.dumps(inconsistent))
+    before = (tmp_path / "verified.json").read_bytes()
+    with pytest.raises(ValueError, match="does not match collected snapshot"):
+        smoke.collect(tmp_path)
+    assert (tmp_path / "verified.json").read_bytes() == before
+
 
 def test_collection_rejects_arbitrary_existing_snapshot(tmp_path, monkeypatch):
     (tmp_path / "submission.json").write_text(json.dumps(record()))
@@ -157,3 +167,50 @@ def test_collection_rejects_arbitrary_existing_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(smoke, "ssh", lambda *_: pytest.fail("must reject locally"))
     with pytest.raises(ValueError, match="unexpected files"):
         smoke.collect(tmp_path)
+
+
+def test_collection_rejects_marker_without_snapshot_before_ssh(tmp_path, monkeypatch):
+    state = record()
+    (tmp_path / "submission.json").write_text(json.dumps(state))
+    (tmp_path / "verified.json").write_text(
+        json.dumps(
+            {
+                **state,
+                "state": "verified",
+                "accounting": ["123", "COMPLETED", "0:0", "00:01", "node1"],
+                "metadata": {
+                    "job_id": "123",
+                    "hostname": "node1",
+                    "script_sha256": state["script_sha256"],
+                    "kind": "infrastructure-smoke",
+                    "research_result": False,
+                },
+            }
+        )
+    )
+    before = (tmp_path / "verified.json").read_bytes()
+    monkeypatch.setattr(smoke, "ssh", lambda *_: pytest.fail("must reject locally"))
+    with pytest.raises(ValueError, match="without collected snapshot"):
+        smoke.collect(tmp_path)
+    assert (tmp_path / "verified.json").read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "payload, expected",
+    [
+        ([], "submission record must contain a JSON object"),
+        ({**record(), "job_id": 123}, "submission field job_id must be a string"),
+        ({**record(), "remote_dir": 123}, "submission field remote_dir must be a string"),
+    ],
+)
+def test_cli_rejects_malformed_submission_without_traceback(tmp_path, payload, expected):
+    (tmp_path / "submission.json").write_text(json.dumps(payload))
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "collect", "--output", str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert expected in result.stderr
+    assert "Traceback" not in result.stderr
