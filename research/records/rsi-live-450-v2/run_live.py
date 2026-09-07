@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -22,53 +23,124 @@ def _git_text(repo: Path, *args: str) -> str:
     return subprocess.check_output(["git", *args], cwd=repo, text=True).strip()
 
 
-def _source_paths(repo: Path) -> list[str]:
-    paths = subprocess.check_output(
-        [
-            "git",
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "--",
-            "src",
-            "tests",
-        ],
-        cwd=repo,
-        text=True,
-    ).splitlines()
-    return sorted(set(paths))
+PhysicalEntry = tuple[str, int, bytes]
+PhysicalManifest = dict[str, PhysicalEntry]
+
+
+def _physical_source_manifest(repo: Path) -> PhysicalManifest:
+    """Return every physical entry below ``src`` and ``tests``.
+
+    This deliberately walks the filesystem instead of asking Git for paths, so
+    ignored and untracked files, symlinks, executable bits, unusual names, and
+    special files cannot silently evade provenance checks. Directories are
+    structural and are represented by their children; empty directories have no
+    source contents to hash.
+    """
+    manifest: PhysicalManifest = {}
+
+    def visit(path: Path, relative: str) -> None:
+        try:
+            metadata = path.lstat()
+            mode = metadata.st_mode
+            if stat.S_ISLNK(mode):
+                manifest[relative] = ("symlink", 0, os.fsencode(os.readlink(path)))
+                return
+            if stat.S_ISDIR(mode):
+                with os.scandir(path) as entries:
+                    children = sorted(entries, key=lambda entry: os.fsencode(entry.name))
+                    for entry in children:
+                        visit(Path(entry.path), f"{relative}/{entry.name}")
+                return
+            if stat.S_ISREG(mode):
+                manifest[relative] = (
+                    "file",
+                    0o755 if mode & 0o111 else 0o644,
+                    hashlib.sha256(path.read_bytes()).digest(),
+                )
+                return
+            descriptor = f"{stat.S_IFMT(mode):o}:{stat.S_IMODE(mode):o}".encode("ascii")
+            manifest[relative] = ("special", 0, descriptor)
+        except OSError as exc:
+            raise RuntimeError(f"cannot inspect candidate source entry {path}: {exc}") from exc
+
+    for root_name in ("src", "tests"):
+        root = repo / root_name
+        if root.exists() or root.is_symlink():
+            visit(root, root_name)
+    return manifest
+
+
+def _seed_source_manifest(repo: Path, seed_sha: str) -> PhysicalManifest:
+    """Read the committed seed's source/test manifest without changing the checkout."""
+    try:
+        tree = subprocess.check_output(
+            ["git", "ls-tree", "-r", "-z", seed_sha, "--", "src", "tests"], cwd=repo
+        )
+        entries: list[tuple[str, bytes, bytes]] = []
+        for record in tree.split(b"\0"):
+            if not record:
+                continue
+            metadata, path_bytes = record.split(b"\t", 1)
+            mode, object_type, object_id = metadata.split()
+            if object_type != b"blob":
+                raise RuntimeError(
+                    f"unsupported committed source entry {os.fsdecode(path_bytes)!r}"
+                )
+            entries.append((os.fsdecode(path_bytes), mode, object_id))
+
+        manifest: PhysicalManifest = {}
+        if entries:
+            content_stream = subprocess.check_output(
+                ["git", "cat-file", "--batch"],
+                cwd=repo,
+                input=b"".join(object_id + b"\n" for _, _, object_id in entries),
+            )
+            offset = 0
+            for relative, mode, object_id in entries:
+                line_end = content_stream.index(b"\n", offset)
+                header = content_stream[offset:line_end].split()
+                if len(header) != 3 or header[0] != object_id or header[1] != b"blob":
+                    raise RuntimeError(f"cannot read committed source entry {relative!r}")
+                size = int(header[2])
+                start = line_end + 1
+                content = content_stream[start : start + size]
+                if len(content) != size or content_stream[start + size : start + size + 1] != b"\n":
+                    raise RuntimeError(f"truncated committed source entry {relative!r}")
+                offset = start + size + 1
+                if mode == b"120000":
+                    manifest[relative] = ("symlink", 0, content)
+                else:
+                    executable = int(mode, 8) & 0o111
+                    manifest[relative] = (
+                        "file",
+                        0o755 if executable else 0o644,
+                        hashlib.sha256(content).digest(),
+                    )
+        return manifest
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            f"cannot read committed candidate source tree {seed_sha}: {exc}"
+        ) from exc
+
+
+def _manifest_identity(manifest: PhysicalManifest) -> str:
+    digest = hashlib.sha256()
+    for relative, (kind, mode, content) in sorted(manifest.items()):
+        digest.update(b"PATH\0")
+        digest.update(os.fsencode(relative))
+        digest.update(b"\0KIND\0")
+        digest.update(kind.encode("ascii"))
+        digest.update(b"\0MODE\0")
+        digest.update(f"{mode:o}".encode("ascii"))
+        digest.update(b"\0CONTENT\0")
+        digest.update(content)
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def source_tree_identity(repo: Path) -> str:
-    """Hash committed and working source/test tree for before/after provenance."""
-    digest = hashlib.sha256()
-    tree = subprocess.check_output(
-        ["git", "ls-tree", "-r", "--full-tree", "HEAD", "--", "src", "tests"],
-        cwd=repo,
-    )
-    dirty_diff = subprocess.check_output(
-        ["git", "diff", "--binary", "HEAD", "--", "src", "tests"],
-        cwd=repo,
-    )
-    digest.update(b"HEAD-TREE\0")
-    digest.update(tree)
-    digest.update(b"WORKTREE-DIFF\0")
-    digest.update(dirty_diff)
-    for rel in _source_paths(repo):
-        path = repo / rel
-        digest.update(b"PATH\0")
-        digest.update(rel.encode())
-        digest.update(b"\0")
-        if path.is_symlink():
-            digest.update(b"SYMLINK\0")
-            digest.update(os.readlink(path).encode())
-        elif path.is_file():
-            digest.update(b"FILE\0")
-            digest.update(path.read_bytes())
-        else:
-            digest.update(b"MISSING\0")
-    return digest.hexdigest()
+    """Hash the physical source/test tree, including ignored and untracked entries."""
+    return _manifest_identity(_physical_source_manifest(repo))
 
 
 def source_diff_identity(repo: Path) -> str:
@@ -89,7 +161,7 @@ def source_diff_identity(repo: Path) -> str:
 
 
 def validate_candidate_start(repo: Path, seed_ref: str) -> tuple[str, str]:
-    """Require frozen seed commit and clean source/test tree before launch."""
+    """Require the frozen commit and a matching physical source/test tree before launch."""
     try:
         actual_sha = _git_text(repo, "rev-parse", "HEAD")
         expected_sha = _git_text(repo, "rev-parse", "--verify", f"{seed_ref}^{{commit}}")
@@ -100,13 +172,25 @@ def validate_candidate_start(repo: Path, seed_ref: str) -> tuple[str, str]:
             f"candidate seed mismatch: launch config requires {seed_ref} ({expected_sha}), "
             f"but candidate HEAD is {actual_sha}"
         )
-    dirty = subprocess.check_output(
-        ["git", "status", "--porcelain=v1", "--untracked-files=all", "--", "src", "tests"],
-        cwd=repo,
-        text=True,
-    ).strip()
-    if dirty:
-        raise RuntimeError(f"candidate source tree is dirty before launch:\n{dirty}")
+    expected = _seed_source_manifest(repo, expected_sha)
+    actual = _physical_source_manifest(repo)
+    if actual != expected:
+        changed = sorted(set(actual) | set(expected))
+        details = []
+        for relative in changed:
+            if relative not in expected:
+                details.append(f"unexpected {relative!r}")
+            elif relative not in actual:
+                details.append(f"missing {relative!r}")
+            elif actual[relative] != expected[relative]:
+                details.append(f"changed {relative!r}")
+            if len(details) == 8:
+                break
+        suffix = "; ".join(details)
+        raise RuntimeError(
+            "candidate source/test tree does not match the committed seed; "
+            f"physical provenance requires a pristine tree ({suffix})"
+        )
     return actual_sha, source_tree_identity(repo)
 
 
