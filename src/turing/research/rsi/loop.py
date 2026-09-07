@@ -100,6 +100,7 @@ What it does not do:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -735,6 +736,20 @@ class RsiLoop:
                 stop = StopReason.STOP_FILE
                 break
 
+            # A prior invocation may have recorded all evidence for a pending
+            # edit and then exited before it could append the judgment event.
+            # Resolve that historical window before starting another engine
+            # round. The round carrying the last piece of evidence owns the
+            # event's round number, including when this is a restart.
+            if pending is not None and len(pending.rounds_after) >= pending.judgment_window:
+                judged = await self._judge_pending(pending, pending.rounds_after[-1].round)
+                if judged == "failed":
+                    stop = StopReason.ROLLBACK_FAILED
+                    break
+                if judged == "rolled_back":
+                    rollbacks += 1
+                pending = None
+
             logger.info("rsi.round.start", round=round_no, slug=cfg.slug)
             await self._reconcile_scaffold(round_no, when="before_round")
             scaffold_sha = self.scaffold_sha
@@ -924,6 +939,20 @@ class RsiLoop:
                 prior_pass = True
             if pending is not None:
                 pending.rounds_after.append(record)
+
+            # A terminal engine failure still produced a verifier observation.
+            # Settle a pending self-edit whose evidence window closes on this
+            # round before the consecutive-failure guard stops the invocation;
+            # otherwise a restart would run one more round under an edit that
+            # was already due for judgment.
+            if pending is not None and len(pending.rounds_after) >= pending.judgment_window:
+                judged = await self._judge_pending(pending, round_no)
+                if judged == "failed":
+                    stop = StopReason.ROLLBACK_FAILED
+                    break
+                if judged == "rolled_back":
+                    rollbacks += 1
+                pending = None
 
             if result.timed_out or result.exit_code != 0:
                 engine_failures += 1
@@ -1151,6 +1180,9 @@ class RsiLoop:
         logger.info("rsi.self_edit.start", round=round_no, head=before.head[:12])
         try:
             sha = await self.self_edit.propose(inputs)
+        except asyncio.CancelledError:
+            await self._cleanup_cancelled_self_edit(before, results_before, round_no, lock)
+            raise
         except Exception:
             # A failing proposal can still have written supervisor-owned
             # history before raising (for example, while rejecting a guarded
@@ -1179,13 +1211,17 @@ class RsiLoop:
         # I3: the results dir is outside the sandbox's git status, so it is
         # compared separately; a self-edit that wrote there loses its edit.
         results_changed = self.cheat.results_changes(self.results, results_before)
-        kept, rejection = await self._verify_self_edit(
-            before,
-            sha,
-            lock,
-            results_changed=results_changed,
-            trajectory_changed=trajectory_reason,
-        )
+        try:
+            kept, rejection = await self._verify_self_edit(
+                before,
+                sha,
+                lock,
+                results_changed=results_changed,
+                trajectory_changed=trajectory_reason,
+            )
+        except asyncio.CancelledError:
+            await self._cleanup_cancelled_self_edit(before, results_before, round_no, lock)
+            raise
         if rejection is not None:
             self._append_event(
                 "self_edit_rejected", round_no, {"proposed": sha, "reason": rejection}
@@ -1194,9 +1230,18 @@ class RsiLoop:
         if kept is None:
             logger.info("rsi.self_edit.no_change", round=round_no)
             return None
-        blob = await run_git(
-            self.sandbox, "rev-parse", "--verify", "-q", f"{kept}:{SCAFFOLD_FILENAME}", check=True
-        )
+        try:
+            blob = await run_git(
+                self.sandbox,
+                "rev-parse",
+                "--verify",
+                "-q",
+                f"{kept}:{SCAFFOLD_FILENAME}",
+                check=True,
+            )
+        except asyncio.CancelledError:
+            await self._cleanup_cancelled_self_edit(before, results_before, round_no, lock)
+            raise
         self.scaffold_blob = blob.stdout.strip()
         self.scaffold_sha = kept
         self._append_event(
@@ -1210,6 +1255,60 @@ class RsiLoop:
         )
         logger.info("rsi.self_edit.kept", round=round_no, scaffold_sha=kept[:12])
         return kept
+
+    async def _cleanup_cancelled_self_edit(
+        self,
+        before: _TreeState,
+        results_before: Any,
+        round_no: int,
+        lock: VerifierLock,
+    ) -> None:
+        """Restore supervisor history after cancellation without hiding verifier tamper.
+
+        ``CancelledError`` inherits ``BaseException`` and otherwise bypasses the
+        proposal failure guard. Preserve changed trajectory bytes as evidence,
+        then discard an ordinary partial proposal. A verifier or pinned-file
+        mutation is deliberately left for the normal lock check to stop on.
+        """
+        try:
+            if (
+                self.cheat.trajectory_change(
+                    self.results, results_before, trajectory=self.trajectory_path
+                )
+                is not None
+            ):
+                evidence = self.cheat.quarantine_trajectory(
+                    self.results, results_before, round_no, trajectory=self.trajectory_path
+                )
+                logger.warning(
+                    "rsi.self_edit.cancelled_history_restored",
+                    round=round_no,
+                    evidence=evidence,
+                )
+
+            guarded = {VERIFIER_LOCK_FILENAME, *lock.file_sha256s}
+            changed = set(await self._changed_since(before))
+            head_now = (await run_git(self.sandbox, "rev-parse", "HEAD")).stdout.strip()
+            if head_now != before.head:
+                diff = await run_git(self.sandbox, "diff", "--name-only", before.head, head_now)
+                if diff.ok:
+                    changed.update(p for p in diff.stdout.splitlines() if p.strip())
+                else:
+                    changed.update(guarded)
+            if changed & guarded:
+                logger.warning(
+                    "rsi.self_edit.cancelled_verifier_tamper",
+                    round=round_no,
+                    paths=sorted(changed & guarded),
+                )
+                return
+            await self._discard_to(before)
+        except BaseException as exc:
+            logger.warning(
+                "rsi.self_edit.cancelled_cleanup_failed",
+                round=round_no,
+                error=repr(exc),
+            )
 
     def _verifier_needles(self, lock: VerifierLock) -> list[str]:
         """Everything I4 keeps out of the summary: command, hashes, lock text, pinned file bodies."""
