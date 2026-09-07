@@ -57,9 +57,9 @@ def _node(
             node_id=node_id,
             node_name=name,
             ollama_advertise_host=advertise,
-            ollama_peer_allowlist=allowed_hosts if allowed_hosts is not None else (
-                [advertise] if advertise else []
-            ),
+            ollama_peer_allowlist=allowed_hosts
+            if allowed_hosts is not None
+            else ([advertise] if advertise else []),
         )
     )
 

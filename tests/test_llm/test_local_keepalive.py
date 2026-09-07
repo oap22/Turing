@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from turing.__main__ import _should_warm_local
+from turing.__main__ import _should_initialize_local_tier, _should_warm_local
 from turing.llm.base import Message, Role
 from turing.llm.local import OllamaProvider
 
@@ -107,6 +107,7 @@ class TestWarmup:
 
 
 def test_cloud_only_routing_skips_local_warmup() -> None:
+    assert _should_initialize_local_tier("cloud") is False
     assert _should_warm_local("cloud", True) is False
     assert _should_warm_local("auto", True) is True
     assert _should_warm_local("local", True) is True

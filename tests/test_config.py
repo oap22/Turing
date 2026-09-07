@@ -278,14 +278,17 @@ class TestOllamaPeerEndpointAuthority:
         assert cfg.ollama_peer_allowlist == ["http://192.168.1.20:11434"]
 
     def test_advertisement_must_be_exactly_allowlisted(self) -> None:
-        with patch.dict(
-            "os.environ",
-            {
-                "TURING_OLLAMA_ADVERTISE_HOST": "http://192.168.1.20:11434",
-                "TURING_OLLAMA_PEER_ALLOWLIST": '["http://192.168.1.21:11434"]',
-            },
-            clear=True,
-        ), pytest.raises(ValueError, match="must be included exactly"):
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "TURING_OLLAMA_ADVERTISE_HOST": "http://192.168.1.20:11434",
+                    "TURING_OLLAMA_PEER_ALLOWLIST": '["http://192.168.1.21:11434"]',
+                },
+                clear=True,
+            ),
+            pytest.raises(ValueError, match="must be included exactly"),
+        ):
             TuringConfig(_env_file=None)  # type: ignore[call-arg]
 
     @pytest.mark.parametrize(
@@ -298,11 +301,14 @@ class TestOllamaPeerEndpointAuthority:
         ],
     )
     def test_allowlist_rejects_unsafe_endpoint_forms(self, bad: str) -> None:
-        with patch.dict(
-            "os.environ",
-            {"TURING_OLLAMA_PEER_ALLOWLIST": f'["{bad}"]'},
-            clear=True,
-        ), pytest.raises(ValueError):
+        with (
+            patch.dict(
+                "os.environ",
+                {"TURING_OLLAMA_PEER_ALLOWLIST": f'["{bad}"]'},
+                clear=True,
+            ),
+            pytest.raises(ValueError),
+        ):
             TuringConfig(_env_file=None)  # type: ignore[call-arg]
 
 

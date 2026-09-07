@@ -106,6 +106,14 @@ validate_host() {
         exit 2
     fi
 }
+validate_user() {
+    # Keep the SSH user an opaque login name. Shell syntax, @, and leading
+    # hyphens must never cross into the ssh target assembled below.
+    if [[ ! "$1" =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]]; then
+        echo "fleet-models: refusing user '$1'" >&2
+        exit 2
+    fi
+}
 validate_keep_alive() {
     if [[ ! "$1" =~ ^(-1|[0-9]+(ms|s|m|h))$ ]]; then
         echo "fleet-models: refusing keep-alive '$1'" >&2
@@ -121,6 +129,7 @@ validate_bind_address() {
         exit 2
     fi
 }
+validate_user "$USER_OPT"
 
 ssh_target() { if [[ -n "$USER_OPT" ]]; then echo "${USER_OPT}@$1"; else echo "$1"; fi; }
 
@@ -250,10 +259,18 @@ case "$COMMAND" in
         while IFS= read -r line || [[ -n "$line" ]]; do
             line="${line%%#*}"
             [[ -z "${line// /}" ]] && continue
+            if [[ "$line" != *:* ]]; then
+                echo "fleet-models: plan line must include a host and at least one model: '$line'" >&2
+                exit 2
+            fi
             host="${line%%:*}"; models="${line#*:}"
             host="${host// /}"
             validate_host "$host"
             read -r -a ms <<<"$models"
+            if [[ ${#ms[@]} -eq 0 ]]; then
+                echo "fleet-models: plan host '$host' must list at least one model" >&2
+                exit 2
+            fi
             for m in ${ms[@]+"${ms[@]}"}; do validate_model "$m"; done
             PLAN_HOSTS+=("$host")
             PLAN_MODELS+=("${ms[*]-}")

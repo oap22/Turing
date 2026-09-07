@@ -95,6 +95,24 @@ class TestValidation:
         assert res.returncode == 2
         assert "refusing host" in res.stderr
 
+    @pytest.mark.parametrize("bad", ["", "op;id", "op@evil", "$(id)", "-root", "user name"])
+    def test_rejects_unsafe_ssh_users_before_dry_run(self, bad: str) -> None:
+        res = run("status", "--dry-run", "--user", bad, "jetson-1")
+        assert res.returncode == 2
+        assert "refusing user" in res.stderr
+        assert "[dry-run]" not in res.stdout
+
+    @pytest.mark.parametrize("line", ["jetson-1:", "jetson-1:   ", "jetson-1"])
+    def test_plan_rejects_empty_or_missing_model_list_before_remote_execution(
+        self, tmp_path: Path, line: str
+    ) -> None:
+        plan = tmp_path / "empty-models.txt"
+        plan.write_text(line + "\n")
+        res = run("plan", "--dry-run", str(plan))
+        assert res.returncode == 2
+        assert "plan" in res.stderr
+        assert "[dry-run]" not in res.stdout
+
     @pytest.mark.parametrize("bad", ["1h' | id; #", "forever", "$(id)", "1 h"])
     def test_rejects_unsafe_keep_alive_values(self, bad: str) -> None:
         res = run(

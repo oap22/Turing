@@ -89,7 +89,10 @@ class TestSelectPeer:
         assert select_peer([b, a], MODEL, allowed_hosts=[HOST]) is a
 
     def test_skips_peer_outside_exact_allowlist(self) -> None:
-        assert select_peer([_peer("a", host="http://other:11434")], MODEL, allowed_hosts=[HOST]) is None
+        assert (
+            select_peer([_peer("a", host="http://other:11434")], MODEL, allowed_hosts=[HOST])
+            is None
+        )
 
 
 class TestPeerModelPool:
