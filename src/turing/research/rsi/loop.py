@@ -1150,11 +1150,26 @@ class RsiLoop:
         results_before = self.cheat.snapshot_before(self.sandbox, self.results)
         logger.info("rsi.self_edit.start", round=round_no, head=before.head[:12])
         sha = await self.self_edit.propose(inputs)
+        trajectory_tamper = self.cheat.trajectory_change(
+            self.results, results_before, trajectory=self.trajectory_path
+        )
+        trajectory_reason: str | None = None
+        if trajectory_tamper is not None:
+            evidence = self.cheat.quarantine_trajectory(
+                self.results, results_before, round_no, trajectory=self.trajectory_path
+            )
+            trajectory_reason = (
+                f"{trajectory_tamper}; quarantined evidence={evidence or '<unavailable>'}"
+            )
         # I3: the results dir is outside the sandbox's git status, so it is
         # compared separately; a self-edit that wrote there loses its edit.
         results_changed = self.cheat.results_changes(self.results, results_before)
         kept, rejection = await self._verify_self_edit(
-            before, sha, lock, results_changed=results_changed
+            before,
+            sha,
+            lock,
+            results_changed=results_changed,
+            trajectory_changed=trajectory_reason,
         )
         if rejection is not None:
             self._append_event(
@@ -1287,6 +1302,7 @@ class RsiLoop:
         lock: VerifierLock,
         *,
         results_changed: Sequence[str] = (),
+        trajectory_changed: str | None = None,
     ) -> tuple[str | None, str | None]:
         """I3: keep ``sha`` only if it changed exactly SCAFFOLD.md and touched nothing else.
 
@@ -1294,7 +1310,9 @@ class RsiLoop:
         that changed nothing. ``results_changed`` lists results-dir entries
         the step created or modified; any such entry rejects the edit (the
         results themselves are never discarded — ``metrics.jsonl`` and the
-        desktop's files are not the loop's to delete).
+        desktop's files are not the loop's to delete). ``trajectory_changed``
+        carries the content-based supervisor-history failure after its changed
+        bytes have been quarantined.
 
         Raises:
             FrozenVerifierError: the step touched ``VERIFIER.json`` or a
@@ -1317,7 +1335,9 @@ class RsiLoop:
                 "it pins); the tree is left untouched for inspection and the loop stops"
             )
         reason: str | None = None
-        if results_changed:
+        if trajectory_changed is not None:
+            reason = trajectory_changed
+        elif results_changed:
             reason = f"self-edit wrote to the results dir: {sorted(results_changed)}"
         elif sha is None:
             if changed or head_after != before.head:

@@ -79,7 +79,7 @@ numbering. The events the loop writes (each also carries `round` and `ts`):
 | `self_edit_rejected` | The self-edit touched something other than `SCAFFOLD.md` and was discarded | `proposed`, `reason` |
 | `self_edit_kept` | The rounds after a self-edit were judged and the edit survives | `scaffold_sha`, `best_before`, `best_after` |
 | `rollback` | The rounds after a self-edit were worse than the noise floor allows; the edit was reverted | `reverted`, `revert_sha`, `best_before`, `best_after`, `scaffold_sha`, `scaffold_blob` |
-| `rollback_failed` | The revert could not be applied; the loop stops (exit 0, `stop_reason=rollback_failed`) | `reverted`, `error` |
+| `rollback_failed` | The revert could not be applied; the loop stops (exit 1, `stop_reason=rollback_failed`) | `reverted`, `error` |
 | `verifier_tampered` | The lock broke at start-up (`when: startup`, written by the CLI) or right after a self-edit (`after: self_edit`); the loop stops with exit 3 | `detail` |
 
 ## The frozen verifier
@@ -218,7 +218,7 @@ internals and never reads outside the sandbox (ADR 0011 §16). Then:
   agent's staged work is left staged) and logs
   `{"event": "rollback", "reverted": <sha>, "revert_sha": …}`. An edit that
   survives its judgement window is logged as `self_edit_kept`. A revert that
-  fails to apply is logged as `rollback_failed` and the loop stops (exit 0,
+  fails to apply is logged as `rollback_failed` and the loop stops (exit 1,
   `stop_reason=rollback_failed`) rather than keep running under an edit it
   could not undo. A pending, not yet judged edit survives a resume: it is
   rebuilt from the trajectory and judged when its window closes.
@@ -366,8 +366,8 @@ the bash path on a locked slug.
 
 | Code | Meaning |
 |---|---|
-| `0` | Normal completion: rounds exhausted, `STOP` file found, or a scaffold rollback that could not be applied (`rollback_failed`; check the log for which). A verifier failure alone remains a round fact and does not fail the invocation. |
-| `1` | Every engine attempt in this invocation timed out or exited unsuccessfully. The trajectory still preserves each round's measured verifier result and failure categories. |
+| `0` | Normal completion: rounds exhausted or `STOP` file found. A verifier failure alone remains a round fact and does not fail the invocation. |
+| `1` | Every engine attempt in this invocation timed out or exited unsuccessfully, or a scaffold rollback could not be applied (`rollback_failed`). The trajectory still preserves each round's measured verifier result and failure categories. |
 | `2` | Usage or pre-flight refusal, before any disk write: bad flag, missing `--problem` or `--verifier` on a first run, a different `--verifier` or `--verifier-file` set on resume, a first run that would pin no file although the command names one, a missing lock on a slug that already ran, unreadable lock, corrupt `trajectory.json`, taxonomy digest mismatch |
 | `3` | The loop stopped on a cheat or a tamper. The last trajectory line is either a void round naming the category, or — when the lock was found broken at start-up, before any round — a `{"event": "verifier_tampered", "when": "startup", …}` line. Investigate before restarting; re-running the same command does not re-lock anything |
 | `130` | Interrupted (Ctrl-C). No trajectory line is written for the round in flight. The engine's (or verifier's) process group is SIGKILLed on interrupt; a descendant that put itself in a new session (`setsid`) is outside that group and may survive — check for a still-running `claude` before restarting, because an orphaned agent writing into the sandbox during the next round reads as a tamper or escape |

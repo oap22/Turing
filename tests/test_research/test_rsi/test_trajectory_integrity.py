@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pytest
 
-from turing.research.rsi.cheat import CheatDetector
-from turing.research.rsi.contracts import VerifierSpec
+from turing.research.rsi.cheat import CheatDetector, run_git
+from turing.research.rsi.contracts import RsiConfig, VerifierSpec
 from turing.research.rsi.engine import FakeEngine, ok_result
-from turing.research.rsi.loop import RsiLoop, read_trajectory
+from turing.research.rsi.loop import DEFAULT_SCAFFOLD, RsiLoop, read_trajectory
+from turing.research.rsi.scaffold import SCAFFOLD_FILENAME
 from turing.research.rsi.taxonomy import FailureCategory
 
 if TYPE_CHECKING:
@@ -55,6 +57,38 @@ def _trajectory_action(dirs: RsiDirs, mutation: str):
         elif mutation == "delete":
             trajectory.unlink()
         with (dirs.config.results_dir / "metrics.jsonl").open("a") as stream:
+            stream.write('{"step":1,"score":1}\n')
+        return ok_result()
+
+    return action
+
+
+class _SelfEdit:
+    def __init__(self, sandbox: Path, results: Path, *, mutate_trajectory: bool) -> None:
+        self.sandbox = sandbox
+        self.results = results
+        self.mutate_trajectory = mutate_trajectory
+
+    async def propose(self, inputs) -> str:
+        del inputs
+        if self.mutate_trajectory:
+            trajectory = self.results / "trajectory.json"
+            before = trajectory.stat()
+            original = trajectory.read_bytes()
+            changed = original.replace(b'"score": 1.0', b'"score": 9.0', 1)
+            assert changed != original and len(changed) == len(original)
+            trajectory.write_bytes(changed)
+            os.utime(trajectory, ns=(before.st_atime_ns, before.st_mtime_ns))
+        (self.sandbox / SCAFFOLD_FILENAME).write_text("SELF EDIT\n")
+        await run_git(self.sandbox, "add", "--", SCAFFOLD_FILENAME, check=True)
+        await run_git(self.sandbox, "commit", "-q", "-m", "rsi: self-edit", check=True)
+        return (await run_git(self.sandbox, "rev-parse", "HEAD", check=True)).stdout.strip()
+
+
+def _score_one(results: Path):
+    def action(prompt: str, cwd: Path):
+        del prompt, cwd
+        with (results / "metrics.jsonl").open("a") as stream:
             stream.write('{"step":1,"score":1}\n')
         return ok_result()
 
@@ -195,3 +229,72 @@ async def test_late_verifier_write_is_quarantined_before_resume(
     assert all(
         record.round != 777 and record.score != 999.0 for record in state_after_resume.records
     )
+
+
+@pytest.mark.asyncio
+async def test_self_edit_same_stat_history_mutation_is_rejected_and_restored(
+    tmp_path: Path,
+) -> None:
+    cfg = RsiConfig(
+        slug="self-edit-history",
+        workspace_root=tmp_path / "workspace",
+        results_root=tmp_path / "results",
+        rounds=1,
+        self_edit_every=1,
+        self_edit_budget=1,
+    )
+    cfg.sandbox_dir.mkdir(parents=True)
+    (cfg.sandbox_dir / "verify.sh").write_text("printf 'score=1\\n'\n")
+    edit = _SelfEdit(cfg.sandbox_dir, cfg.results_dir, mutate_trajectory=True)
+
+    outcome = await RsiLoop(
+        cfg,
+        engine=FakeEngine(script=[_score_one(cfg.results_dir)]),
+        verifier=VerifierSpec(command="sh verify.sh", files=("verify.sh",)),
+        self_edit=edit,
+        cheat=CheatDetector(),
+        problem="reject self-edit history mutation",
+    ).run()
+
+    state = read_trajectory(cfg.results_dir / "trajectory.json")
+    assert outcome.exit_code == 0
+    assert outcome.self_edits == 0
+    assert state.best_score == 1.0
+    assert state.records[-1].score == 1.0
+    assert state.events[-1].event == "self_edit_rejected"
+    assert "trajectory.json" in state.events[-1].details["reason"]
+    evidence = sorted(cfg.results_dir.glob("trajectory.tamper-round-1*.json"))
+    assert len(evidence) == 1
+    assert b'"score": 9.0' in evidence[0].read_bytes()
+    assert (cfg.sandbox_dir / SCAFFOLD_FILENAME).read_text() == DEFAULT_SCAFFOLD
+
+
+@pytest.mark.asyncio
+async def test_ordinary_self_edit_remains_valid(tmp_path: Path) -> None:
+    cfg = RsiConfig(
+        slug="ordinary-self-edit",
+        workspace_root=tmp_path / "workspace",
+        results_root=tmp_path / "results",
+        rounds=1,
+        self_edit_every=1,
+        self_edit_budget=1,
+    )
+    cfg.sandbox_dir.mkdir(parents=True)
+    (cfg.sandbox_dir / "verify.sh").write_text("printf 'score=1\\n'\n")
+    edit = _SelfEdit(cfg.sandbox_dir, cfg.results_dir, mutate_trajectory=False)
+
+    outcome = await RsiLoop(
+        cfg,
+        engine=FakeEngine(script=[_score_one(cfg.results_dir)]),
+        verifier=VerifierSpec(command="sh verify.sh", files=("verify.sh",)),
+        self_edit=edit,
+        cheat=CheatDetector(),
+        problem="accept ordinary self-edit",
+    ).run()
+
+    state = read_trajectory(cfg.results_dir / "trajectory.json")
+    assert outcome.exit_code == 0
+    assert outcome.self_edits == 1
+    assert state.best_score == 1.0
+    assert state.events[-1].event == "self_edit"
+    assert (cfg.sandbox_dir / SCAFFOLD_FILENAME).read_text() == "SELF EDIT\n"
