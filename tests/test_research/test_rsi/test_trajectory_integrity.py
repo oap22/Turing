@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from turing.research.contracts import ContractViolationError
 from turing.research.rsi.cheat import CheatDetector, run_git
 from turing.research.rsi.contracts import RsiConfig, VerifierSpec
 from turing.research.rsi.engine import FakeEngine, ok_result
@@ -64,10 +65,18 @@ def _trajectory_action(dirs: RsiDirs, mutation: str):
 
 
 class _SelfEdit:
-    def __init__(self, sandbox: Path, results: Path, *, mutate_trajectory: bool) -> None:
+    def __init__(
+        self,
+        sandbox: Path,
+        results: Path,
+        *,
+        mutate_trajectory: bool,
+        fail_after_mutation: bool = False,
+    ) -> None:
         self.sandbox = sandbox
         self.results = results
         self.mutate_trajectory = mutate_trajectory
+        self.fail_after_mutation = fail_after_mutation
 
     async def propose(self, inputs) -> str:
         del inputs
@@ -79,6 +88,8 @@ class _SelfEdit:
             assert changed != original and len(changed) == len(original)
             trajectory.write_bytes(changed)
             os.utime(trajectory, ns=(before.st_atime_ns, before.st_mtime_ns))
+            if self.fail_after_mutation:
+                raise ContractViolationError("self-edit proposal failed after writing history")
         (self.sandbox / SCAFFOLD_FILENAME).write_text("SELF EDIT\n")
         await run_git(self.sandbox, "add", "--", SCAFFOLD_FILENAME, check=True)
         await run_git(self.sandbox, "commit", "-q", "-m", "rsi: self-edit", check=True)
@@ -267,6 +278,43 @@ async def test_self_edit_same_stat_history_mutation_is_rejected_and_restored(
     assert len(evidence) == 1
     assert b'"score": 9.0' in evidence[0].read_bytes()
     assert (cfg.sandbox_dir / SCAFFOLD_FILENAME).read_text() == DEFAULT_SCAFFOLD
+
+
+@pytest.mark.asyncio
+async def test_failed_self_edit_history_mutation_is_restored(tmp_path: Path) -> None:
+    cfg = RsiConfig(
+        slug="failed-self-edit-history",
+        workspace_root=tmp_path / "workspace",
+        results_root=tmp_path / "results",
+        rounds=1,
+        self_edit_every=1,
+        self_edit_budget=1,
+    )
+    cfg.sandbox_dir.mkdir(parents=True)
+    (cfg.sandbox_dir / "verify.sh").write_text("printf 'score=1\\n'\n")
+    edit = _SelfEdit(
+        cfg.sandbox_dir,
+        cfg.results_dir,
+        mutate_trajectory=True,
+        fail_after_mutation=True,
+    )
+
+    with pytest.raises(ContractViolationError, match="after writing history"):
+        await RsiLoop(
+            cfg,
+            engine=FakeEngine(script=[_score_one(cfg.results_dir)]),
+            verifier=VerifierSpec(command="sh verify.sh", files=("verify.sh",)),
+            self_edit=edit,
+            cheat=CheatDetector(),
+            problem="reject failed self-edit history mutation",
+        ).run()
+
+    state = read_trajectory(cfg.results_dir / "trajectory.json")
+    assert state.best_score == 1.0
+    assert state.records[-1].score == 1.0
+    evidence = sorted(cfg.results_dir.glob("trajectory.tamper-round-1*.json"))
+    assert len(evidence) == 1
+    assert b'"score": 9.0' in evidence[0].read_bytes()
 
 
 @pytest.mark.asyncio

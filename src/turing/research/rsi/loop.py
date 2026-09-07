@@ -1149,7 +1149,22 @@ class RsiLoop:
         before = await self._tree_state()
         results_before = self.cheat.snapshot_before(self.sandbox, self.results)
         logger.info("rsi.self_edit.start", round=round_no, head=before.head[:12])
-        sha = await self.self_edit.propose(inputs)
+        try:
+            sha = await self.self_edit.propose(inputs)
+        except Exception:
+            # A failing proposal can still have written supervisor-owned
+            # history before raising (for example, while rejecting a guarded
+            # verifier edit). Restore that history before the failure escapes.
+            if (
+                self.cheat.trajectory_change(
+                    self.results, results_before, trajectory=self.trajectory_path
+                )
+                is not None
+            ):
+                self.cheat.quarantine_trajectory(
+                    self.results, results_before, round_no, trajectory=self.trajectory_path
+                )
+            raise
         trajectory_tamper = self.cheat.trajectory_change(
             self.results, results_before, trajectory=self.trajectory_path
         )
