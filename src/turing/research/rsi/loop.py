@@ -200,6 +200,9 @@ _REGULAR_FILE_MODE: str = "100644"
 _NEEDLE_MAX_BYTES: int = 1024 * 1024
 #: Shortest pinned-file body worth redacting; anything shorter would mangle ordinary text.
 _NEEDLE_MIN_CHARS: int = 8
+#: Minimum evidence window used when an older self-edit event has no persisted
+#: schedule and the current invocation has proposals disabled.
+_LEGACY_PENDING_WINDOW: int = 1
 #: Events that carry the loop-owned scaffold blob id.
 _SCAFFOLD_EVENTS: frozenset[str] = frozenset(
     {"scaffold_seeded", "self_edit", "rollback", "scaffold_drift"}
@@ -415,6 +418,8 @@ class _TreeState:
 class _PendingEdit:
     sha: str
     committed_after_round: int
+    judgment_window: int
+    judgment_window_source: str
     best_before: float | None
     passed_before: bool
     prior_scores: tuple[float, ...]
@@ -508,8 +513,11 @@ class RsiLoop:
         startup_round = max(0, state.next_round - 1)
         self._check_lock_provenance(state, first_lock=first_lock, round_no=startup_round)
         await self._adopt_scaffold(state, startup_round)
-        await self._reconcile_scaffold(startup_round, when="startup")
         self._pending = await self._rebuild_pending(state)
+        # Validate pending-edit provenance before restoring an event-owned blob;
+        # a missing commit must refuse the resume rather than reconstructing an
+        # unjudged scaffold and continuing under it.
+        await self._reconcile_scaffold(startup_round, when="startup")
         logger.info(
             "rsi.loop.prepared",
             sandbox=str(self.sandbox),
@@ -859,11 +867,7 @@ class RsiLoop:
             # invocations. Proposal timing remains on the existing invocation
             # schedule so a restart does not create an extra edit as a side effect
             # of catching up on a completed judgment window.
-            if (
-                cfg.self_edit_every
-                and pending is not None
-                and len(pending.rounds_after) >= cfg.self_edit_every
-            ):
+            if pending is not None and len(pending.rounds_after) >= pending.judgment_window:
                 judged = await self._judge_pending(pending, round_no)
                 if judged == "failed":
                     stop = StopReason.ROLLBACK_FAILED
@@ -897,6 +901,8 @@ class RsiLoop:
                     pending = _PendingEdit(
                         sha=sha,
                         committed_after_round=round_no,
+                        judgment_window=cfg.self_edit_every,
+                        judgment_window_source="recorded",
                         best_before=best_score,
                         passed_before=bool(counted and counted[-1].passed),
                         prior_scores=tuple(
@@ -1080,7 +1086,13 @@ class RsiLoop:
         self.scaffold_blob = blob.stdout.strip()
         self.scaffold_sha = kept
         self._append_event(
-            "self_edit", round_no, {"scaffold_sha": kept, "scaffold_blob": self.scaffold_blob}
+            "self_edit",
+            round_no,
+            {
+                "scaffold_sha": kept,
+                "scaffold_blob": self.scaffold_blob,
+                "judgment_window": self.config.self_edit_every,
+            },
         )
         logger.info("rsi.self_edit.kept", round=round_no, scaffold_sha=kept[:12])
         return kept
@@ -1297,29 +1309,89 @@ class RsiLoop:
         """The newest ``self_edit`` not yet judged, reconstructed from the trajectory."""
         pending_sha: str | None = None
         pending_round = 0
+        pending_blob: str | None = None
+        pending_window: int | None = None
+        pending_window_source = "recorded"
         for event in state.events:
-            if event.event == "self_edit" and event.details.get("scaffold_sha"):
-                pending_sha = str(event.details["scaffold_sha"])
+            if event.event == "self_edit":
+                raw_sha = event.details.get("scaffold_sha")
+                if raw_sha is None or not str(raw_sha).strip():
+                    raise ContractViolationError(
+                        f"self-edit event at round {event.round} is missing scaffold_sha; "
+                        "refusing to resume without rollback provenance"
+                    )
+                pending_sha = str(raw_sha).strip()
                 pending_round = event.round
+                raw_blob = event.details.get("scaffold_blob")
+                pending_blob = None if raw_blob is None else str(raw_blob).strip()
+                raw_window = event.details.get("judgment_window")
+                if raw_window is None:
+                    # Events written before #456 did not persist their window.
+                    # Preserve the old invocation's usual behavior when the
+                    # operator still supplies a schedule, but use one round as
+                    # a visible fail-safe when proposals are now disabled.
+                    if self.config.self_edit_every > 0:
+                        pending_window = self.config.self_edit_every
+                        pending_window_source = "legacy_config"
+                    else:
+                        pending_window = _LEGACY_PENDING_WINDOW
+                        pending_window_source = "legacy_minimum"
+                elif (
+                    isinstance(raw_window, bool)
+                    or not isinstance(raw_window, int)
+                    or raw_window <= 0
+                ):
+                    raise ContractViolationError(
+                        f"self-edit event at round {event.round} has invalid judgment_window "
+                        f"{raw_window!r}; refusing to resume without rollback provenance"
+                    )
+                else:
+                    pending_window = raw_window
+                    pending_window_source = "recorded"
             elif event.event in {"rollback", "rollback_failed", "self_edit_kept"}:
                 judged = event.details.get("reverted") or event.details.get("scaffold_sha")
                 if judged is not None and str(judged) == pending_sha:
                     pending_sha = None
+                    pending_blob = None
+                    pending_window = None
         if pending_sha is None:
             return None
         ancestor = await run_git(self.sandbox, "merge-base", "--is-ancestor", pending_sha, "HEAD")
         if not ancestor.ok:
-            logger.warning(
-                "rsi.self_edit.pending_dropped",
-                scaffold_sha=pending_sha[:12],
-                hint="the edit's commit is no longer in HEAD's history",
+            raise ContractViolationError(
+                f"pending self-edit {pending_sha[:12]} is no longer in HEAD's history; "
+                "refusing to resume without rollback provenance"
             )
-            return None
+        committed_blob = await run_git(
+            self.sandbox,
+            "rev-parse",
+            "--verify",
+            "-q",
+            f"{pending_sha}:{SCAFFOLD_FILENAME}",
+        )
+        committed_blob_text = committed_blob.stdout.strip()
+        if not committed_blob.ok or not committed_blob_text:
+            raise ContractViolationError(
+                f"pending self-edit {pending_sha[:12]} has no verifiable {SCAFFOLD_FILENAME}; "
+                "refusing to resume without rollback provenance"
+            )
+        if pending_blob is not None and pending_blob != committed_blob_text:
+            raise ContractViolationError(
+                f"pending self-edit {pending_sha[:12]} records scaffold blob {pending_blob[:12]}, "
+                f"but its commit contains {committed_blob_text[:12]}; refusing to resume"
+            )
+        if pending_window is None:
+            raise ContractViolationError(
+                f"pending self-edit {pending_sha[:12]} has no judgment window; "
+                "refusing to resume without rollback provenance"
+            )
         counted_before = [r for r in state.records if not r.void and r.round <= pending_round]
         scores_before = [r.score for r in counted_before if r.passed and r.score is not None]
         pending = _PendingEdit(
             sha=pending_sha,
             committed_after_round=pending_round,
+            judgment_window=pending_window,
+            judgment_window_source=pending_window_source,
             best_before=max(scores_before) if scores_before else None,
             passed_before=bool(counted_before and counted_before[-1].passed),
             prior_scores=tuple(scores_before),
@@ -1329,6 +1401,8 @@ class RsiLoop:
             "rsi.self_edit.pending_resumed",
             scaffold_sha=pending_sha[:12],
             rounds_after=len(pending.rounds_after),
+            judgment_window=pending.judgment_window,
+            judgment_window_source=pending.judgment_window_source,
         )
         return pending
 
@@ -1362,6 +1436,8 @@ class RsiLoop:
                 round_no,
                 {
                     "scaffold_sha": pending.sha,
+                    "judgment_window": pending.judgment_window,
+                    "judgment_window_source": pending.judgment_window_source,
                     "best_before": pending.best_before,
                     "best_after": best_after,
                 },
@@ -1383,6 +1459,8 @@ class RsiLoop:
             {
                 "reverted": pending.sha,
                 "revert_sha": revert_sha,
+                "judgment_window": pending.judgment_window,
+                "judgment_window_source": pending.judgment_window_source,
                 "best_before": pending.best_before,
                 "best_after": best_after,
                 "scaffold_sha": revert_sha,
