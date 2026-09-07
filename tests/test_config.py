@@ -6,6 +6,8 @@ import uuid
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+import pytest
+
 from turing.config import TuringConfig
 
 if TYPE_CHECKING:
@@ -32,6 +34,18 @@ class TestDefaults:
         with patch.dict("os.environ", {}, clear=True):
             cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.ollama_model == "gemma3:1b"
+
+    def test_default_ollama_tools_disabled(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.ollama_tools_enabled is False
+
+    def test_native_mailbox_defaults_unset(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.agent_mailbox_db is None
+        assert cfg.agent_mailbox_workflow is None
+        assert cfg.agent_mailbox_agent is None
 
     def test_default_anthropic_model(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
@@ -100,6 +114,52 @@ class TestEnvOverrides:
         with patch.dict("os.environ", {"TURING_ANTHROPIC_API_KEY": "sk-test"}, clear=True):
             cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.anthropic_api_key == "sk-test"
+
+    def test_ollama_tools_override(self) -> None:
+        with patch.dict("os.environ", {"TURING_OLLAMA_TOOLS_ENABLED": "true"}, clear=True):
+            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.ollama_tools_enabled is True
+
+    def test_native_mailbox_complete_override(self, tmp_path: Path) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "TURING_AGENT_MAILBOX_DB": str(tmp_path / "mailbox.db"),
+                "TURING_AGENT_MAILBOX_WORKFLOW": "workflow-1",
+                "TURING_AGENT_MAILBOX_AGENT": "local-agent",
+            },
+            clear=True,
+        ):
+            cfg = TuringConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.agent_mailbox_db == (tmp_path / "mailbox.db").resolve()
+        assert cfg.agent_mailbox_workflow == "workflow-1"
+        assert cfg.agent_mailbox_agent == "local-agent"
+
+    def test_native_mailbox_memory_sentinel_is_rejected(self) -> None:
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "TURING_AGENT_MAILBOX_DB": ":memory:",
+                    "TURING_AGENT_MAILBOX_WORKFLOW": "workflow-1",
+                    "TURING_AGENT_MAILBOX_AGENT": "local-agent",
+                },
+                clear=True,
+            ),
+            pytest.raises(ValueError, match="durable file"),
+        ):
+            TuringConfig(_env_file=None)  # type: ignore[call-arg]
+
+    def test_native_mailbox_partial_override_is_rejected(self, tmp_path: Path) -> None:
+        with (
+            patch.dict(
+                "os.environ",
+                {"TURING_AGENT_MAILBOX_DB": str(tmp_path / "mailbox.db")},
+                clear=True,
+            ),
+            pytest.raises(ValueError, match="must be configured together"),
+        ):
+            TuringConfig(_env_file=None)  # type: ignore[call-arg]
 
     def test_routing_mode_override(self) -> None:
         with patch.dict("os.environ", {"TURING_LLM_ROUTING_MODE": "cloud"}, clear=True):

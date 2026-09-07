@@ -1,0 +1,902 @@
+"""A small, provider-neutral mailbox backed by a dedicated SQLite database.
+
+The mailbox deliberately has a synchronous API.  Native Turing integrations
+can run these operations in a worker thread while command-line clients use the
+same store directly.  The database is a workflow namespace: anyone who can
+open the SQLite file is a trusted peer and filesystem permissions remain the
+access control boundary.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import datetime as _datetime
+import json
+import math
+import os
+import re
+import sqlite3
+import time
+import uuid
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, TypeVar
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
+__all__ = [
+    "MAX_CONTENT_BYTES",
+    "MAX_MESSAGES_PER_WORKFLOW",
+    "Mailbox",
+    "MailboxError",
+]
+
+
+SCHEMA_VERSION = 1
+MAX_CONTENT_BYTES = 64 * 1024
+MAX_MESSAGES_PER_WORKFLOW = 10_000
+MAX_PAGE_SIZE = 100
+MAX_IDENTIFIER_LENGTH = 64
+MAX_MESSAGE_ID_LENGTH = 128
+BUSY_TIMEOUT_MS = 10_000
+TRANSACTION_RETRIES = 6
+
+_MAILBOX_TABLES = frozenset(
+    {
+        "mailbox_schema",
+        "mailbox_workflows",
+        "mailbox_registrations",
+        "mailbox_sequences",
+        "mailbox_messages",
+    }
+)
+_MAILBOX_INDEXES = frozenset({"mailbox_messages_inbox_idx"})
+_EXPECTED_TABLE_COLUMNS = {
+    "mailbox_schema": (
+        ("id", "INTEGER", 0, 1),
+        ("version", "INTEGER", 1, 0),
+    ),
+    "mailbox_workflows": (
+        ("workflow", "TEXT", 0, 1),
+        ("created_at", "TEXT", 1, 0),
+    ),
+    "mailbox_registrations": (
+        ("workflow", "TEXT", 1, 1),
+        ("agent", "TEXT", 1, 2),
+        ("provider", "TEXT", 1, 0),
+        ("registered_at", "TEXT", 1, 0),
+        ("updated_at", "TEXT", 1, 0),
+    ),
+    "mailbox_sequences": (
+        ("workflow", "TEXT", 0, 1),
+        ("next_sequence", "INTEGER", 1, 0),
+    ),
+    "mailbox_messages": (
+        ("message_id", "TEXT", 0, 1),
+        ("workflow", "TEXT", 1, 0),
+        ("sequence", "INTEGER", 1, 0),
+        ("sender", "TEXT", 1, 0),
+        ("recipient", "TEXT", 1, 0),
+        ("created_at", "TEXT", 1, 0),
+        ("kind", "TEXT", 1, 0),
+        ("text", "TEXT", 1, 0),
+        ("data_json", "TEXT", 0, 0),
+        ("reply_to", "TEXT", 0, 0),
+        ("idempotency_key", "TEXT", 0, 0),
+        ("acknowledged_at", "TEXT", 0, 0),
+    ),
+}
+_EXPECTED_INDEX_COLUMNS = {
+    ("mailbox_workflows", "pk"): (("workflow",),),
+    ("mailbox_registrations", "pk"): (("workflow", "agent"),),
+    ("mailbox_sequences", "pk"): (("workflow",),),
+    ("mailbox_messages", "pk"): (("message_id",),),
+    ("mailbox_messages", "unique"): (
+        ("workflow", "sequence"),
+        ("workflow", "sender", "idempotency_key"),
+    ),
+    ("mailbox_messages", "inbox"): (("workflow", "recipient", "acknowledged_at", "sequence"),),
+}
+_SCHEMA_OBJECT_DDL = {
+    "mailbox_schema": """
+        CREATE TABLE mailbox_schema
+            (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)
+    """,
+    "mailbox_workflows": """
+        CREATE TABLE mailbox_workflows (
+            workflow TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL
+        )
+    """,
+    "mailbox_registrations": """
+        CREATE TABLE mailbox_registrations (
+            workflow TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            registered_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (workflow, agent),
+            FOREIGN KEY (workflow) REFERENCES mailbox_workflows(workflow)
+        )
+    """,
+    "mailbox_sequences": """
+        CREATE TABLE mailbox_sequences (
+            workflow TEXT PRIMARY KEY,
+            next_sequence INTEGER NOT NULL CHECK (next_sequence >= 1),
+            FOREIGN KEY (workflow) REFERENCES mailbox_workflows(workflow)
+        )
+    """,
+    "mailbox_messages": """
+        CREATE TABLE mailbox_messages (
+            message_id TEXT PRIMARY KEY,
+            workflow TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            sender TEXT NOT NULL,
+            recipient TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            text TEXT NOT NULL,
+            data_json TEXT,
+            reply_to TEXT,
+            idempotency_key TEXT,
+            acknowledged_at TEXT,
+            UNIQUE (workflow, sequence),
+            UNIQUE (workflow, sender, idempotency_key),
+            FOREIGN KEY (workflow, sender)
+                REFERENCES mailbox_registrations(workflow, agent),
+            FOREIGN KEY (workflow, recipient)
+                REFERENCES mailbox_registrations(workflow, agent)
+        )
+    """,
+    "mailbox_messages_inbox_idx": """
+        CREATE INDEX mailbox_messages_inbox_idx
+            ON mailbox_messages(workflow, recipient, acknowledged_at, sequence)
+    """,
+}
+
+# Portable labels intentionally avoid path separators, whitespace, shell
+# metacharacters, and non-ASCII normalization surprises.  UUIDs generated by
+# this module also satisfy the broader message-id expression below.
+_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+_T = TypeVar("_T")
+
+
+class MailboxError(ValueError):
+    """Raised when a mailbox operation cannot satisfy the contract."""
+
+
+def _validate_identifier(value: object, field: str, *, allow_empty: bool = False) -> str:
+    if not isinstance(value, str):
+        raise MailboxError(f"{field} must be a string")
+    if allow_empty and value == "":
+        return value
+    if not value:
+        raise MailboxError(f"{field} must not be empty")
+    if len(value) > MAX_IDENTIFIER_LENGTH or _IDENTIFIER_PATTERN.fullmatch(value) is None:
+        raise MailboxError(
+            f"{field} must be a portable identifier of at most {MAX_IDENTIFIER_LENGTH} "
+            "ASCII characters (letters, digits, '.', '_' or '-')"
+        )
+    return value
+
+
+def _validate_message_id(value: object, field: str = "message_id") -> str:
+    if not isinstance(value, str):
+        raise MailboxError(f"{field} must be a string")
+    if (
+        not value
+        or len(value) > MAX_MESSAGE_ID_LENGTH
+        or _MESSAGE_ID_PATTERN.fullmatch(value) is None
+    ):
+        raise MailboxError(f"{field} must be a bounded portable identifier")
+    return value
+
+
+def _utc_now() -> str:
+    return (
+        _datetime.datetime.now(_datetime.UTC)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _json_data(data: object) -> tuple[str | None, object | None]:
+    """Validate a JSON object and return canonical storage plus parsed value."""
+
+    if data is None:
+        return None, None
+    if not isinstance(data, dict):
+        raise MailboxError("data must be a JSON object")
+    try:
+        _validate_json_value(data, "data")
+    except RecursionError as exc:
+        raise MailboxError("data is too deeply nested for JSON") from exc
+    try:
+        encoded = json.dumps(
+            data,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        # Round-tripping catches values that a JSON encoder accepts through a
+        # surprising conversion and makes the value returned from the API
+        # match what was persisted.
+        parsed = json.loads(encoded)
+        if not isinstance(parsed, dict):  # pragma: no cover - encoder invariant
+            raise MailboxError("data must be a JSON object")
+        encoded.encode("utf-8")
+    except MailboxError:
+        raise
+    except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError) as exc:
+        raise MailboxError(f"data is not finite, valid JSON: {exc}") from exc
+    return encoded, parsed
+
+
+def _validate_json_value(value: object, path: str) -> None:
+    """Reject values that ``json.dumps`` would coerce or silently lose."""
+
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise MailboxError(f"{path} contains a non-finite JSON number")
+        return
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if not isinstance(key, str):
+                raise MailboxError(f"{path} object keys must be strings")
+            _validate_json_value(child, f"{path}.{key}")
+        return
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            _validate_json_value(child, f"{path}[{index}]")
+        return
+    raise MailboxError(f"{path} contains a value that is not JSON-compatible")
+
+
+def _serialized_content_size(kind: str, text: str, data_json: str | None) -> int:
+    # Store the same logical payload that callers supplied.  Metadata such as
+    # a generated ID and timestamp is not content and should not consume the
+    # user payload budget.
+    try:
+        payload = {
+            "kind": kind,
+            "text": text,
+            "data": json.loads(data_json) if data_json else None,
+        }
+        return len(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+    except (TypeError, UnicodeError, ValueError, OverflowError, RecursionError) as exc:
+        raise MailboxError(f"message content is not valid JSON: {exc}") from exc
+
+
+def _normalize_schema_sql(sql: str) -> str:
+    """Normalize DDL formatting while preserving every schema token."""
+
+    return " ".join(sql.split()).casefold()
+
+
+def _message_content_matches(
+    row: sqlite3.Row,
+    *,
+    recipient: str,
+    kind: str,
+    text: str,
+    data_json: str | None,
+    reply_to: str | None,
+) -> bool:
+    return bool(
+        row["recipient"] == recipient
+        and row["kind"] == kind
+        and row["text"] == text
+        and row["data_json"] == data_json
+        and row["reply_to"] == reply_to
+    )
+
+
+def _row_to_message(row: sqlite3.Row) -> dict[str, Any]:
+    data: object | None = None
+    if row["data_json"] is not None:
+        try:
+            data = json.loads(row["data_json"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise MailboxError("mailbox contains invalid stored JSON") from exc
+    return {
+        "message_id": row["message_id"],
+        "sequence": int(row["sequence"]),
+        "workflow": row["workflow"],
+        "sender": row["sender"],
+        "recipient": row["recipient"],
+        "created_at": row["created_at"],
+        "kind": row["kind"],
+        "text": row["text"],
+        "data": data,
+        "reply_to": row["reply_to"],
+        "idempotency_key": row["idempotency_key"],
+        "acknowledged_at": row["acknowledged_at"],
+    }
+
+
+class Mailbox:
+    """Synchronous client bound to one database, workflow, and agent label."""
+
+    def __init__(self, db_path: str | os.PathLike[str], workflow: str, agent: str) -> None:
+        if isinstance(db_path, bytes):
+            raise MailboxError("db_path must be a string or path-like value")
+        try:
+            raw_path = os.fspath(db_path)
+        except (TypeError, ValueError) as exc:
+            raise MailboxError("db_path must be a string or path-like value") from exc
+        if isinstance(raw_path, bytes) or not raw_path:
+            raise MailboxError("db_path must not be empty")
+        self.workflow = _validate_identifier(workflow, "workflow")
+        self.agent = _validate_identifier(agent, "agent")
+        if raw_path == ":memory:":
+            raise MailboxError("mailbox database must be a durable file path")
+        try:
+            # Bind the resolved path once. A long-lived client must not start
+            # writing to a different database after a cwd change.
+            self.db_path = str(Path(raw_path).expanduser().resolve(strict=False))
+        except OSError as exc:
+            raise MailboxError(f"cannot resolve mailbox database path: {exc}") from exc
+        try:
+            self._create_database_file_if_needed()
+            # Do not touch journal mode until the existing-file check in
+            # ``_initialize_connection`` has established this is a dedicated
+            # mailbox store.
+            with self._connection(enable_wal=False) as connection:
+                self._initialize_connection(connection)
+        except MailboxError:
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            raise MailboxError(f"cannot initialize mailbox database: {exc}") from exc
+
+    def _create_database_file_if_needed(self) -> None:
+        """Create a new store with owner-only permissions when possible.
+
+        ``sqlite3.connect`` follows the process umask but does not let a
+        caller request a creation mode.  Pre-creating the file closes that
+        gap, while the existence check means an operator-owned database is
+        never chmod'ed as a side effect of opening it.
+        """
+
+        try:
+            descriptor = os.open(
+                self.db_path,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            return
+        except OSError as exc:
+            raise MailboxError(f"cannot create mailbox database: {exc}") from exc
+        else:
+            os.close(descriptor)
+
+    @property
+    def database_path(self) -> str:
+        """The explicitly bound database path."""
+
+        return self.db_path
+
+    def register(self, provider: str = "") -> dict[str, Any]:
+        """Register this client in its workflow, idempotently."""
+
+        provider = _validate_identifier(provider, "provider", allow_empty=True)
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            now = _utc_now()
+            connection.execute(
+                "INSERT OR IGNORE INTO mailbox_workflows(workflow, created_at) VALUES (?, ?)",
+                (self.workflow, now),
+            )
+            row = connection.execute(
+                "SELECT provider, registered_at, updated_at FROM mailbox_registrations "
+                "WHERE workflow = ? AND agent = ?",
+                (self.workflow, self.agent),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO mailbox_registrations "
+                    "(workflow, agent, provider, registered_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (self.workflow, self.agent, provider, now, now),
+                )
+                registered_at = now
+                updated_at = now
+            else:
+                registered_at = row["registered_at"]
+                updated_at = row["updated_at"]
+                # A registration retry with the same provider is a no-op.  A
+                # changed provider intentionally updates the label while
+                # preserving the original registration timestamp.
+                if row["provider"] != provider:
+                    connection.execute(
+                        "UPDATE mailbox_registrations SET provider = ?, updated_at = ? "
+                        "WHERE workflow = ? AND agent = ?",
+                        (provider, now, self.workflow, self.agent),
+                    )
+                    updated_at = now
+            connection.execute(
+                "INSERT OR IGNORE INTO mailbox_sequences(workflow, next_sequence) VALUES (?, 1)",
+                (self.workflow,),
+            )
+            return {
+                "workflow": self.workflow,
+                "agent": self.agent,
+                "provider": provider,
+                "registered_at": registered_at,
+                "updated_at": updated_at,
+            }
+
+        return self._write(operation)
+
+    def peers(self) -> list[dict[str, Any]]:
+        """Return registrations in this workflow, ordered by agent label."""
+
+        def operation(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = connection.execute(
+                "SELECT workflow, agent, provider, registered_at, updated_at "
+                "FROM mailbox_registrations WHERE workflow = ? ORDER BY agent",
+                (self.workflow,),
+            ).fetchall()
+            return [
+                {
+                    "workflow": row["workflow"],
+                    "agent": row["agent"],
+                    "provider": row["provider"],
+                    "registered_at": row["registered_at"],
+                    "updated_at": row["updated_at"],
+                }
+                for row in rows
+            ]
+
+        return self._read(operation)
+
+    def send(
+        self,
+        recipient: str,
+        text: str,
+        *,
+        kind: str = "message",
+        data: dict[str, Any] | None = None,
+        reply_to: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Send a message and return its durable record.
+
+        The sender is always the agent bound to this client.  The idempotency
+        key, when supplied, is scoped to that sender and workflow.
+        """
+
+        recipient = _validate_identifier(recipient, "recipient")
+        if not isinstance(text, str):
+            raise MailboxError("text must be a string")
+        kind = _validate_identifier(kind, "kind")
+        if reply_to is not None:
+            reply_to = _validate_message_id(reply_to, "reply_to")
+        if idempotency_key is not None:
+            idempotency_key = _validate_identifier(idempotency_key, "idempotency_key")
+        data_json, parsed_data = _json_data(data)
+        if _serialized_content_size(kind, text, data_json) > MAX_CONTENT_BYTES:
+            raise MailboxError(f"serialized message content exceeds {MAX_CONTENT_BYTES} bytes")
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            sender_row = connection.execute(
+                "SELECT 1 FROM mailbox_registrations WHERE workflow = ? AND agent = ?",
+                (self.workflow, self.agent),
+            ).fetchone()
+            if sender_row is None:
+                raise MailboxError(
+                    f"sender {self.agent!r} is not registered in workflow {self.workflow!r}"
+                )
+            recipient_row = connection.execute(
+                "SELECT 1 FROM mailbox_registrations WHERE workflow = ? AND agent = ?",
+                (self.workflow, recipient),
+            ).fetchone()
+            if recipient_row is None:
+                raise MailboxError(
+                    f"recipient {recipient!r} is not registered in workflow {self.workflow!r}"
+                )
+            if reply_to is not None:
+                reply_row = connection.execute(
+                    "SELECT * FROM mailbox_messages WHERE workflow = ? AND message_id = ?",
+                    (self.workflow, reply_to),
+                ).fetchone()
+                if reply_row is None:
+                    raise MailboxError(
+                        f"reply_to message {reply_to!r} does not exist in this workflow"
+                    )
+                if reply_row["recipient"] != self.agent:
+                    raise MailboxError("reply_to must reference a message addressed to this agent")
+                if reply_row["sender"] != recipient:
+                    raise MailboxError("reply recipient must be the original message sender")
+
+            if idempotency_key is not None:
+                existing = connection.execute(
+                    "SELECT * FROM mailbox_messages WHERE workflow = ? AND sender = ? "
+                    "AND idempotency_key = ?",
+                    (self.workflow, self.agent, idempotency_key),
+                ).fetchone()
+                if existing is not None:
+                    if _message_content_matches(
+                        existing,
+                        recipient=recipient,
+                        kind=kind,
+                        text=text,
+                        data_json=data_json,
+                        reply_to=reply_to,
+                    ):
+                        return _row_to_message(existing)
+                    raise MailboxError(
+                        f"idempotency_key {idempotency_key!r} was already used with different content"
+                    )
+
+            count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM mailbox_messages WHERE workflow = ?", (self.workflow,)
+                ).fetchone()[0]
+            )
+            if count >= MAX_MESSAGES_PER_WORKFLOW:
+                raise MailboxError(
+                    f"workflow {self.workflow!r} has reached its {MAX_MESSAGES_PER_WORKFLOW}-message limit"
+                )
+            sequence_row = connection.execute(
+                "SELECT next_sequence FROM mailbox_sequences WHERE workflow = ?", (self.workflow,)
+            ).fetchone()
+            if sequence_row is None:
+                # This can only happen after a manually damaged database; fail
+                # loudly rather than inventing a sequence that may collide.
+                raise MailboxError("mailbox sequence state is missing for this workflow")
+            sequence = int(sequence_row["next_sequence"])
+            message_id = uuid.uuid4().hex
+            created_at = _utc_now()
+            connection.execute(
+                "INSERT INTO mailbox_messages "
+                "(message_id, workflow, sequence, sender, recipient, created_at, kind, text, "
+                "data_json, reply_to, idempotency_key, acknowledged_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    message_id,
+                    self.workflow,
+                    sequence,
+                    self.agent,
+                    recipient,
+                    created_at,
+                    kind,
+                    text,
+                    data_json,
+                    reply_to,
+                    idempotency_key,
+                ),
+            )
+            connection.execute(
+                "UPDATE mailbox_sequences SET next_sequence = ? WHERE workflow = ?",
+                (sequence + 1, self.workflow),
+            )
+            row = connection.execute(
+                "SELECT * FROM mailbox_messages WHERE workflow = ? AND message_id = ?",
+                (self.workflow, message_id),
+            ).fetchone()
+            if row is None:  # pragma: no cover - insert and select same transaction
+                raise MailboxError("message disappeared before commit")
+            return _row_to_message(row)
+
+        # parsed_data is deliberately computed above so malformed data fails
+        # before any database work; ``data_json`` is the canonical comparison
+        # value used by retries.
+        _ = parsed_data
+        return self._write(operation)
+
+    def inbox(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Read this agent's unacknowledged messages oldest first."""
+
+        _validate_page_size(limit)
+
+        def operation(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = connection.execute(
+                "SELECT * FROM mailbox_messages WHERE workflow = ? AND recipient = ? "
+                "AND acknowledged_at IS NULL ORDER BY sequence ASC LIMIT ?",
+                (self.workflow, self.agent, limit),
+            ).fetchall()
+            return [_row_to_message(row) for row in rows]
+
+        return self._read(operation)
+
+    def ack(self, message_id: str) -> dict[str, Any]:
+        """Acknowledge a message addressed to this client, idempotently."""
+
+        message_id = _validate_message_id(message_id)
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            row = connection.execute(
+                "SELECT * FROM mailbox_messages WHERE workflow = ? AND message_id = ?",
+                (self.workflow, message_id),
+            ).fetchone()
+            if row is None:
+                raise MailboxError(f"message {message_id!r} does not exist in this workflow")
+            if row["recipient"] != self.agent:
+                raise MailboxError("an agent may acknowledge only messages addressed to it")
+            if row["acknowledged_at"] is None:
+                acknowledged_at = _utc_now()
+                connection.execute(
+                    "UPDATE mailbox_messages SET acknowledged_at = ? "
+                    "WHERE workflow = ? AND message_id = ? AND acknowledged_at IS NULL",
+                    (acknowledged_at, self.workflow, message_id),
+                )
+                row = connection.execute(
+                    "SELECT * FROM mailbox_messages WHERE workflow = ? AND message_id = ?",
+                    (self.workflow, message_id),
+                ).fetchone()
+            return {
+                "message_id": message_id,
+                "acknowledged": True,
+                "acknowledged_at": row["acknowledged_at"],
+            }
+
+        return self._write(operation)
+
+    @staticmethod
+    def _new_connection(path: str) -> sqlite3.Connection:
+        try:
+            connection = sqlite3.connect(
+                path,
+                timeout=BUSY_TIMEOUT_MS / 1000,
+                isolation_level=None,
+                check_same_thread=False,
+            )
+        except sqlite3.Error as exc:
+            raise MailboxError(f"cannot open mailbox database: {exc}") from exc
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    @staticmethod
+    def _configure_connection(connection: sqlite3.Connection, *, enable_wal: bool = True) -> None:
+        try:
+            connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+            connection.execute("PRAGMA foreign_keys = ON")
+        except sqlite3.Error as exc:
+            raise MailboxError(f"cannot configure mailbox database: {exc}") from exc
+        if not enable_wal:
+            return
+        for attempt in range(TRANSACTION_RETRIES):
+            try:
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.execute("PRAGMA synchronous = FULL")
+                return
+            except sqlite3.OperationalError as exc:
+                if not _is_busy_error(exc) or attempt >= TRANSACTION_RETRIES - 1:
+                    raise MailboxError(f"cannot configure mailbox database: {exc}") from exc
+                time.sleep(_retry_delay(attempt))
+            except sqlite3.Error as exc:
+                raise MailboxError(f"cannot configure mailbox database: {exc}") from exc
+
+    @contextlib.contextmanager
+    def _connection(self, *, enable_wal: bool = True) -> Iterator[sqlite3.Connection]:
+        connection = self._new_connection(self.db_path)
+        try:
+            self._configure_connection(connection, enable_wal=enable_wal)
+            yield connection
+        finally:
+            connection.close()
+
+    def _initialize_connection(self, connection: sqlite3.Connection) -> None:
+        for attempt in range(TRANSACTION_RETRIES):
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if type(user_version) is not int or user_version != 0:
+                    raise MailboxError(
+                        "database has an unsupported SQLite user_version; "
+                        "choose a separate mailbox database path"
+                    )
+                application_id = connection.execute("PRAGMA application_id").fetchone()[0]
+                if type(application_id) is not int or application_id != 0:
+                    raise MailboxError(
+                        "database has an unsupported SQLite application_id; "
+                        "choose a separate mailbox database path"
+                    )
+                objects = connection.execute(
+                    "SELECT type, name, sql FROM sqlite_master "
+                    "WHERE type IN ('table', 'index', 'view', 'trigger')"
+                ).fetchall()
+                table_names = {row["name"] for row in objects if row["type"] == "table"}
+                if "mailbox_schema" not in table_names:
+                    if objects:
+                        raise MailboxError(
+                            "database is not an empty dedicated mailbox store; "
+                            "choose a separate mailbox database path"
+                        )
+                    self._create_schema(connection)
+                    connection.commit()
+                    return
+
+                self._validate_existing_schema(connection, objects)
+                row = connection.execute(
+                    "SELECT version FROM mailbox_schema WHERE id = 1"
+                ).fetchone()
+                if row is None:
+                    raise MailboxError("mailbox schema marker is missing its version row")
+                version = row["version"]
+                if type(version) is not int:
+                    raise MailboxError("mailbox schema version is invalid")
+                if version != SCHEMA_VERSION:
+                    raise MailboxError(
+                        f"unsupported mailbox schema version {version}; expected {SCHEMA_VERSION}"
+                    )
+                connection.commit()
+                return
+            except MailboxError:
+                connection.rollback()
+                raise
+            except sqlite3.OperationalError as exc:
+                connection.rollback()
+                if not _is_busy_error(exc) or attempt >= TRANSACTION_RETRIES - 1:
+                    raise MailboxError(f"cannot initialize mailbox schema: {exc}") from exc
+                time.sleep(_retry_delay(attempt))
+            except sqlite3.Error as exc:
+                connection.rollback()
+                raise MailboxError(f"cannot initialize mailbox schema: {exc}") from exc
+
+    @staticmethod
+    def _create_schema(connection: sqlite3.Connection) -> None:
+        for statement in _SCHEMA_OBJECT_DDL.values():
+            connection.execute(statement)
+        connection.execute(
+            "INSERT INTO mailbox_schema(id, version) VALUES (1, ?)",
+            (SCHEMA_VERSION,),
+        )
+
+    @staticmethod
+    def _validate_existing_schema(
+        connection: sqlite3.Connection, objects: list[sqlite3.Row]
+    ) -> None:
+        object_names = {(row["type"], row["name"]) for row in objects}
+        expected_objects = {("table", name) for name in _MAILBOX_TABLES}
+        expected_objects |= {("index", name) for name in _MAILBOX_INDEXES}
+        unexpected = {
+            item
+            for item in object_names
+            if not (
+                item in expected_objects
+                or (item[0] == "index" and item[1].startswith("sqlite_autoindex_"))
+            )
+        }
+        missing = expected_objects - object_names
+        if missing or unexpected:
+            raise MailboxError(
+                "existing mailbox schema is incomplete or contains unexpected objects"
+            )
+
+        for table, expected_columns in _EXPECTED_TABLE_COLUMNS.items():
+            rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+            actual_columns = tuple(
+                (
+                    row["name"],
+                    str(row["type"]).upper(),
+                    int(row["notnull"]),
+                    int(row["pk"]),
+                )
+                for row in rows
+            )
+            if actual_columns != expected_columns:
+                raise MailboxError(f"existing mailbox table {table!r} has an unsupported schema")
+
+        expected_indexes = {
+            "mailbox_workflows": {
+                ("pk", columns) for columns in _EXPECTED_INDEX_COLUMNS[("mailbox_workflows", "pk")]
+            },
+            "mailbox_registrations": {
+                ("pk", columns)
+                for columns in _EXPECTED_INDEX_COLUMNS[("mailbox_registrations", "pk")]
+            },
+            "mailbox_sequences": {
+                ("pk", columns) for columns in _EXPECTED_INDEX_COLUMNS[("mailbox_sequences", "pk")]
+            },
+            "mailbox_messages": {
+                ("pk", columns) for columns in _EXPECTED_INDEX_COLUMNS[("mailbox_messages", "pk")]
+            }
+            | {
+                ("unique", columns)
+                for columns in _EXPECTED_INDEX_COLUMNS[("mailbox_messages", "unique")]
+            }
+            | {
+                ("inbox", columns)
+                for columns in _EXPECTED_INDEX_COLUMNS[("mailbox_messages", "inbox")]
+            },
+        }
+        for table, expected in expected_indexes.items():
+            actual: set[tuple[str, tuple[str, ...]]] = set()
+            for index in connection.execute(f"PRAGMA index_list({table})").fetchall():
+                columns = tuple(
+                    row["name"]
+                    for row in connection.execute(f"PRAGMA index_info({index['name']})").fetchall()
+                )
+                origin = index["origin"]
+                if origin == "pk":
+                    category = "pk"
+                elif origin == "u":
+                    category = "unique"
+                elif index["name"] == "mailbox_messages_inbox_idx":
+                    category = "inbox"
+                else:
+                    raise MailboxError(f"existing mailbox table {table!r} has an unexpected index")
+                actual.add((category, columns))
+            if actual != expected:
+                raise MailboxError(f"existing mailbox table {table!r} has an unsupported schema")
+
+        expected_foreign_keys: dict[str, set[tuple[str, str, str]]] = {
+            "mailbox_registrations": {("mailbox_workflows", "workflow", "workflow")},
+            "mailbox_sequences": {("mailbox_workflows", "workflow", "workflow")},
+            "mailbox_messages": {
+                ("mailbox_registrations", "workflow", "workflow"),
+                ("mailbox_registrations", "sender", "agent"),
+                ("mailbox_registrations", "recipient", "agent"),
+            },
+        }
+        for table, expected_foreign_keys_for_table in expected_foreign_keys.items():
+            actual_foreign_keys: set[tuple[str, str, str]] = {
+                (row["table"], row["from"], row["to"])
+                for row in connection.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+            }
+            if actual_foreign_keys != expected_foreign_keys_for_table:
+                raise MailboxError(f"existing mailbox table {table!r} has an unsupported schema")
+
+        sql_by_name = {row["name"]: row["sql"] or "" for row in objects}
+        for name, expected_sql in _SCHEMA_OBJECT_DDL.items():
+            if _normalize_schema_sql(sql_by_name[name]) != _normalize_schema_sql(expected_sql):
+                raise MailboxError(f"existing mailbox object {name!r} has an unsupported schema")
+
+    def _write(self, operation: Callable[[sqlite3.Connection], _T]) -> _T:
+        return self._run(operation, write=True)
+
+    def _read(self, operation: Callable[[sqlite3.Connection], _T]) -> _T:
+        return self._run(operation, write=False)
+
+    def _run(self, operation: Callable[[sqlite3.Connection], _T], *, write: bool) -> _T:
+        for attempt in range(TRANSACTION_RETRIES):
+            try:
+                with self._connection() as connection:
+                    if write:
+                        connection.execute("BEGIN IMMEDIATE")
+                    result = operation(connection)
+                    if write:
+                        connection.commit()
+                    return result
+            except MailboxError:
+                raise
+            except sqlite3.OperationalError as exc:
+                if not _is_busy_error(exc) or attempt >= TRANSACTION_RETRIES - 1:
+                    raise MailboxError(f"mailbox database operation failed: {exc}") from exc
+                time.sleep(_retry_delay(attempt))
+            except sqlite3.IntegrityError as exc:
+                raise MailboxError(f"mailbox data constraint failed: {exc}") from exc
+            except sqlite3.Error as exc:
+                raise MailboxError(f"mailbox database operation failed: {exc}") from exc
+
+        raise MailboxError("mailbox database operation failed after retries")  # pragma: no cover
+
+
+def _validate_page_size(limit: object) -> int:
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise MailboxError("limit must be an integer")
+    if not 1 <= limit <= MAX_PAGE_SIZE:
+        raise MailboxError(f"limit must be between 1 and {MAX_PAGE_SIZE}")
+    return limit
+
+
+def _is_busy_error(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
+
+
+def _retry_delay(attempt: int) -> float:
+    return min(0.05 * float(2**attempt), 0.5)

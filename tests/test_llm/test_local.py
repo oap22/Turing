@@ -84,7 +84,32 @@ class TestRequestShaping:
         sent = provider._client.chat.call_args.kwargs["messages"]
         assert sent[0]["role"] == "assistant"
         assert sent[0]["tool_calls"][0]["function"]["name"] == "t"
-        assert sent[1] == {"role": "tool", "content": "result"}
+        assert sent[1] == {"role": "tool", "tool_name": "t", "content": "result"}
+
+    @pytest.mark.asyncio
+    async def test_tool_names_correlate_across_reused_ollama_ids(
+        self, provider: OllamaProvider
+    ) -> None:
+        """Synthetic Ollama IDs repeat per response; resolve by transcript order."""
+        provider._client.chat = AsyncMock(return_value={"message": {"content": ""}})
+        msgs = [
+            Message(
+                role=Role.ASSISTANT,
+                content="",
+                tool_calls=[ToolCall(id="ollama_0", name="first", arguments={})],
+            ),
+            Message(role=Role.TOOL, content="one", tool_call_id="ollama_0"),
+            Message(
+                role=Role.ASSISTANT,
+                content="",
+                tool_calls=[ToolCall(id="ollama_0", name="second", arguments={})],
+            ),
+            Message(role=Role.TOOL, content="two", tool_call_id="ollama_0"),
+        ]
+        await provider.complete(msgs)
+        sent = provider._client.chat.call_args.kwargs["messages"]
+        assert sent[1] == {"role": "tool", "tool_name": "first", "content": "one"}
+        assert sent[3] == {"role": "tool", "tool_name": "second", "content": "two"}
 
     @pytest.mark.asyncio
     async def test_system_role_message_passed_through(self, provider: OllamaProvider) -> None:

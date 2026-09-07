@@ -53,6 +53,15 @@ npm --prefix desktop run install-app       # build + (re)install /Applications/t
   (`scripts/install-desktop.sh` — build, quit, replace, re-sign, report version).
 - Full keymap, panes, runners, troubleshooting: `desktop/README.md`.
 
+## Coding-agent communication
+
+Cooperating agents can exchange durable text and JSON messages using
+`turing-agent-mailbox` (or `python -m turing.agent_mailbox`). Claude, Codex,
+and local shell-capable agents share a workflow mailbox across worktrees on
+the same machine. Native Turing agents can use the corresponding tool, with
+explicit local-model tool opt-in. See the [setup and complete exchange example](docs/agents/communication.md)
+and [feasibility/specification](docs/specs/436-agent-communication.md).
+
 ## Dormant fleet stack
 
 <details>

@@ -277,6 +277,62 @@ class TestToolForcing:
         call_kwargs = cloud_provider.complete.call_args
         assert call_kwargs.kwargs.get("tools") == [tool] or call_kwargs[1].get("tools") == [tool]
 
+    @pytest.mark.asyncio
+    async def test_local_tool_opt_in_passes_definitions_to_local_provider(
+        self,
+        cloud_provider: AsyncMock,
+        local_provider: AsyncMock,
+        classifier: ComplexityClassifier,
+    ) -> None:
+        tool = ToolDefinition(
+            name="agent_mailbox",
+            description="Exchange messages",
+            parameters={"type": "object", "properties": {}},
+        )
+        router = LLMRouter(
+            cloud_provider,
+            local_provider,
+            classifier,
+            "local_only",
+            local_tools_enabled=True,
+        )
+        await router.route([_user_msg("send a note to the other agent")], tools=[tool])
+        assert local_provider.complete.call_args.kwargs["tools"] == [tool]
+
+    @pytest.mark.asyncio
+    async def test_local_opt_in_is_preserved_for_cloud_auth_fallback(
+        self,
+        cloud_provider: AsyncMock,
+        local_provider: AsyncMock,
+        classifier: ComplexityClassifier,
+    ) -> None:
+        import anthropic
+        import httpx
+
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx.Response(401, request=request)
+        cloud_provider.complete.side_effect = anthropic.AuthenticationError(
+            message="missing api key",
+            response=response,
+            body=None,
+        )
+        tool = ToolDefinition(
+            name="agent_mailbox",
+            description="Exchange messages",
+            parameters={"type": "object", "properties": {}},
+        )
+        router = LLMRouter(
+            cloud_provider,
+            local_provider,
+            classifier,
+            "auto",
+            local_tools_enabled=True,
+        )
+        await router.route(
+            [_user_msg("analyze and explain the entire system architecture")], tools=[tool]
+        )
+        assert local_provider.complete.call_args.kwargs["tools"] == [tool]
+
 
 # ── misc ──────────────────────────────────────────────────────────────
 
@@ -432,5 +488,15 @@ class TestWarnIfLocalOnlyDisablesTools:
 
         with structlog.testing.capture_logs() as cap:
             emitted = warn_if_local_only_disables_tools("cloud_only", tool_count=5)
+        assert emitted is False
+        assert not [e for e in cap if e.get("event") == "llm.local_only_disables_tools"]
+
+    def test_silent_when_local_tools_are_explicitly_enabled(self) -> None:
+        import structlog
+
+        with structlog.testing.capture_logs() as cap:
+            emitted = warn_if_local_only_disables_tools(
+                "local_only", tool_count=5, local_tools_enabled=True
+            )
         assert emitted is False
         assert not [e for e in cap if e.get("event") == "llm.local_only_disables_tools"]

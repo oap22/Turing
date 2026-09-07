@@ -52,6 +52,7 @@ turing = "turing.__main__:main"
 turing-ui = "turing.launcher:main"
 turing-gateway = "turing.gateway.__main__:main"
 turing-vault-watcher = "turing.vault.cli:main"
+turing-agent-mailbox = "turing.agent_mailbox.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/turing"]
