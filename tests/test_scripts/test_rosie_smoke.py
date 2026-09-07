@@ -23,6 +23,35 @@ def record():
     }
 
 
+def write_valid_snapshot(output: Path) -> dict:
+    script = b"test script\n"
+    state = record()
+    state["script_sha256"] = hashlib.sha256(script).hexdigest()
+    metadata = {
+        "job_id": "123",
+        "hostname": "node1",
+        "script_sha256": state["script_sha256"],
+        "kind": "infrastructure-smoke",
+        "research_result": False,
+    }
+    destination = output / "collected"
+    destination.mkdir()
+    (destination / "job.sbatch").write_bytes(script)
+    (destination / "metadata.json").write_text(json.dumps(metadata))
+    (destination / "verified.json").write_text(
+        json.dumps(
+            {
+                **state,
+                "state": "verified",
+                "accounting": ["123", "COMPLETED", "0:0", "00:01", "node1"],
+                "metadata": metadata,
+            }
+        )
+    )
+    (output / "submission.json").write_text(json.dumps(state))
+    return state
+
+
 @pytest.mark.parametrize(
     "key,value",
     [
@@ -167,6 +196,26 @@ def test_collection_rejects_arbitrary_existing_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(smoke, "ssh", lambda *_: pytest.fail("must reject locally"))
     with pytest.raises(ValueError, match="unexpected files"):
         smoke.collect(tmp_path)
+
+
+def test_collection_rejects_extra_snapshot_file_before_remote_access(tmp_path, monkeypatch):
+    write_valid_snapshot(tmp_path)
+    (tmp_path / "collected/unexpected.txt").write_text("untrusted")
+    monkeypatch.setattr(smoke, "ssh", lambda *_: pytest.fail("must reject before SSH"))
+    monkeypatch.setattr(smoke, "run", lambda *_: pytest.fail("must reject before rsync"))
+    with pytest.raises(ValueError, match="unexpected files"):
+        smoke.collect(tmp_path)
+    assert not (tmp_path / "verified.json").exists()
+
+
+def test_collection_rejects_symlink_snapshot_file_before_remote_access(tmp_path, monkeypatch):
+    write_valid_snapshot(tmp_path)
+    (tmp_path / "collected/stdout.log").symlink_to("job.sbatch")
+    monkeypatch.setattr(smoke, "ssh", lambda *_: pytest.fail("must reject before SSH"))
+    monkeypatch.setattr(smoke, "run", lambda *_: pytest.fail("must reject before rsync"))
+    with pytest.raises(ValueError, match="regular file"):
+        smoke.collect(tmp_path)
+    assert not (tmp_path / "verified.json").exists()
 
 
 def test_collection_rejects_marker_without_snapshot_before_ssh(tmp_path, monkeypatch):
