@@ -13,7 +13,8 @@
 #   scripts/fleet-models.sh status  HOST...                      what each node has (+ loaded)
 #   scripts/fleet-models.sh pull    --models "M1 M2" HOST...     pull M1 M2 on every HOST
 #   scripts/fleet-models.sh plan    FILE                         pull per-host from a plan file
-#   scripts/fleet-models.sh expose  HOST...                      make each node's Ollama LAN-reachable
+#   scripts/fleet-models.sh expose  --bind-address ADDR --i-understand-unauthenticated HOST...
+#                                                               make each node's Ollama reachable
 #   scripts/fleet-models.sh prune   --keep "M1 M2" HOST...       remove every model NOT in --keep
 #
 # Plan file format (`#` comments allowed; blank lines ignored):
@@ -29,7 +30,8 @@
 #   --dry-run        print the exact remote commands; run nothing
 #   -h, --help       this help
 #
-# `expose` writes a systemd drop-in so ollama.service listens on 0.0.0.0:11434
+# `expose` writes a systemd drop-in so ollama.service listens on the explicitly
+# selected address at port 11434
 # and keeps models resident (OLLAMA_KEEP_ALIVE), then restarts it. It is what
 # makes `TURING_OLLAMA_ADVERTISE_HOST=http://<host>:11434` on that node true.
 # Ollama has no auth, so only do this on the tailnet/LAN the fleet lives on —
@@ -45,6 +47,8 @@ USER_OPT="${TURING_FLEET_USER:-${USER:-}}"
 PARALLEL=0
 DRY_RUN=0
 KEEP_ALIVE="30m"
+BIND_ADDRESS=""
+ACK_UNAUTHENTICATED=0
 MODELS=""
 KEEP=""
 COMMAND=""
@@ -59,6 +63,8 @@ while [[ $# -gt 0 ]]; do
         --parallel) PARALLEL=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --keep-alive) KEEP_ALIVE="${2:-}"; shift 2 ;;
+        --bind-address) BIND_ADDRESS="${2:-}"; shift 2 ;;
+        --i-understand-unauthenticated) ACK_UNAUTHENTICATED=1; shift ;;
         --models) MODELS="${2:-}"; shift 2 ;;
         --keep) KEEP="${2:-}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
@@ -106,6 +112,15 @@ validate_keep_alive() {
         exit 2
     fi
 }
+validate_bind_address() {
+    # Hostnames, IPv4 literals, and bracketed IPv6 literals are safe to place
+    # in the quoted systemd command.  The address is still an operator choice;
+    # this validation only prevents shell syntax from crossing SSH.
+    if [[ ! "$1" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ && ! "$1" =~ ^\[[0-9A-Fa-f:]+\]$ ]]; then
+        echo "fleet-models: refusing bind address '$1'" >&2
+        exit 2
+    fi
+}
 
 ssh_target() { if [[ -n "$USER_OPT" ]]; then echo "${USER_OPT}@$1"; else echo "$1"; fi; }
 
@@ -138,10 +153,10 @@ expose_cmd() {
     # A drop-in rather than editing the unit: survives ollama upgrades.
     cat <<EOF
 sudo mkdir -p /etc/systemd/system/ollama.service.d && \
-printf '[Service]\nEnvironment=OLLAMA_HOST=0.0.0.0:11434\nEnvironment=OLLAMA_KEEP_ALIVE=${KEEP_ALIVE}\n' | \
+printf '[Service]\nEnvironment=OLLAMA_HOST=${BIND_ADDRESS}:11434\nEnvironment=OLLAMA_KEEP_ALIVE=${KEEP_ALIVE}\n' | \
 sudo tee /etc/systemd/system/ollama.service.d/10-turing-fleet.conf >/dev/null && \
 sudo systemctl daemon-reload && sudo systemctl restart ollama && \
-sleep 2 && curl -fsS http://127.0.0.1:11434/api/tags >/dev/null && echo 'ollama exposed on 0.0.0.0:11434'
+sleep 2 && curl -fsS http://127.0.0.1:11434/api/tags >/dev/null && echo 'ollama exposed on ${BIND_ADDRESS}:11434'
 EOF
 }
 
@@ -209,6 +224,15 @@ case "$COMMAND" in
         run_on_hosts build ${HOSTS[@]+"${HOSTS[@]}"}
         ;;
     expose)
+        if [[ -z "$BIND_ADDRESS" ]]; then
+            echo "fleet-models: expose requires --bind-address (refusing an implicit public bind)" >&2
+            exit 2
+        fi
+        if [[ "$ACK_UNAUTHENTICATED" -ne 1 ]]; then
+            echo "fleet-models: expose requires --i-understand-unauthenticated" >&2
+            exit 2
+        fi
+        validate_bind_address "$BIND_ADDRESS"
         validate_keep_alive "$KEEP_ALIVE"
         build() { expose_cmd; }
         # `${arr[@]+"${arr[@]}"}`: an empty array is "unbound" under `set -u`

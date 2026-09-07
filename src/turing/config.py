@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from turing.llm.endpoints import validate_ollama_allowlist, validate_ollama_endpoint
 from turing.worker.tools.web_fetch import DEFAULT_ALLOWED_HOSTS
 
 
@@ -123,14 +124,26 @@ class TuringConfig(BaseSettings):
         "other nodes can route local-tier requests here for models they have "
         "not pulled. Unset = never advertised, peers never target this node. "
         "Ollama must listen on a LAN-reachable interface for this to work "
-        "(OLLAMA_HOST=0.0.0.0 in its service environment; "
-        "scripts/fleet-models.sh --expose does that).",
+        "(configure an explicit bind address with the acknowledged "
+        "scripts/fleet-models.sh expose command).",
+    )
+    ollama_peer_allowlist: list[str] = Field(
+        default_factory=list,
+        description="Exact Ollama endpoint URLs authorized for peer routing. "
+        "Presence advertisements are never authority by themselves; each URL "
+        "must be listed here by the operator.",
     )
     llm_peer_models_enabled: bool = Field(
         default=True,
         description="When mesh is enabled, let the local tier borrow a peer's "
         "Ollama for the configured model if this node has not pulled it "
         "(turing.llm.pool). Off = the local tier is always this node.",
+    )
+    llm_peer_fallback_enabled: bool = Field(
+        default=False,
+        description="Explicitly allow cloud-auth fallback to use a peer Ollama. "
+        "Normal local-to-peer routing remains controlled separately by "
+        "llm_peer_models_enabled.",
     )
 
     # ── LLM routing ─────────────────────────────────────────────────────
@@ -207,13 +220,15 @@ class TuringConfig(BaseSettings):
     # ── Sandbox / security ───────────────────────────────────────────────
     safety_auto_approve_high_risk: bool = Field(
         default=False,
-        description="Approve HIGH-risk tool calls for every user, not only "
-        "admin_user_ids. The shell deny-list still applies and everything is "
-        "still audit-logged. The interactive confirmation surface was retired "
-        "with ADR 0010, so without this (or an admin id) a NEEDS_CONFIRMATION "
-        "outcome is a hard deny — on a single-operator node that is just a "
-        "worse UX for the same trust decision. Env: "
+        description="Permit HIGH-risk auto-approval only for an authenticated "
+        "admin or safety_single_operator_user_id. The shell deny-list still "
+        "applies and everything is still audit-logged. Env: "
         "TURING_SAFETY_AUTO_APPROVE_HIGH_RISK.",
+    )
+    safety_single_operator_user_id: str | None = Field(
+        default=None,
+        description="Explicit authenticated operator identity permitted to use "
+        "safety_auto_approve_high_risk when not listed as an admin",
     )
     sandbox_enabled: bool = Field(default=True, description="Enable bubblewrap sandbox for tools")
     sandbox_timeout: int = Field(default=30, description="Sandbox execution timeout in seconds")
@@ -312,6 +327,17 @@ class TuringConfig(BaseSettings):
         if self.agent_mailbox_db is not None:
             self.agent_mailbox_db = self.agent_mailbox_db.expanduser().resolve()
             self.agent_mailbox_db.parent.mkdir(parents=True, exist_ok=True)
+
+    @model_validator(mode="after")
+    def _validate_ollama_peer_authority(self) -> TuringConfig:
+        """Require self-advertisement to be explicitly operator-authorized."""
+        if self.ollama_advertise_host is not None and (
+            self.ollama_advertise_host not in self.ollama_peer_allowlist
+        ):
+            raise ValueError(
+                "TURING_OLLAMA_ADVERTISE_HOST must be included exactly in "
+                "TURING_OLLAMA_PEER_ALLOWLIST"
+            )
         return self
 
     @field_validator("db_path", mode="after")
@@ -329,6 +355,18 @@ class TuringConfig(BaseSettings):
         if isinstance(v, (str, Path)) and str(v) == ":memory:":
             raise ValueError("agent mailbox requires a durable file, not :memory:")
         return None if v == "" else v
+
+    @field_validator("ollama_host", "ollama_advertise_host", mode="after")
+    @classmethod
+    def _validate_ollama_url(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return validate_ollama_endpoint(v)
+
+    @field_validator("ollama_peer_allowlist", mode="after")
+    @classmethod
+    def _validate_ollama_peer_urls(cls, v: list[str]) -> list[str]:
+        return validate_ollama_allowlist(v)
 
     @field_validator("embedding_model_path", mode="after")
     @classmethod

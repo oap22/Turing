@@ -46,9 +46,21 @@ class _Fleet:
         )
 
 
-def _node(node_id: str, name: str, advertise: str | None = None) -> MeshNode:
+def _node(
+    node_id: str,
+    name: str,
+    advertise: str | None = None,
+    allowed_hosts: list[str] | None = None,
+) -> MeshNode:
     return MeshNode(
-        SimpleNamespace(node_id=node_id, node_name=name, ollama_advertise_host=advertise)
+        SimpleNamespace(
+            node_id=node_id,
+            node_name=name,
+            ollama_advertise_host=advertise,
+            ollama_peer_allowlist=allowed_hosts if allowed_hosts is not None else (
+                [advertise] if advertise else []
+            ),
+        )
     )
 
 
@@ -77,7 +89,7 @@ class TestModelAdvertisement:
     async def test_models_and_host_round_trip_via_heartbeat(self) -> None:
         fleet = _Fleet(["a", "b"])
         node_a = _node("a", "jetson-1", advertise="http://jetson-1:11434")
-        node_b = _node("b", "jetson-2")
+        node_b = _node("b", "jetson-2", allowed_hosts=["http://jetson-1:11434"])
         pres_a = _presence(node_a, fleet)
         pres_b = _presence(node_b, fleet)
         pres_a.set_model_sampler(AsyncMock(return_value=["qwen2.5:7b", "gemma3:1b", "qwen2.5:7b"]))

@@ -8,11 +8,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from turing.llm.base import LLMProvider, LLMResponse, Message, Role
-from turing.llm.pool import PeerModelPool, peer_load, select_peer
+from turing.llm.pool import LOCAL_MODEL_CACHE_TTL, PeerModelPool, peer_load, select_peer
 from turing.mesh.node import PeerInfo
 from turing.specs.collector import NodeSpecs
 
 MODEL = "qwen2.5:7b"
+HOST = "http://host:11434"
 
 
 def _specs(loadavg_1m: float, cores: int = 4) -> NodeSpecs:
@@ -74,18 +75,21 @@ class TestSelectPeer:
     def test_prefers_lowest_load_per_core(self) -> None:
         busy = _peer("busy", load=3.0)
         idle = _peer("idle", load=0.4)
-        assert select_peer([busy, idle], MODEL) is idle
+        assert select_peer([busy, idle], MODEL, allowed_hosts=[HOST]) is idle
 
     def test_unknown_load_sorts_after_measured(self) -> None:
         unknown = _peer("unknown")  # no specs
         measured = _peer("measured", load=2.0)  # 0.5 per core < 1.0 pessimistic
-        assert select_peer([unknown, measured], MODEL) is measured
+        assert select_peer([unknown, measured], MODEL, allowed_hosts=[HOST]) is measured
         assert peer_load(unknown) == 1.0
 
     def test_tie_breaks_on_name_for_determinism(self) -> None:
         a = _peer("a", load=1.0)
         b = _peer("b", load=1.0)
-        assert select_peer([b, a], MODEL) is a
+        assert select_peer([b, a], MODEL, allowed_hosts=[HOST]) is a
+
+    def test_skips_peer_outside_exact_allowlist(self) -> None:
+        assert select_peer([_peer("a", host="http://other:11434")], MODEL, allowed_hosts=[HOST]) is None
 
 
 class TestPeerModelPool:
@@ -93,7 +97,12 @@ class TestPeerModelPool:
     async def test_serves_locally_until_local_models_are_known(self) -> None:
         local = _provider("local")
         factory = AsyncMock()
-        pool = PeerModelPool(local, model=MODEL, provider_factory=factory)
+        pool = PeerModelPool(
+            local,
+            model=MODEL,
+            provider_factory=factory,
+            allowed_peer_hosts=["http://a:11434"],
+        )
         pool.attach_peers(lambda: [_peer("a")])
 
         result = await pool.complete([Message(role=Role.USER, content="hi")])
@@ -124,7 +133,12 @@ class TestPeerModelPool:
             built.append((host, model))
             return remote
 
-        pool = PeerModelPool(local, model=MODEL, provider_factory=factory)
+        pool = PeerModelPool(
+            local,
+            model=MODEL,
+            provider_factory=factory,
+            allowed_peer_hosts=["http://a:11434"],
+        )
         pool.attach_peers(lambda: [_peer("a", host="http://a:11434")])
         await pool.refresh_local_models()
 
@@ -155,7 +169,12 @@ class TestPeerModelPool:
         local.list_models = AsyncMock(return_value=[])
         remote = _provider("remote")
         remote.complete = AsyncMock(side_effect=ConnectionError("peer down"))
-        pool = PeerModelPool(local, model=MODEL, provider_factory=lambda _h, _m: remote)
+        pool = PeerModelPool(
+            local,
+            model=MODEL,
+            provider_factory=lambda _h, _m: remote,
+            allowed_peer_hosts=[HOST],
+        )
         pool.attach_peers(lambda: [_peer("a")])
         await pool.refresh_local_models()
 
@@ -180,7 +199,12 @@ class TestPeerModelPool:
         dead.complete = AsyncMock(side_effect=ConnectionError("down"))
         healthy = _provider("healthy")
         providers = {"http://a:11434": dead, "http://b:11434": healthy}
-        pool = PeerModelPool(local, model=MODEL, provider_factory=lambda host, _m: providers[host])
+        pool = PeerModelPool(
+            local,
+            model=MODEL,
+            provider_factory=lambda host, _m: providers[host],
+            allowed_peer_hosts=["http://a:11434", "http://b:11434"],
+        )
         pool.attach_peers(
             lambda: [
                 _peer("a", host="http://a:11434", load=0.1),
@@ -195,6 +219,78 @@ class TestPeerModelPool:
         dead.complete.assert_awaited_once()
         healthy.complete.assert_awaited_once()
         local.complete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_provider_factory_failure_quarantines_and_tries_next_peer(self) -> None:
+        local = _provider("local")
+        local.list_models = AsyncMock(return_value=[])
+        healthy = _provider("healthy")
+
+        def factory(host: str, _model: str) -> LLMProvider:
+            if host == "http://a:11434":
+                raise ValueError("malformed peer endpoint")
+            return healthy
+
+        pool = PeerModelPool(
+            local,
+            model=MODEL,
+            provider_factory=factory,
+            allowed_peer_hosts=["http://a:11434", "http://b:11434"],
+        )
+        pool.attach_peers(
+            lambda: [
+                _peer("a", host="http://a:11434", load=0.1),
+                _peer("b", host="http://b:11434", load=0.2),
+            ]
+        )
+        await pool.refresh_local_models()
+
+        result = await pool.complete([Message(role=Role.USER, content="hi")])
+
+        assert result.content == "healthy"
+        assert pool.describe()["quarantined_hosts"] == ["http://a:11434"]
+
+    @pytest.mark.asyncio
+    async def test_local_model_cache_refreshes_after_ttl_or_invalidation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        local = _provider("local")
+        local.list_models = AsyncMock(return_value=[MODEL])
+        pool = PeerModelPool(local, model=MODEL, provider_factory=AsyncMock())
+        clock = 100.0
+        monkeypatch.setattr("turing.llm.pool.time.monotonic", lambda: clock)
+
+        assert await pool.refresh_local_models() is True
+        assert await pool.refresh_local_models() is True
+        assert local.list_models.await_count == 1
+        clock += LOCAL_MODEL_CACHE_TTL
+        assert await pool.refresh_local_models() is True
+        assert local.list_models.await_count == 2
+        pool.invalidate_local_model_cache()
+        assert await pool.refresh_local_models() is True
+        assert local.list_models.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_health_status_reports_local_and_selected_peer_separately(self) -> None:
+        local = _provider("local")
+        local.list_models = AsyncMock(return_value=[])
+        local.health_check = AsyncMock(return_value=True)
+        remote = _provider("remote")
+        remote.health_check = AsyncMock(return_value=True)
+        pool = PeerModelPool(
+            local,
+            model=MODEL,
+            provider_factory=lambda _host, _model: remote,
+            allowed_peer_hosts=[HOST],
+        )
+        pool.attach_peers(lambda: [_peer("a")])
+        await pool.refresh_local_models()
+
+        status = await pool.health_status()
+
+        assert status["local"] == {"target": "local", "healthy": True}
+        assert status["peer"] == {"host": HOST, "healthy": True}
+        assert status["selected"] == {"target": "peer:a", "healthy": True}
 
     @pytest.mark.asyncio
     async def test_stream_peer_failure_before_output_falls_back_local(self) -> None:
@@ -212,7 +308,12 @@ class TestPeerModelPool:
 
         remote.stream = failed_stream
         local.stream = local_stream
-        pool = PeerModelPool(local, model=MODEL, provider_factory=lambda _h, _m: remote)
+        pool = PeerModelPool(
+            local,
+            model=MODEL,
+            provider_factory=lambda _h, _m: remote,
+            allowed_peer_hosts=[HOST],
+        )
         pool.attach_peers(lambda: [_peer("a")])
         await pool.refresh_local_models()
 
@@ -233,7 +334,12 @@ class TestPeerModelPool:
 
         remote.stream = partial_stream
         local.stream = local_stream
-        pool = PeerModelPool(local, model=MODEL, provider_factory=lambda _h, _m: remote)
+        pool = PeerModelPool(
+            local,
+            model=MODEL,
+            provider_factory=lambda _h, _m: remote,
+            allowed_peer_hosts=[HOST],
+        )
         pool.attach_peers(lambda: [_peer("a")])
         await pool.refresh_local_models()
 

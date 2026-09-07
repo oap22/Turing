@@ -59,9 +59,19 @@ class TestDryRun:
         assert "llama3.2:3b" in j2 and "nomic-embed-text" in j2 and "qwen2.5" not in j2
 
     def test_expose_writes_a_systemd_dropin_with_keep_alive(self) -> None:
-        res = run("expose", "--dry-run", "--keep-alive", "1h", "jetson-3")
+        res = run(
+            "expose",
+            "--dry-run",
+            "--bind-address",
+            "192.168.1.10",
+            "--i-understand-unauthenticated",
+            "--keep-alive",
+            "1h",
+            "jetson-3",
+        )
         assert res.returncode == 0, res.stderr
-        assert "OLLAMA_HOST=0.0.0.0:11434" in res.stdout
+        assert "OLLAMA_HOST=192.168.1.10:11434" in res.stdout
+        assert "0.0.0.0:11434" not in res.stdout
         assert "OLLAMA_KEEP_ALIVE=1h" in res.stdout
         assert "ollama.service.d" in res.stdout
         assert "systemctl restart ollama" in res.stdout
@@ -87,9 +97,40 @@ class TestValidation:
 
     @pytest.mark.parametrize("bad", ["1h' | id; #", "forever", "$(id)", "1 h"])
     def test_rejects_unsafe_keep_alive_values(self, bad: str) -> None:
-        res = run("expose", "--dry-run", "--keep-alive", bad, "jetson-1")
+        res = run(
+            "expose",
+            "--dry-run",
+            "--bind-address",
+            "192.168.1.10",
+            "--i-understand-unauthenticated",
+            "--keep-alive",
+            bad,
+            "jetson-1",
+        )
         assert res.returncode == 2
         assert "refusing keep-alive" in res.stderr
+
+    def test_expose_requires_explicit_bind_and_acknowledgement(self) -> None:
+        missing_bind = run("expose", "--dry-run", "--i-understand-unauthenticated", "jetson-1")
+        assert missing_bind.returncode == 2
+        assert "--bind-address" in missing_bind.stderr
+
+        missing_ack = run("expose", "--dry-run", "--bind-address", "192.168.1.10", "jetson-1")
+        assert missing_ack.returncode == 2
+        assert "--i-understand-unauthenticated" in missing_ack.stderr
+
+    @pytest.mark.parametrize("bad", ["0.0.0.0;id", "$(id)", "", "[::1]bad"])
+    def test_rejects_unsafe_bind_addresses(self, bad: str) -> None:
+        res = run(
+            "expose",
+            "--dry-run",
+            "--bind-address",
+            bad,
+            "--i-understand-unauthenticated",
+            "jetson-1",
+        )
+        assert res.returncode == 2
+        assert "bind address" in res.stderr or "--bind-address" in res.stderr
 
     def test_model_matching_is_literal_not_regex(self) -> None:
         pull = run("pull", "--dry-run", "--models", "qwen2.5:7b", "jetson-1")

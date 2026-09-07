@@ -85,6 +85,7 @@ async def _run(config: TuringConfig) -> None:
                 keep_alive=config.ollama_keep_alive,
                 num_ctx=config.ollama_num_ctx,
             ),
+            allowed_peer_hosts=config.ollama_peer_allowlist,
         )
         local_tier = peer_pool
 
@@ -116,6 +117,7 @@ async def _run(config: TuringConfig) -> None:
         classifier,
         routing_mode,
         local_tools_enabled=config.ollama_tools_enabled,
+        peer_fallback_enabled=config.llm_peer_fallback_enabled,
     )
 
     # 3. Initialize Tools

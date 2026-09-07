@@ -9,9 +9,17 @@ import pytest
 from turing.agent.safety import SafetyDecision, SafetyGate
 
 
-def _gate(auto: bool, admins: list[str] | None = None) -> SafetyGate:
+def _gate(
+    auto: bool,
+    admins: list[str] | None = None,
+    single_operator: str | None = None,
+) -> SafetyGate:
     return SafetyGate(
-        SimpleNamespace(admin_user_ids=admins or [], safety_auto_approve_high_risk=auto)
+        SimpleNamespace(
+            admin_user_ids=admins or [],
+            safety_auto_approve_high_risk=auto,
+            safety_single_operator_user_id=single_operator,
+        )
     )
 
 
@@ -23,8 +31,14 @@ class TestAutoApproveHighRisk:
         assert result.decision == SafetyDecision.NEEDS_CONFIRMATION
 
     @pytest.mark.asyncio
-    async def test_flag_approves_high_risk_shell_for_non_admin(self) -> None:
+    async def test_flag_without_operator_authority_still_needs_confirmation(self) -> None:
         gate = _gate(auto=True)
+        result = await gate.check("shell", {"command": "systemctl restart turing"}, "u1")
+        assert result.decision == SafetyDecision.NEEDS_CONFIRMATION
+
+    @pytest.mark.asyncio
+    async def test_flag_approves_high_risk_shell_for_single_operator(self) -> None:
+        gate = _gate(auto=True, single_operator="u1")
         result = await gate.check("shell", {"command": "systemctl restart turing"}, "u1")
         assert result.decision == SafetyDecision.APPROVED
         assert result.risk_level == "high"
@@ -35,7 +49,7 @@ class TestAutoApproveHighRisk:
         # The process tool has its own admin short-circuit ahead of the
         # risk-based step; the flag must cover that path too or it is a
         # half-switch.
-        gate = _gate(auto=True)
+        gate = _gate(auto=True, single_operator="u1")
         result = await gate.check("process", {"action": "kill_process", "pid": 1234}, "u1")
         assert result.decision == SafetyDecision.APPROVED
 

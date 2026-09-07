@@ -104,6 +104,7 @@ class LLMRouter:
         routing_mode: RoutingMode = "auto",
         prompt_sample_max_bytes: int = 2048,
         local_tools_enabled: bool = False,
+        peer_fallback_enabled: bool = False,
     ) -> None:
         self._cloud = cloud_provider
         self._local = local_provider
@@ -111,6 +112,7 @@ class LLMRouter:
         self._routing_mode: RoutingMode = routing_mode
         self._sample_max_bytes = prompt_sample_max_bytes
         self._local_tools_enabled = local_tools_enabled
+        self._peer_fallback_enabled = peer_fallback_enabled
 
     # ── public API ─────────────────────────────────────────────────────
 
@@ -165,8 +167,15 @@ class LLMRouter:
                     "llm_cloud_unavailable_failing_open_to_local",
                     exc_info=True,
                 )
+                fallback_provider = self._local
+                if not self._peer_fallback_enabled:
+                    # A cloud authentication failure must not silently move a
+                    # prompt to a remote peer. PeerModelPool exposes its
+                    # same-machine provider through ``local``; use that
+                    # explicitly unless the operator opted into peer fallback.
+                    fallback_provider = getattr(self._local, "local", self._local)
                 local_fallback: LLMResponse = await self._invoke_provider(
-                    self._local,
+                    fallback_provider,
                     "local",
                     messages,
                     system,

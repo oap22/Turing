@@ -14,7 +14,9 @@ from turing.llm.base import (
     ToolDefinition,
 )
 from turing.llm.classifier import ComplexityClassifier
+from turing.llm.pool import PeerModelPool
 from turing.llm.router import LLMRouter, warn_if_local_only_disables_tools
+from turing.mesh.node import PeerInfo
 from turing.telemetry.bus import Telemetry, TelemetryEvent
 
 # ── fixtures ──────────────────────────────────────────────────────────
@@ -157,6 +159,99 @@ class TestFallback:
         assert result.content == "local response"
         cloud_provider.complete.assert_awaited_once()
         local_provider.complete.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cloud_auth_failure_does_not_fall_back_to_peer_by_default(
+        self,
+        cloud_provider: AsyncMock,
+        local_provider: AsyncMock,
+        classifier: ComplexityClassifier,
+    ) -> None:
+        import anthropic
+        import httpx
+
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx.Response(401, request=request)
+        cloud_provider.complete.side_effect = anthropic.AuthenticationError(
+            message="missing api key", response=response, body=None
+        )
+        local_provider.list_models = AsyncMock(return_value=[])
+        peer = AsyncMock(spec=LLMProvider)
+        peer.complete = AsyncMock(return_value=_make_response("peer response", "qwen"))
+        pool = PeerModelPool(
+            local_provider,
+            model="qwen2.5:7b",
+            provider_factory=lambda _host, _model: peer,
+            allowed_peer_hosts=["http://peer:11434"],
+        )
+        pool.attach_peers(
+            lambda: [
+                PeerInfo(
+                    node_id="p",
+                    name="peer",
+                    models=["qwen2.5:7b"],
+                    ollama_host="http://peer:11434",
+                )
+            ]
+        )
+        router = LLMRouter(cloud_provider, pool, classifier, "auto")
+
+        result = await router.route(
+            [_user_msg("Analyze and explain the entire system architecture")]
+        )
+
+        assert result.content == "local response"
+        local_provider.complete.assert_awaited_once()
+        peer.complete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cloud_auth_failure_peer_fallback_requires_explicit_opt_in(
+        self,
+        cloud_provider: AsyncMock,
+        local_provider: AsyncMock,
+        classifier: ComplexityClassifier,
+    ) -> None:
+        import anthropic
+        import httpx
+
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx.Response(401, request=request)
+        cloud_provider.complete.side_effect = anthropic.AuthenticationError(
+            message="missing api key", response=response, body=None
+        )
+        local_provider.list_models = AsyncMock(return_value=[])
+        peer = AsyncMock(spec=LLMProvider)
+        peer.complete = AsyncMock(return_value=_make_response("peer response", "qwen"))
+        pool = PeerModelPool(
+            local_provider,
+            model="qwen2.5:7b",
+            provider_factory=lambda _host, _model: peer,
+            allowed_peer_hosts=["http://peer:11434"],
+        )
+        pool.attach_peers(
+            lambda: [
+                PeerInfo(
+                    node_id="p",
+                    name="peer",
+                    models=["qwen2.5:7b"],
+                    ollama_host="http://peer:11434",
+                )
+            ]
+        )
+        router = LLMRouter(
+            cloud_provider,
+            pool,
+            classifier,
+            "auto",
+            peer_fallback_enabled=True,
+        )
+
+        result = await router.route(
+            [_user_msg("Analyze and explain the entire system architecture")]
+        )
+
+        assert result.content == "peer response"
+        peer.complete.assert_awaited_once()
 
 
 # ── explicit modes ───────────────────────────────────────────────────

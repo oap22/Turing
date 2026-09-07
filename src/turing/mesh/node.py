@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from turing.llm.endpoints import validate_ollama_endpoint
+
 if TYPE_CHECKING:
     from turing.specs.collector import NodeSpecs
 
@@ -88,7 +90,31 @@ class MeshNode:
         # a second sample. ``None`` before the first heartbeat.
         self._self_specs: NodeSpecs | None = None
         # What this node advertises for peer model routing (see PeerInfo).
-        self.ollama_host: str | None = getattr(config, "ollama_advertise_host", None) or None
+        configured_allowlist = getattr(config, "ollama_peer_allowlist", ()) or ()
+        allowed_hosts: set[str] = set()
+        for host in configured_allowlist:
+            try:
+                allowed_hosts.add(validate_ollama_endpoint(host, field="allowed peer endpoint"))
+            except ValueError:
+                logger.warning("ollama_peer_endpoint_rejected", exc_info=True)
+        self._ollama_peer_allowlist = frozenset(allowed_hosts)
+        configured_host = getattr(config, "ollama_advertise_host", None) or None
+        self.ollama_host: str | None = None
+        if configured_host is not None:
+            try:
+                validated_host = validate_ollama_endpoint(
+                    configured_host, field="ollama advertise host"
+                )
+            except ValueError:
+                logger.warning("ollama_advertise_host_rejected", exc_info=True)
+            else:
+                if validated_host in self._ollama_peer_allowlist:
+                    self.ollama_host = validated_host
+                else:
+                    logger.warning(
+                        "ollama_advertise_host_not_allowlisted",
+                        host=validated_host,
+                    )
         self.self_models: list[str] = []
 
     @property
@@ -122,6 +148,11 @@ class MeshNode:
     @self_specs.setter
     def self_specs(self, value: NodeSpecs | None) -> None:
         self._self_specs = value
+
+    @property
+    def ollama_peer_allowlist(self) -> frozenset[str]:
+        """Exact operator-authorized peer endpoints for this node."""
+        return self._ollama_peer_allowlist
 
     @property
     def is_running(self) -> bool:

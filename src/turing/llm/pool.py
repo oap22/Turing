@@ -10,9 +10,10 @@ carry each node's pulled model list plus the URL its Ollama answers on
 this node has not pulled the configured model, sends the request to the
 least-loaded peer that has.
 
-The pool sits *between* the router and the local provider, so the router's
-own fallbacks (local → cloud on error, cloud → local when credentials are
-missing) keep working unchanged: the pool is just a smarter "local".
+The pool sits *between* the router and the local provider. Local-to-peer
+failover is explicit in this pool, while the router's cloud-auth fallback
+unwraps the pool to the same-machine provider unless peer fallback is
+explicitly enabled.
 
 Decision order for a request:
 
@@ -36,6 +37,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from turing.llm.base import LLMProvider
+from turing.llm.endpoints import validate_ollama_endpoint
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterable
@@ -46,6 +48,7 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 PEER_FAILURE_BACKOFF = 60.0
+LOCAL_MODEL_CACHE_TTL = 60.0
 
 
 def peer_load(peer: PeerInfo) -> float:
@@ -62,19 +65,36 @@ def peer_load(peer: PeerInfo) -> float:
 
 
 def select_peer(
-    peers: Iterable[PeerInfo], model: str, *, excluded_hosts: set[str] | None = None
+    peers: Iterable[PeerInfo],
+    model: str,
+    *,
+    allowed_hosts: Iterable[str] = (),
+    excluded_hosts: set[str] | None = None,
 ) -> PeerInfo | None:
     """Pick the freshest, least-loaded peer that advertises ``model``.
 
     Pure so it can be tested without a mesh. Peers with no advertised Ollama
-    host are skipped — a host of ``http://localhost:11434`` would only ever
-    point back at ourselves.
+    host are skipped — and every advertised host must also be in the exact
+    operator allowlist passed to this function.
     """
+    authorized: set[str] = set()
+    for host in allowed_hosts:
+        try:
+            authorized.add(validate_ollama_endpoint(host, field="allowed peer endpoint"))
+        except ValueError:
+            # A caller-provided allowlist is not authority until each entry is
+            # itself a valid endpoint.  Production config validates this at
+            # startup; the pure selector remains fail-closed for other users.
+            continue
     excluded = excluded_hosts or set()
     candidates = [
         p
         for p in peers
-        if p.ollama_host and p.ollama_host not in excluded and model in p.models and not p.is_stale
+        if p.ollama_host
+        and p.ollama_host in authorized
+        and p.ollama_host not in excluded
+        and model in p.models
+        and not p.is_stale
     ]
     if not candidates:
         return None
@@ -90,10 +110,15 @@ class PeerModelPool(LLMProvider):
         *,
         model: str,
         provider_factory: Callable[[str, str], LLMProvider],
+        allowed_peer_hosts: Iterable[str] = (),
     ) -> None:
         self._local = local
         self._model = model
         self._factory = provider_factory
+        self._allowed_peer_hosts = frozenset(
+            validate_ollama_endpoint(host, field="allowed peer endpoint")
+            for host in allowed_peer_hosts
+        )
         # host -> provider, so a peer's HTTP client is built once, not per turn.
         self._peer_providers: dict[str, LLMProvider] = {}
         # Failed Ollama endpoints remain excluded even while their Turing
@@ -101,6 +126,7 @@ class PeerModelPool(LLMProvider):
         self._peer_failed_until: dict[str, float] = {}
         # None = not yet checked; treat as "have it" (never leave the box on a guess).
         self._local_has_model: bool | None = None
+        self._local_models_checked_at: float | None = None
         self._peers_fn: Callable[[], Iterable[PeerInfo]] = lambda: ()
 
     # ── wiring ──────────────────────────────────────────────────────────
@@ -121,21 +147,31 @@ class PeerModelPool(LLMProvider):
     def local_has_model(self) -> bool | None:
         return self._local_has_model
 
-    async def refresh_local_models(self) -> bool | None:
+    async def refresh_local_models(self, *, force: bool = False) -> bool | None:
         """Ask the local provider what it has pulled; cache the answer.
 
         A provider without ``list_models`` (or one that errors) leaves the
         cache at *unknown*, which the selector treats as "serve locally".
         """
+        now = time.monotonic()
+        if (
+            not force
+            and self._local_models_checked_at is not None
+            and now - self._local_models_checked_at < LOCAL_MODEL_CACHE_TTL
+        ):
+            return self._local_has_model
         lister = self._local
         if not hasattr(lister, "list_models"):
+            self._local_models_checked_at = now
             return self._local_has_model
         try:
             models = await lister.list_models()  # type: ignore[attr-defined]
         except Exception:
+            self._local_models_checked_at = now
             logger.warning("peer_pool.local_model_list_failed", exc_info=True)
             return self._local_has_model
         self._local_has_model = self._model in set(models)
+        self._local_models_checked_at = now
         logger.info(
             "peer_pool.local_models",
             model=self._model,
@@ -143,6 +179,17 @@ class PeerModelPool(LLMProvider):
             pulled=len(models),
         )
         return self._local_has_model
+
+    def invalidate_local_model_cache(self) -> None:
+        """Force the next request to re-check the local model inventory."""
+        self._local_has_model = None
+        self._local_models_checked_at = None
+
+    async def _refresh_local_models_if_stale(self) -> None:
+        if self._local_models_checked_at is None or (
+            time.monotonic() - self._local_models_checked_at >= LOCAL_MODEL_CACHE_TTL
+        ):
+            await self.refresh_local_models()
 
     # ── selection ───────────────────────────────────────────────────────
 
@@ -153,17 +200,29 @@ class PeerModelPool(LLMProvider):
         self._peer_failed_until = {
             host: until for host, until in self._peer_failed_until.items() if until > now
         }
-        peer = select_peer(
-            self._peers_fn(), self._model, excluded_hosts=set(self._peer_failed_until)
-        )
-        if peer is None:
-            return self._local, "local:no-healthy-peer-has-model", None
-        host = peer.ollama_host or ""
-        provider = self._peer_providers.get(host)
-        if provider is None:
-            provider = self._factory(host, self._model)
+        while True:
+            peer = select_peer(
+                self._peers_fn(),
+                self._model,
+                allowed_hosts=self._allowed_peer_hosts,
+                excluded_hosts=set(self._peer_failed_until),
+            )
+            if peer is None:
+                return self._local, "local:no-healthy-peer-has-model", None
+            host = peer.ollama_host or ""
+            reason = f"peer:{peer.name}"
+            provider = self._peer_providers.get(host)
+            if provider is not None:
+                return provider, reason, host
+            try:
+                provider = self._factory(host, self._model)
+            except Exception:
+                # A malformed or unavailable endpoint must be quarantined and
+                # allow the selector to continue to another peer/local tier.
+                self._quarantine(host, reason)
+                continue
             self._peer_providers[host] = provider
-        return provider, f"peer:{peer.name}", host
+            return provider, reason, host
 
     def select(self) -> tuple[LLMProvider, str]:
         """Return ``(provider, reason)`` for the next request."""
@@ -189,6 +248,7 @@ class PeerModelPool(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
     ) -> LLMResponse:
+        await self._refresh_local_models_if_stale()
         provider, reason, host = self._select_target()
         while True:
             logger.info("peer_pool.route", model=self._model, target=reason)
@@ -216,6 +276,7 @@ class PeerModelPool(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
     ) -> AsyncIterator[str]:
+        await self._refresh_local_models_if_stale()
         provider, reason, host = self._select_target()
         while True:
             logger.info("peer_pool.route", model=self._model, target=reason, stream=True)
@@ -240,7 +301,32 @@ class PeerModelPool(LLMProvider):
                 provider, reason, host = self._select_target()
 
     async def health_check(self) -> bool:
-        return await self._local.health_check()
+        status = await self.health_status()
+        return bool(status["selected"]["healthy"])
+
+    async def health_status(self) -> dict[str, Any]:
+        """Report local health separately from the route selected for serving."""
+        await self._refresh_local_models_if_stale()
+        try:
+            local_healthy = await self._local.health_check()
+        except Exception:
+            local_healthy = False
+        provider, reason, host = self._select_target()
+        if provider is self._local:
+            selected = {"target": reason, "healthy": local_healthy}
+            peer = None
+        else:
+            try:
+                peer_healthy = await provider.health_check()
+            except Exception:
+                peer_healthy = False
+            selected = {"target": reason, "healthy": peer_healthy}
+            peer = {"host": host, "healthy": peer_healthy}
+        return {
+            "local": {"target": "local", "healthy": local_healthy},
+            "peer": peer,
+            "selected": selected,
+        }
 
     # ── introspection (gateway / logs) ──────────────────────────────────
 
@@ -253,4 +339,9 @@ class PeerModelPool(LLMProvider):
             "target": reason,
             "peer_hosts": sorted(self._peer_providers),
             "quarantined_hosts": sorted(self._peer_failed_until),
+            "local_model_cache_age": (
+                None
+                if self._local_models_checked_at is None
+                else max(0.0, time.monotonic() - self._local_models_checked_at)
+            ),
         }

@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from turing.llm.endpoints import validate_ollama_endpoint
 from turing.mesh.node import MeshNode, PeerInfo
 from turing.specs.collector import NodeSpecs, collect_specs
 from turing.transport.envelope import MeshMessage
@@ -350,7 +351,21 @@ class PresenceService:
             else []
         )
         raw_host = msg.get("ollama_host")
-        ollama_host = raw_host if isinstance(raw_host, str) and raw_host else None
+        ollama_host: str | None = None
+        if raw_host is not None:
+            try:
+                validated_host = validate_ollama_endpoint(raw_host, field="peer Ollama endpoint")
+            except ValueError:
+                logger.warning("presence_peer_endpoint_rejected", sender_id=sender_id)
+            else:
+                if validated_host in self._node.ollama_peer_allowlist:
+                    ollama_host = validated_host
+                else:
+                    logger.warning(
+                        "presence_peer_endpoint_not_allowlisted",
+                        sender_id=sender_id,
+                        host=validated_host,
+                    )
         peer = PeerInfo(
             node_id=sender_id,
             name=str(msg.get("node_name", sender_id)),

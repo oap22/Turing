@@ -59,26 +59,32 @@ into a terminal pane with the filesystem access it needs already granted:
 | `claude (scratch workspace)` | Claude inside `~/turing-workspace`, outside every checkout. This is organizational convenience, not an OS sandbox; normal permission prompts still apply. |
 | `codex (repo)` | Codex CLI in the checkout. |
 
-To stop the repo runner from asking before every `pytest` / `ruff` / `git
-commit`, give the checkout a project permission profile at
+To stop the repo runner from asking before every `pytest` / `ruff`, give the
+checkout a narrowly scoped project permission profile at
 `.claude/settings.json` (the directory is gitignored, so it stays yours).
-A profile that covers the project's own tooling without granting anything
-destructive looks like this:
+This is a convenience allowlist, not an OS sandbox. It permits reads and
+repeatable verification commands, while edits and repository mutations still
+remain outside the allowlist and are not pre-approved; the host can prompt or
+deny them according to its permission policy. A profile that covers the
+project's own tooling without pre-approving destructive actions looks like:
 
 ```json
 {
   "permissions": {
     "allow": [
-      "Read", "Edit", "Write", "Glob", "Grep",
-      "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git add:*)",
-      "Bash(git commit:*)", "Bash(git checkout:*)", "Bash(git switch:*)", "Bash(git push:*)",
-      "Bash(gh pr view:*)", "Bash(gh pr checks:*)", "Bash(gh pr create:*)",
+      "Read", "Glob", "Grep",
+      "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)",
+      "Bash(gh pr view:*)", "Bash(gh pr checks:*)",
       "Bash(pytest:*)", "Bash(.venv/bin/pytest:*)", "Bash(ruff:*)", "Bash(mypy:*)",
       "Bash(npm run:*)", "Bash(npm test:*)", "Bash(npx vitest:*)",
       "Bash(cargo build:*)", "Bash(cargo test:*)", "Bash(cargo clippy:*)",
       "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(grep:*)", "Bash(rg:*)"
     ],
-    "deny": ["Bash(git push --force:*)", "Bash(rm -rf:*)", "Bash(sudo:*)"]
+    "deny": [
+      "Bash(git add:*)", "Bash(git commit:*)", "Bash(git checkout:*)",
+      "Bash(git switch:*)", "Bash(git push:*)", "Bash(git reset:*)",
+      "Bash(git clean:*)", "Bash(rm -rf:*)", "Bash(sudo:*)"
+    ]
   }
 }
 ```
