@@ -16,6 +16,13 @@ export interface RsiConfig {
   verifier: string;
 }
 
+// Verifiers are pre-typed into a PTY. A literal newline would submit the
+// command before the rest of it was typed, so reject multiline commands rather
+// than silently changing their meaning.
+export function isValidRsiVerifier(text: string): boolean {
+  return text.trim() !== "" && !/[\r\n]/.test(text);
+}
+
 // Lowercases, collapses anything outside [a-z0-9] into single hyphens, and
 // trims. Used both as the workstation's sandbox directory name
 // (~/turing-workspace/rsi-<slug>) and as the results subdirectory
@@ -38,6 +45,12 @@ export function shellQuoteSingle(text: string): string {
   return "'" + collapsed.replaceAll("'", "'\\''") + "'";
 }
 
+// Verifier commands are executable syntax, not prose. Preserve repeated
+// spaces, tabs, and quoted literals exactly while still making one shell argv.
+export function shellQuoteSingleExact(text: string): string {
+  return "'" + text.replaceAll("'", "'\\''") + "'";
+}
+
 export interface RsiParams {
   slug: string;
   problem: string;
@@ -57,7 +70,10 @@ export function isRsiParams(x: unknown): x is RsiParams {
     o.problem !== ""
   ) {
     if (o.engine !== undefined && o.engine !== "claude" && o.engine !== "codex") return false;
-    if (o.verifier !== undefined && (typeof o.verifier !== "string" || o.verifier.trim() === "")) {
+    if (
+      o.verifier !== undefined &&
+      (typeof o.verifier !== "string" || !isValidRsiVerifier(o.verifier))
+    ) {
       return false;
     }
     return true;
@@ -73,7 +89,7 @@ export function isRsiParams(x: unknown): x is RsiParams {
 export function rsiRunner(params: RsiParams): Runner {
   const configArgs = [
     params.engine ? `--engine ${params.engine}` : "",
-    params.verifier ? `--verifier ${shellQuoteSingle(params.verifier)}` : "",
+    params.verifier ? `--verifier ${shellQuoteSingleExact(params.verifier)}` : "",
   ]
     .filter(Boolean)
     .join(" ");

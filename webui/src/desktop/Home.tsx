@@ -28,7 +28,7 @@ import type { Session, SessionKind } from "./sessions";
 import Select from "./Select";
 import { THEMES } from "./theme";
 import UpdateOverlay from "./UpdateOverlay";
-import type { RsiConfig, RsiEngine } from "./rsi";
+import { isValidRsiVerifier, type RsiConfig, type RsiEngine } from "./rsi";
 
 interface Props {
   sessions: ReadonlyArray<Session>;
@@ -77,7 +77,13 @@ type Mode =
       id: string | null;
       value: string;
     }
-  | { kind: "rsiConfig"; name: string; engine: RsiEngine; verifier: string }
+  | {
+      kind: "rsiConfig";
+      name: string;
+      engine: RsiEngine;
+      verifier: string;
+      error?: string;
+    }
   | { kind: "problem"; name: string; engine: RsiEngine; verifier: string; value: string }
   | { kind: "confirmRemove"; id: string }
   // In-app update (issue #397). Lives on Home rather than in the shell: no
@@ -222,8 +228,15 @@ export default function Home({
 
   function commitRsiConfig() {
     if (mode.kind !== "rsiConfig") return;
-    const verifier = mode.verifier.trim();
-    if (verifier === "") return;
+    const verifier = mode.verifier;
+    if (verifier.trim() === "") {
+      setMode({ ...mode, error: "verifier command is required" });
+      return;
+    }
+    if (!isValidRsiVerifier(verifier)) {
+      setMode({ ...mode, error: "verifier must stay on one line" });
+      return;
+    }
     setMode({
       kind: "problem",
       name: mode.name,
@@ -482,7 +495,7 @@ export default function Home({
                   value={mode.engine}
                   aria-label="rsi engine"
                   onChange={(e) =>
-                    setMode({ ...mode, engine: e.target.value as RsiEngine })
+                    setMode({ ...mode, engine: e.target.value as RsiEngine, error: undefined })
                   }
                   className="min-w-0 flex-1 border border-term-edge bg-term-bg px-2 py-1 text-sm text-term-fg focus:outline-none"
                 >
@@ -498,15 +511,17 @@ export default function Home({
               <input
                 ref={inputRef}
                 value={mode.verifier}
-                onChange={(e) => setMode({ ...mode, verifier: e.target.value })}
+                onChange={(e) => setMode({ ...mode, verifier: e.target.value, error: undefined })}
                 onKeyDown={onKeyDown}
                 placeholder="verifier command, e.g. pytest tests/"
                 aria-label="rsi verifier command"
                 className="mt-2 w-full border border-term-edge bg-term-bg px-2 py-1 text-sm text-term-fg placeholder:text-term-dim focus:outline-none"
               />
               <div className="mt-1 text-[10px] text-term-dim">
-                required · runs from the RSI sandbox after each round · return continue · esc back
+                required · one line · runs from the RSI sandbox after each round · return continue ·
+                esc back
               </div>
+              {mode.error && <div className="mt-1 text-[10px] text-rose-400">{mode.error}</div>}
             </div>
           )}
 

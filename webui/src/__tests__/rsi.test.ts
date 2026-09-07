@@ -3,7 +3,15 @@
 // flag, not from vitest.
 
 import { describe, expect, it } from "vitest";
-import { isRsiParams, rsiRunner, rsiSlug, shellQuoteSingle } from "../desktop/rsi";
+import { execFileSync } from "node:child_process";
+import {
+  isRsiParams,
+  isValidRsiVerifier,
+  rsiRunner,
+  rsiSlug,
+  shellQuoteSingle,
+  shellQuoteSingleExact,
+} from "../desktop/rsi";
 import { REPO, RESULTS_ROOT_TOKEN } from "../desktop/runners";
 
 describe("rsiSlug", () => {
@@ -74,9 +82,11 @@ describe("isRsiParams", () => {
     ).toBe(true);
   });
 
-  it("rejects an unknown engine or empty verifier", () => {
+  it("rejects an unknown engine, empty verifier, or multiline verifier", () => {
     expect(isRsiParams({ slug: "a", problem: "x", engine: "ollama" })).toBe(false);
     expect(isRsiParams({ slug: "a", problem: "x", verifier: "  " })).toBe(false);
+    expect(isRsiParams({ slug: "a", problem: "x", verifier: "pytest\n--strict" })).toBe(false);
+    expect(isValidRsiVerifier("pytest\n--strict")).toBe(false);
   });
 });
 
@@ -92,14 +102,22 @@ describe("rsiRunner", () => {
   });
 
   it("passes the selected engine and frozen verifier to the loop", () => {
+    const verifier = `pytest -k "two  spaces" --arg 'it's'`;
     const runner = rsiRunner({
       slug: "demo",
       problem: "solve x",
       engine: "codex",
-      verifier: "pytest tests/",
+      verifier,
     });
     expect(runner.command).toContain("--engine codex");
-    expect(runner.command).toContain("--verifier 'pytest tests/'");
+    expect(runner.command).toContain(`--verifier ${shellQuoteSingleExact(verifier)}`);
     expect(runner.command).toContain("--problem 'solve x'");
+
+    const roundTripped = execFileSync(
+      "/bin/sh",
+      ["-c", `set -- ${shellQuoteSingleExact(verifier)}; printf '%s' "$1"`],
+      { encoding: "utf8" },
+    );
+    expect(roundTripped).toBe(verifier);
   });
 });
