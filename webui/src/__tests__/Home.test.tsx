@@ -196,7 +196,7 @@ describe("Home", () => {
       ).toBeInTheDocument();
     });
 
-    it("creates an rsi workstation via chooser → name → problem", () => {
+    it("creates an rsi workstation via chooser → name → config → problem", () => {
       const { dialog, onCreateRsi, onCreate } = setup();
       fireEvent.keyDown(dialog, { key: "n" });
       fireEvent.keyDown(dialog, { key: "ArrowDown" });
@@ -207,12 +207,21 @@ describe("Home", () => {
       fireEvent.change(nameInput, { target: { value: "flywheel-tune" } });
       fireEvent.keyDown(nameInput, { key: "Enter" });
 
+      const engineInput = screen.getByLabelText("rsi engine");
+      fireEvent.change(engineInput, { target: { value: "codex" } });
+      const verifierInput = screen.getByLabelText("rsi verifier command");
+      fireEvent.change(verifierInput, { target: { value: "pytest tests/" } });
+      fireEvent.keyDown(verifierInput, { key: "Enter" });
+
       const problemInput = screen.getByLabelText("experiment problem statement");
       expect(problemInput).toHaveAttribute("placeholder", "what should the agent iterate on?");
       fireEvent.change(problemInput, { target: { value: "improve the sampler" } });
       fireEvent.keyDown(problemInput, { key: "Enter" });
 
-      expect(onCreateRsi).toHaveBeenCalledWith("flywheel-tune", "improve the sampler");
+      expect(onCreateRsi).toHaveBeenCalledWith("flywheel-tune", "improve the sampler", {
+        engine: "codex",
+        verifier: "pytest tests/",
+      });
       expect(onCreate).not.toHaveBeenCalled();
     });
 
@@ -236,7 +245,25 @@ describe("Home", () => {
         target: { value: "flywheel-tune" },
       });
       fireEvent.keyDown(screen.getByLabelText("new workstation name"), { key: "Enter" });
+      fireEvent.change(screen.getByLabelText("rsi verifier command"), {
+        target: { value: "pytest tests/" },
+      });
+      fireEvent.keyDown(screen.getByLabelText("rsi verifier command"), { key: "Enter" });
       fireEvent.keyDown(screen.getByLabelText("experiment problem statement"), { key: "Enter" });
+      expect(onCreateRsi).not.toHaveBeenCalled();
+    });
+
+    it("requires a verifier before continuing to the problem", () => {
+      const { dialog, onCreateRsi } = setup();
+      fireEvent.keyDown(dialog, { key: "n" });
+      fireEvent.keyDown(dialog, { key: "ArrowDown" });
+      fireEvent.keyDown(dialog, { key: "Enter" });
+      fireEvent.change(screen.getByLabelText("new workstation name"), {
+        target: { value: "flywheel-tune" },
+      });
+      fireEvent.keyDown(screen.getByLabelText("new workstation name"), { key: "Enter" });
+      fireEvent.keyDown(screen.getByLabelText("rsi verifier command"), { key: "Enter" });
+      expect(screen.queryByLabelText("experiment problem statement")).not.toBeInTheDocument();
       expect(onCreateRsi).not.toHaveBeenCalled();
     });
 

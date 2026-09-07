@@ -66,7 +66,7 @@ import {
   switchSession,
   type SessionStore,
 } from "./sessions";
-import { isRsiParams, rsiSlug } from "./rsi";
+import { isRsiParams, rsiSlug, type RsiConfig } from "./rsi";
 import AgentFeedPane from "./panes/AgentFeedPane";
 import AgentsPane from "./panes/AgentsPane";
 import FlywheelPane from "./panes/FlywheelPane";
@@ -549,8 +549,8 @@ export default function DesktopShell({ surface }: Props) {
   // pre-types the sandbox loop command, and persist the session with
   // kind: "rsi" so Home can label it. The loop does not start until the
   // user presses Enter in that terminal.
-  function createRsiWorkstation(name: string, problem: string) {
-    const layout = rsiLayout(rsiSlug(name), problem);
+  function createRsiWorkstation(name: string, problem: string, config: RsiConfig) {
+    const layout = rsiLayout(rsiSlug(name), problem, config);
     const next = createRsiSession(sessions, name, layout);
     commitSessions(next);
     dispatchFrom({ type: "setLayout", layout }, "passive");

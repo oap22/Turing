@@ -28,6 +28,7 @@ import type { Session, SessionKind } from "./sessions";
 import Select from "./Select";
 import { THEMES } from "./theme";
 import UpdateOverlay from "./UpdateOverlay";
+import type { RsiConfig, RsiEngine } from "./rsi";
 
 interface Props {
   sessions: ReadonlyArray<Session>;
@@ -38,7 +39,7 @@ interface Props {
   onCreate: (name: string) => void;
   // Create a fresh RSI workstation (seeded loop-terminal layout, pre-typed
   // command) and open it. `problem` is the experiment's problem statement.
-  onCreateRsi: (name: string, problem: string) => void;
+  onCreateRsi: (name: string, problem: string, config: RsiConfig) => void;
   onRename: (id: string, name: string) => void;
   onRemove: (id: string) => void;
   // Escape: resume the last-used workstation without touching the list. Home
@@ -76,7 +77,8 @@ type Mode =
       id: string | null;
       value: string;
     }
-  | { kind: "problem"; name: string; value: string }
+  | { kind: "rsiConfig"; name: string; engine: RsiEngine; verifier: string }
+  | { kind: "problem"; name: string; engine: RsiEngine; verifier: string; value: string }
   | { kind: "confirmRemove"; id: string }
   // In-app update (issue #397). Lives on Home rather than in the shell: no
   // workstation is mounted here, so nothing running is lost if it succeeds
@@ -159,6 +161,7 @@ export default function Home({
   const [mode, setMode] = useState<Mode>({ kind: "list" });
   const boxRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const engineRef = useRef<HTMLSelectElement | null>(null);
   const listRef = useRef<HTMLUListElement | null>(null);
   const stamp = useMemo(() => now ?? Date.now(), [now]);
 
@@ -173,6 +176,7 @@ export default function Home({
   useEffect(() => {
     if (mode.kind === "update") return;
     if (mode.kind === "name" || mode.kind === "problem") inputRef.current?.focus();
+    else if (mode.kind === "rsiConfig") engineRef.current?.focus();
     else boxRef.current?.focus();
   }, [mode.kind]);
 
@@ -206,7 +210,7 @@ export default function Home({
     if (name === "") return;
     if (mode.command === "new") {
       if (mode.workstation === "rsi") {
-        setMode({ kind: "problem", name, value: "" });
+        setMode({ kind: "rsiConfig", name, engine: "claude", verifier: "" });
       } else {
         onCreate(name);
       }
@@ -216,11 +220,24 @@ export default function Home({
     }
   }
 
+  function commitRsiConfig() {
+    if (mode.kind !== "rsiConfig") return;
+    const verifier = mode.verifier.trim();
+    if (verifier === "") return;
+    setMode({
+      kind: "problem",
+      name: mode.name,
+      engine: mode.engine,
+      verifier,
+      value: "",
+    });
+  }
+
   function commitProblem() {
     if (mode.kind !== "problem") return;
     const problem = mode.value.trim();
     if (problem === "") return;
-    onCreateRsi(mode.name, problem);
+    onCreateRsi(mode.name, problem, { engine: mode.engine, verifier: mode.verifier });
   }
 
   function onKeyDown(e: React.KeyboardEvent) {
@@ -265,6 +282,13 @@ export default function Home({
       if (e.key === "Enter") {
         e.preventDefault();
         commitName();
+      }
+      return;
+    }
+    if (mode.kind === "rsiConfig") {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        commitRsiConfig();
       }
       return;
     }
@@ -443,8 +467,45 @@ export default function Home({
                 className="w-full border border-term-edge bg-term-bg px-2 py-1 text-sm text-term-fg placeholder:text-term-dim focus:outline-none"
               />
               <div className="mt-1 text-[10px] text-term-dim">
-                runs claude in a sandbox at ~/turing-workspace · results stream to the metrics
-                panes · return create · esc back
+                runs {mode.engine} with the locked verifier in ~/turing-workspace · return create
+                · esc back
+              </div>
+            </div>
+          )}
+
+          {mode.kind === "rsiConfig" && (
+            <div className="border-b border-term-edge px-3 py-2">
+              <label className="flex items-center gap-2 text-[10px] text-term-dim">
+                <span className="w-16 shrink-0 uppercase tracking-wider">engine</span>
+                <select
+                  ref={engineRef}
+                  value={mode.engine}
+                  aria-label="rsi engine"
+                  onChange={(e) =>
+                    setMode({ ...mode, engine: e.target.value as RsiEngine })
+                  }
+                  className="min-w-0 flex-1 border border-term-edge bg-term-bg px-2 py-1 text-sm text-term-fg focus:outline-none"
+                >
+                  <option value="claude">Claude CLI</option>
+                  <option value="codex">Codex · Luna xhigh</option>
+                </select>
+              </label>
+              <div className="mt-1 text-[10px] text-term-dim">
+                {mode.engine === "codex"
+                  ? "fixed model gpt-5.6-luna · reasoning xhigh · sandbox workspace-write"
+                  : "Claude CLI runs through the bounded Python engine"}
+              </div>
+              <input
+                ref={inputRef}
+                value={mode.verifier}
+                onChange={(e) => setMode({ ...mode, verifier: e.target.value })}
+                onKeyDown={onKeyDown}
+                placeholder="verifier command, e.g. pytest tests/"
+                aria-label="rsi verifier command"
+                className="mt-2 w-full border border-term-edge bg-term-bg px-2 py-1 text-sm text-term-fg placeholder:text-term-dim focus:outline-none"
+              />
+              <div className="mt-1 text-[10px] text-term-dim">
+                required · runs from the RSI sandbox after each round · return continue · esc back
               </div>
             </div>
           )}

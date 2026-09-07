@@ -67,6 +67,17 @@ describe("isRsiParams", () => {
     expect(isRsiParams({ slug: "a b", problem: "x" })).toBe(false);
     expect(isRsiParams({ slug: "Abc", problem: "x" })).toBe(false);
   });
+
+  it("accepts the explicit engine and verifier configuration", () => {
+    expect(
+      isRsiParams({ slug: "a", problem: "x", engine: "codex", verifier: "pytest tests/" }),
+    ).toBe(true);
+  });
+
+  it("rejects an unknown engine or empty verifier", () => {
+    expect(isRsiParams({ slug: "a", problem: "x", engine: "ollama" })).toBe(false);
+    expect(isRsiParams({ slug: "a", problem: "x", verifier: "  " })).toBe(false);
+  });
 });
 
 describe("rsiRunner", () => {
@@ -78,5 +89,17 @@ describe("rsiRunner", () => {
     expect(runner.autorun).toBe(false);
     expect(runner.group).toBe("research");
     expect(runner.cwd).toBe(REPO);
+  });
+
+  it("passes the selected engine and frozen verifier to the loop", () => {
+    const runner = rsiRunner({
+      slug: "demo",
+      problem: "solve x",
+      engine: "codex",
+      verifier: "pytest tests/",
+    });
+    expect(runner.command).toContain("--engine codex");
+    expect(runner.command).toContain("--verifier 'pytest tests/'");
+    expect(runner.command).toContain("--problem 'solve x'");
   });
 });
