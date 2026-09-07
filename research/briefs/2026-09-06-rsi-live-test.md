@@ -36,3 +36,9 @@ Budget: at most three concurrent Luna xhigh specialists; initial live attempt ca
 ## Checkpoint
 
 Work in progress. Do not cite this document as a completed experiment. Native launch, live source improvement, verification and review remain pending.
+
+## Corrective attempt, separately identified
+
+Original live attempt launched through the native terminal with Codex Luna xhigh. Round 1 exhausted its 600 second engine cap; round 2 was interrupted when independent source inspection found the frozen verifier imported baseline code because pytest pythonpath overrode the environment. Its verifier failures are invalid evidence about the candidate. Preserve the original record at ~/research-results/2026-09-06-turing-rsi-450-live (1086 seconds, exit 130); do not edit its verifier or recast it as success.
+
+Corrective v2 uses a new slug, manifest, and committed seed 1e623e8 preserving the interrupted candidate. Its eight external cases assert actual module paths inside pytest. The seed passes seven and fails the late verifier write restoration case. The bounded correction is one 600 second Codex round plus one verifier capped at 120 seconds, approximately 12 additional minutes, using the existing subscription. Marginal dollar usage is unavailable. Target only the demonstrated post-verifier corruption defect; no causal self-edit claim. The engine source is committed separately before launch.
