@@ -375,6 +375,59 @@ class TestModelAdvertisement:
         assert error_service._active_model_sample is None
         assert error_service._node.self_models == ["previous-model"]
 
+    async def test_restart_does_not_duplicate_an_unfinished_detached_sampler(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A stopped service retains one live sampler until it can be reaped."""
+        fleet = _Fleet(["a"])
+        pres_a = _presence(_node("a", "jetson-1"), fleet)
+        pres_a._heartbeat_interval = 60.0
+        monkeypatch.setattr("turing.mesh.presence.MODEL_SAMPLE_TIMEOUT", 0.01)
+        sampler_release = threading.Event()
+        sampler_started = threading.Event()
+        sampler_finished = threading.Event()
+        started_count = 0
+
+        async def sampler() -> list[str]:
+            nonlocal started_count
+            started_count += 1
+            if started_count == 1:
+                sampler_started.set()
+                while not sampler_release.is_set():
+                    await asyncio.sleep(0.005)
+                sampler_finished.set()
+            return [f"model-{started_count}"]
+
+        pres_a.set_model_sampler(background_loop_safe_model_sampler(sampler))
+        try:
+            await pres_a.start()
+            await _wait_for_thread_event(sampler_started)
+            first_handle = pres_a._active_model_sample
+            assert first_handle is not None and not first_handle.completed
+
+            await pres_a.stop()
+            await pres_a.start()
+            await asyncio.sleep(0.05)
+            assert started_count == 1
+            assert pres_a._active_model_sample is first_handle
+
+            sampler_release.set()
+            await _wait_for_thread_event(sampler_finished)
+            for _ in range(100):
+                if first_handle.completed:
+                    break
+                await asyncio.sleep(0.005)
+            assert first_handle.completed
+
+            pres_a._models_sampled_at = None
+            assert await pres_a._sample_self_models() == ["model-2"]
+            assert started_count == 2
+        finally:
+            sampler_release.set()
+            await _wait_for_thread_event(sampler_finished)
+            if pres_a.is_running:
+                await pres_a.stop()
+
     async def test_slow_sampler_does_not_block_start_and_publishes_last_known_models(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

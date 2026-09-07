@@ -354,6 +354,13 @@ class PresenceService:
         ):
             return self._node.self_models
 
+        # ``stop()`` detaches the current handle but retains an unfinished
+        # worker slot. A restart must not launch a second sampler while that
+        # cancellation-resistant callback is still alive.
+        if self._active_model_sample is not None:
+            self._models_sampled_at = now
+            return self._node.self_models
+
         # A previous probe may still be running after its deadline. Never
         # start a duplicate or await a cancellation-resistant sampler.
         if self._model_sample is not None:
