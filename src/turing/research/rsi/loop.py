@@ -846,53 +846,62 @@ class RsiLoop:
             else:
                 consecutive_failures = 0
 
-            # Self-edit scheduling: judge the previous edit first, then maybe propose.
-            if cfg.self_edit_every and rounds_run % cfg.self_edit_every == 0:
-                if pending is not None and len(pending.rounds_after) >= cfg.self_edit_every:
-                    judged = await self._judge_pending(pending, round_no)
-                    if judged == "failed":
-                        stop = StopReason.ROLLBACK_FAILED
-                        break
-                    if judged == "rolled_back":
-                        rollbacks += 1
-                    pending = None
-                if (
-                    self.self_edit is not None
-                    and self_edits < cfg.self_edit_budget
-                    and pending is None
-                ):
-                    try:
-                        sha = await self._self_edit(records, round_no, best_score, lock)
-                    except FrozenVerifierError as exc:
-                        # I1/I5: the step (or its own guard) touched the verifier; stop, restore nothing.
-                        logger.error("rsi.self_edit.tampered", round=round_no, detail=str(exc))
-                        self._append_event(
-                            "verifier_tampered",
-                            round_no,
-                            {"detail": str(exc), "after": "self_edit"},
-                        )
-                        stop = StopReason.VERIFIER_TAMPERED
-                        break
-                    if sha is not None:
-                        self_edits += 1
-                        counted = [r for r in records if not r.void]
-                        pending = _PendingEdit(
-                            sha=sha,
-                            committed_after_round=round_no,
-                            best_before=best_score,
-                            passed_before=bool(counted and counted[-1].passed),
-                            prior_scores=tuple(
-                                r.score for r in counted if r.passed and r.score is not None
-                            ),
-                        )
-                    tamper = self._lock_mismatch(lock)
-                    if tamper is not None:
-                        # I1 after a self-edit: the round already ran, so log an event and stop.
-                        self._append_event(
-                            "verifier_tampered", round_no, {"detail": tamper, "after": "self_edit"}
-                        )
-                        stop = StopReason.VERIFIER_TAMPERED
-                        break
+            # Judge a pending edit from its accumulated evidence, which can span
+            # invocations. Proposal timing remains on the existing invocation
+            # schedule so a restart does not create an extra edit as a side effect
+            # of catching up on a completed judgment window.
+            if (
+                cfg.self_edit_every
+                and pending is not None
+                and len(pending.rounds_after) >= cfg.self_edit_every
+            ):
+                judged = await self._judge_pending(pending, round_no)
+                if judged == "failed":
+                    stop = StopReason.ROLLBACK_FAILED
+                    break
+                if judged == "rolled_back":
+                    rollbacks += 1
+                pending = None
+
+            if (
+                cfg.self_edit_every
+                and rounds_run % cfg.self_edit_every == 0
+                and self.self_edit is not None
+                and self_edits < cfg.self_edit_budget
+                and pending is None
+            ):
+                try:
+                    sha = await self._self_edit(records, round_no, best_score, lock)
+                except FrozenVerifierError as exc:
+                    # I1/I5: the step (or its own guard) touched the verifier; stop, restore nothing.
+                    logger.error("rsi.self_edit.tampered", round=round_no, detail=str(exc))
+                    self._append_event(
+                        "verifier_tampered",
+                        round_no,
+                        {"detail": str(exc), "after": "self_edit"},
+                    )
+                    stop = StopReason.VERIFIER_TAMPERED
+                    break
+                if sha is not None:
+                    self_edits += 1
+                    counted = [r for r in records if not r.void]
+                    pending = _PendingEdit(
+                        sha=sha,
+                        committed_after_round=round_no,
+                        best_before=best_score,
+                        passed_before=bool(counted and counted[-1].passed),
+                        prior_scores=tuple(
+                            r.score for r in counted if r.passed and r.score is not None
+                        ),
+                    )
+                tamper = self._lock_mismatch(lock)
+                if tamper is not None:
+                    # I1 after a self-edit: the round already ran, so log an event and stop.
+                    self._append_event(
+                        "verifier_tampered", round_no, {"detail": tamper, "after": "self_edit"}
+                    )
+                    stop = StopReason.VERIFIER_TAMPERED
+                    break
 
             round_no += 1
 
