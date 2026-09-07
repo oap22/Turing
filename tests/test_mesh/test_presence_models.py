@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import AsyncMock
 
 import pytest
@@ -18,7 +18,9 @@ from turing.mesh.presence import (
     HEARTBEAT_SUBJECT,
     MODEL_SAMPLE_INTERVAL,
     SCHEMA_VERSION,
+    ModelSamplerContractError,
     PresenceService,
+    background_loop_safe_model_sampler,
 )
 from turing.transport.bus import InMemoryBus
 from turing.transport.envelope import MeshMessage
@@ -102,7 +104,11 @@ class TestModelAdvertisement:
         node_b = _node("b", "jetson-2", allowed_hosts=["http://jetson-1:11434"])
         pres_a = _presence(node_a, fleet)
         pres_b = _presence(node_b, fleet)
-        pres_a.set_model_sampler(AsyncMock(return_value=["qwen2.5:7b", "gemma3:1b", "qwen2.5:7b"]))
+        pres_a.set_model_sampler(
+            background_loop_safe_model_sampler(
+                AsyncMock(return_value=["qwen2.5:7b", "gemma3:1b", "qwen2.5:7b"])
+            )
+        )
 
         await pres_a.start()
         await pres_b.start()
@@ -125,7 +131,9 @@ class TestModelAdvertisement:
         node_b = _node("b", "jetson-2")
         pres_a = _presence(node_a, fleet)
         pres_b = _presence(node_b, fleet)
-        pres_a.set_model_sampler(AsyncMock(return_value=["gemma3:1b"]))
+        pres_a.set_model_sampler(
+            background_loop_safe_model_sampler(AsyncMock(return_value=["gemma3:1b"]))
+        )
         await pres_a.start()
         await pres_b.start()
         try:
@@ -142,7 +150,7 @@ class TestModelAdvertisement:
         node_a = _node("a", "jetson-1")
         pres_a = _presence(node_a, fleet)
         sampler = AsyncMock(return_value=["gemma3:1b"])
-        pres_a.set_model_sampler(sampler)
+        pres_a.set_model_sampler(background_loop_safe_model_sampler(sampler))
 
         first = await pres_a._sample_self_models()
         second = await pres_a._sample_self_models()
@@ -160,12 +168,59 @@ class TestModelAdvertisement:
         node_a = _node("a", "jetson-1")
         pres_a = _presence(node_a, fleet)
         sampler = AsyncMock(return_value=["gemma3:1b"])
-        pres_a.set_model_sampler(sampler)
+        pres_a.set_model_sampler(background_loop_safe_model_sampler(sampler))
         assert await pres_a._sample_self_models() == ["gemma3:1b"]
 
         pres_a._models_sampled_at = None
         sampler.side_effect = ConnectionError("ollama restarting")
         assert await pres_a._sample_self_models() == ["gemma3:1b"]
+
+    async def test_unmarked_sampler_is_rejected(self) -> None:
+        fleet = _Fleet(["a"])
+        pres_a = _presence(_node("a", "jetson-1"), fleet)
+
+        async def unmarked_sampler() -> list[str]:
+            return []
+
+        with pytest.raises(ModelSamplerContractError, match="opt in"):
+            pres_a.set_model_sampler(unmarked_sampler)
+
+    async def test_ollama_sampler_uses_a_dedicated_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Presence must not reuse the provider's request-loop-bound client."""
+        import ollama
+
+        from turing.llm.local import OllamaProvider
+
+        fleet = _Fleet(["a"])
+        pres_a = _presence(_node("a", "jetson-1"), fleet)
+        provider = OllamaProvider(host="http://ollama.test")
+        shared_list = AsyncMock(side_effect=AssertionError("shared client was reused"))
+        provider._client.list = shared_list  # type: ignore[method-assign]
+
+        class DedicatedClient:
+            instances: ClassVar[list[DedicatedClient]] = []
+
+            def __init__(self, *, host: str, timeout: Any) -> None:
+                self.host = host
+                self.timeout = timeout
+                self.closed = False
+                self.instances.append(self)
+
+            async def list(self) -> dict[str, list[dict[str, str]]]:
+                return {"models": [{"name": "dedicated-model"}]}
+
+            async def close(self) -> None:
+                self.closed = True
+
+        monkeypatch.setattr(ollama, "AsyncClient", DedicatedClient)
+        pres_a.set_model_sampler(provider.list_models)
+        assert await pres_a._sample_self_models() == ["dedicated-model"]
+        assert shared_list.await_count == 0
+        assert len(DedicatedClient.instances) == 1
+        assert DedicatedClient.instances[0].host == "http://ollama.test"
+        assert DedicatedClient.instances[0].closed
 
     async def test_loop_affine_sampler_fails_clearly(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A sampler awaiting an app-loop Future is rejected, not silently accepted."""
@@ -184,7 +239,7 @@ class TestModelAdvertisement:
             "turing.mesh.presence.logger.error",
             lambda event, **fields: contract_errors.append((event, fields)),
         )
-        pres_a.set_model_sampler(loop_affine_sampler)
+        pres_a.set_model_sampler(background_loop_safe_model_sampler(loop_affine_sampler))
         assert await pres_a._sample_self_models() == []
         assert contract_errors
         event, fields = contract_errors[0]
@@ -210,14 +265,16 @@ class TestModelAdvertisement:
             sampler_finished.set()
             return ["late-model"]
 
-        pres_a.set_model_sampler(cancellation_resistant_sampler)
+        pres_a.set_model_sampler(background_loop_safe_model_sampler(cancellation_resistant_sampler))
         try:
             assert await pres_a._sample_self_models() == []
             await _wait_for_thread_event(sampler_started)
             handle = pres_a._active_model_sample
             assert handle is not None and not handle.completed
             with pytest.raises(RuntimeError, match="still active"):
-                pres_a.set_model_sampler(AsyncMock(return_value=["replacement"]))
+                pres_a.set_model_sampler(
+                    background_loop_safe_model_sampler(AsyncMock(return_value=["replacement"]))
+                )
 
             sampler_release.set()
             await _wait_for_thread_event(sampler_finished)
@@ -226,13 +283,97 @@ class TestModelAdvertisement:
                     break
                 await asyncio.sleep(0.005)
             assert handle.completed
-            pres_a.set_model_sampler(AsyncMock(return_value=["replacement"]))
+            pres_a.set_model_sampler(
+                background_loop_safe_model_sampler(AsyncMock(return_value=["replacement"]))
+            )
             assert await pres_a._sample_self_models() == ["replacement"]
         finally:
             sampler_release.set()
             await _wait_for_thread_event(sampler_finished)
             if pres_a.is_running:
                 await pres_a.stop()
+
+    async def test_stale_waiter_cannot_clear_or_apply_new_generation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Replacement or disable wins over a completed but stale waiter."""
+        fleet = _Fleet(["a", "b"])
+        result_service = _presence(_node("a", "jetson-1"), fleet)
+        error_service = _presence(_node("b", "jetson-2"), fleet)
+        result_gate = asyncio.Event()
+        error_gate = asyncio.Event()
+        result_wait_started = asyncio.Event()
+        error_wait_started = asyncio.Event()
+        active_gate = result_gate
+        active_wait_started = result_wait_started
+
+        async def blocked_wait(_handle: Any) -> None:
+            active_wait_started.set()
+            await active_gate.wait()
+
+        monkeypatch.setattr("turing.mesh.presence._DetachedModelSampler.wait", blocked_wait)
+        result_release = threading.Event()
+        result_finished = threading.Event()
+        error_release = threading.Event()
+        error_finished = threading.Event()
+
+        async def late_result() -> list[str]:
+            while not result_release.is_set():
+                await asyncio.sleep(0.005)
+            result_finished.set()
+            return ["stale-result"]
+
+        async def late_error() -> list[str]:
+            while not error_release.is_set():
+                await asyncio.sleep(0.005)
+            error_finished.set()
+            raise RuntimeError("stale sampler failure")
+
+        result_service.set_model_sampler(background_loop_safe_model_sampler(late_result))
+        result_task = asyncio.create_task(result_service._sample_self_models())
+        await result_wait_started.wait()
+        result_handle = result_service._active_model_sample
+        assert result_handle is not None
+        result_release.set()
+        await _wait_for_thread_event(result_finished)
+        for _ in range(100):
+            if result_handle.completed:
+                break
+            await asyncio.sleep(0.005)
+        assert result_handle.completed
+
+        replacement = background_loop_safe_model_sampler(AsyncMock(return_value=["replacement"]))
+        result_service.set_model_sampler(replacement)
+        result_gate.set()
+        assert await result_task == []
+        assert result_service._model_sampler is replacement
+        assert result_service._model_sample is None
+        assert result_service._active_model_sample is None
+        assert result_service._node.self_models == []
+
+        active_gate = error_gate
+        active_wait_started = error_wait_started
+        error_service.set_model_sampler(background_loop_safe_model_sampler(late_error))
+        error_task = asyncio.create_task(error_service._sample_self_models())
+        await error_wait_started.wait()
+        error_handle = error_service._active_model_sample
+        assert error_handle is not None
+        error_release.set()
+        await _wait_for_thread_event(error_finished)
+        for _ in range(100):
+            if error_handle.completed:
+                break
+            await asyncio.sleep(0.005)
+        assert error_handle.completed
+
+        error_service._node.self_models = ["previous-model"]
+        error_service.set_model_sampler(None)
+        error_gate.set()
+        assert await error_task == ["previous-model"]
+        assert isinstance(error_handle.error, RuntimeError)
+        assert error_service._model_sample is None
+        assert error_service._active_model_sample is None
+        assert error_service._node.self_models == ["previous-model"]
 
     async def test_slow_sampler_does_not_block_start_and_publishes_last_known_models(
         self, monkeypatch: pytest.MonkeyPatch
@@ -253,7 +394,7 @@ class TestModelAdvertisement:
             sampler_finished.set()
             raise ConnectionError("ollama unreachable")
 
-        pres_a.set_model_sampler(slow_failing_sampler)
+        pres_a.set_model_sampler(background_loop_safe_model_sampler(slow_failing_sampler))
         await pres_b.start()
         await asyncio.wait_for(pres_a.start(), timeout=0.2)
         try:
@@ -303,7 +444,7 @@ class TestModelAdvertisement:
             sampler_finished.set()
             raise RuntimeError("late sampler failure") from None
 
-        pres_a.set_model_sampler(cancellation_resistant_sampler)
+        pres_a.set_model_sampler(background_loop_safe_model_sampler(cancellation_resistant_sampler))
         await pres_b.start()
         try:
             await asyncio.wait_for(pres_a.start(), timeout=0.2)
@@ -367,7 +508,7 @@ class TestModelAdvertisement:
             sampler_finished.set()
             return ["late-model"]
 
-        pres_a.set_model_sampler(late_sampler)
+        pres_a.set_model_sampler(background_loop_safe_model_sampler(late_sampler))
         await pres_b.start()
         try:
             await pres_a.start()

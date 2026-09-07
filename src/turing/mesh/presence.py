@@ -81,6 +81,77 @@ class ModelSamplerContractError(TypeError):
     """Raised when a model sampler depends on the application's event loop."""
 
 
+_BACKGROUND_LOOP_SAFE = "__turing_background_loop_safe__"
+
+
+def background_loop_safe_model_sampler(
+    sampler: Callable[[], Awaitable[list[str]]],
+) -> Callable[[], Awaitable[list[str]]]:
+    """Mark a callback as safe to execute on a private event loop.
+
+    The caller owns this assertion. The callback must not await Futures or
+    Tasks created by the application's loop, and must not depend on mutable
+    async-client state shared with that loop. This explicit opt-in keeps
+    unsupported loop-affine callbacks from silently becoming empty metadata.
+    """
+    setattr(sampler, _BACKGROUND_LOOP_SAFE, True)
+    return sampler
+
+
+def _dedicated_ollama_sampler(
+    sampler: Callable[[], Awaitable[list[str]]],
+) -> Callable[[], Awaitable[list[str]]]:
+    """Adapt the production Ollama method to an isolated client.
+
+    ``OllamaProvider`` owns one async client for normal completions. Reusing
+    that client from the detached sampler would bind its connection pool to
+    the wrong event loop, so presence gives the model inventory probe a fresh
+    client that is created and closed inside the worker loop. Other callbacks
+    retain the explicit loop-independent contract and are run unchanged.
+    """
+    owner = getattr(sampler, "__self__", None)
+    owner_type = type(owner)
+    if (
+        owner is None
+        or owner_type.__module__ != "turing.llm.local"
+        or owner_type.__name__ != "OllamaProvider"
+    ):
+        return sampler
+    host = getattr(owner, "host", None)
+    if not isinstance(host, str):
+        return sampler
+    shared_client = getattr(owner, "_client", None)
+    shared_http_client = getattr(shared_client, "_client", None)
+    timeout = getattr(shared_http_client, "timeout", 120.0)
+
+    async def sample() -> list[str]:
+        import ollama
+
+        client = ollama.AsyncClient(host=host, timeout=timeout)
+        try:
+            result = await client.list()
+            raw = (
+                result.get("models", [])
+                if isinstance(result, dict)
+                else getattr(result, "models", [])
+            )
+            names: list[str] = []
+            for entry in raw or []:
+                name = (
+                    entry.get("model") or entry.get("name")
+                    if isinstance(entry, dict)
+                    else getattr(entry, "model", None) or getattr(entry, "name", None)
+                )
+                if name:
+                    names.append(str(name))
+            return names
+        finally:
+            await client.close()
+
+    setattr(sample, _BACKGROUND_LOOP_SAFE, True)
+    return sample
+
+
 class _DetachedModelSampler:
     """Run an optional model probe outside the application's event loop.
 
@@ -198,6 +269,7 @@ class PresenceService:
         # sampler can be installed, preventing replacement from accumulating
         # resource-owning daemon threads.
         self._active_model_sample: _DetachedModelSampler | None = None
+        self._model_sampler_generation = 0
 
     @property
     def is_running(self) -> bool:
@@ -232,7 +304,17 @@ class PresenceService:
                 "cannot replace model sampler while its detached callback is still active"
             )
         self._discard_model_sample()
-        self._model_sampler = sampler
+        adapted = _dedicated_ollama_sampler(sampler) if sampler is not None else None
+        if (
+            adapted is sampler
+            and sampler is not None
+            and not getattr(sampler, _BACKGROUND_LOOP_SAFE, False)
+        ):
+            raise ModelSamplerContractError(
+                "model sampler must opt in with background_loop_safe_model_sampler"
+            )
+        self._model_sampler = adapted
+        self._model_sampler_generation += 1
         self._models_sampled_at = None
 
     def _reap_active_model_sample(self) -> None:
@@ -240,12 +322,20 @@ class PresenceService:
         if handle is not None and handle.completed:
             self._active_model_sample = None
 
-    def _discard_model_sample(self) -> None:
+    def _discard_model_sample(
+        self,
+        handle: _DetachedModelSampler | None = None,
+        generation: int | None = None,
+    ) -> None:
         """Detach a probe without waiting for arbitrary sampler code."""
-        handle = self._model_sample
+        current = self._model_sample
+        if handle is not None and (
+            current is not handle or generation != self._model_sampler_generation
+        ):
+            return
         self._model_sample = None
-        if handle is not None:
-            handle.discard()
+        if current is not None:
+            current.discard()
 
     async def _sample_self_models(self) -> list[str]:
         """Refresh ``node.self_models`` at most every ``MODEL_SAMPLE_INTERVAL``.
@@ -256,6 +346,7 @@ class PresenceService:
         if self._model_sampler is None:
             return self._node.self_models
         self._reap_active_model_sample()
+        generation = self._model_sampler_generation
         now = time.monotonic()
         if (
             self._models_sampled_at is not None
@@ -291,16 +382,23 @@ class PresenceService:
             waiter.cancel()
             with contextlib.suppress(BaseException):
                 await waiter
-            self._discard_model_sample()
+            self._discard_model_sample(handle, generation)
             raise
         if not done:
             waiter.cancel()
             with contextlib.suppress(BaseException):
                 await waiter
-            handle.discard()
-            self._models_sampled_at = now
+            if self._model_sample is handle and generation == self._model_sampler_generation:
+                handle.discard()
+                self._models_sampled_at = now
             return self._node.self_models
 
+        if (
+            self._model_sample is not handle
+            or generation != self._model_sampler_generation
+            or handle.ignored
+        ):
+            return self._node.self_models
         self._model_sample = None
         self._active_model_sample = None
         try:
