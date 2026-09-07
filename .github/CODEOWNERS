@@ -4,11 +4,11 @@
 # from Code Owners": any PR touching them needs approval from a listed
 # owner who is not the PR author.
 
-/src/turing/agent/safety.py               @oap22 @loducaj
-/src/turing/transport/                    @oap22 @loducaj
-/src/turing/gateway/auth.py               @oap22 @loducaj
-/src/turing/plugins/loader.py             @oap22 @loducaj
-/src/turing/coordinator/capability_token/ @oap22 @loducaj
+/src/turing/agent/safety.py               @oap22
+/src/turing/transport/                    @oap22
+/src/turing/gateway/auth.py               @oap22
+/src/turing/plugins/loader.py             @oap22
+/src/turing/coordinator/capability_token/ @oap22
 
 # Workflow files can exfiltrate secrets or weaken the gate itself.
-/.github/                                 @oap22 @loducaj
+/.github/                                 @oap22
