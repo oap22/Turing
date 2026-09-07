@@ -117,6 +117,7 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
   // animation frame), and both throw against a disposed Terminal — which is
   // where the unhandled `_renderer.value.dimensions` rejections came from.
   const disposedRef = useRef(false);
+  const resizeErrorReportedRef = useRef(false);
   const [dead, setDead] = useState(false);
   const [startupError, setStartupError] = useState<string | null>(null);
   const [exitCode, setExitCode] = useState<number | null>(null);
@@ -124,6 +125,17 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
   function reportStartupError(stage: string, error: unknown): void {
     if (disposedRef.current) return;
     setStartupError(formatTerminalStartupError(stage, error));
+  }
+
+  function resizePty(id: number, cols: number, rows: number): void {
+    void inv("pty_resize", { id, cols, rows }).catch((error: unknown) => {
+      // A broken resize backend should be visible once, but a healthy resize
+      // path must remain state-free and stale failures after teardown are safe
+      // to ignore.
+      if (disposedRef.current || resizeErrorReportedRef.current) return;
+      resizeErrorReportedRef.current = true;
+      reportStartupError("resize", error);
+    });
   }
 
   useEffect(() => {
@@ -264,7 +276,7 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
         return;
       }
       if (cancelled) {
-        void inv("pty_kill", { id });
+        void inv("pty_kill", { id }).catch(() => undefined);
         return;
       }
       idRef.current = id;
@@ -278,7 +290,7 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
       // been opened and fit() since spawn started). Re-sync once we have an
       // id and current terminal metrics, regardless of which raced which —
       // the `visible` effect below also resyncs on every later show.
-      void inv("pty_resize", { id, cols: term.cols, rows: term.rows });
+      resizePty(id, term.cols, term.rows);
 
       if (runner && !runner.autorun) {
         input.push(runner.command);
@@ -309,7 +321,9 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
       document.removeEventListener("themechange", onThemeChange);
       outputSub.unsubscribe();
       exitSub.unsubscribe();
-      if (idRef.current !== null) void inv("pty_kill", { id: idRef.current });
+      if (idRef.current !== null) {
+        void inv("pty_kill", { id: idRef.current }).catch(() => undefined);
+      }
       term.dispose();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -340,7 +354,7 @@ export default function TermPane({ leafId, runnerId, rsi, visible }: Props) {
       return;
     }
     if (idRef.current !== null) {
-      void inv("pty_resize", { id: idRef.current, cols: term.cols, rows: term.rows });
+      resizePty(idRef.current, term.cols, term.rows);
     }
   }
 
