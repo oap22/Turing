@@ -95,7 +95,11 @@ directory, and records the Slurm job ID. Slurm opens log files in the already
 created directory. Collection requires `sacct` to report `COMPLETED` and
 `0:0`, downloads only four named files, verifies both job identity and script
 SHA-256, then publishes an atomic snapshot. `verified.json` records the
-accounting and metadata. Repeated collection refuses to overwrite that snapshot.
+accounting and metadata inside the snapshot before publication. If a process
+crashes before the top-level marker is written, a retry validates that complete
+snapshot and recreates the marker; an incomplete or mismatched `collected/`
+directory is rejected. Repeated collection after verification refuses to
+overwrite that snapshot.
 Nothing is deleted remotely. Hostnames, Python version, and job IDs come from
 the compute node, not reconstructed from the login node.
 

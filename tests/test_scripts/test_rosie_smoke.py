@@ -105,3 +105,55 @@ def test_submission_reuse_never_calls_ssh(tmp_path, monkeypatch):
     monkeypatch.setattr(smoke, "ssh", lambda *_: pytest.fail("must not submit"))
     with pytest.raises(FileExistsError):
         smoke.submit(tmp_path, "ROSIE")
+
+
+def test_collection_resumes_after_snapshot_publish_crash(tmp_path, monkeypatch):
+    script = b"test script\n"
+    state = record()
+    state["script_sha256"] = hashlib.sha256(script).hexdigest()
+    (tmp_path / "submission.json").write_text(json.dumps(state))
+    monkeypatch.setattr(smoke, "ssh", lambda *_: "123|COMPLETED|0:0|00:01|node1")
+
+    def transfer(argv):
+        path = Path(argv[-1])
+        (path / "job.sbatch").write_bytes(script)
+        (path / "metadata.json").write_text(
+            json.dumps(
+                {
+                    "job_id": "123",
+                    "hostname": "node1",
+                    "script_sha256": state["script_sha256"],
+                    "kind": "infrastructure-smoke",
+                    "research_result": False,
+                }
+            )
+        )
+        return ""
+
+    monkeypatch.setattr(smoke, "run", transfer)
+    original_publish = smoke._publish_verification_record
+
+    def crash(*_):
+        raise RuntimeError("simulated crash")
+
+    monkeypatch.setattr(smoke, "_publish_verification_record", crash)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        smoke.collect(tmp_path)
+
+    assert (tmp_path / "collected/verified.json").exists()
+    assert not (tmp_path / "verified.json").exists()
+
+    monkeypatch.setattr(smoke, "_publish_verification_record", original_publish)
+    monkeypatch.setattr(smoke, "ssh", lambda *_: pytest.fail("resume must be local"))
+    monkeypatch.setattr(smoke, "run", lambda *_: pytest.fail("resume must not pull again"))
+    smoke.collect(tmp_path)
+    assert json.loads((tmp_path / "verified.json").read_text())["state"] == "verified"
+
+
+def test_collection_rejects_arbitrary_existing_snapshot(tmp_path, monkeypatch):
+    (tmp_path / "submission.json").write_text(json.dumps(record()))
+    (tmp_path / "collected").mkdir()
+    (tmp_path / "collected/metadata.json").write_text("{}")
+    monkeypatch.setattr(smoke, "ssh", lambda *_: pytest.fail("must reject locally"))
+    with pytest.raises(ValueError, match="unexpected files"):
+        smoke.collect(tmp_path)
