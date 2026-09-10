@@ -35,6 +35,7 @@ from turing.research.rsi.loop import (
     read_trajectory,
     redact,
 )
+from turing.research.rsi.scaffold import render_self_edit_prompt
 from turing.research.rsi.taxonomy import TAXONOMY_DIGEST, FailureCategory
 
 from .conftest import RsiDirs, bash_round
@@ -942,10 +943,15 @@ class StubSelfEdit:
     text: str = "BAD ADVICE\n"
     also_touch: str | None = None
     commit: bool = True
+    #: Mirror the real step's reporting of the prompt size it sent.
+    report_prompt: bool = True
     seen: list[SelfEditInputs] = field(default_factory=list)
+    last_prompt_chars: int | None = None
 
     async def propose(self, inputs: SelfEditInputs) -> str | None:
         self.seen.append(inputs)
+        if self.report_prompt:
+            self.last_prompt_chars = len(render_self_edit_prompt(inputs))
         text = self.text if len(self.seen) == 1 else f"{self.text}edit {len(self.seen)}\n"
         (self.sandbox / SCAFFOLD_FILENAME).write_text(text)
         paths = [SCAFFOLD_FILENAME]

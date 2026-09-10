@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import inspect
 import os
 import signal
@@ -74,6 +75,8 @@ __all__ = [
     "DEFAULT_MAX_OUTPUT_BYTES",
     "DRAIN_GRACE_SECONDS",
     "OUTPUT_LIMIT_EXIT",
+    "PROMPT_MAX_BYTES",
+    "PROMPT_TOO_LARGE_EXIT",
     "CappedOutput",
     "ClaudeCliEngine",
     "CodexCliEngine",
@@ -82,6 +85,7 @@ __all__ = [
     "ScriptItem",
     "kill_process_group",
     "ok_result",
+    "prompt_too_large",
     "run_capped",
 ]
 
@@ -98,6 +102,15 @@ _EXIT_NOT_FOUND = 127
 _EXIT_TIMED_OUT = 124
 #: Exit code reported when either captured output stream exceeds its byte cap.
 OUTPUT_LIMIT_EXIT: int = 125
+#: Exit code reported when the prompt is too large to pass as one argv string.
+PROMPT_TOO_LARGE_EXIT: int = 126
+#: Largest prompt (UTF-8 bytes) an engine will pass on argv. Both CLIs take
+#: the prompt as a single argument, and Linux caps one argument at 128 KiB
+#: (``MAX_ARG_STRLEN``); ``execve`` then fails with ``E2BIG`` before the CLI
+#: runs. The cap sits under that limit so the failure is reported as what it
+#: is — a prompt that outgrew argv, almost always a bloated ``SCAFFOLD.md`` —
+#: instead of as a CLI that could not be started.
+PROMPT_MAX_BYTES: int = 120 * 1024
 #: Default retained output per stream. The cap is deliberately per stream.
 DEFAULT_MAX_OUTPUT_BYTES: int = 8 * 1024 * 1024
 #: How long the pipe drain (and the post-kill wait) may take once the process is done.
@@ -374,8 +387,61 @@ async def _cleanup_invalid_process(proc: asyncio.subprocess.Process, grace_secon
     _close_pipes(proc)
 
 
+def prompt_too_large(prompt: str, *, command: str, started: float) -> EngineResult | None:
+    """The engine failure for a prompt over :data:`PROMPT_MAX_BYTES`, else ``None``.
+
+    Checked before ``execve`` so the round is recorded as an engine failure
+    with a diagnosis the operator can act on. The byte count is in the
+    message; the loop's own accounting records the prompt size on the round.
+    """
+    size = len(prompt.encode("utf-8"))
+    if size <= PROMPT_MAX_BYTES:
+        return None
+    logger.error(
+        "rsi.engine.prompt_too_large", command=command, bytes=size, max_bytes=PROMPT_MAX_BYTES
+    )
+    return EngineResult(
+        exit_code=PROMPT_TOO_LARGE_EXIT,
+        stdout="",
+        stderr=(
+            f"prompt is {size} bytes, over the {PROMPT_MAX_BYTES}-byte argv cap; "
+            f"{command!r} was not started. SCAFFOLD.md is prepended to every round "
+            "prompt: shrink it (or reject the self-edit that grew it) and resume"
+        ),
+        wall_seconds=time.monotonic() - started,
+        timed_out=False,
+    )
+
+
+def _start_failed(exc: OSError, *, command: str, started: float) -> EngineResult:
+    """Map an ``execve`` failure to an engine result, naming ``E2BIG`` for what it is."""
+    logger.error("rsi.engine.start_failed", command=command, error=str(exc))
+    if exc.errno == errno.E2BIG:
+        return EngineResult(
+            exit_code=PROMPT_TOO_LARGE_EXIT,
+            stdout="",
+            stderr=(
+                f"could not start {command!r}: the argument list is too long for this OS "
+                f"({exc.strerror}); the prompt (SCAFFOLD.md included) must shrink"
+            ),
+            wall_seconds=time.monotonic() - started,
+            timed_out=False,
+        )
+    return EngineResult(
+        exit_code=_EXIT_NOT_FOUND,
+        stdout="",
+        stderr=f"could not start {command!r}: {exc}",
+        wall_seconds=time.monotonic() - started,
+        timed_out=False,
+    )
+
+
 class ClaudeCliEngine:
-    """Runs ``claude -p <prompt> --permission-mode bypassPermissions --output-format text``."""
+    """Runs ``claude -p <prompt> --permission-mode bypassPermissions --output-format text``.
+
+    A prompt over :data:`PROMPT_MAX_BYTES` is refused with
+    :data:`PROMPT_TOO_LARGE_EXIT` before the CLI is started.
+    """
 
     def __init__(self, claude_bin: str = "claude") -> None:
         if not claude_bin:
@@ -397,6 +463,9 @@ class ClaudeCliEngine:
         if timeout_seconds <= 0:
             raise ContractViolationError("timeout_seconds must be positive")
         started = time.monotonic()
+        refused = prompt_too_large(prompt, command=self._bin, started=started)
+        if refused is not None:
+            return refused
         try:
             proc = await asyncio.create_subprocess_exec(
                 *self.argv(prompt),
@@ -407,14 +476,7 @@ class ClaudeCliEngine:
                 start_new_session=True,
             )
         except OSError as exc:
-            logger.error("rsi.engine.start_failed", command=self._bin, error=str(exc))
-            return EngineResult(
-                exit_code=_EXIT_NOT_FOUND,
-                stdout="",
-                stderr=f"could not start {self._bin!r}: {exc}",
-                wall_seconds=time.monotonic() - started,
-                timed_out=False,
-            )
+            return _start_failed(exc, command=self._bin, started=started)
         capped = await run_capped(proc, timeout_seconds=timeout_seconds)
         wall = time.monotonic() - started
         if capped.output_limit_exceeded:
@@ -509,6 +571,9 @@ class CodexCliEngine:
             add_dirs=[str(directory) for directory in self._add_dirs],
             cwd=str(cwd),
         )
+        refused = prompt_too_large(prompt, command=self._bin, started=started)
+        if refused is not None:
+            return refused
         try:
             proc = await asyncio.create_subprocess_exec(
                 *self.argv(prompt),
@@ -519,14 +584,7 @@ class CodexCliEngine:
                 start_new_session=True,
             )
         except OSError as exc:
-            logger.error("rsi.engine.start_failed", command=self._bin, error=str(exc))
-            return EngineResult(
-                exit_code=_EXIT_NOT_FOUND,
-                stdout="",
-                stderr=f"could not start {self._bin!r}: {exc}",
-                wall_seconds=time.monotonic() - started,
-                timed_out=False,
-            )
+            return _start_failed(exc, command=self._bin, started=started)
         capped = await run_capped(proc, timeout_seconds=timeout_seconds)
         wall = time.monotonic() - started
         if capped.output_limit_exceeded:

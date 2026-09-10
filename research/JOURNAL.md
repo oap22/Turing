@@ -21,6 +21,150 @@ first run is how real priors start accumulating.
 
 ---
 
+## 2026-09-10 — Prompt-size caps and accounting in the RSI loop; live compaction run, 4 rounds, one self-edit, 13.07× best
+
+**Two things in one entry, kept apart:** an engineering change to the loop
+with a measured before/after, and one live run that exercises it. The run is
+one trajectory on one problem and is read as a smoke test of the new
+accounting, not as evidence about self-improvement (ADR 0011, Consequences).
+
+### The change: the loop paid for every prompt byte and measured none
+
+Reading the loop for token efficiency turned up four holes, all closed in
+this branch (`docs/rsi-loop.md` § Self-edit has the operator view):
+
+1. **A scaffold could brick the loop.** Both CLI engines pass the round prompt
+   as a single argv string; Linux caps one argument at 128 KiB
+   (`MAX_ARG_STRLEN`, confirmed here: a 131,072-byte argument fails `execve`
+   with `E2BIG`, 131,000 does not). `SCAFFOLD.md` is prepended to every round
+   prompt and nothing bounded it, so a self-edit that grew it past that limit
+   turned every later round into `engine_error` reported as "could not start
+   claude" (exit 127), and the loop gave up after three with the hint "is the
+   claude CLI installed?". The engine now refuses a prompt over 120 KiB before
+   starting (exit 126, stderr naming the byte count and `SCAFFOLD.md`) and
+   names an `E2BIG` from the OS for what it is.
+2. **"Keep the scaffold short" was requested, not enforced.** The self-edit
+   prompt now states a 24 KiB cap and the current size; an edit that grows the
+   scaffold past the cap is rejected (`self_edit_rejected`) by the step and,
+   independently, by the loop. The cap is on growth, so an oversized scaffold
+   can still be trimmed down in steps; a size git cannot report rejects the
+   edit rather than passing it.
+3. **The self-edit summary grew without bound.** One table row per round, and a
+   notes tail capped in lines but not characters. The table now shows the first
+   3 and last 12 rounds and folds the rest into one aggregate row; the notes
+   tail is at most 8,000 characters as well as 40 lines, newest text kept, cut
+   announced. The same growth hole existed in the loop-1 research runner's
+   `ProposalAdapter`, which rendered every past iteration with its full
+   model-written rationale into the prompt charged against the token cap; it
+   now lists 2 + 8 iterations, aggregates the rest, and shows 400 characters of
+   a rationale.
+4. **Nothing recorded prompt size.** Every round line now carries
+   `prompt_chars`; `self_edit` / `self_edit_rejected` events carry
+   `prompt_chars` (the length the step reports having sent) and the scaffold's
+   bytes before and after.
+
+Measured on the recorded `rsi-import-speedup-2026-09-04` scaffold and notes,
+reconstructing the exact prompts the loop builds (characters; tokens are
+roughly a quarter to a third of that):
+
+| Prompt | Before | After |
+|---|---|---|
+| Self-edit summary, 3 rounds (the real run) | 9,927 | 10,105 (+178: the cap statement) |
+| Self-edit summary, 50 synthetic rounds | 11,819 | 10,659 |
+| Self-edit summary, 200 synthetic rounds | 18,144 | 10,688 |
+| Self-edit summary, 40 note lines of 4,000 chars | 167,288 | ~8,600 (loop path; the cut is announced) |
+| Round prompt, scaffold grown 30× | 172,511 → `E2BIG`, misreported | refused before exec with the reason |
+
+Tests: `tests/test_research/test_rsi/test_prompt_budget.py` (37 cases) and
+four in `test_backends/test_adapter.py`; the whole suite is 3,857 green with
+ruff and mypy clean. An adversarial review of the diff found three real
+defects (fail-open size read, absolute rather than growth cap, a prompt size
+the loop rendered but never sent) — fixed in the third commit.
+
+### The run: compaction as the problem
+
+Problem: write `compact.py` so that an agent-session transcript on stdin
+comes out much shorter with every fact a later reader needs still present.
+The frozen verifier (`grade.py`, sha-locked) *generates* five fresh
+transcripts from a template family with a new random seed on every run, so
+the compactor has to be general; pass = every fact string present and output
+no longer than input; score = mean len(input)/len(output). Identity = 1.0.
+
+Configuration: `claude -p` (Claude Code CLI 2.1.267, serving `claude-sonnet-5`)
+as root in a Linux session container with `IS_SANDBOX=1`; 4 rounds; self-edit
+every 2, budget 1; noise floor auto; round cap 600 s; verifier cap 120 s.
+Artifacts: `research/results/rsi-compaction-2026-09-10/` (trajectory, metrics,
+taxonomy, lock, `grade.py`, final `compact.py`, seed and final `SCAFFOLD.md`,
+the agent's `NOTES.md`, sandbox git log, loop log).
+
+| Round | Score | Categories | Engine wall | `prompt_chars` | What the agent did |
+|---|---|---|---|---|---|
+| 1 | 12.01 | — | 200 s | 1,799 | whitelist fact extraction, minimal substrings, dedup |
+| 2 | 11.88 | `no_progress`, `regressed` | 298 s | 1,799 | shortest-common-superstring packing + lowercasing |
+| — | self-edit kept, `SCAFFOLD.md` 191 → 3,543 bytes | | 39 s | 4,326 | wrote "scoring is noisy, benchmark over ≥8 runs before judging", what works, one dead end |
+| 3 | 12.40 | — | 338 s | 5,133 | tried smarter merge orders, measured no gain, reverted |
+| 4 | 13.07 | — | 310 s | 5,133 | no code change; 200-trial correctness check, exact-DP optimality check, created `STOP` |
+
+Loop time 20 min (02:27–02:47 UTC), exit 0, no detector fired, no tamper, no
+rollback. Best measured **13.07×**.
+
+**What the numbers mean, honestly.** Rounds 3 and 4 ran the *same*
+`compact.py` as round 2's commit (round 3 reverted its experiment; round 4
+changed nothing) and scored 12.40 and 13.07 against round 2's 11.88. That
+spread is the verifier: five random transcripts per run, single run per
+round. The agent measured the same code at 12.68 mean over 300 fixed-seed
+trials (its `metrics.jsonl`, step 4) and put the single-run range at
+10.3–14.0. So the `regressed` on round 2 and the `self_edit_kept` verdict
+(best 12.01 before the edit, 13.07 after) are both noise read as signal —
+exactly the failure the agent's own scaffold edit warned the next rounds
+about. The loop's rollback rule uses the population stdev of prior scores as
+its floor (0.06 after two rounds here), which is far below this verifier's
+real noise. A verifier that scores stochastically needs either a fixed seed
+set or a noise floor supplied with `--noise-floor` from a repeated run of the
+unchanged code; this run supplied neither.
+
+**What the accounting shows.** The one kept self-edit multiplied the round
+prompt by 2.85 (1,799 → 5,133 chars) for rounds 3–4. Whether that bought
+anything is not answerable from one trajectory — but it is now a number on
+the trajectory line rather than a guess, which is the point of the change.
+
+**The self-edit itself** read the trajectory correctly: it saw a `regressed`
+round that the agent's notes said was an improvement and wrote a rule not to
+trust a single round's score. Round 4 followed that rule (300 trials) and
+stopped. "Reads well" is still not a measurement.
+
+### Falsification
+Checked: verifier lock intact before and after every round and after the
+self-edit (yes); self-edit touched only `SCAFFOLD.md` (yes, and it stayed
+under the new cap: 3,543 of 24,576 bytes); `metrics.jsonl` lines for every
+round (yes; none carried a `score` key, so the cheat detector had nothing to
+compare — the round prompt asks for a score, the agent wrote `score_final`
+and per-run scores instead; `agent_reported_score` is `null` on every line);
+results dir gained only `metrics.jsonl` (yes). Not checked: whether 13.07×
+holds on a different template family — the verifier and the compactor share
+`grade.py`'s fact vocabulary by construction, and the agent's round-4 note
+says the ratio is bounded by that vocabulary. This is one problem against
+its own verifier, as the workstation loop is built to be.
+
+### Estimate vs actual
+| | Estimate | Actual |
+|---|---|---|
+| Wall-clock, 4 rounds | 20–30 min | 20 min loop time; rounds 3.3–5.6 min, self-edit 39 s |
+| Subscription consumption | not estimated | not metered by this loop; five `claude -p` calls |
+| Solve rate | ≥5× on round 1 | 12.01× on round 1; 13.07× best |
+
+### Next
+- Supply a noise floor for stochastic verifiers, or seed them: the rollback
+  and `no_progress`/`regressed` classifier are only as good as that floor.
+- The round prompt's "write a `score`" instruction and the cheat detector's
+  `score` key did not meet: the agent wrote `score_final`. Either the prompt
+  names the key exactly or the detector reads nothing — today it silently
+  reads nothing.
+- Both are loop-level items; the held-out split and measured noise floor for a
+  scaffold-gain claim remain loop-1 work and this entry does not move them.
+
+---
+
 ## 2026-09-06 — Native Codex RSI repairs Turing trajectory evidence
 
 A real Luna xhigh RSI round launched through Turing repaired late trajectory corruption and was accepted by the supervisor. The corrected run took 7.34 minutes against a 12-minute estimate. The original 18.10-minute attempt is preserved as invalid verifier evidence after an import-path mistake was found. Controls, exact provenance, three-specialist implementation/review, native evidence and limits are in the [campaign report](records/rsi-live-450-v2/REPORT.md). Run: `~/research-results/2026-09-06-turing-rsi-450-live-v2/`. This is engineering verification, not causal scaffold self-improvement evidence.

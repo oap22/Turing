@@ -1,0 +1,8 @@
+{
+  "command": "python grade.py",
+  "command_sha256": "61093be2fe97a15e829c6fc69542e1b4addfd74008ec3f6a5fdc8328a7c174a9",
+  "created_at_ms": 1789007241066,
+  "file_sha256s": {
+    "grade.py": "3b1402ce955e6c4cc4ce69beb1d606932a96b84cc639b7305cb12426fc6cff8b"
+  }
+}

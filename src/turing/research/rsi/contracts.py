@@ -438,6 +438,10 @@ class RoundRecord:
     void: bool = False
     agent_reported_score: float | None = None
     verifier_wall_seconds: float | None = None
+    #: Characters in the prompt the engine was given (scaffold included);
+    #: ``None`` on lines written before the loop recorded it. Token spend is
+    #: proportional, so this is the per-round efficiency number.
+    prompt_chars: int | None = None
 
     def __post_init__(self) -> None:
         if self.round < 1:
@@ -456,6 +460,10 @@ class RoundRecord:
                 raise ContractViolationError(f"{name} must be finite or None")
         if self.verifier_wall_seconds is not None and self.verifier_wall_seconds < 0:
             raise ContractViolationError("verifier_wall_seconds must be non-negative")
+        if self.prompt_chars is not None and (
+            isinstance(self.prompt_chars, bool) or self.prompt_chars < 0
+        ):
+            raise ContractViolationError("prompt_chars must be a non-negative int or None")
 
     @property
     def improved(self) -> bool:
@@ -476,6 +484,7 @@ class RoundRecord:
             "void": self.void,
             "agent_reported_score": self.agent_reported_score,
             "verifier_wall_seconds": self.verifier_wall_seconds,
+            "prompt_chars": self.prompt_chars,
         }
 
     def to_json_line(self) -> str:
@@ -500,9 +509,14 @@ class RoundRecord:
                 void=bool(payload.get("void", False)),
                 agent_reported_score=_opt_float(payload.get("agent_reported_score")),
                 verifier_wall_seconds=_opt_float(payload.get("verifier_wall_seconds")),
+                prompt_chars=_opt_int(payload.get("prompt_chars")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ContractViolationError(f"malformed trajectory line: {exc!r}") from exc
+
+
+def _opt_int(v: object) -> int | None:
+    return None if v is None else int(v)  # type: ignore[call-overload]
 
 
 def _opt_float(v: object) -> float | None:

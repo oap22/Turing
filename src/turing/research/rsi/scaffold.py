@@ -32,6 +32,13 @@ What this module guarantees:
   if they did not exist), and ``rsi.self_edit.rejected`` is logged with the
   reason and paths. Nothing under the results dir and no ``metrics.jsonl``
   is ever discarded. Filenames are never interpreted as globs.
+* **The scaffold stays bounded.** The summary's rounds table is a fixed
+  size (:data:`SUMMARY_ROUNDS_HEAD` + one aggregate row +
+  :data:`SUMMARY_ROUNDS_TAIL`), the notes tail is capped in characters as
+  well as lines (:func:`compact_notes_tail`), and an edit that leaves
+  ``SCAFFOLD.md`` over :data:`SCAFFOLD_MAX_BYTES` is rejected like any
+  other bad edit — the scaffold is paid on every round's prompt, and an
+  unbounded one eventually cannot be passed to the engine at all.
 * **The step never adjusts the verifier (I1, I5).** If ``VERIFIER.json`` or
   any file the lock pins changed in the working tree, the index or a commit
   the engine made, the step raises
@@ -102,21 +109,41 @@ __all__ = [
     "DEFAULT_SCAFFOLD_TEXT",
     "NOTES_FILENAME",
     "NOTES_TAIL_LINES",
+    "NOTES_TAIL_MAX_CHARS",
     "SCAFFOLD_FILENAME",
+    "SCAFFOLD_MAX_BYTES",
+    "SUMMARY_ROUNDS_HEAD",
+    "SUMMARY_ROUNDS_TAIL",
     "ScaffoldSelfEditStep",
     "build_self_edit_inputs",
+    "compact_notes_tail",
     "read_or_create_scaffold",
     "render_self_edit_prompt",
     "rollback_scaffold",
     "rollback_scaffold_async",
     "scaffold_head",
     "scaffold_head_async",
+    "scaffold_size_problem",
 ]
 
 SCAFFOLD_FILENAME: str = "SCAFFOLD.md"
 NOTES_FILENAME: str = "NOTES.md"
 #: How many trailing lines of ``NOTES.md`` the summary carries.
 NOTES_TAIL_LINES: int = 40
+#: ...and how many characters at most. A line cap alone is no cap: forty
+#: lines of a pasted log can be hundreds of kilobytes. The tail keeps its
+#: *last* characters (the newest notes) and says how much it dropped.
+NOTES_TAIL_MAX_CHARS: int = 8_000
+#: Largest ``SCAFFOLD.md`` a self-edit may leave behind. The scaffold is
+#: prepended verbatim to every round prompt, so its size is paid on every
+#: round; "keep it short" is enforced here, not requested. Well under the
+#: engine's argv cap so a scaffold can never brick the loop.
+SCAFFOLD_MAX_BYTES: int = 24 * 1024
+#: The rounds table in the self-edit summary shows the first ``HEAD`` and
+#: last ``TAIL`` rounds in full; rounds between are collapsed into one
+#: aggregate row. Category counts always cover every round.
+SUMMARY_ROUNDS_HEAD: int = 3
+SUMMARY_ROUNDS_TAIL: int = 12
 
 #: Written when ``SCAFFOLD.md`` is missing. Short on purpose: the first
 #: self-edit is where the real content comes from.
@@ -224,12 +251,50 @@ def read_or_create_scaffold(sandbox: Path) -> str:
     return _read_plain_file(path, sandbox)
 
 
+def compact_notes_tail(
+    text: str, *, lines: int = NOTES_TAIL_LINES, max_chars: int = NOTES_TAIL_MAX_CHARS
+) -> str:
+    """The last ``lines`` lines of ``text``, then the last ``max_chars`` of those.
+
+    The character cut lands on a line boundary when one exists inside the
+    kept window, so the tail starts with a whole line; a single line longer
+    than the cap is cut mid-line. A cut is announced on a first line of its
+    own, so the reader knows the notes continue above what it sees.
+    """
+    if lines < 0 or max_chars < 0:
+        raise ContractViolationError("notes tail bounds must be non-negative")
+    tail = "\n".join(text.splitlines()[-lines:]) if lines else ""
+    if len(tail) <= max_chars:
+        return tail
+    dropped = len(tail) - max_chars
+    kept = tail[-max_chars:] if max_chars else ""
+    newline = kept.find("\n")
+    if 0 <= newline < len(kept) - 1:
+        dropped += newline + 1
+        kept = kept[newline + 1 :]
+    return f"[notes tail cut: {dropped} earlier characters omitted]\n{kept}"
+
+
 def _notes_tail(sandbox: Path, lines: int = NOTES_TAIL_LINES) -> str:
     path = sandbox / NOTES_FILENAME
     if not _assert_plain_file_inside(path, sandbox, must_exist=False):
         return ""
-    text = _read_plain_file(path, sandbox)
-    return "\n".join(text.splitlines()[-lines:])
+    return compact_notes_tail(_read_plain_file(path, sandbox), lines=lines)
+
+
+def scaffold_size_problem(
+    size: int, *, previous: int | None = None, max_bytes: int = SCAFFOLD_MAX_BYTES
+) -> str | None:
+    """Why a ``SCAFFOLD.md`` of ``size`` bytes may not be kept, or ``None``.
+
+    The cap is on *growth*: an edit is refused when it leaves the scaffold
+    over ``max_bytes`` **and** larger than ``previous``. A scaffold already
+    over the cap (seeded that way, or written before the cap existed) can
+    therefore still be trimmed back down in steps; it can never grow.
+    """
+    if size > max_bytes and (previous is None or size > previous):
+        return f"{SCAFFOLD_FILENAME} is {size} bytes, over the {max_bytes}-byte cap"
+    return None
 
 
 def _read_lock(sandbox: Path) -> tuple[str | None, VerifierLock | None]:
@@ -333,6 +398,49 @@ def _fmt_score(score: float | None) -> str:
     return "-" if score is None else f"{score:.6g}"
 
 
+def _summary_row(r: RoundSummary) -> str:
+    return (
+        f"| {r.round} | {_fmt_score(r.score)} | {'yes' if r.passed else 'no'} | "
+        f"{', '.join(r.categories) or 'improved'} | {r.wall_seconds:.0f} |"
+    )
+
+
+def _summary_rows(
+    rounds: Sequence[RoundSummary],
+    *,
+    head: int = SUMMARY_ROUNDS_HEAD,
+    tail: int = SUMMARY_ROUNDS_TAIL,
+) -> list[str]:
+    """Table rows: every round when few, else head + one aggregate row + tail.
+
+    The aggregate row carries what a reader would otherwise scan the elided
+    rows for — how many, how many passed, the best score among them, and
+    their category counts — so the table stays a fixed size however long
+    the loop has run, without hiding a trend.
+    """
+    if len(rounds) <= head + tail:
+        return [_summary_row(r) for r in rounds]
+    middle = rounds[head : len(rounds) - tail]
+    scores = [r.score for r in middle if r.score is not None]
+    counts: dict[str, int] = {}
+    for r in middle:
+        for c in r.categories:
+            counts[c] = counts.get(c, 0) + 1
+    cats = ", ".join(f"{name}×{n}" for name, n in sorted(counts.items())) or "improved"
+    first, last = middle[0].round, middle[-1].round
+    elided = (
+        f"| {first}–{last} | best {_fmt_score(max(scores) if scores else None)} | "
+        f"{sum(1 for r in middle if r.passed)}/{len(middle)} | "
+        f"{len(middle)} rounds elided: {cats} | "
+        f"{sum(r.wall_seconds for r in middle):.0f} |"
+    )
+    return [
+        *(_summary_row(r) for r in rounds[:head]),
+        elided,
+        *(_summary_row(r) for r in rounds[len(rounds) - tail :]),
+    ]
+
+
 def render_self_edit_prompt(inputs: SelfEditInputs) -> str:
     """The prompt for the self-edit round: edit ``SCAFFOLD.md`` only, do not commit.
 
@@ -341,15 +449,15 @@ def render_self_edit_prompt(inputs: SelfEditInputs) -> str:
             substring (cannot happen when ``inputs`` was built by
             :func:`build_self_edit_inputs`, re-checked anyway).
     """
-    rows = [
-        f"| {r.round} | {_fmt_score(r.score)} | {'yes' if r.passed else 'no'} | "
-        f"{', '.join(r.categories) or 'improved'} | {r.wall_seconds:.0f} |"
-        for r in inputs.rounds
-    ]
     table = "\n".join(
-        ["| round | score | passed | categories | wall s |", "|---|---|---|---|---|", *rows]
+        [
+            "| round | score | passed | categories | wall s |",
+            "|---|---|---|---|---|",
+            *_summary_rows(inputs.rounds),
+        ]
     )
     counts = "\n".join(f"- {name}: {n}" for name, n in inputs.taxonomy_counts.items())
+    scaffold_bytes = len(inputs.scaffold_text.encode("utf-8"))
     prompt = f"""You are the self-edit step of a continuous research loop, running after
 round {inputs.round_index}. The file {SCAFFOLD_FILENAME} in this working directory holds
 the standing instructions that are prepended verbatim to every round's prompt.
@@ -365,6 +473,9 @@ Rules — these are enforced by the loop, not merely requested:
   NOTES.md or PROBLEM.md, do not create STOP.
 - Keep the scaffold short and concrete: what to try next, what to avoid,
   what has been measured to work. Remove instructions that did not help.
+  It is prepended to EVERY round's prompt, so every byte is paid every round.
+  Hard cap: {SCAFFOLD_MAX_BYTES} bytes (it is {scaffold_bytes} bytes now); an
+  edit that grows it past the cap is discarded whole.
 - If the current scaffold is already as good as you can make it, change nothing.
 
 ## Rounds so far (score is measured by the loop's verifier; higher is better)
@@ -519,6 +630,8 @@ class _TreeSnapshot:
     #: Directory holding a copy of every pre-existing dirty regular file (for restore).
     keep_dir: Path
     kept: dict[str, Path] = field(default_factory=dict)
+    #: Size of ``SCAFFOLD.md`` before the engine ran (``None`` when absent).
+    scaffold_bytes: int | None = None
 
 
 def _snapshot(sandbox: Path) -> _TreeSnapshot:
@@ -562,6 +675,7 @@ def _snapshot(sandbox: Path) -> _TreeSnapshot:
             shutil.copytree(src, dst, symlinks=True)
         else:
             shutil.copy2(src, dst, follow_symlinks=False)
+    scaffold_path = sandbox / SCAFFOLD_FILENAME
     return _TreeSnapshot(
         head=head,
         index_tree=tree.stdout.strip(),
@@ -570,6 +684,7 @@ def _snapshot(sandbox: Path) -> _TreeSnapshot:
         guarded=_verifier_paths(sandbox),
         keep_dir=keep_dir,
         kept=kept,
+        scaffold_bytes=scaffold_path.stat().st_size if scaffold_path.is_file() else None,
     )
 
 
@@ -828,9 +943,13 @@ class ScaffoldSelfEditStep:
         )
         if not self._timeout > 0:
             raise ContractViolationError("self-edit timeout must be positive")
+        #: Length of the prompt the last ``propose`` actually sent; the loop
+        #: records it on the trajectory event. ``None`` before the first call.
+        self.last_prompt_chars: int | None = None
 
     async def propose(self, inputs: SelfEditInputs) -> str | None:
         prompt = render_self_edit_prompt(inputs)
+        self.last_prompt_chars = len(prompt)
         sandbox = self._sandbox
         before = await asyncio.to_thread(self._prepare)
         try:
@@ -909,6 +1028,10 @@ class ScaffoldSelfEditStep:
                 scaffold_path.is_symlink() or not scaffold_path.is_file()
             ):
                 reason = f"{SCAFFOLD_FILENAME} is no longer a regular file"
+            elif SCAFFOLD_FILENAME in seen.changed:
+                reason = scaffold_size_problem(
+                    scaffold_path.stat().st_size, previous=before.scaffold_bytes
+                )
 
         if reason is not None:
             self._reject(round_index, before, seen, reason)

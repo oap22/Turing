@@ -12,10 +12,11 @@ from turing.research.backends import (
     Usage,
     encode_proposal,
 )
+from turing.research.backends.adapter import HISTORY_HEAD, HISTORY_TAIL, RATIONALE_MAX_CHARS
 from turing.research.backends.errors import BackendError, BackendProtocolError
 from turing.research.backends.fake import ScriptedTurn
 from turing.research.contracts import CapConsumption, ProblemType
-from turing.research.solver.models import ProposalContext
+from turing.research.solver.models import IterationSummary, ProposalContext
 from turing.research.solver.protocols import ProposalBackend, ResumableBackend
 
 if TYPE_CHECKING:
@@ -180,3 +181,79 @@ class TestSeam:
         fake = FakeBackend.replying(f"```json\n{body}\n```")
         proposal = await ProposalAdapter(fake).propose(_context(tmp_path))
         assert proposal.edits[0].content == "ok"
+
+
+# --------------------------------------------------------------------------- #
+# History block: bounded, so the prompt does not grow with the attempt
+# --------------------------------------------------------------------------- #
+
+
+def _summaries(n: int, *, rationale: str = "try again") -> tuple[IterationSummary, ...]:
+    return tuple(
+        IterationSummary(
+            iteration_index=i,
+            rationale=f"{rationale} {i}",
+            score=None if i % 5 == 0 else float(i),
+            passed_correctness=i % 3 != 0,
+        )
+        for i in range(n)
+    )
+
+
+def _history_context(workspace: Path, history: tuple[IterationSummary, ...]) -> ProposalContext:
+    return ProposalContext(
+        problem_id="synth",
+        problem_type=ProblemType.SPEEDUP,
+        goal="raise the number",
+        score_scale="speedup_ratio",
+        workspace=workspace,
+        iteration_index=len(history),
+        seed=7,
+        remaining=CapConsumption(steps=3, tokens=1000, wall_clock_seconds=60.0),
+        history=history,
+    )
+
+
+async def _user_text_for(workspace: Path, history: tuple[IterationSummary, ...]) -> str:
+    fake = FakeBackend.replying(encode_proposal(rationale="x", edits=(("a.txt", "1"),)))
+    await ProposalAdapter(fake).propose(_history_context(workspace, history))
+    return fake.calls[0].messages[0].text
+
+
+class TestHistoryBlock:
+    async def test_short_history_is_listed_in_full(self, tmp_path: Path) -> None:
+        n = HISTORY_HEAD + HISTORY_TAIL
+        text = await _user_text_for(tmp_path, _summaries(n))
+        assert "elided" not in text
+        assert all(f"[{i}] " in text for i in range(n))
+
+    async def test_long_history_keeps_head_and_tail_and_aggregates_the_middle(
+        self, tmp_path: Path
+    ) -> None:
+        n = 40
+        history = _summaries(n)
+        text = await _user_text_for(tmp_path, history)
+        head = range(HISTORY_HEAD)
+        tail = range(n - HISTORY_TAIL, n)
+        assert all(f"[{i}] " in text for i in (*head, *tail))
+        middle = range(HISTORY_HEAD, n - HISTORY_TAIL)
+        assert not any(f"[{i}] " in text for i in middle)
+        line = next(ln for ln in text.splitlines() if "elided" in ln)
+        assert line.startswith(f"  [{middle.start}–{middle.stop - 1}] {len(middle)} iterations")
+        elided = [h for h in history if h.iteration_index in middle]
+        best = max(h.score for h in elided if h.score is not None)
+        assert f"best score={best}" in line
+        assert f"correct={sum(1 for h in elided if h.passed_correctness)}/{len(elided)}" in line
+
+    async def test_prompt_size_is_flat_in_iterations(self, tmp_path: Path) -> None:
+        small = len(await _user_text_for(tmp_path, _summaries(20)))
+        large = len(await _user_text_for(tmp_path, _summaries(500)))
+        assert large - small < 60, (small, large)
+
+    async def test_rationale_is_truncated_and_kept_on_one_line(self, tmp_path: Path) -> None:
+        long = "word\n" * 2_000
+        text = await _user_text_for(tmp_path, _summaries(1, rationale=long))
+        line = next(ln for ln in text.splitlines() if ln.startswith("  [0] "))
+        assert len(line) < RATIONALE_MAX_CHARS + 60
+        assert line.endswith("…")
+        assert "\n" not in line and "word word word" in line
