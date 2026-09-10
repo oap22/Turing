@@ -140,7 +140,6 @@ from turing.research.rsi.scaffold import (
     NOTES_TAIL_LINES,
     SCAFFOLD_FILENAME,
     compact_notes_tail,
-    render_self_edit_prompt,
     scaffold_size_problem,
 )
 from turing.research.rsi.taxonomy import (
@@ -1184,9 +1183,6 @@ class RsiLoop:
             notes_tail=notes_tail,
             forbidden=forbidden,
         )
-        # Rendering is pure; the size is recorded on the event so the cost of
-        # a self-edit is visible next to what it changed.
-        prompt_chars = len(render_self_edit_prompt(inputs))
         scaffold_bytes_before = len(scaffold_text.encode("utf-8"))
         before = await self._tree_state()
         results_before = self.cheat.snapshot_before(self.sandbox, self.results)
@@ -1194,7 +1190,6 @@ class RsiLoop:
             "rsi.self_edit.start",
             round=round_no,
             head=before.head[:12],
-            prompt_chars=prompt_chars,
             scaffold_bytes=scaffold_bytes_before,
         )
         try:
@@ -1216,6 +1211,10 @@ class RsiLoop:
                     self.results, results_before, round_no, trajectory=self.trajectory_path
                 )
             raise
+        # The size of the prompt the step actually sent, when it says; a step
+        # that does not report one gets ``null`` rather than a number the loop
+        # made up by rendering a prompt that never went anywhere.
+        prompt_chars = _reported_prompt_chars(self.self_edit)
         trajectory_tamper = self.cheat.trajectory_change(
             self.results, results_before, trajectory=self.trajectory_path
         )
@@ -1237,6 +1236,7 @@ class RsiLoop:
                 lock,
                 results_changed=results_changed,
                 trajectory_changed=trajectory_reason,
+                scaffold_bytes_before=scaffold_bytes_before,
             )
         except asyncio.CancelledError:
             await self._cleanup_cancelled_self_edit(before, results_before, round_no, lock)
@@ -1442,6 +1442,7 @@ class RsiLoop:
         *,
         results_changed: Sequence[str] = (),
         trajectory_changed: str | None = None,
+        scaffold_bytes_before: int | None = None,
     ) -> tuple[str | None, str | None]:
         """I3: keep ``sha`` only if it changed exactly SCAFFOLD.md and touched nothing else.
 
@@ -1501,7 +1502,16 @@ class RsiLoop:
                     size = await run_git(
                         self.sandbox, "cat-file", "-s", f"{sha.strip()}:{SCAFFOLD_FILENAME}"
                     )
-                    reason = scaffold_size_problem(int(size.stdout.strip() or 0))
+                    if not size.ok or not size.stdout.strip().isdigit():
+                        # Fail closed: a size that cannot be read is not a small size.
+                        reason = (
+                            f"could not measure {SCAFFOLD_FILENAME} in {sha.strip()[:12]}: "
+                            f"{size.stderr.strip() or 'no size from git'}"
+                        )
+                    else:
+                        reason = scaffold_size_problem(
+                            int(size.stdout.strip()), previous=scaffold_bytes_before
+                        )
         if reason is None:
             return (sha.strip() if sha else None), None
         logger.warning("rsi.self_edit.rejected", reason=reason, discarded_paths=changed)
@@ -1785,6 +1795,14 @@ class RsiLoop:
 # --------------------------------------------------------------------------- #
 # Filesystem helpers
 # --------------------------------------------------------------------------- #
+
+
+def _reported_prompt_chars(step: object) -> int | None:
+    """``step.last_prompt_chars`` when the step reports it as a non-negative int, else ``None``."""
+    value = getattr(step, "last_prompt_chars", None)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _is_content_digest(digest: str) -> bool:

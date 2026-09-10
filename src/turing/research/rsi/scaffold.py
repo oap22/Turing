@@ -282,9 +282,17 @@ def _notes_tail(sandbox: Path, lines: int = NOTES_TAIL_LINES) -> str:
     return compact_notes_tail(_read_plain_file(path, sandbox), lines=lines)
 
 
-def scaffold_size_problem(size: int, *, max_bytes: int = SCAFFOLD_MAX_BYTES) -> str | None:
-    """Why a ``SCAFFOLD.md`` of ``size`` bytes may not be kept, or ``None``."""
-    if size > max_bytes:
+def scaffold_size_problem(
+    size: int, *, previous: int | None = None, max_bytes: int = SCAFFOLD_MAX_BYTES
+) -> str | None:
+    """Why a ``SCAFFOLD.md`` of ``size`` bytes may not be kept, or ``None``.
+
+    The cap is on *growth*: an edit is refused when it leaves the scaffold
+    over ``max_bytes`` **and** larger than ``previous``. A scaffold already
+    over the cap (seeded that way, or written before the cap existed) can
+    therefore still be trimmed back down in steps; it can never grow.
+    """
+    if size > max_bytes and (previous is None or size > previous):
         return f"{SCAFFOLD_FILENAME} is {size} bytes, over the {max_bytes}-byte cap"
     return None
 
@@ -467,7 +475,7 @@ Rules — these are enforced by the loop, not merely requested:
   what has been measured to work. Remove instructions that did not help.
   It is prepended to EVERY round's prompt, so every byte is paid every round.
   Hard cap: {SCAFFOLD_MAX_BYTES} bytes (it is {scaffold_bytes} bytes now); an
-  edit that leaves it larger is discarded whole.
+  edit that grows it past the cap is discarded whole.
 - If the current scaffold is already as good as you can make it, change nothing.
 
 ## Rounds so far (score is measured by the loop's verifier; higher is better)
@@ -622,6 +630,8 @@ class _TreeSnapshot:
     #: Directory holding a copy of every pre-existing dirty regular file (for restore).
     keep_dir: Path
     kept: dict[str, Path] = field(default_factory=dict)
+    #: Size of ``SCAFFOLD.md`` before the engine ran (``None`` when absent).
+    scaffold_bytes: int | None = None
 
 
 def _snapshot(sandbox: Path) -> _TreeSnapshot:
@@ -665,6 +675,7 @@ def _snapshot(sandbox: Path) -> _TreeSnapshot:
             shutil.copytree(src, dst, symlinks=True)
         else:
             shutil.copy2(src, dst, follow_symlinks=False)
+    scaffold_path = sandbox / SCAFFOLD_FILENAME
     return _TreeSnapshot(
         head=head,
         index_tree=tree.stdout.strip(),
@@ -673,6 +684,7 @@ def _snapshot(sandbox: Path) -> _TreeSnapshot:
         guarded=_verifier_paths(sandbox),
         keep_dir=keep_dir,
         kept=kept,
+        scaffold_bytes=scaffold_path.stat().st_size if scaffold_path.is_file() else None,
     )
 
 
@@ -931,9 +943,13 @@ class ScaffoldSelfEditStep:
         )
         if not self._timeout > 0:
             raise ContractViolationError("self-edit timeout must be positive")
+        #: Length of the prompt the last ``propose`` actually sent; the loop
+        #: records it on the trajectory event. ``None`` before the first call.
+        self.last_prompt_chars: int | None = None
 
     async def propose(self, inputs: SelfEditInputs) -> str | None:
         prompt = render_self_edit_prompt(inputs)
+        self.last_prompt_chars = len(prompt)
         sandbox = self._sandbox
         before = await asyncio.to_thread(self._prepare)
         try:
@@ -1013,7 +1029,9 @@ class ScaffoldSelfEditStep:
             ):
                 reason = f"{SCAFFOLD_FILENAME} is no longer a regular file"
             elif SCAFFOLD_FILENAME in seen.changed:
-                reason = scaffold_size_problem(scaffold_path.stat().st_size)
+                reason = scaffold_size_problem(
+                    scaffold_path.stat().st_size, previous=before.scaffold_bytes
+                )
 
         if reason is not None:
             self._reject(round_index, before, seen, reason)

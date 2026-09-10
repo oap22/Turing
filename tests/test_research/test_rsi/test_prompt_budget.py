@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -257,6 +258,41 @@ class TestScaffoldCap:
         problem = scaffold_size_problem(SCAFFOLD_MAX_BYTES + 1)
         assert problem is not None and "over the" in problem
 
+    def test_cap_is_on_growth_so_an_oversized_scaffold_can_still_shrink(self) -> None:
+        over = SCAFFOLD_MAX_BYTES + 5_000
+        assert scaffold_size_problem(over - 1, previous=over) is None, "shrinking is allowed"
+        assert scaffold_size_problem(over, previous=over) is None, "not growing is allowed"
+        assert scaffold_size_problem(over + 1, previous=over) is not None, "growing is not"
+        assert scaffold_size_problem(over, previous=100) is not None
+        assert scaffold_size_problem(SCAFFOLD_MAX_BYTES, previous=10) is None
+
+    async def test_step_lets_an_oversized_scaffold_be_trimmed(
+        self,
+        rsi_dirs: RsiDirs,
+        repo: Path,  # noqa: F811
+    ) -> None:
+        # A scaffold from before the cap existed: 30 KiB committed.
+        big = "# S\n" + "b" * (30 * 1024)
+        (repo / SCAFFOLD_FILENAME).write_text(big)
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "old oversized scaffold")
+        smaller = big[: 27 * 1024]
+
+        def trim(cwd: Path) -> None:
+            (cwd / SCAFFOLD_FILENAME).write_text(smaller)
+
+        step = ScaffoldSelfEditStep(CallableEngine(trim), rsi_dirs.config, repo, timeout_seconds=5)
+        inputs = build_self_edit_inputs(rsi_dirs.config, [], repo, forbidden=[VERIFIER_CMD])
+        assert await step.propose(inputs) is not None
+        assert (repo / SCAFFOLD_FILENAME).read_text() == smaller
+
+        def grow(cwd: Path) -> None:
+            (cwd / SCAFFOLD_FILENAME).write_text(smaller + "more")
+
+        step = ScaffoldSelfEditStep(CallableEngine(grow), rsi_dirs.config, repo, timeout_seconds=5)
+        assert await step.propose(inputs) is None
+        assert (repo / SCAFFOLD_FILENAME).read_text() == smaller
+
     def test_cap_leaves_room_under_the_argv_cap(self) -> None:
         body = build_round_prompt(
             round_no=1, results_dir=Path("/r"), scaffold_text="", verifier_command="sh v.sh"
@@ -295,6 +331,30 @@ class TestScaffoldCap:
         step = ScaffoldSelfEditStep(CallableEngine(edit), rsi_dirs.config, repo, timeout_seconds=5)
         inputs = build_self_edit_inputs(rsi_dirs.config, [], repo, forbidden=[VERIFIER_CMD])
         assert await step.propose(inputs) is not None
+
+    async def test_loop_fails_closed_when_the_scaffold_size_cannot_be_read(
+        self, rsi_dirs: RsiDirs, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from turing.research.rsi import loop as loop_module
+
+        results = rsi_dirs.results
+        step = StubSelfEdit(rsi_dirs.sandbox, text="small\n")
+        real = loop_module.run_git
+
+        async def flaky(cwd: Any, *args: str, **kwargs: Any) -> Any:
+            result = await real(cwd, *args, **kwargs)
+            if args[:2] == ("cat-file", "-s"):
+                return replace(result, exit_code=128, stdout="", stderr="simulated git failure")
+            return result
+
+        monkeypatch.setattr(loop_module, "run_git", flaky)
+        engine = FakeEngine(script=[score_step(v, results=results) for v in (1, 2)])
+        cfg = _config(rsi_dirs, rounds=2, self_edit_every=2, self_edit_budget=1)
+        outcome = await _loop(rsi_dirs, engine, config=cfg, self_edit=step).run()
+        assert outcome.self_edits == 0
+        rejected = next(e for e in _events(results) if e["event"] == "self_edit_rejected")
+        assert "could not measure" in rejected["reason"]
+        assert "simulated git failure" in rejected["reason"]
 
     async def test_loop_rejects_an_oversized_scaffold_a_custom_step_committed(
         self, rsi_dirs: RsiDirs
@@ -361,6 +421,7 @@ class TestPromptAccounting:
         cfg = _config(rsi_dirs, rounds=4, self_edit_every=2, self_edit_budget=1)
         await _loop(rsi_dirs, engine, config=cfg, self_edit=step).run()
         edit = next(e for e in _events(results) if e["event"] == "self_edit")
+        assert edit["prompt_chars"] == step.last_prompt_chars
         assert edit["prompt_chars"] == len(render_self_edit_prompt(step.seen[0]))
         assert edit["scaffold_bytes_before"] == len(step.seen[0].scaffold_text.encode())
         assert edit["scaffold_bytes_after"] == len(b"GOOD ADVICE\n")
@@ -379,6 +440,34 @@ class TestPromptAccounting:
         await _loop(rsi_dirs, engine, config=cfg, self_edit=step).run()
         rejected = next(e for e in _events(results) if e["event"] == "self_edit_rejected")
         assert rejected["prompt_chars"] == len(render_self_edit_prompt(step.seen[0]))
+
+    async def test_a_step_that_reports_no_prompt_size_records_null_not_fiction(
+        self, rsi_dirs: RsiDirs
+    ) -> None:
+        results = rsi_dirs.results
+        step = StubSelfEdit(rsi_dirs.sandbox, text="fine\n", report_prompt=False)
+        engine = FakeEngine(script=[score_step(v, results=results) for v in (1, 2)])
+        cfg = _config(rsi_dirs, rounds=2, self_edit_every=2, self_edit_budget=1)
+        await _loop(rsi_dirs, engine, config=cfg, self_edit=step).run()
+        edit = next(e for e in _events(results) if e["event"] == "self_edit")
+        assert edit["prompt_chars"] is None
+
+    async def test_the_real_step_records_the_prompt_it_sent(self, rsi_dirs: RsiDirs) -> None:
+        # ScaffoldSelfEditStep through the loop: the event carries the exact prompt length.
+        results = rsi_dirs.results
+        engine = FakeEngine(script=[score_step(v, results=results) for v in (1, 2)])
+        loop = _loop(rsi_dirs, engine, config=_config(rsi_dirs, rounds=2, self_edit_every=2))
+        await loop.prepare()
+        editor = CallableEngine(
+            lambda cwd: (cwd / SCAFFOLD_FILENAME).write_text("# Scaffold\n\nreal step\n")
+        )
+        loop.self_edit = ScaffoldSelfEditStep(
+            editor, rsi_dirs.config, rsi_dirs.sandbox, timeout_seconds=5
+        )
+        await loop.run()
+        edit = next(e for e in _events(results) if e["event"] == "self_edit")
+        assert edit["prompt_chars"] == len(editor.prompts[0]) == loop.self_edit.last_prompt_chars
+        assert edit["scaffold_bytes_after"] == len(b"# Scaffold\n\nreal step\n")
 
     async def test_loop_compacts_a_huge_notes_tail_before_the_self_edit(
         self, rsi_dirs: RsiDirs

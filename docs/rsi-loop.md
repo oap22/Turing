@@ -78,7 +78,7 @@ numbering. The events the loop writes (each also carries `round` and `ts`):
 | `verifier_locked` | First run, right after `VERIFIER.json` is written | `command_sha256`, `file_sha256s`, `lock_sha256` (sha256 of the lock file's bytes; a resume whose on-disk lock differs is a tamper) |
 | `scaffold_seeded` | First run, when `SCAFFOLD.md` is created and committed | `scaffold_sha`, `scaffold_blob` |
 | `scaffold_drift` | A round agent rewrote or committed `SCAFFOLD.md`; the loop restored its own version | `when`, `head_moved`, `worktree_moved`, `restored_sha`, `scaffold_sha`, `scaffold_blob` |
-| `self_edit` | A self-edit was kept and committed | `scaffold_sha`, `scaffold_blob`, `judgment_window`, `prompt_chars` (the self-edit prompt's length), `scaffold_bytes_before`, `scaffold_bytes_after` |
+| `self_edit` | A self-edit was kept and committed | `scaffold_sha`, `scaffold_blob`, `judgment_window`, `prompt_chars` (the length of the prompt the step reports having sent; `null` for a step that reports none), `scaffold_bytes_before`, `scaffold_bytes_after` |
 | `self_edit_rejected` | The self-edit touched something other than `SCAFFOLD.md`, or left it over the size cap, and was discarded | `proposed`, `reason`, `prompt_chars` |
 | `self_edit_kept` | The rounds after a self-edit were judged and the edit survives | `scaffold_sha`, `best_before`, `best_after` |
 | `rollback` | The rounds after a self-edit were worse than the noise floor allows; the edit was reverted | `reverted`, `revert_sha`, `best_before`, `best_after`, `scaffold_sha`, `scaffold_blob` |
@@ -214,9 +214,12 @@ used to make it 167 K.
 
 **The scaffold has a hard size cap, enforced.** The prompt tells the
 self-edit step the cap (24 KiB) and the scaffold's current size; an edit
-that leaves `SCAFFOLD.md` larger is discarded like any other bad edit
+that grows `SCAFFOLD.md` past the cap is discarded like any other bad edit
 (`self_edit_rejected`, reason `SCAFFOLD.md is N bytes, over the …-byte
-cap`), by the step and independently by the loop. The reason is not taste:
+cap`), by the step and independently by the loop. The cap is on growth:
+a scaffold already over it (seeded that way, or written before the cap
+existed) can still be trimmed down in steps, and a size the loop cannot
+read from git rejects the edit rather than passing it. The reason is not taste:
 both CLIs take the prompt as one argv string, Linux caps one argument at
 128 KiB, and past that `execve` fails with `E2BIG`. Before this cap a
 scaffold that grew past it turned every following round into
