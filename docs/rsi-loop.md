@@ -66,7 +66,10 @@ live run (`research/JOURNAL.md`, 2026-09-04) hit exactly this.
 
 The trajectory line keeps the bash script's four keys first
 (`round`, `started`, `ended`, `exit`) and adds `score`, `passed`, `categories`,
-`scaffold_sha`, `void`, `agent_reported_score`, `verifier_wall_seconds`. Lines
+`scaffold_sha`, `void`, `agent_reported_score`, `verifier_wall_seconds`, and
+`prompt_chars` — the length of the prompt the engine was handed that round,
+scaffold included, so the token cost of a trajectory can be read off it
+(lines written before this key existed load as `null`). Lines
 with an `event` key are not rounds; the resume logic skips them when
 numbering. The events the loop writes (each also carries `round` and `ts`):
 
@@ -75,8 +78,8 @@ numbering. The events the loop writes (each also carries `round` and `ts`):
 | `verifier_locked` | First run, right after `VERIFIER.json` is written | `command_sha256`, `file_sha256s`, `lock_sha256` (sha256 of the lock file's bytes; a resume whose on-disk lock differs is a tamper) |
 | `scaffold_seeded` | First run, when `SCAFFOLD.md` is created and committed | `scaffold_sha`, `scaffold_blob` |
 | `scaffold_drift` | A round agent rewrote or committed `SCAFFOLD.md`; the loop restored its own version | `when`, `head_moved`, `worktree_moved`, `restored_sha`, `scaffold_sha`, `scaffold_blob` |
-| `self_edit` | A self-edit was kept and committed | `scaffold_sha`, `scaffold_blob` |
-| `self_edit_rejected` | The self-edit touched something other than `SCAFFOLD.md` and was discarded | `proposed`, `reason` |
+| `self_edit` | A self-edit was kept and committed | `scaffold_sha`, `scaffold_blob`, `judgment_window`, `prompt_chars` (the self-edit prompt's length), `scaffold_bytes_before`, `scaffold_bytes_after` |
+| `self_edit_rejected` | The self-edit touched something other than `SCAFFOLD.md`, or left it over the size cap, and was discarded | `proposed`, `reason`, `prompt_chars` |
 | `self_edit_kept` | The rounds after a self-edit were judged and the edit survives | `scaffold_sha`, `best_before`, `best_after` |
 | `rollback` | The rounds after a self-edit were worse than the noise floor allows; the edit was reverted | `reverted`, `revert_sha`, `best_before`, `best_after`, `scaffold_sha`, `scaffold_blob` |
 | `rollback_failed` | The revert could not be applied; the loop stops (exit 1, `stop_reason=rollback_failed`) | `reverted`, `error` |
@@ -196,7 +199,33 @@ engine an **aggregate summary** — per round: number, score, pass/fail,
 categories, wall seconds; the category counts; the best score; the current
 `SCAFFOLD.md`; the last ~40 lines of `NOTES.md` — and a prompt that permits
 editing **only** `SCAFFOLD.md`. The summary never includes the verifier's
-internals and never reads outside the sandbox (ADR 0011 §16). Then:
+internals and never reads outside the sandbox (ADR 0011 §16).
+
+**The summary is a fixed size.** Its rounds table lists the first 3 and the
+last 12 rounds in full; rounds between are collapsed into one row carrying
+their count, how many passed, their best score and their category counts
+(the category-count section always covers every round). The notes tail is
+the last 40 lines *and* at most 8,000 characters, newest text kept, with a
+first line saying how many characters were cut. Measured on the recorded
+`rsi-import-speedup-2026-09-04` scaffold and notes, the self-edit prompt is
+about 10 K characters at 3 rounds and stays there at 200 (it was 18 K
+before the table was bounded); forty pasted 4,000-character note lines
+used to make it 167 K.
+
+**The scaffold has a hard size cap, enforced.** The prompt tells the
+self-edit step the cap (24 KiB) and the scaffold's current size; an edit
+that leaves `SCAFFOLD.md` larger is discarded like any other bad edit
+(`self_edit_rejected`, reason `SCAFFOLD.md is N bytes, over the …-byte
+cap`), by the step and independently by the loop. The reason is not taste:
+both CLIs take the prompt as one argv string, Linux caps one argument at
+128 KiB, and past that `execve` fails with `E2BIG`. Before this cap a
+scaffold that grew past it turned every following round into
+`engine_error` reported as "could not start claude", and the loop gave up
+after three with the hint "is the claude CLI installed?". The engine now
+refuses a prompt over 120 KiB itself (exit `126`, stderr naming the byte
+count and `SCAFFOLD.md`) and names an `E2BIG` from the OS for what it is.
+An operator-seeded scaffold over the cap is still prepended verbatim — the
+round is then an `engine_error` whose stderr says why. Then:
 
 - The repo is inspected — working tree (ignored files included), index, HEAD
   and `.git` internals — against a snapshot taken before the engine ran. If
@@ -367,7 +396,7 @@ the bash path on a locked slug.
 | Code | Meaning |
 |---|---|
 | `0` | Normal completion: rounds exhausted or `STOP` file found. A verifier failure alone remains a round fact and does not fail the invocation. |
-| `1` | Every engine attempt in this invocation timed out or exited unsuccessfully, or a scaffold rollback could not be applied (`rollback_failed`). The trajectory still preserves each round's measured verifier result and failure categories. |
+| `1` | Every engine attempt in this invocation timed out or exited unsuccessfully (a prompt the engine refused as too large counts: its round's `exit` is `126`), or a scaffold rollback could not be applied (`rollback_failed`). The trajectory still preserves each round's measured verifier result and failure categories. |
 | `2` | Usage or pre-flight refusal, before any disk write: bad flag, missing `--problem` or `--verifier` on a first run, a different `--verifier` or `--verifier-file` set on resume, a first run that would pin no file although the command names one, a missing lock on a slug that already ran, unreadable lock, corrupt `trajectory.json`, taxonomy digest mismatch |
 | `3` | The loop stopped on a cheat or a tamper. The last trajectory line is either a void round naming the category, or — when the lock was found broken at start-up, before any round — a `{"event": "verifier_tampered", "when": "startup", …}` line. Investigate before restarting; re-running the same command does not re-lock anything |
 | `130` | Interrupted (Ctrl-C). No trajectory line is written for the round in flight. The engine's (or verifier's) process group is SIGKILLed on interrupt; a descendant that put itself in a new session (`setsid`) is outside that group and may survive — check for a still-running `claude` before restarting, because an orphaned agent writing into the sandbox during the next round reads as a tamper or escape |
@@ -375,7 +404,8 @@ the bash path on a locked slug.
 ## What is deliberately not here
 
 - No OS-level isolation (above). No network policy. No resource caps beyond
-  wall-clock timeouts.
+  wall-clock timeouts and the prompt/scaffold byte caps above — the loop
+  records `prompt_chars`, it does not budget tokens.
 - No held-out split, no secondary axis, no escalation channel — those belong
   to the research runner in `docs/research-agent.md`, and this loop makes no
   claim about generalisation: it improves one problem against one verifier.

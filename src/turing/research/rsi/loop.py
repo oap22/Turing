@@ -133,11 +133,15 @@ from turing.research.rsi.contracts import (
     iter_forbidden,
     sha256_file,
 )
+from turing.research.rsi.engine import PROMPT_TOO_LARGE_EXIT
 from turing.research.rsi.scaffold import (
     DEFAULT_SCAFFOLD_TEXT,
     NOTES_FILENAME,
     NOTES_TAIL_LINES,
     SCAFFOLD_FILENAME,
+    compact_notes_tail,
+    render_self_edit_prompt,
+    scaffold_size_problem,
 )
 from turing.research.rsi.taxonomy import (
     TAXONOMY_DIGEST,
@@ -772,6 +776,8 @@ class RsiLoop:
                 scaffold_text=self._read_text(self.sandbox / SCAFFOLD_FILENAME),
                 verifier_command=lock.command,
             )
+            prompt_chars = len(prompt)
+            logger.info("rsi.round.prompt", round=round_no, prompt_chars=prompt_chars)
             result = await self.engine.run(
                 prompt, cwd=self.sandbox, timeout_seconds=cfg.round_timeout_seconds
             )
@@ -781,7 +787,13 @@ class RsiLoop:
             tamper = self._lock_mismatch(lock)
             if tamper is not None:
                 record = self._void_tamper_record(
-                    round_no, started, scaffold_sha, tamper, ended=ended, exit_code=result.exit_code
+                    round_no,
+                    started,
+                    scaffold_sha,
+                    tamper,
+                    ended=ended,
+                    exit_code=result.exit_code,
+                    prompt_chars=prompt_chars,
                 )
                 records.append(record)
                 append_jsonl(self.trajectory_path, record.to_json_line())
@@ -836,6 +848,7 @@ class RsiLoop:
                     scaffold_sha=scaffold_sha,
                     void=verdict.fired,
                     agent_reported_score=agent_score,
+                    prompt_chars=prompt_chars,
                 )
                 records.append(record)
                 append_jsonl(self.trajectory_path, record.to_json_line())
@@ -907,6 +920,7 @@ class RsiLoop:
                 void=verdict.fired,
                 agent_reported_score=agent_score,
                 verifier_wall_seconds=outcome.wall_seconds if outcome is not None else None,
+                prompt_chars=prompt_chars,
             )
             records.append(record)
             append_jsonl(self.trajectory_path, record.to_json_line())
@@ -968,7 +982,11 @@ class RsiLoop:
                     logger.error(
                         "rsi.loop.aborting",
                         consecutive_failures=consecutive_failures,
-                        hint="is the claude CLI installed?",
+                        hint=(
+                            result.stderr.strip()[-400:]
+                            if result.exit_code == PROMPT_TOO_LARGE_EXIT
+                            else "is the engine CLI installed?"
+                        ),
                     )
                     stop = StopReason.ENGINE_FAILURES
                     round_no += 1
@@ -1065,6 +1083,7 @@ class RsiLoop:
         *,
         ended: int | None = None,
         exit_code: int = -1,
+        prompt_chars: int | None = None,
     ) -> RoundRecord:
         del detail  # logged by _lock_mismatch; the record carries the category
         return RoundRecord(
@@ -1075,6 +1094,7 @@ class RsiLoop:
             categories=frozenset({FailureCategory.VERIFIER_TAMPERED}),
             scaffold_sha=scaffold_sha,
             void=True,
+            prompt_chars=prompt_chars,
         )
 
     def _append_event(self, event: str, round_no: int, details: dict[str, Any]) -> None:
@@ -1154,8 +1174,7 @@ class RsiLoop:
         # I4: SCAFFOLD.md and NOTES.md are read only as regular files inside the
         # sandbox, never through a symlink the round may have planted.
         scaffold_text = redact(self._read_sandbox_file(SCAFFOLD_FILENAME), needles)
-        notes_lines = self._read_sandbox_file(NOTES_FILENAME).splitlines()
-        notes_tail = redact("\n".join(notes_lines[-NOTES_TAIL_LINES:]), needles)
+        notes_tail = redact(compact_notes_tail(self._read_sandbox_file(NOTES_FILENAME)), needles)
         inputs = SelfEditInputs(
             round_index=round_no,
             best_score=best_score,
@@ -1165,9 +1184,19 @@ class RsiLoop:
             notes_tail=notes_tail,
             forbidden=forbidden,
         )
+        # Rendering is pure; the size is recorded on the event so the cost of
+        # a self-edit is visible next to what it changed.
+        prompt_chars = len(render_self_edit_prompt(inputs))
+        scaffold_bytes_before = len(scaffold_text.encode("utf-8"))
         before = await self._tree_state()
         results_before = self.cheat.snapshot_before(self.sandbox, self.results)
-        logger.info("rsi.self_edit.start", round=round_no, head=before.head[:12])
+        logger.info(
+            "rsi.self_edit.start",
+            round=round_no,
+            head=before.head[:12],
+            prompt_chars=prompt_chars,
+            scaffold_bytes=scaffold_bytes_before,
+        )
         try:
             sha = await self.self_edit.propose(inputs)
         except asyncio.CancelledError:
@@ -1214,7 +1243,9 @@ class RsiLoop:
             raise
         if rejection is not None:
             self._append_event(
-                "self_edit_rejected", round_no, {"proposed": sha, "reason": rejection}
+                "self_edit_rejected",
+                round_no,
+                {"proposed": sha, "reason": rejection, "prompt_chars": prompt_chars},
             )
             return None
         if kept is None:
@@ -1234,6 +1265,7 @@ class RsiLoop:
             raise
         self.scaffold_blob = blob.stdout.strip()
         self.scaffold_sha = kept
+        scaffold_bytes_after = len(self._read_sandbox_file(SCAFFOLD_FILENAME).encode("utf-8"))
         self._append_event(
             "self_edit",
             round_no,
@@ -1241,6 +1273,9 @@ class RsiLoop:
                 "scaffold_sha": kept,
                 "scaffold_blob": self.scaffold_blob,
                 "judgment_window": self.config.self_edit_every,
+                "prompt_chars": prompt_chars,
+                "scaffold_bytes_before": scaffold_bytes_before,
+                "scaffold_bytes_after": scaffold_bytes_after,
             },
         )
         logger.info("rsi.self_edit.kept", round=round_no, scaffold_sha=kept[:12])
@@ -1462,6 +1497,11 @@ class RsiLoop:
                 mode = listed.stdout.split(" ", 1)[0] if listed.stdout else ""
                 if mode != _REGULAR_FILE_MODE:
                     reason = f"{SCAFFOLD_FILENAME} in {sha.strip()[:12]} has mode {mode or '?'}"
+                else:
+                    size = await run_git(
+                        self.sandbox, "cat-file", "-s", f"{sha.strip()}:{SCAFFOLD_FILENAME}"
+                    )
+                    reason = scaffold_size_problem(int(size.stdout.strip() or 0))
         if reason is None:
             return (sha.strip() if sha else None), None
         logger.warning("rsi.self_edit.rejected", reason=reason, discarded_paths=changed)
