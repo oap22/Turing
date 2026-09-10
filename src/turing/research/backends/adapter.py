@@ -32,7 +32,23 @@ if TYPE_CHECKING:
     from turing.research.contracts import CapConsumption, VerificationResult
     from turing.research.solver.models import IterationSummary, ProposalContext
 
-__all__ = ["PROPOSAL_SCHEMA_HINT", "ProposalAdapter", "encode_proposal"]
+__all__ = [
+    "HISTORY_HEAD",
+    "HISTORY_TAIL",
+    "PROPOSAL_SCHEMA_HINT",
+    "RATIONALE_MAX_CHARS",
+    "ProposalAdapter",
+    "encode_proposal",
+]
+
+#: The history block lists the first ``HISTORY_HEAD`` and last ``HISTORY_TAIL``
+#: iterations in full and folds the rest into one aggregate line. Without a
+#: bound the block grew by one model-written rationale per iteration, so the
+#: prompt — and the token cap it is charged against — grew with the run.
+HISTORY_HEAD = 2
+HISTORY_TAIL = 8
+#: A rationale is model-authored and unbounded; the history shows this much of it.
+RATIONALE_MAX_CHARS = 400
 
 #: What the model is asked to emit. Kept as a constant so tests can pin the
 #: contract without scraping a prompt, and so a second backend can reuse it.
@@ -182,17 +198,40 @@ def _result_line(result: VerificationResult | None) -> str:
     )
 
 
+def _history_line(item: IterationSummary) -> str:
+    score = "—" if item.score is None else str(item.score)
+    rationale = " ".join(item.rationale.split())
+    if len(rationale) > RATIONALE_MAX_CHARS:
+        rationale = rationale[: RATIONALE_MAX_CHARS - 1] + "…"
+    return f"  [{item.iteration_index}] score={score} correct={item.passed_correctness} {rationale}"
+
+
 def _history_block(history: tuple[IterationSummary, ...]) -> str:
+    """Past iterations, bounded: head, one aggregate line, tail.
+
+    The aggregate line carries what the elided lines would be scanned for —
+    how many, how many verified correct, the best score among them — so the
+    block is a fixed size however long the attempt has run.
+    """
     if not history:
         return "  (none)"
-    lines: list[str] = []
-    for item in history:
-        score = "—" if item.score is None else str(item.score)
-        lines.append(
-            f"  [{item.iteration_index}] score={score} "
-            f"correct={item.passed_correctness} {item.rationale}"
-        )
-    return "\n".join(lines)
+    if len(history) <= HISTORY_HEAD + HISTORY_TAIL:
+        return "\n".join(_history_line(item) for item in history)
+    middle = history[HISTORY_HEAD : len(history) - HISTORY_TAIL]
+    scores = [item.score for item in middle if item.score is not None]
+    best = "—" if not scores else str(max(scores))
+    correct = sum(1 for item in middle if item.passed_correctness)
+    elided = (
+        f"  [{middle[0].iteration_index}–{middle[-1].iteration_index}] "
+        f"{len(middle)} iterations elided: best score={best} correct={correct}/{len(middle)}"
+    )
+    return "\n".join(
+        [
+            *(_history_line(item) for item in history[:HISTORY_HEAD]),
+            elided,
+            *(_history_line(item) for item in history[len(history) - HISTORY_TAIL :]),
+        ]
+    )
 
 
 def _carry_accounted_usage(exc: BackendError, usage: Usage) -> None:
