@@ -1,0 +1,6 @@
+772b80a 2026-09-10 02:47:01 +0000 Round 4: rigorous verification confirms architecture is at ceiling; STOP
+b487c7d 2026-09-10 02:41:48 +0000 Test SCS merge-order quality (round 3): confirmed no gain, revert
+59d2273 2026-09-10 02:36:18 +0000 rsi: self-edit after round 2
+185f6d7 2026-09-10 02:35:29 +0000 Pack facts with shortest-common-superstring merging + lowercase normalization
+837e4d7 2026-09-10 02:30:32 +0000 Implement fact-extracting compactor (score ~12x identity)
+03df117 2026-09-10 02:27:21 +0000 rsi: lock verifier and seed scaffold

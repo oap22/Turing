@@ -1,0 +1,15 @@
+{
+  "categories": {
+    "CHEAT_DETECTED": "cheat_detected",
+    "ENGINE_ERROR": "engine_error",
+    "NO_METRICS": "no_metrics",
+    "NO_PROGRESS": "no_progress",
+    "REGRESSED": "regressed",
+    "SANDBOX_ESCAPE": "sandbox_escape",
+    "TIMEOUT": "timeout",
+    "VERIFIER_FAILED": "verifier_failed",
+    "VERIFIER_TAMPERED": "verifier_tampered"
+  },
+  "digest": "2ee65add4eb8a03fe2466d53584904d12f7d78a374c45f74475ef646dc3dcd8d",
+  "version": "1"
+}
