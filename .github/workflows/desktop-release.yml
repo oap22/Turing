@@ -87,7 +87,7 @@ jobs:
           echo "dmg=$out" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.name.outputs.dmg }}
           path: |
