@@ -14,7 +14,7 @@ authors = [
 ]
 
 dependencies = [
-    "anthropic>=0.111.0",
+    "anthropic>=1.4.0",
     "ollama>=0.6.2",
     "aiosqlite>=0.22.1",
     "sqlite-vec>=0.1.9",
